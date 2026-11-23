@@ -1,6 +1,7 @@
 //! Issue #616 — `font-weight: normal` must override a UA `bold`.
 //!
-//! `<b>`/`<strong>` get `font-weight: bold` from the UA stylesheet. An author
+//! `<b>`/`<strong>` get `font-weight: bolder` from the UA stylesheet (700 under a
+//! normal parent; `ua_strong_bolder_tests` covers the other parents). An author
 //! declaration of `normal` computes to 400 and should beat it, exactly as
 //! `300` or `bold` do. The same shape applies to `font-style: normal` on
 //! `<em>`/`<i>` and to `text-decoration: none` on `<u>`/`<s>`.
@@ -409,14 +410,11 @@ fn an_author_text_decoration_replaces_the_ua_one_rather_than_joining_it() {
     );
 }
 
-// ===== The one presentational default still applied by tag =====
+// ===== rinch's user-select default for code =====
 
-/// `user-select` is the only presentational default `apply_stylo_styles_to_taffy`
-/// still applies by tag name, because this Stylo build does not carry the
-/// property at all — so there is nothing for a UA rule to cascade and nothing
-/// for `from_stylo` to read. The tag set must stay exactly the code-ish
-/// elements, and because the tag default is written *before* the inline `style`
-/// attribute is re-read, an author declaration must still win.
+/// `user-select: text` on the code-ish elements is a UA rule since #2231 (it
+/// was applied by tag after the cascade before). The set must stay exactly the
+/// code-ish elements, and an author declaration must still win.
 #[test]
 fn user_select_is_applied_by_tag_only_to_the_code_elements() {
     use rinch_dom::computed_style::UserSelectValue as U;

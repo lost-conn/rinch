@@ -28,13 +28,13 @@ const TYPEAHEAD_RESET_MS: u128 = 900;
 /// highlight/type-ahead state. Index-aligned vectors mirror the resolved options.
 pub(crate) struct OpenSelect {
     /// The `<select>` element the popup belongs to.
-    pub select_id: usize,
+    pub select_id: u64,
     /// Full-window click-catcher behind the panel.
-    pub backdrop_id: usize,
+    pub backdrop_id: u64,
     /// The option-list panel.
-    pub panel_id: usize,
+    pub panel_id: u64,
     /// Option row node ids, aligned to the option list.
-    pub option_ids: Vec<usize>,
+    pub option_ids: Vec<u64>,
     /// Option submit values, aligned.
     pub values: Vec<String>,
     /// Option display labels, aligned (for type-ahead).
@@ -43,6 +43,15 @@ pub(crate) struct OpenSelect {
     pub disabled: Vec<bool>,
     /// Currently highlighted option index.
     pub highlighted: usize,
+    /// The model's resolved selection as of the last time it was checked
+    /// (popup open, or the last [`RinchApp::sync_open_select_highlight_from_dom`]
+    /// call) — issue #757's "vice versa". This is the baseline a resync
+    /// compares the model's *current* answer against, deliberately **not**
+    /// `highlighted`: the user's own arrow-key navigation moves `highlighted`
+    /// without writing anything `resolve_select_model` reads, so comparing
+    /// against `highlighted` would snap the highlight back to the selection
+    /// on every repaint after the very first arrow key.
+    pub last_known_selected_index: usize,
     /// Accumulated type-ahead buffer.
     pub typeahead: String,
     /// When the last type-ahead key landed (buffer resets after a gap).
@@ -53,6 +62,13 @@ pub(crate) struct OpenSelect {
     /// its resolved default option, and re-picking it is not a change.
     pub initial_value: String,
 }
+
+/// The popup rows' `font-size` in `NATIVE_SELECT_CSS` (`.rinch-nsel-option`).
+const POPUP_ROW_FONT_SIZE: f32 = 14.0;
+/// Horizontal chrome around a popup row's label in `NATIVE_SELECT_CSS`: the
+/// panel's border (1px) and padding (4px) and the row's padding (10px), each
+/// side. The panel is `box-sizing: border-box`, so its `width` includes them.
+const POPUP_ROW_CHROME: f32 = 2.0 * (1.0 + 4.0 + 10.0);
 
 /// Popup stylesheet, injected once. Uses theme variables with light fallbacks so
 /// it looks right with or without the theme feature.
@@ -79,7 +95,10 @@ const NATIVE_SELECT_CSS: &str = r#"
     font-size: 14px;
     line-height: 1.4;
     color: var(--rinch-color-text, #212529);
-    white-space: nowrap;
+    white-space: pre;
+    letter-spacing: normal;
+    word-spacing: normal;
+    text-transform: none;
     cursor: pointer;
 }
 .rinch-nsel-option[data-selected]:not([data-highlighted]) {
@@ -102,7 +121,7 @@ impl RinchApp {
     }
 
     /// Walk up from a hit node to the enclosing `<select>` element, if any.
-    pub(super) fn select_ancestor(tree: &rinch_dom::NodeTree, hit_id: usize) -> Option<usize> {
+    pub(super) fn select_ancestor(tree: &rinch_dom::NodeTree, hit_id: u64) -> Option<u64> {
         let mut cur = Some(hit_id);
         while let Some(nid) = cur {
             let node = tree.get(nid)?;
@@ -117,7 +136,7 @@ impl RinchApp {
     /// Absolute on-screen rect `(x, y, w, h)` of a node — the box it is
     /// *painted* in, so the popup is anchored under the control the user can
     /// see rather than under an untransformed layout box (#203).
-    fn absolute_rect(tree: &rinch_dom::NodeTree, node_id: usize) -> (f32, f32, f32, f32) {
+    fn absolute_rect(tree: &rinch_dom::NodeTree, node_id: u64) -> (f32, f32, f32, f32) {
         if tree.get(node_id).is_none() {
             return (0.0, 0.0, 0.0, 0.0);
         }
@@ -142,7 +161,7 @@ impl RinchApp {
     /// does not dispatch a click on a disabled form control at all, so an
     /// enclosing card's `data-rid` must not run either. Same rule
     /// `found_input_focus` follows for a disabled `<input>`.
-    pub(super) fn open_select_popup(&mut self, select_id: usize, vp_w: f32, vp_h: f32) {
+    pub(super) fn open_select_popup(&mut self, select_id: u64, vp_w: f32, vp_h: f32) {
         let disabled = self
             .doc
             .as_ref()
@@ -213,13 +232,58 @@ impl RinchApp {
 
         let panel = d.create_element("div");
         d.set_attribute(panel, "class", "rinch-nsel-panel");
-        d.set_style(panel, "left", &format!("{sx}px"));
+        // At least the control's width, and wide enough for the widest row, as
+        // Chrome's popup is. (The width is spelled out rather than left to a
+        // `width: auto` fixed block's shrink-to-fit, #893.) The control's own width is no stand-in for
+        // the rows': since #1098 it is exactly its label plus 22px at the
+        // select's font, with no slack for the panel's 30px of chrome, and the
+        // rows are set at `POPUP_ROW_FONT_SIZE` in the body's font, which can be
+        // wider than the select's.
+        //
+        // A row is the label as the select sets it (#1130), measured by the
+        // builder the closed control is: Chrome 155's popup rows take the
+        // select's `text-transform` and no `letter-spacing` or
+        // `word-spacing`, so the row style is the body's at 14px with the
+        // select's transform and both spacings 0, and `NATIVE_SELECT_CSS`
+        // gives a row `letter-spacing: normal; word-spacing: normal;
+        // text-transform: none` and holds the already-transformed text. A row
+        // is `white-space: pre`, as the measure is: a `label` attribute's
+        // spaces are drawn as written.
+        let select_style = d
+            .tree
+            .get(select_id)
+            .map(|n| n.computed_style.clone())
+            .unwrap_or_default();
+        let mut row_style = d
+            .tree
+            .get(body.0)
+            .map(|n| n.computed_style.clone())
+            .unwrap_or_default();
+        row_style.font_size = POPUP_ROW_FONT_SIZE;
+        row_style.letter_spacing = 0.0;
+        row_style.word_spacing = 0.0;
+        row_style.text_transform = select_style.text_transform;
+        let label_refs: Vec<&str> = model.options.iter().map(|o| o.label.as_str()).collect();
+        let widest = rinch_dom::select::widest_label_at(&mut d, &row_style, &label_refs);
+        let rows_w = widest.ceil() + POPUP_ROW_CHROME;
+        // Never wider than the viewport, never narrower than the control
+        // (unless the control is wider than the viewport).
+        let panel_w = rows_w.max(sw).min(vp_w);
+        // Horizontal placement, Chrome 155's (#1132; measured): at the
+        // select's left edge when the popup fits there; otherwise it ends
+        // where the select ends (an 80px select at x = 900 in a 1000px
+        // window opens a 464px popup whose right edge is the select's, 980);
+        // and kept on screen either way. It used to stay at the select's left
+        // edge and shrink to the viewport's, clipping its widest rows.
+        let left = if sx + panel_w <= vp_w {
+            sx
+        } else {
+            (sx + sw - panel_w).min(vp_w - panel_w)
+        }
+        .max(0.0);
+        d.set_style(panel, "left", &format!("{left}px"));
         d.set_style(panel, "top", &format!("{top}px"));
-        // Match the control's width. A `width: auto` fixed block fills the
-        // viewport, and the closed control is already sized to its widest option
-        // (PR1), so the control width is the right popup width. Long labels clip
-        // (option is white-space: nowrap), as a browser's popup does.
-        d.set_style(panel, "width", &format!("{sw}px"));
+        d.set_style(panel, "width", &format!("{panel_w}px"));
         d.set_style(panel, "max-height", &format!("{max_h}px"));
 
         let mut option_ids = Vec::with_capacity(model.options.len());
@@ -237,12 +301,31 @@ impl RinchApp {
             if opt.disabled {
                 d.set_attribute(o, "data-disabled", "");
             }
-            let t = d.create_text(&opt.label);
+            // An empty label (the usual `<option value="">` "choose…"
+            // placeholder) generates no line box, so its row would be only its
+            // padding, a 12px sliver (#1155). A zero-width space gives it the
+            // one line a labelled row has, at whatever height the row's font
+            // and `line-height` make, as Chrome's popup gives it a full row.
+            // Not NBSP or an ideographic space: under `white-space: normal` or
+            // `nowrap` a row of either collapses to zero height, as a plain
+            // space does (#1154). Only the row's text: `labels` below keeps
+            // the real label.
+            let set = rinch_dom::select::label_as_set(&row_style, &opt.label);
+            let row_text = if opt.label.is_empty() {
+                "\u{200B}"
+            } else {
+                set.as_ref()
+            };
+            let t = d.create_text(row_text);
             d.append_child(o, t);
             d.append_child(panel, o);
             option_ids.push(o.0);
             values.push(opt.value.clone());
-            labels.push(opt.label.clone());
+            // Type-ahead matches the label's words, not a `label`
+            // attribute's leading spaces.
+            labels.push(rinch_dom::select::strip_and_collapse_ascii_whitespace(
+                &opt.label,
+            ));
             disabled.push(opt.disabled);
         }
         d.append_child(body, panel);
@@ -269,6 +352,7 @@ impl RinchApp {
             labels,
             disabled,
             highlighted: selected,
+            last_known_selected_index: selected,
             typeahead: String::new(),
             typeahead_at: None,
             initial_value,
@@ -363,7 +447,7 @@ impl RinchApp {
     /// Refuses a control that vanished or was disabled while the popup was
     /// open — a change handler that disables the select it just committed must
     /// not be handed the keyboard back (issue #315).
-    fn focus_select_control(&mut self, select_id: usize) {
+    fn focus_select_control(&mut self, select_id: u64) {
         let ok = self.doc.as_ref().is_some_and(|doc| {
             let d = doc.borrow();
             d.tree.get(select_id).is_some() && !Self::node_is_disabled_in_tree(&d.tree, select_id)
@@ -384,10 +468,16 @@ impl RinchApp {
 
     /// Handle a click while a popup is open. Returns `true` (the click is always
     /// consumed while open — the backdrop is modal).
+    ///
+    /// Only the **primary** button picks an option (issue #1111): a right or
+    /// middle press on the list is consumed and leaves it open, as a browser's
+    /// list ignores them. A press **outside** the list dismisses it whatever the
+    /// button — a browser takes a transient popup down on any press elsewhere.
     pub(super) fn handle_open_select_click(
         &mut self,
         x: f32,
         y: f32,
+        button: MouseButton,
         vp_w: f32,
         vp_h: f32,
     ) -> bool {
@@ -406,7 +496,7 @@ impl RinchApp {
         }
         let hit = {
             let d = doc.borrow();
-            match hit_test(&d.tree, x, y) {
+            match self.shared_hit(&d, x, y) {
                 Some(hid) => {
                     let mut cur = Some(hid);
                     let mut result = Hit::Outside;
@@ -434,7 +524,7 @@ impl RinchApp {
 
         match hit {
             Hit::Option(idx) => {
-                if !open.disabled.get(idx).copied().unwrap_or(true) {
+                if button == MouseButton::Left && !open.disabled.get(idx).copied().unwrap_or(true) {
                     self.commit_select(idx, vp_w, vp_h);
                 }
             }
@@ -622,7 +712,7 @@ impl RinchApp {
     /// label starts with it (case-insensitive). A single repeated letter cycles
     /// through the options that start with that letter.
     fn select_typeahead(&mut self, ch: &str, vp_w: f32, vp_h: f32) {
-        let now = Instant::now();
+        let now = rinch_core::timer::now();
         let Some(open) = self.open_select.as_mut() else {
             return;
         };
@@ -727,5 +817,69 @@ impl RinchApp {
             self.scene_dirty = true;
             self.resolve_and_repaint(vp_w, vp_h);
         }
+    }
+
+    /// Re-sync the open popup's highlight with the model's resolved selection
+    /// (issue #757's "vice versa"). A script that writes an option's
+    /// `selected` attribute, or the select's own `value`, while the popup is
+    /// still open moves `resolve_select_model`'s answer; this is what makes
+    /// the popup follow it rather than freezing at whatever was selected when
+    /// it opened. Compares against [`OpenSelect::last_known_selected_index`],
+    /// not `highlighted` — see that field's doc for why.
+    ///
+    /// Called from the top of [`RinchApp::resolve_and_repaint`], ahead of its
+    /// short-circuit, so it runs on the next repaint after any such write —
+    /// including the one *within* `resolve_and_repaint` that a changed
+    /// `data-highlighted`/`data-selected` attribute itself triggers here,
+    /// which is why this function never calls `resolve_and_repaint` (or
+    /// anything that does): it just writes the attributes and marks the
+    /// scene dirty, the way `set_select_highlight`'s own writes would be
+    /// picked up by the *caller's* next repaint.
+    pub(super) fn sync_open_select_highlight_from_dom(&mut self) {
+        let Some((select_id, baseline)) = self
+            .open_select
+            .as_ref()
+            .map(|o| (o.select_id, o.last_known_selected_index))
+        else {
+            return;
+        };
+        let Some(doc) = self.doc.clone() else {
+            return;
+        };
+        let resolved = {
+            let d = doc.borrow();
+            resolve_select_model(&d.tree, select_id).selected_index
+        };
+        let Some(new_idx) = resolved else {
+            return;
+        };
+        if new_idx == baseline {
+            return;
+        }
+        let Some(open) = self.open_select.as_mut() else {
+            return;
+        };
+        open.last_known_selected_index = new_idx;
+        if new_idx >= open.option_ids.len() {
+            return;
+        }
+        let old_highlighted_id = open.option_ids[open.highlighted];
+        let old_selected_id = open.option_ids.get(baseline).copied();
+        let new_id = open.option_ids[new_idx];
+        open.highlighted = new_idx;
+
+        let mut d = doc.borrow_mut();
+        if old_highlighted_id != new_id {
+            d.remove_attribute(NodeId(old_highlighted_id), "data-highlighted");
+        }
+        if let Some(old_sel) = old_selected_id
+            && old_sel != new_id
+        {
+            d.remove_attribute(NodeId(old_sel), "data-selected");
+        }
+        d.set_attribute(NodeId(new_id), "data-highlighted", "");
+        d.set_attribute(NodeId(new_id), "data-selected", "");
+        drop(d);
+        self.scene_dirty = true;
     }
 }

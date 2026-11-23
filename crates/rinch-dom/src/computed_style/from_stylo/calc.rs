@@ -40,8 +40,8 @@
 //! is not representable without carrying the calc tree, and the previous
 //! answer for these was a silent `(0, 0)`. Exact non-affine support would
 //! need either a stylo calc tree carried to resolution time or Taffy's calc
-//! pointer, which `TaffyTree` resolves to `0.0` unconditionally (taffy-0.12.2,
-//! `src/tree/taffy_tree.rs:391`).
+//! pointer, which `TaffyTree` resolves to `0.0` unconditionally (taffy-0.14.0,
+//! `src/tree/taffy_tree.rs:387`).
 
 use style::values::computed::{Length, LengthPercentage};
 
@@ -111,8 +111,10 @@ pub(crate) fn split_length_percentage(lp: &LengthPercentage) -> (f32, f32) {
 mod tests {
     use super::*;
     use style::OwnedSlice;
+    use style::typed_om::NumericBaseType;
     use style::values::computed::Percentage;
-    use style::values::computed::length_percentage::{CalcLengthPercentageLeaf, CalcNode};
+    use style::values::computed::length_percentage::{CalcNode, CalcPercentageLeaf, ComputedLeaf};
+    use style::values::generics::Optional;
     use style_traits::values::specified::AllowedNumericType;
 
     /// A computed `calc(<pct> + <px>)` with the given clamping mode, built the
@@ -120,8 +122,11 @@ mod tests {
     /// `resolve()` behavior, clamping included, not a model of it.
     fn mixed_calc(px: f32, pct: f32, clamp: AllowedNumericType) -> LengthPercentage {
         let node = CalcNode::Sum(OwnedSlice::from(vec![
-            CalcNode::Leaf(CalcLengthPercentageLeaf::Percentage(Percentage(pct))),
-            CalcNode::Leaf(CalcLengthPercentageLeaf::Length(Length::new(px))),
+            CalcNode::Leaf(ComputedLeaf::Percentage(CalcPercentageLeaf::new(
+                pct,
+                Optional::Some(NumericBaseType::Length),
+            ))),
+            CalcNode::Leaf(ComputedLeaf::Length(Length::new(px))),
         ]));
         LengthPercentage::new_calc(node, clamp)
     }
@@ -207,8 +212,11 @@ mod tests {
     fn non_affine_min_takes_large_basis_linearization() {
         let node = CalcNode::MinMax(
             OwnedSlice::from(vec![
-                CalcNode::Leaf(CalcLengthPercentageLeaf::Percentage(Percentage(0.5))),
-                CalcNode::Leaf(CalcLengthPercentageLeaf::Length(Length::new(100.0))),
+                CalcNode::Leaf(ComputedLeaf::Percentage(CalcPercentageLeaf::new(
+                    0.5,
+                    Optional::Some(NumericBaseType::Length),
+                ))),
+                CalcNode::Leaf(ComputedLeaf::Length(Length::new(100.0))),
             ]),
             style::values::generics::calc::MinMaxOp::Min,
         );
@@ -221,8 +229,11 @@ mod tests {
     fn non_affine_max_takes_large_basis_linearization() {
         let node = CalcNode::MinMax(
             OwnedSlice::from(vec![
-                CalcNode::Leaf(CalcLengthPercentageLeaf::Percentage(Percentage(0.5))),
-                CalcNode::Leaf(CalcLengthPercentageLeaf::Length(Length::new(100.0))),
+                CalcNode::Leaf(ComputedLeaf::Percentage(CalcPercentageLeaf::new(
+                    0.5,
+                    Optional::Some(NumericBaseType::Length),
+                ))),
+                CalcNode::Leaf(ComputedLeaf::Length(Length::new(100.0))),
             ]),
             style::values::generics::calc::MinMaxOp::Max,
         );

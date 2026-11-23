@@ -1,9 +1,57 @@
 //! No-op stubs for window control functions on Android.
 
+/// Android has no xdg-activation: a request is answered
+/// [`ActivationTokenError::Unsupported`].
+pub use crate::activation::{
+    ActivationToken, ActivationTokenError, ActivationTokenResult, request_activation_token,
+    take_launch_activation_token,
+};
+
 pub fn minimize_current_window() {}
 pub fn toggle_maximize_current_window() {}
 pub fn hide_current_window() {}
 pub fn show_current_window() {}
+pub fn focus_current_window() {}
+/// Android has no xdg-activation, and its one window is always in front.
+pub fn activate_current_window_with_token(_token: &str) {}
+/// Android shows its one window always: nothing to prepare.
+pub fn prepare_current_window() {}
+/// Android shows its one window always: nothing to prepare.
+pub fn prepare_current_window_at_scale(_scale: f64) {}
+pub fn set_click_through_current_window(_click_through: bool) {}
+/// No windows to give an input region to on this target.
+pub fn set_input_region_current_window(_region: rinch_core::element::InputRegion) {}
+pub fn current_window_position() -> Option<(f64, f64)> {
+    None
+}
+pub fn current_window_size() -> Option<(f64, f64)> {
+    None
+}
+/// The desktop's `WindowRestore`; nothing here has one to give.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowRestore {
+    pub position: Option<(f64, f64)>,
+    pub size: (f64, f64),
+    pub maximized: bool,
+    /// The platform's name for the monitor `position` is on; give it back as
+    /// `WindowProps::monitor`. On a desktop whose monitors have different
+    /// scales a logical position can name a point on two of them, and this
+    /// says which. `None` with no position, or where the platform names no
+    /// monitor.
+    pub monitor: Option<String>,
+}
+pub fn current_window_restore() -> Option<WindowRestore> {
+    None
+}
+pub fn set_current_window_position(_x: f64, _y: f64) {}
+pub fn set_current_window_size(_width: f64, _height: f64) {}
 pub fn close_current_window() {
     std::process::exit(0);
 }
+pub fn current_window_surface_kind() -> Option<rinch_core::element::WindowSurfaceKind> {
+    None
+}
+pub fn set_current_window_output(_output: Option<&str>) {}
+pub fn set_current_window_layer(_surface: rinch_core::element::LayerSurface) {}
+pub fn start_window_drag() {}
+pub fn start_window_resize(_edge: rinch_platform::ResizeDirection) {}

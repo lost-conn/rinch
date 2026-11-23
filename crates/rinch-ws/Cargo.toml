@@ -7,9 +7,13 @@ description = "Cross-platform callback-based WebSocket client for rinch (web Web
 
 [dependencies]
 rinch-core = { workspace = true }
+# For the one `debug!` when a dead socket callback is pruned (issue #374). Already
+# in the graph through `rinch-core`, and wasm-clean.
+tracing = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# Synchronous WebSocket client; `tungstenite` is already in the tree (rinch-signaling).
+# Synchronous WebSocket client. examples/rtc-room-relay's server uses the same
+# tungstenite version (rinch-signaling, which used to share it, is gone, #1916).
 # `rustls-tls-webpki-roots` adds `wss://` support reusing the rustls stack that
 # `rinch-http`'s `ureq` already pulls in.
 tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
@@ -43,3 +47,11 @@ rinch-core = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+
+# Browser-driven tests (issue #1773). Run with a matching chromedriver:
+#     CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+#     cargo test -p rinch-ws --target wasm32-unknown-unknown
+# Set RINCH_WS_TEST_URL at build time to a server like the one in
+# tests/web_subprotocols_1773.rs's doc to run the live half too.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"

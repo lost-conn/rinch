@@ -1,7 +1,7 @@
 //! Conversion from ComputedStyle to Taffy Style.
 
-use super::ComputedStyle;
 use super::values::*;
+use super::{ComputedStyle, WebkitBoxAlign, WebkitBoxPack};
 
 impl ComputedStyle {
     /// Convert to Taffy Style using the stored `has_explicit_display` flag.
@@ -47,9 +47,31 @@ impl ComputedStyle {
             self.flex_wrap.to_taffy()
         };
 
-        Style {
-            display: self.display.to_taffy(),
+        let display = self.display.to_taffy();
+        // Whether `justify-content` aligns along the inline axis: a grid's
+        // columns, a row flex container's main axis.
+        let justify_axis_is_inline = match display {
+            Display::Grid => true,
+            Display::Flex => matches!(
+                flex_direction,
+                taffy::FlexDirection::Row | taffy::FlexDirection::RowReverse
+            ),
+            _ => false,
+        };
+
+        let mut style = Style {
+            // `box-sizing` (#1278): Taffy's default is `border-box`, which
+            // used to size every box whatever its CSS said; the initial value
+            // is `content-box`. The theme sets `* { box-sizing: border-box }`.
+            box_sizing: if self.box_sizing_border_box {
+                BoxSizing::BorderBox
+            } else {
+                BoxSizing::ContentBox
+            },
+            display,
             position: self.position.to_taffy(),
+            float: self.float,
+            clear: self.clear,
             overflow: taffy::Point {
                 x: self.overflow_x.to_taffy(),
                 y: self.overflow_y.to_taffy(),
@@ -60,12 +82,12 @@ impl ComputedStyle {
                 height: self.height.to_taffy(),
             },
             min_size: Size {
-                width: self.min_width.to_taffy(),
-                height: self.min_height.to_taffy(),
+                width: self.min_width.to_taffy_lpa(),
+                height: self.min_height.to_taffy_lpa(),
             },
             max_size: Size {
-                width: self.max_width.to_taffy(),
-                height: self.max_height.to_taffy(),
+                width: self.max_width.to_taffy_lpa(),
+                height: self.max_height.to_taffy_lpa(),
             },
 
             flex_direction,
@@ -74,19 +96,36 @@ impl ComputedStyle {
             flex_shrink: self.flex_shrink,
             flex_basis: self.flex_basis.to_taffy(),
             align_items: self.align_items.map(|v| v.to_taffy()),
-            // CSS spec: absolute/fixed elements are NOT flex items, so the parent's
-            // align-items: stretch shouldn't stretch them.  Taffy doesn't distinguish,
-            // so force flex-start when align-self isn't explicitly set.
-            align_self: if self.align_self.is_none()
-                && matches!(
-                    self.position,
-                    PositionValue::Absolute | PositionValue::Fixed
-                ) {
-                Some(taffy::AlignSelf::FLEX_START)
+            // An out-of-flow child of a flex container takes its static
+            // position as if it were the sole flex item (css-flexbox-1 §4.1):
+            // its own `align-self`, else the container's `align-items`, on
+            // the cross axis — `stretch` as the start, and nothing stretched,
+            // which Taffy's absolute layout does itself. (This used to force
+            // `flex-start` on every out-of-flow box with no `align-self` of
+            // its own, so the cross axis ignored `align-items`: #1492.)
+            align_self: self.align_self.map(|v| v.to_taffy()),
+            justify_content: self
+                .justify_content
+                .map(|v| v.to_taffy(self.direction_rtl, justify_axis_is_inline)),
+            // Read by Taffy's grid and block layout (#1985); a flex
+            // container ignores both. `justify-self`'s `left` / `right` and
+            // baselines are the parent's business: these are this box's own
+            // answers, which `taffy_style_from_computed` redoes against the
+            // box's parent.
+            justify_items: self
+                .justify_items
+                .map(|v| v.to_taffy(self.direction_rtl, display == Display::Block)),
+            justify_self: self
+                .justify_self
+                .map(|v| v.to_taffy(self.direction_rtl, false)),
+            // `direction` (#1995): Taffy's grid and flex lay out their
+            // columns and rows from the right, and its block layout puts a
+            // block-level box at the right, under `rtl`.
+            direction: if self.direction_rtl {
+                taffy::Direction::Rtl
             } else {
-                self.align_self.map(|v| v.to_taffy())
+                taffy::Direction::Ltr
             },
-            justify_content: self.justify_content.map(|v| v.to_taffy()),
 
             padding: Rect {
                 top: self.padding_top.to_taffy(),
@@ -123,10 +162,98 @@ impl ComputedStyle {
             grid_template_columns: self.grid_template_columns.clone(),
             grid_template_rows: self.grid_template_rows.clone(),
             grid_auto_flow: self.grid_auto_flow,
+            grid_auto_columns: self.grid_auto_columns.clone(),
+            grid_auto_rows: self.grid_auto_rows.clone(),
+            grid_template_areas: self.grid_template_areas.clone(),
+            grid_template_column_names: self.grid_template_column_names.clone(),
+            grid_template_row_names: self.grid_template_row_names.clone(),
             grid_column: self.grid_column.clone(),
             grid_row: self.grid_row.clone(),
 
+            // `aspect-ratio` (#1286). `auto` matters only to a box with a
+            // natural ratio, which this is not: a replaced element's ratio is
+            // its measure's business (`taffy_style_from_computed` clears this
+            // for one, `crate::replaced`).
+            aspect_ratio: self.aspect_ratio.ratio,
+
+            // `display: flow-root` establishes a block formatting context
+            // (#2351). Paint containment is how Taffy's block layout is told
+            // so (the same predicate as a scroll container's), and it has no
+            // other effect on layout: it does not suppress the baseline, as
+            // layout containment would. CSS `contain` itself is not mapped.
+            contain: if self.flow_root {
+                taffy::Contain::PAINT
+            } else {
+                taffy::Contain::NONE
+            },
+
             ..Default::default()
+        };
+        self.legacy_box_taffy_style(&mut style);
+        style
+    }
+
+    /// What `display: -webkit-box` makes of the Taffy style (#2581), as
+    /// Chrome 155 lays it out.
+    ///
+    /// - A box that clamps (`line_clamp`) is the `flow-root` Stylo was given,
+    ///   a block formatting context (`ComputedStyle::flow_root`, #2351).
+    /// - Any other legacy box is a flex container, a column under
+    ///   `-webkit-box-orient: vertical` and a row otherwise, that does not
+    ///   wrap. Its computed `display` stays the block Stylo was given, so
+    ///   that its runs of inline content are each one anonymous block box
+    ///   (`create_anonymous_block_boxes`), which Taffy then lays out as one
+    ///   item, as Chrome does; a box holding only inline content is an IFC
+    ///   root and a Taffy leaf, which no `display` changes.
+    /// - It places its items by `-webkit-box-pack` (the main axis),
+    ///   `-webkit-box-align` (the cross axis) and `-webkit-box-direction:
+    ///   reverse` (from the main axis's end); Chrome 158 ignores
+    ///   `justify-content`, `align-items`, `flex-direction` and an item's
+    ///   `align-self` on it.
+    /// - Its items grow and shrink by `-webkit-box-flex` alone (`0`, neither,
+    ///   unless declared), and in a row an item of `auto` width is at most as
+    ///   wide as the box (Chrome sizes it to fit the box: `short` and a long
+    ///   paragraph in a 230px box are 39.02 and 230 wide).
+    pub(crate) fn legacy_box_taffy_style(&self, style: &mut taffy::Style) {
+        if self.webkit_box && self.line_clamp.is_none() {
+            style.display = taffy::Display::Flex;
+            style.flex_direction = match (self.webkit_box_vertical, self.webkit_box_reverse) {
+                (false, false) => taffy::FlexDirection::Row,
+                (false, true) => taffy::FlexDirection::RowReverse,
+                (true, false) => taffy::FlexDirection::Column,
+                (true, true) => taffy::FlexDirection::ColumnReverse,
+            };
+            style.flex_wrap = taffy::FlexWrap::NoWrap;
+            style.justify_content = Some(match self.webkit_box_pack {
+                WebkitBoxPack::Start => taffy::JustifyContent::FLEX_START,
+                WebkitBoxPack::End => taffy::JustifyContent::FLEX_END,
+                WebkitBoxPack::Center => taffy::JustifyContent::CENTER,
+                WebkitBoxPack::Justify => taffy::JustifyContent::SPACE_BETWEEN,
+            });
+            style.align_items = Some(match self.webkit_box_align {
+                WebkitBoxAlign::Stretch => taffy::AlignItems::STRETCH,
+                WebkitBoxAlign::Start => taffy::AlignItems::FLEX_START,
+                WebkitBoxAlign::End => taffy::AlignItems::FLEX_END,
+                WebkitBoxAlign::Center => taffy::AlignItems::CENTER,
+                WebkitBoxAlign::Baseline => taffy::AlignItems::BASELINE,
+            });
         }
+        if let Some(vertical) = self.webkit_box_item {
+            legacy_item_taffy_style(style, self.webkit_box_flex, vertical);
+        }
+    }
+}
+
+/// An item of a legacy flex `-webkit-box` (see
+/// [`ComputedStyle::legacy_box_taffy_style`]), whose `-webkit-box-flex` is
+/// `flex`: an element, or an anonymous block box holding a run of inline
+/// content (`flex` 0).
+pub(crate) fn legacy_item_taffy_style(style: &mut taffy::Style, flex: f32, vertical: bool) {
+    style.align_self = None;
+    style.flex_grow = flex;
+    style.flex_shrink = flex;
+    style.flex_basis = taffy::Dimension::auto();
+    if !vertical && style.size.width.is_auto() && style.max_size.width.is_auto() {
+        style.max_size.width = taffy::LengthPercentageAuto::percent(1.0);
     }
 }

@@ -9,7 +9,7 @@ rinch = { workspace = true, features = ["desktop", "components", "theme"] }
 
 > **Note:** The workspace dependency uses `default-features = false`, so features must be listed explicitly:
 > - `"desktop"` — enables `run()`, window management, and the software renderer (tiny-skia)
-> - `"gpu"` — (optional) enables GPU rendering via Vello/wgpu instead of the software renderer
+> - `"gpu"` — (optional) adds GPU rendering via Vello/wgpu beside the software renderer, chosen at run time
 > - `"components"` — enables the component library (Button, TextInput, Stack, etc.)
 > - `"theme"` — enables automatic theme CSS loading and CSS variables
 
@@ -344,6 +344,63 @@ Tooltip { label: "Top tooltip", position: "top",
 }
 ```
 
+#### The `title` attribute
+
+For a plain advisory tooltip you do not need the component: any element with a
+`title` attribute gets one, as in a browser.
+
+```rust
+button { title: "Delete the selected rows", "Delete" }
+div { title: {|| format!("{} unread", unread.get())}, "Inbox" }
+```
+
+On a component, quote the name — `Button { "title": "Delete the selected
+rows", "Delete" }` — and it is written on the component's root element (#1653);
+a bare `title:` there is the component's own prop, which on `Alert`, `Modal`,
+`Drawer` and others is a heading. `ActionIcon` and `CloseButton` take a bare
+`title` prop that is the tooltip:
+
+```rust
+ActionIcon { icon: TablerIcon::Trash, title: "Delete", onclick: … }
+Alert { title: "Heads up", "title": "Shown on hover", "Body" }
+```
+
+On `rinch-web` the browser shows it. On desktop (and in an embedded
+`RinchContext`) rinch draws it (#1646):
+
+- it shows after the pointer has **rested** for 500 ms (`TITLE_TOOLTIP_DELAY`)
+  over the element or a descendant of it — the nearest `title` up the tree
+  applies, and a `title=""` (or white space only) on a nearer element means
+  *no* tooltip there, not its ancestor's, as HTML specifies (and Chrome 155
+  does);
+- it sits below and to the right of the pointer, and flips left of it or above
+  it rather than leave the window; line feeds in the title break lines, and a
+  line longer than 400px wraps;
+- it hides when the pointer moves onto content under another `title` (or
+  none), and on any press, wheel, key press, window blur, resize or the
+  pointer leaving the window. After a press, wheel or key it stays hidden
+  until the pointer reaches content under another `title`;
+- it follows the attribute: changing `title` while it shows changes the text,
+  removing it hides it;
+- its colours are the theme's `--rinch-color-surface` (background),
+  `--rinch-color-text` and `--rinch-color-border`, so a dark theme gets a dark
+  tooltip, with light fallbacks without the theme; its font is
+  `--rinch-font-family` (else `sans-serif`) at 12px.
+
+It is painted over the frame, not added to the document, so showing it runs no
+style or layout pass and it never appears in `dom_tree` or hit testing.
+`App::new(app).title_tooltips(false)` turns it off (an embed host: see the
+game-engine guide); it is off on Android, where there is no resting pointer.
+
+In SVG, as in Chrome, a `title` *attribute* is no tooltip; an `<svg>`'s
+`<title>` child is. (A `<title>` inside one of its shapes is not shown yet:
+rinch hit-tests the `<svg>` as one box.)
+
+Two places it is not a browser's: after a press it stays away over the same
+element however far the pointer moves inside it (Chrome brings it back after a
+larger move), and a `title` changed while it shows changes its text (Chrome
+keeps the old text).
+
 ### Data Display
 
 | Component | Description |
@@ -355,6 +412,8 @@ Tooltip { label: "Top tooltip", position: "top",
 | `Divider` | Horizontal/vertical separator |
 | `Image` | Responsive image with fallback |
 | `List` / `ListItem` | Styled list |
+| `Tree` | Hierarchical rows with expand/collapse, selection, drag-to-rearrange and keyboard navigation |
+| `SortableList` | Items that drag within and between lists of one group (cards across columns, columns, lanes), with a live judge, a pointer-following preview, a caret or an animated gap, and a keyboard flow + `SortableItem`, `SortableHandle` — see [Sortable Lists](sortable.md) |
 
 ```rust
 // Avatar
@@ -411,6 +470,183 @@ List {
     ListItem { "Third item" }
 }
 ```
+
+#### Rearranging a Tree by dragging
+
+A `Tree` with `draggable: true` (and a `tree` state) makes every row a drag
+source and a drop target. The Tree knows rows, not what they mean: it offers
+a drop, the app judges it, and the app moves its own data when it arrives.
+
+```rust
+let tree = UseTreeReturn::new(UseTreeOptions::default());
+let data = Signal::new(initial_rows());
+rsx! {
+    Tree {
+        tree: Some(tree),
+        data_source: Some(Rc::new(move || data.get())),
+        draggable: true,
+        // Only folders take children; a file splits into before / after.
+        accepts_children: Some(Rc::new(|node: &TreeNodeData| node.has_children())),
+        judge_drop: Some(Rc::new(|drop: &TreeDrop| {
+            if drop.parent.as_deref() == Some("archive") { DropVerdict::Refused } else { DropVerdict::Allowed }
+        })),
+        ondrop: move |drop: TreeDrop| data.update(|rows| move_rows(rows, &drop)),
+    }
+}
+```
+
+- **Where a drop lands** follows the part of the row under the pointer: its
+  top quarter is before it, its middle half inside it (last), its bottom
+  quarter after it. After an expanded row with children is first inside it.
+  A row `accepts_children` refuses has no inside: half before, half after.
+- **Depth at the end of a group.** After the last row of a group, the
+  pointer's column picks how far out the drop goes, which is how a drag
+  outdents. The column is read in units of `indent` when it is set, and
+  otherwise in the indent the tree measures from its rendered rows. A dragged
+  row is placed as if collapsed, so its own bottom edge can take it out of its
+  group even when it is expanded and last.
+- **Drawing.** The row under the pointer draws the drop: a line before or
+  after it at the depth the drop takes, or an outline for "inside"; a refused
+  drop is drawn in the error color and is never delivered.
+- **Reporting.** `ondropchange` reports the drop on offer each time it
+  changes, for an app that says in words where the rows will land; `ondrop`
+  delivers an allowed one. Resting inside a collapsed row with children
+  expands it after `hover_expand_ms` (600 by default).
+
+#### The Tree's keyboard
+
+With `keyboard: true` (and a `tree` state) the Tree follows the WAI-ARIA
+tree pattern. It is **one Tab stop**: the cursor row (the first row before
+there is one) has `tabindex="0"` and every other row `-1`, so Tab moves into
+the tree and out of it in one press. While one of its rows has the keyboard
+(a click, Tab, or `TreeController::focus()`), the keys act from that row:
+
+- Up/Down, Home/End and PageUp/PageDown move the cursor over the rows drawn;
+  Right expands a closed row or steps into an open one; Left collapses an
+  open row or steps out to the parent; `*` (Shift+8 or the numpad's)
+  expands the cursor row's siblings; typed letters find the next row whose
+  text starts with them (`label_of` gives that text when labels carry
+  something else).
+- **Selection.** In a single-select tree the selection follows the cursor,
+  as a click would select: only with `select_on_click`, never a disabled row
+  (the cursor can rest on one), and `onselect` is told. In a `multiple` tree
+  a plain arrow selects nothing; Space toggles the cursor row; Shift with a
+  move key, and Shift+Space, select the run of drawn rows from the **anchor**
+  to the cursor row, replacing the selection; Ctrl+A (Cmd+A) selects the
+  cursor row's siblings; Enter adds the cursor row as a click would, keeping
+  the rest. See *Selecting several rows* below.
+- The cursor row takes the keyboard and is scrolled into view; `oncursor`
+  tells the app once it has rested `cursor_delay_ms` (120), for an app that
+  opens what the cursor is on without opening every row it passes.
+- `handle_key` sees every key first. `TreeKey::drop_for(TreeMove::Indent)`
+  (and `Outdent`, `Up`, `Down`) turns one into the `TreeDrop` a drag would
+  make, refused exactly as the drag would refuse it, so keyboard moves are
+  delivered by the same code as dropped ones:
+
+```rust
+Tree {
+    tree: Some(tree),
+    data_source: Some(Rc::new(move || data.get())),
+    keyboard: true,
+    select_on_click: true,
+    handle_key: Some(Rc::new(move |key: &TreeKey| {
+        if key.alt && key.shift && key.key == "ArrowUp" {
+            if let Some(drop) = key.drop_for(TreeMove::Up) {
+                data.update(|rows| move_rows(rows, &drop));
+            }
+            return true;
+        }
+        false
+    })),
+}
+```
+
+- Keys are the tree's only while one of its rows has the keyboard: a field
+  inside a row (a rename box) keeps its own, and so does everything outside.
+- A cursor row drawn again while it has the keyboard (its data changed, or
+  the app moved it) gets the keyboard back. A cursor row the app deletes
+  hands the cursor, and the keyboard, to the row drawn below it (above it at
+  the end). The tree never takes the keyboard back from a field it went to
+  in the meantime.
+- The row that has the keyboard is the `treeitem`, carrying `aria-selected`,
+  `aria-expanded`, `aria-level` and `aria-disabled`; its list item is
+  `role="none"` and its group is `aria-owns`ed. A `multiple` tree is
+  `aria-multiselectable`.
+- The cursor row carries a ring (`rinch-tree__node-content--cursor`, an inset
+  shadow) while the tree has the keyboard (`.rinch-tree--focused`), in place
+  of the focus outline. The row an "inside" drop is drawn on keeps its
+  outline, so a cursor row being dropped into shows both.
+
+#### Selecting several rows
+
+With `UseTreeOptions { multiple: true, .. }` and `select_on_click: true`:
+
+- **A plain click** selects the row alone (and expands or collapses it under
+  `expand_on_click`), and tells `onselect`. **Enter** on the cursor row does
+  the same except that the row **joins** the selection instead of replacing
+  it (as a click did in a `multiple` tree before #1598): a click is the
+  pointer's way to start a new selection, Enter keeps the one built with
+  the keyboard. **Ctrl- (Cmd-) click** adds or removes the row;
+  **Shift-click** selects the run of drawn rows from the anchor to the
+  clicked row, replacing the selection. Neither of those two expands,
+  collapses or tells `onselect`.
+- **The anchor** is the row last clicked, Ctrl-clicked, toggled with Space
+  or entered with Enter — the row the user last acted on to select, not a
+  row the cursor merely moved to. A Ctrl-click or Space that *unselects* a
+  row still makes it the anchor (as in a desktop file manager), so the next
+  Shift run starts there. An anchor the data no longer has is replaced by
+  the cursor row (from the keyboard) or the clicked row (Shift-click); one
+  hidden inside a collapsed row counts as its shown ancestor.
+  `TreeController::set_anchor(Some(value))` sets it from code, and
+  `set_anchor(None)` clears it; `anchor()` reads it. An app whose selection
+  follows the cursor (it calls `set_selection([row])` from `oncursor`, the
+  file-manager model) sets the anchor there too, or the next Shift run
+  starts at the row last clicked. Setting it changes nothing else: no
+  selection change and no callback. A value no row has behaves as a
+  deleted anchor. The anchor lives on the `UseTreeReturn`, so it is kept
+  when the `Tree` re-renders.
+- The keys are the ones listed above; Shift+arrows move the cursor (and tell
+  `oncursor`) as the plain arrows do.
+- **Disabled rows** are never selected: a run and Ctrl+A leave them out.
+- **A collapse** by the chevron, Left, a row click or Enter unselects the
+  rows it hides; a click or Enter that collapses and selects reports once,
+  with the final selection. A collapse by the app
+  (`TreeController::collapse`) does not unselect.
+- `onselectionchange` gets the selection top to bottom each time a click or
+  a key changes it (never when it did not change; a `multiple` tree only).
+  A selected value whose row the app deleted is left out of the report, but
+  the tree does not prune it from `UseTreeReturn::selected`.
+  `TreeController::set_selection(values)` replaces the selection from code.
+- Without `select_on_click` (#1601's rule for every tree), the selection is
+  the app's: neither clicks nor keys select anything (Shift+arrows only move
+  the cursor, Ctrl+A is not the tree's), and no collapse unselects.
+
+**Moving a selection.** A drag from a selected row, and `TreeKey::drop_for`
+from one, move the whole selection (top to bottom, rows inside other
+selected rows left out). What they carry (`TreeDrop::dragged`,
+`TreeKey::carried()`) goes through `drag_values` when it is set, called for
+each moved row with each value kept once, so a `drag_values` that returns
+the whole selection for any row carries it once. Which rows move is the
+tree's own answer, never `drag_values`' (which may name app ids): the
+cursor row alone, or the selected rows in tree order. A keyboard move moves
+those rows as one block: they must share a parent (a selection spanning two
+parents gives `None`, where a drag of the same rows is offered and
+delivered), Up goes before the row above the first, Down after the row
+below the last, and a block with gaps closes them (`b` and `d` moved Down
+land after `e`). `TreeKey::above` and `below` are then the rows around the
+block.
+
+**Where this differs from the WAI-ARIA tree pattern:** Ctrl+A selects the
+cursor row's siblings, not every row; Shift with an arrow selects the run
+from the anchor (the desktop file-manager model), where the pattern's
+recommended model toggles the next row and keeps the rest; Ctrl+Shift-click
+toggles the row (Ctrl wins) rather than adding the run; a row Space or
+Ctrl-click unselects still becomes the anchor, where the pattern runs
+Shift+Space from the most recently *selected* row; and Ctrl+Shift+Home /
+Ctrl+Shift+End (optional in the pattern) are not supported.
+
+See the Tree section of [Component Props](component-props.md#tree) for every
+prop and type.
 
 ### Navigation
 
@@ -508,6 +744,29 @@ clear any window chrome rinch draws (the Linux in-app menu bar, the
 invisible click-catching backdrops behind `DropdownMenu` and `Select` deliberately
 do not — they must catch clicks on the chrome too.
 
+**`DropdownMenu` and `Popover` stay on screen.** Each open measures the dropdown
+and, like Floating UI's `flip`/`shift`/`size`: opens it on the side you asked
+for when it fits there, else on the opposite side when it fits there (the
+root's position class is swapped, so `rinch-popover--top` is on a popover that
+opened above, and its arrow points down); moves it back inside the viewport, 8px
+from the edge, when it runs past the left or right edge (top or bottom, for a
+`left`/`right` popover); and when it fits on neither side, puts it on the side
+with more room with a `max-height` and `overflow-y: auto`. A dropdown that fits
+is left exactly where its position puts it. The placement is written inline on
+the dropdown element (`top`/`bottom`/`left`/`right`, a pinned `width`, and the
+cap). Only what it writes is taken back at the next open, with your own
+inline values (a `width`, `left`, `max-height` you set on `DropdownMenuDropdown`
+/ `PopoverDropdown`) restored: the dropdown is measured as you styled it, a
+`max-height` of yours still caps it (the cap written for a lack of room is never
+above yours), and a `width` of yours is what gets pinned. It
+follows the trigger while open (a scroll, an outer menu placing itself), but a
+window resize or a change of the dropdown's own content keeps the placement
+until the next open. Only the viewport is a boundary, not a clipping ancestor.
+`DropdownMenu`'s `left`/`right` positions have no stylesheet rules and are not
+placed. A popover's offset is now a margin on the side facing its target rather
+than a `translate`, so its `transform` is only the centring `translateX(-50%)`
+(or none).
+
 If you hand-roll a `position: fixed` overlay, offset it the same way
 (`top: var(--rinch-window-top-inset, 0px)`); fixed resolves against the real
 viewport, so a bare `top: 0` renders underneath the chrome. See
@@ -523,22 +782,59 @@ two worked examples: both keep their panel rendered while closed, `Drawer` slide
 its `transform` and `Popover` fades its `opacity`. See [the transitions section
 of the rendering pipeline](../architecture/rendering-pipeline.md).
 
+**To animate the close as well, delay the hide.** Put `transition: visibility 0s
+linear <duration>` on the *hidden* state only: the box stays `visible` through
+the transition's delay, then hides, and the shown state — which declares no
+`visibility` transition — cancels a pending hide if the overlay reopens first.
+`Drawer` and `Popover` both do this. `visibility` is transitionable on desktop
+since issue #759, interpolated as CSS says (every step strictly inside a
+transition with a `visible` end is `visible`), and unlike any other property
+there its animated value reaches the descendants that inherit it, so the panel's
+content stays on screen with it.
+
+**Show the open state with `visibility: inherit`, not `visible`.** A declared
+`visible` overrides an inherited `hidden`, so a panel shown that way paints
+through a closed container around it — an open `Popover` inside a closed
+`Drawer` did until issue #936. `inherit` is `visible` inside a visible
+container and `hidden` inside a hidden one. `Popover`, `HoverCard` and
+`LoadingOverlay` declare it. A panel nested in another overlay's panel then
+takes that panel's *animated* value too: when both open in the same pass, the
+inner one's own transition starts when the outer one's ends.
+
 A `visibility: hidden` subtree is excluded from paint, from hit testing and from
 the Tab order, which is most of what `display: none` was doing — but not all of
 it, and the difference is that the box is still **there**. Two consequences to
-know before you reach for it:
+know before you reach for it are below.
 
-- **It still takes part in layout**, so a hidden overlay that is a direct child
-  of an `overflow: auto` container contributes its box to that container's
-  scrollable extent, and the container grows a scrollbar for content nobody can
-  see. `position: fixed` does not exempt it: `paint::scrollbar::content_extents`
-  measures every child's border box, out-of-flow ones included.
-- **A descendant may declare `visibility: visible`**, and the three readers do
-  not agree about what that means. Paint honours it (the node is drawn), the Tab
-  order honours it (`collect_focusable_nodes_from` tests each node on its own),
-  and hit testing does **not** — it rejects the whole subtree at the hidden
-  ancestor before it ever reaches the descendant. So such a node is painted and
-  tabbable but not clickable.
+On desktop, "excluded from paint" covers the box's background, border and
+shadow, and also its text, underline (wavy too) and line-through, `text-shadow`, inline
+backgrounds, SVG shapes, scrollbar thumbs, `RenderSurface` frame, `filter`
+overlay and read-only selection highlight (desktop drew the text until issue
+#829), a hidden span on a line `text-overflow: ellipsis` cuts included
+(#853). Two known exceptions remain: a hidden `data-viewport` still cuts its
+hole in its ancestors' backgrounds (#854), and a ligature that straddles a
+visibility boundary follows the wrong end of it (#852). As in CSS,
+a descendant that declares `visibility: visible` is painted again.
+
+A closed overlay costs paint nothing (#2137): a hidden subtree with no
+`visibility: visible` descendant is skipped whole, by paint and by the stacking
+sequence its positioned boxes would otherwise be hoisted into, so a page with a
+closed `Drawer`, `Popover` or menu paints what the page without it paints. A
+subtree that does hold a visible descendant is walked, for that descendant.
+
+
+- **It still takes part in layout**, so a hidden overlay that is an in-flow
+  child of an `overflow: auto` container contributes its box to that
+  container's scrollable extent, and the container grows a scrollbar for
+  content nobody can see — as it would in a browser. A `position: fixed`
+  overlay (`Modal`, `Drawer`) is exempt, since #765: a fixed box is no part of
+  any scroll range below the viewport.
+- **A descendant may declare `visibility: visible`**, and it is shown again:
+  paint draws it, the Tab order reaches it (`collect_focusable_nodes_from`
+  tests each node on its own) and, since #843, hit testing hits it, as Chrome's
+  `elementFromPoint` does. Before #843 hit testing rejected the whole subtree at
+  the hidden ancestor, so such a node was painted and tabbable but not
+  clickable.
 
 Neither is a reason to go back to `display`, which cannot animate at all. They
 are the two places to look when a closed overlay misbehaves.
@@ -549,18 +845,23 @@ let modal_open = Signal::new(false);
 
 Button { onclick: move || modal_open.set(true), "Open Modal" }
 
+// The footer is pinned below the body: it stays in view while a tall body
+// scrolls, and ends its buttons with a gap (`.rinch-modal__footer`).
+let modal_footer: SectionRenderer = Rc::new(move |__scope| rsx! {
+    Fragment {
+        Button { variant: "outline", onclick: move || modal_open.set(false), "Cancel" }
+        Button { onclick: move || modal_open.set(false), "Save" }
+    }
+});
+
 Modal {
-    opened: modal_open.get(),
+    opened_fn: move || modal_open.get(),
     onclose: move || modal_open.set(false),
     title: "Confirm Action",
     size: "md",
+    footer: Some(modal_footer),
 
     Text { "Are you sure you want to proceed?" }
-    Space { h: "lg" }
-    Group { justify: "end", gap: "sm",
-        Button { variant: "outline", "Cancel" }
-        Button { "Confirm" }
-    }
 }
 
 // Drawer
@@ -626,8 +927,9 @@ HoverCard { position: "bottom",
 }
 
 // LoadingOverlay — the `position: relative` on the container is REQUIRED.
-// Without it the overlay's containing block is the viewport and it covers the
-// whole window (the CSS rule, and what rinch-web has always done).
+// Without it the overlay's containing block is the nearest positioned ancestor
+// further up — or the viewport, and it covers the whole window (the CSS rule,
+// and what rinch-web has always done).
 div { style: "position: relative; height: 200px;",
     // Your content
     LoadingOverlay { visible: is_loading.get() }
@@ -716,6 +1018,28 @@ A `position: fixed` overlay does not — it resolves against the real viewport a
 would cover the titlebar and its close button. Offset such overlays by
 `var(--rinch-window-top-inset, 0px)`; see
 [Theming → Window Chrome Inset](./theming.md#window-chrome-inset).
+
+### A transformed element contains its fixed descendants
+
+A `position: fixed` element is placed against the viewport **unless** one of its
+ancestors has a `transform` other than `none` (even `translateX(0)`), a
+`filter` or `backdrop-filter`, a `perspective`, `contain: paint` or `layout`, or
+a `will-change` naming one of those. That ancestor becomes its containing block:
+the fixed element is placed against it, scrolls and is clipped with it, and is
+painted under its transform. This is CSS (rinch matches Chrome here, and
+`rinch-web` gets it from the browser).
+
+It matters for overlays. The full-window dismiss backdrops of `Select`,
+`DropdownMenu`, `Popover` and `ColorInput` are `position: fixed`; inside a
+transformed element they cover only that element, and a tap outside it reaches
+whatever is behind. So the built-in panels made to hold menus and forms carry no
+transform when at rest: an open `Drawer` panel is `transform: none`, and a
+centred `Popover` dropdown is centred by its placement, not by
+`translate(-50%)`. `HoverCard`, `Tooltip` and `Notification` still centre with
+`translate(-50%)`, so a menu inside one of those gets a backdrop the size of the
+card; use a `Popover` for content that opens menus. Do the same in your own components: put a slide-in or a
+centring transform on an element that does not hold menus, or remove it once the
+animation ends.
 
 ## Building Custom Components
 
@@ -827,6 +1151,10 @@ impl Component for MyButton {
     }
 }
 ```
+
+`invoke` runs the app's handler untracked, so it is safe to call from inside one
+of your component's effects too: whatever signals the handler reads, your effect
+is not subscribed to them. See [Reactivity](reactivity.md#app-handlers-never-subscribe-the-effect-that-calls-them).
 
 ### 4. Create CSS Styles
 
@@ -1271,7 +1599,7 @@ rsx! {
 | Prop Type | Accepts `{|| ...}` | Update Strategy |
 |---|---|---|
 | HTML element attributes | Yes | Surgical DOM update |
-| Component `style:`/`class:` | Yes | Surgical DOM update |
+| Component `style:`/`class:`, style shorthands, hyphenated attributes | Yes | Surgical DOM update (also on a component that re-renders for a struct prop) |
 | Component `_fn` props | Yes (auto-wrapped) | Surgical DOM update |
 | Component props (all others) | Yes | Full component re-render |
 
@@ -1307,6 +1635,15 @@ rsx! {
     }
 }
 ```
+
+**The echo is not written back.** In this pattern every keystroke runs
+`oninput` → signal → `value_fn`, which returns the very text the field already
+shows. `TextInput`, `PasswordInput`, `Textarea` and `NumberInput` compare
+`value_fn`'s result with the field's live text (`NodeHandle::live_value`,
+issue #238) and write only when they differ — a normalising handler's rewrite,
+or a programmatic change. The comparison is against the *live* text, not the
+`value` attribute, which on the web still holds the last programmatic write
+while the user types.
 
 **Writing to the field the user is typing in.** A `value_fn` write (or any
 `set_attribute("value")`) that lands on the *focused* field is adopted by the

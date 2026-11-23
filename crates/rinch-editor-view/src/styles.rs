@@ -13,9 +13,8 @@
 //! [`EditorHandle::set_dark_mode`](super::EditorHandle::set_dark_mode)); the dark
 //! rules below carry that extra attribute so they win by specificity.
 //!
-//! **Tables:** rinch-dom has no `display: table`, so tables are laid out with
-//! flexbox (`table` = column, `row` = row, cells = equal-width flex items). This
-//! is why the default stylesheet is load-bearing for tables, not just cosmetic.
+//! **Tables:** the editor lays its tables out with CSS grid (below), not as CSS
+//! tables, so the stylesheet is load-bearing for them, not just cosmetic.
 //!
 //! **Inline decorations:** a
 //! [`Decoration::Inline`](rinch_editor_core::decoration::Decoration::Inline)
@@ -42,6 +41,11 @@ pub(crate) const DEFAULT_EDITOR_CSS: &str = r#"
   padding: 16px 20px;
   border: 1px solid #d0d7de;
   border-radius: 10px;
+  /* An app sizes the editor by its outside: a `width` or `height` given to it
+     includes this padding and border, themed or not, on desktop and the web
+     alike (rinch reads `box-sizing` since #1278; the theme's
+     `* { box-sizing: border-box }` used to stand in for this). */
+  box-sizing: border-box;
   /* Preserve the model's whitespace exactly (inherited by every textblock). Without
      this the browser collapses trailing spaces and runs of spaces, so a space typed
      at end of line is invisible until the next character, and — worse — the rendered
@@ -106,44 +110,72 @@ pub(crate) const DEFAULT_EDITOR_CSS: &str = r#"
 }
 
 /* ── Lists ─────────────────────────────────────────────────────────────── */
-/* `li` is flex so the bullet/number aligns with the first line of its content
-   (rinch-dom renders list markers as block siblings otherwise). `flex-wrap: wrap`
-   plus `flex-basis: 100%` on a *nested* list make the sublist break onto its own
-   full-width line and indent below the item, instead of floating beside it. */
+/* A list item is an ordinary block whose marker hangs outside it, as a browser's
+   `display: list-item` does. rinch-web keeps the browser's own `::marker` (it sets
+   `ul > li, ol > li { display: list-item }`). rinch-dom has `DisplayValue::ListItem`
+   too (#725), and since #1356 an outside marker box of its own: the marker
+   `resolve_list_marker` generates is out of flow and placed beside the item's
+   first line box, in the list's padding, so this sheet does not hang it (it
+   did, with a `li > span` rule, before #1356).
+
+   The item used to be a wrapping flex row of the marker and its blocks. A
+   paragraph there has `flex-basis: auto`, so it was sized at its max-content
+   width (the whole text on one line) and `flex-wrap` moved a long one onto a
+   line of its own, leaving the bullet alone above it (#1246; Chrome does the
+   same with that CSS). As blocks, the text wraps beside the marker, a second
+   paragraph and a nested list start their own lines under the text, and no
+   alignment rule is involved (rinch-dom used to baseline-align a multi-line
+   flex item by its bottom edge, which put a flex marker beside the paragraph's
+   last line; fixed by #1013). */
 [data-pm-editor] ul, [data-pm-editor] ol { padding-left: 1.6em; margin: 0 0 0.75em; }
-[data-pm-editor] li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.4em; margin: 0.15em 0; }
+[data-pm-editor] li { position: relative; margin: 0.15em 0; }
 [data-pm-editor] li > ul, [data-pm-editor] li > ol,
-[data-pm-editor] li > [data-pm-type="task_list"] { flex-basis: 100%; margin: 0.15em 0 0; }
+[data-pm-editor] li > [data-pm-type="task_list"] { margin: 0.15em 0 0; }
 
 /* ── Task lists ────────────────────────────────────────────────────────────
    task_list / task_item have no native HTML tag (they render as <div>), so they
    are styled by their `data-pm-type` marker. Each item gets a checkbox `::before`
-   (☑ when its `data-checked` is set by the view); a checked item is dimmed and
-   struck through. Nested task lists wrap onto their own indented line, like ul/ol. */
+   (☑ when its `data-checked` is set by the view), hung in the item's left padding
+   the way a list marker hangs (#1246: as a flex item beside the paragraph it put a
+   long paragraph on a line of its own); a checked item is dimmed and struck
+   through. A nested task list starts its own line under the item's text. */
 [data-pm-editor] [data-pm-type="task_list"] { margin: 0 0 0.75em; padding-left: 0.1em; }
-[data-pm-editor] [data-pm-type="task_item"] {
-  display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5em; margin: 0.15em 0;
-}
+[data-pm-editor] [data-pm-type="task_item"] { position: relative; padding-left: 1.5em; margin: 0.15em 0; }
 [data-pm-editor] [data-pm-type="task_item"]::before {
-  content: "\2610"; flex: 0 0 auto; color: #57606a; line-height: 1.4;
+  content: "\2610"; position: absolute; top: 0; left: 0; color: #57606a;
 }
 [data-pm-editor] [data-pm-type="task_item"][data-checked="true"]::before { content: "\2611"; color: #1a7f37; }
 /* Dim + strike the item's *own* content only — never a nested sub-list (whose items
    carry their own checked state); `> *` would grey/strike unchecked sub-tasks. */
 [data-pm-editor] [data-pm-type="task_item"][data-checked="true"] > :not([data-pm-type="task_list"]) { color: #8c959f; text-decoration: line-through; }
 [data-pm-editor] [data-pm-type="task_item"] > * { margin-bottom: 0; }
-[data-pm-editor] [data-pm-type="task_item"] > [data-pm-type="task_list"],
+[data-pm-editor] [data-pm-type="task_item"] > [data-pm-type="task_list"] { margin: 0.15em 0 0; padding-left: 0; }
 [data-pm-editor] [data-pm-type="task_item"] > ul,
-[data-pm-editor] [data-pm-type="task_item"] > ol { flex-basis: 100%; margin: 0.15em 0 0; padding-left: 1.4em; }
+[data-pm-editor] [data-pm-type="task_item"] > ol { margin: 0.15em 0 0; padding-left: 1.4em; }
 
 /* ── Horizontal rule ───────────────────────────────────────────────────── */
 [data-pm-editor] hr { border: none; border-top: 2px solid #e1e4e8; margin: 1.2em 0; height: 0; }
 
-/* ── Tables (CSS grid — rinch-dom has no display:table) ─────────────────
+/* ── Embed (a block an app draws: a node view) ───────────────────────────
+   A block atom whose host the app fills. Empty, it still has a line of height,
+   so it can be clicked (a click node-selects it, as for an hr). */
+[data-pm-editor] [data-pm-type="embed"] { min-height: 1lh; margin: 0.85em 0; }
+[data-pm-editor] [data-pm-type="embed"]:empty { border: 1px dashed #d0d7de; border-radius: 6px; }
+/* A host an app's component is drawn in (a node view) keeps a frame of its own
+   around it: a press there node-selects the node, a press on the component is
+   the component's. */
+[data-pm-editor] [data-pm-node-view] { padding: 6px; border-radius: 6px; }
+/* A claimed inline image is the app's component on the line and nothing else:
+   no frame (a press beside it places the caret, an arrow steps over it). */
+[data-pm-editor] [data-pm-type="image"][data-pm-node-view] { padding: 0; border-radius: 0; }
+
+/* ── Tables (CSS grid, placed from the TableMap) ─────────────────
    The <table> is a grid; the view sets `grid-template-columns: repeat(N, …)`
    inline (N = column count). <tr> is `display: contents`, so its cells become
-   the grid's direct items, and a merged cell carries an inline
-   `grid-column`/`grid-row` span — that is how colspan/rowspan render. */
+   the grid's direct items, and each cell carries an inline
+   `grid-column`/`grid-row` — its rectangle in the table's TableMap, as column
+   lines and (where auto-placement would not keep the map's rows) row lines,
+   else row spans; that is how colspan/rowspan render (#1182, #1209, #1226). */
 [data-pm-editor] table {
   display: grid; margin: 0.85em 0;
   grid-template-columns: minmax(0, 1fr);
@@ -163,8 +195,14 @@ pub(crate) const DEFAULT_EDITOR_CSS: &str = r#"
    below ship only because a spellcheck squiggle is the reason inline
    decorations exist — that case then works with no consumer CSS at all. The
    wrapper is deliberately given no metrics of its own: a squiggle appearing
-   must not reflow the text it sits under. */
-[data-pm-editor] [data-pm-deco].pm-spell-error { text-decoration: underline wavy #d1242f; }
+   must not reflow the text it sits under. The spellcheck squiggle takes its
+   style and colour from `--rinch-spellcheck-style` / `--rinch-spellcheck-color`
+   (inherited, so set per editor or app-wide; Chrome's red by default), as a
+   text field's marks do (#2862); `--rinch-spellcheck-style: none` makes the
+   declaration invalid at computed-value time, so no line is drawn. */
+[data-pm-editor] [data-pm-deco].pm-spell-error {
+  text-decoration: underline var(--rinch-spellcheck-style, wavy) var(--rinch-spellcheck-color, #ff0000);
+}
 [data-pm-editor] [data-pm-deco].pm-grammar-error { text-decoration: underline wavy #1a7f37; }
 
 /* ── Placeholder (empty-document hint) ─────────────────────────────────── */
@@ -194,6 +232,7 @@ pub(crate) const DEFAULT_EDITOR_CSS: &str = r#"
 [data-pm-editor][data-pm-theme="dark"] [data-pm-type="task_item"][data-checked="true"]::before { color: #3fb950; }
 [data-pm-editor][data-pm-theme="dark"] [data-pm-type="task_item"][data-checked="true"] > :not([data-pm-type="task_list"]) { color: #6e7681; }
 [data-pm-editor][data-pm-theme="dark"] hr { border-top-color: #30363d; }
+[data-pm-editor][data-pm-theme="dark"] [data-pm-type="embed"]:empty { border-color: #30363d; }
 [data-pm-editor][data-pm-theme="dark"] table,
 [data-pm-editor][data-pm-theme="dark"] td,
 [data-pm-editor][data-pm-theme="dark"] th { border-color: #30363d; }
@@ -207,7 +246,7 @@ pub(crate) const DEFAULT_EDITOR_CSS: &str = r#"
 [data-pm-editor][data-pm-theme="dark"] [data-pm-deco].pm-grammar-error { text-decoration-color: #3fb950; }
 "#;
 
-thread_local! {
+rinch_core::doc_keyed! {
     /// The [`doc_key`](rinch_core::dom::DomDocument::doc_key)s of documents that
     /// already carry [`DEFAULT_EDITOR_CSS`]. Keyed **per document**, not per
     /// thread: two documents on one thread (e.g. two embedded `RinchContext`s,
@@ -215,8 +254,10 @@ thread_local! {
     /// flag left the second document's editor completely unstyled. The guard
     /// still stops every mounted editor from adding a duplicate copy to *its*
     /// document.
-    static INJECTED: RefCell<std::collections::HashSet<u64>> =
-        RefCell::new(std::collections::HashSet::new());
+    ///
+    /// Swept with its document (#2797), so a closed window's key does not stay
+    /// for the thread's life.
+    static INJECTED: rinch_core::DocMap<()> = rinch_core::DocMap::new();
 }
 
 /// Inject [`DEFAULT_EDITOR_CSS`] into the document `<body>` as a `<style>` element,
@@ -228,7 +269,7 @@ pub(crate) fn ensure_default_styles(doc: &Weak<RefCell<dyn DomDocument>>) {
         return;
     };
     let doc_key = doc.borrow().doc_key();
-    if INJECTED.with(|f| f.borrow().contains(&doc_key)) {
+    if INJECTED.with(|f| f.contains(doc_key)) {
         return;
     }
     let mut d = doc.borrow_mut();
@@ -238,5 +279,5 @@ pub(crate) fn ensure_default_styles(doc: &Weak<RefCell<dyn DomDocument>>) {
     let text = d.create_text(DEFAULT_EDITOR_CSS);
     d.append_child(style, text);
     d.append_child(body, style);
-    INJECTED.with(|f| f.borrow_mut().insert(doc_key));
+    INJECTED.with_mut(|f| f.insert(doc_key, ()));
 }

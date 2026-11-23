@@ -115,8 +115,8 @@ pub fn styles() -> String {
    The column-flex panel sizes its cross axis to the widest child's
    intrinsic width, so this is what actually grows the panel past
    `min-width: 100%` up to the `max-width` cap (the `width: max-content`
-   above is a defensive hint — Stylo currently parses it as Auto). Without
-   nowrap, options wrap inside the trigger-width panel and nothing grows. */
+   above asks for the same size, and lays out since #691). Without nowrap,
+   options wrap inside the trigger-width panel and nothing grows. */
 .rinch-select__option {
     padding: 8px var(--rinch-spacing-sm);
     font-size: var(--rinch-font-size-sm);
@@ -128,6 +128,12 @@ pub fn styles() -> String {
 }
 
 .rinch-select__option:hover {
+    background-color: var(--rinch-color-option-hover);
+}
+
+/* The keyboard highlight (#434): the option Enter would commit. The hover
+   colour, so the pointer and the keyboard show one kind of "here". */
+.rinch-select__option--highlighted {
     background-color: var(--rinch-color-option-hover);
 }
 

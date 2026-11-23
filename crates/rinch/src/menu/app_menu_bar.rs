@@ -200,9 +200,17 @@ pub fn render_menu_bar_standalone(
 /// Returns a flex container with the top-level menu items. Uses a shared
 /// `active_menu` signal so the overlay and items stay in sync.
 ///
-/// Only the borderless desktop window lays a menu bar out this way, so unlike
-/// the two renderers above this one stays crate-internal.
-#[cfg(all(feature = "desktop", target_os = "linux"))]
+/// Only the borderless desktop window lays a menu bar out this way (Linux and Windows, and every
+/// platform in a build without `native-menus`), so unlike the two renderers above this one stays
+/// crate-internal.
+#[cfg(all(
+    feature = "windowing",
+    any(
+        target_os = "linux",
+        target_os = "windows",
+        not(feature = "native-menus")
+    )
+))]
 pub(crate) fn render_menu_items_inline(
     scope: &mut RenderScope,
     menus: &[(&str, &Menu)],
@@ -233,7 +241,14 @@ pub(crate) fn render_menu_items_inline(
 /// Render just the click-outside overlay (for inline titlebar layout).
 ///
 /// Uses a shared `active_menu` signal so clicking the overlay closes menus.
-#[cfg(all(feature = "desktop", target_os = "linux"))]
+#[cfg(all(
+    feature = "windowing",
+    any(
+        target_os = "linux",
+        target_os = "windows",
+        not(feature = "native-menus")
+    )
+))]
 pub(crate) fn render_inline_overlay(
     scope: &mut RenderScope,
     active_menu: Signal<i32>,
@@ -325,6 +340,8 @@ fn build_overlay(scope: &mut RenderScope, active_menu: Signal<i32>) -> NodeHandl
         active_menu.set(-1);
     });
     overlay.set_attribute("data-rid", &handler_id.0.to_string());
+    // A press of any button outside dismisses, not only a left one (#1093).
+    overlay.set_attribute(rinch_core::events::BACKDROP_ATTRIBUTE, "");
     overlay
 }
 
@@ -402,6 +419,10 @@ fn build_top_level_item(
 
     // Dropdown panel — visibility controlled by the active_menu signal.
     let dropdown = scope.create_element("div");
+    // The dropdown scrolls (`max-height: 95vh; overflow-y: auto`) and is window
+    // chrome: it is in no overlay's root, and it paints over an open `Modal`.
+    // A `lock_scroll` overlay must not take its wheel (#701).
+    dropdown.set_attribute(rinch_core::events::SCROLL_LOCK_EXEMPT_ATTRIBUTE, "");
     {
         let dropdown_handle = dropdown.clone();
         Effect::new(move || {
@@ -437,6 +458,9 @@ fn build_top_level_item(
         let flyout_idx = flyout_idx as i32;
         let flyout = scope.create_element("div");
         flyout.set_attribute("class", "rinch-app-menu-submenu__flyout");
+        // A scroll container of its own and a sibling of the dropdown, so the
+        // dropdown's exemption does not reach it (#701).
+        flyout.set_attribute(rinch_core::events::SCROLL_LOCK_EXEMPT_ATTRIBUTE, "");
 
         let top_px = LABEL_HEIGHT + flyout_data.trigger_y;
         let pos_style = format!("left: 220px; top: {top_px}px;");
@@ -503,6 +527,39 @@ fn build_menu_entries_with_flyouts(
                 }
                 entry_node.set_attribute("class", &cls);
 
+                // A checkbox or radio item draws its mark in a slot before the
+                // label, kept in step with the item's signal by an effect owned
+                // by this render (issue #1520).
+                if let Some(toggle) = item.toggle.as_ref() {
+                    let radio = matches!(toggle.kind, super::ToggleKind::Radio { .. });
+                    entry_node.set_attribute(
+                        "role",
+                        if radio {
+                            "menuitemradio"
+                        } else {
+                            "menuitemcheckbox"
+                        },
+                    );
+                    let mark = scope.create_element("span");
+                    let glyph = scope.create_text(if radio { "\u{2022}" } else { "\u{2713}" });
+                    mark.append_child(&glyph);
+                    entry_node.append_child(&mark);
+                    let is_on = Rc::clone(&toggle.is_on);
+                    let (mark, row) = (mark.clone(), entry_node.clone());
+                    Effect::new(move || {
+                        let on = is_on().unwrap_or(false);
+                        mark.set_attribute(
+                            "class",
+                            if on {
+                                "rinch-app-menu-entry__check rinch-app-menu-entry__check--on"
+                            } else {
+                                "rinch-app-menu-entry__check"
+                            },
+                        );
+                        row.set_attribute("aria-checked", if on { "true" } else { "false" });
+                    });
+                }
+
                 let label_span = scope.create_element("span");
                 label_span.set_attribute("class", "rinch-app-menu-entry__label");
                 let text = scope.create_text(&item.label);
@@ -518,17 +575,17 @@ fn build_menu_entries_with_flyouts(
                 }
 
                 if enabled {
-                    if let Some(cb) = item.callback.as_ref() {
-                        let cb = Rc::clone(cb);
+                    if let Some(cb) = item.activation() {
                         // The item is invoked straight from the `Menu` here — it
                         // never goes through the callback registry — so this
                         // path has to apply the #183 lifetime rule itself, or a
                         // click would run a callback whose component has
                         // unmounted and read its freed signals.
                         let owner = item.callback_owner.clone();
+                        let frame = item.callback_frame;
                         let handler_id = scope.register_handler(move || {
                             active_menu.set(-1);
-                            super::invoke_menu_callback(&cb, owner.as_ref());
+                            super::invoke_menu_callback(&cb, owner.as_ref(), frame);
                         });
                         entry_node.set_attribute("data-rid", &handler_id.0.to_string());
                     }
@@ -608,7 +665,7 @@ fn build_menu_entries_with_flyouts(
 // the borderless Linux window's.
 #[cfg(all(
     test,
-    feature = "desktop",
+    feature = "windowing",
     feature = "components",
     feature = "theme",
     target_os = "linux"
@@ -703,7 +760,7 @@ mod tests {
     }
 
     /// Every node carrying `class` exactly, in tree order.
-    fn nodes_with_class(doc: &RinchDocument, class: &str) -> Vec<usize> {
+    fn nodes_with_class(doc: &RinchDocument, class: &str) -> Vec<u64> {
         let mut out = Vec::new();
         let mut stack = vec![doc.tree.body_id];
         while let Some(id) = stack.pop() {
@@ -722,7 +779,7 @@ mod tests {
         out
     }
 
-    fn rid_of(doc: &RinchDocument, node_id: usize) -> String {
+    fn rid_of(doc: &RinchDocument, node_id: u64) -> String {
         doc.tree
             .get(node_id)
             .and_then(|n| n.attributes.get("data-rid"))
@@ -745,13 +802,13 @@ mod tests {
     }
 
     /// Run a node's own `data-rid` handler, as the click dispatcher would.
-    fn run_rid_handler(doc: &Rc<RefCell<RinchDocument>>, node_id: usize) {
+    fn run_rid_handler(doc: &Rc<RefCell<RinchDocument>>, node_id: u64) {
         let rid: usize = rid_of(&doc.borrow(), node_id).parse().unwrap();
         rinch_core::events::dispatch_event(rinch_core::events::EventHandlerId(rid));
     }
 
     /// Run a node's `data-onenter` handler, as the hover dispatcher would.
-    fn run_onenter_handler(doc: &Rc<RefCell<RinchDocument>>, node_id: usize) {
+    fn run_onenter_handler(doc: &Rc<RefCell<RinchDocument>>, node_id: u64) {
         let id: usize = doc
             .borrow()
             .tree
@@ -763,12 +820,12 @@ mod tests {
         rinch_core::events::dispatch_event(rinch_core::events::EventHandlerId(id));
     }
 
-    fn center(doc: &RinchDocument, id: usize) -> (f32, f32) {
+    fn center(doc: &RinchDocument, id: u64) -> (f32, f32) {
         let r = rinch_dom::paint::painted_border_box(&doc.tree, id, 1.0);
         (r.center().x as f32, r.center().y as f32)
     }
 
-    fn is_displayed(doc: &RinchDocument, id: usize) -> bool {
+    fn is_displayed(doc: &RinchDocument, id: u64) -> bool {
         doc.tree.get(id).unwrap().computed_style.display
             != rinch_dom::computed_style::DisplayValue::None
     }
@@ -778,7 +835,7 @@ mod tests {
     /// Returns the document plus the ids of the dismiss overlay, the open menu's
     /// single entry, and the *other* top-level label — the hover-to-switch
     /// target, which the same defect made unreachable.
-    fn open_inline_menu() -> (Rc<RefCell<RinchDocument>>, usize, usize, usize) {
+    fn open_inline_menu() -> (Rc<RefCell<RinchDocument>>, u64, u64, u64) {
         let doc = Rc::new(RefCell::new(RinchDocument::new()));
         let body = doc.borrow().body();
         load_stylesheets(&doc, body);
@@ -941,7 +998,7 @@ mod tests {
 
     /// `BorderlessWindow`'s BelowTitlebar tree — the other Linux layout, whose
     /// bar renders under the title bar rather than inside it — menu 0 open.
-    fn open_below_titlebar_menu() -> (Rc<RefCell<RinchDocument>>, usize, usize) {
+    fn open_below_titlebar_menu() -> (Rc<RefCell<RinchDocument>>, u64, u64) {
         let doc = Rc::new(RefCell::new(RinchDocument::new()));
         let body = doc.borrow().body();
         load_stylesheets(&doc, body);
@@ -981,6 +1038,21 @@ mod tests {
         (doc, overlay_id, entry_id)
     }
 
+    /// The overlay is an outside-press backdrop: a right or middle press on it
+    /// closes the open menu too, as it closes a native one (#1093).
+    #[test]
+    fn the_overlay_answers_a_press_of_any_button() {
+        let (doc, overlay_id, _) = open_below_titlebar_menu();
+        let d = doc.borrow();
+        assert!(
+            d.tree
+                .get(overlay_id)
+                .unwrap()
+                .attributes
+                .contains_key(rinch_core::events::BACKDROP_ATTRIBUTE)
+        );
+    }
+
     /// The below-titlebar layout had the same defect and the same cure, and it
     /// is the one whose overlay is not laid out where it has to cover: its
     /// *parent* starts `TITLEBAR_HEIGHT` down the window. `position: fixed`
@@ -1017,7 +1089,7 @@ mod tests {
     /// The third layout: a *non*-borderless window, where `render_with_menu_bar`
     /// wraps the app's content itself and there is no `BorderlessWindow`
     /// container. Menu 0 open. Returns the overlay's and the entry's ids.
-    fn open_wrapped_menu() -> (Rc<RefCell<RinchDocument>>, usize, usize) {
+    fn open_wrapped_menu() -> (Rc<RefCell<RinchDocument>>, u64, u64) {
         let doc = Rc::new(RefCell::new(RinchDocument::new()));
         let body = doc.borrow().body();
         load_stylesheets(&doc, body);
@@ -1145,7 +1217,7 @@ mod tests {
         assert_eq!(flyouts.len(), 2, "two flyout panels");
 
         /// Which flyouts are showing, as a `[bool; 2]`.
-        fn shown(doc: &Rc<RefCell<RinchDocument>>, flyouts: &[usize]) -> Vec<bool> {
+        fn shown(doc: &Rc<RefCell<RinchDocument>>, flyouts: &[u64]) -> Vec<bool> {
             let d = doc.borrow();
             flyouts.iter().map(|&f| is_displayed(&d, f)).collect()
         }
@@ -1201,7 +1273,7 @@ mod tests {
 // ── The renderer with no desktop backend under it ───────────────────────────
 //
 // The suite above mounts the real stylesheet through `RinchDocument` and so
-// needs `desktop`. These do not: they drive the renderer against rinch-core's
+// needs `windowing`. These do not: they drive the renderer against rinch-core's
 // headless document double, which is the configuration a `rinch-web` build
 // compiles — `--no-default-features --features components,theme`. If the module
 // ever re-acquires a dependency on muda, winit or rinch-dom, these stop
@@ -1346,5 +1418,49 @@ mod portable_tests {
             "Escape closed the menu"
         );
         assert!(!escape(), "and the bar goes back to passing Escape through");
+    }
+
+    /// Issue #1520: a checkbox row draws a mark that follows its signal — on
+    /// an app write as well as on a click — and says so to assistive tech.
+    #[test]
+    fn a_checkbox_entry_mark_follows_its_signal() {
+        let mut h = harness();
+        let on = rinch_core::reactive::Signal::new(false);
+        let model = rinch_core::reactive::Signal::new(2u8);
+        let menu = Menu::new()
+            .item(MenuItem::checkbox("Mute", on))
+            .item(MenuItem::radio("One", model, 1))
+            .item(MenuItem::radio("Two", model, 2));
+        let content = h.scope.create_element("div");
+        let root = render_with_menu_bar(&mut h.scope, &[("View", &menu)], content, 0);
+        let root = root.node_id();
+
+        let on_marks =
+            |h: &Harness| nodes_with_class(h, root, "rinch-app-menu-entry__check--on").len();
+        let rows = nodes_with_class(&h, root, "rinch-app-menu-entry");
+        let attr = |h: &Harness, id, a: &str| h.doc.borrow().get_attribute(id, a);
+        assert_eq!(
+            nodes_with_class(&h, root, "rinch-app-menu-entry__check").len(),
+            3
+        );
+        assert_eq!(on_marks(&h), 1, "only the selected radio option is marked");
+        assert_eq!(
+            attr(&h, rows[0], "role").as_deref(),
+            Some("menuitemcheckbox")
+        );
+        assert_eq!(attr(&h, rows[1], "role").as_deref(), Some("menuitemradio"));
+        assert_eq!(attr(&h, rows[0], "aria-checked").as_deref(), Some("false"));
+
+        on.set(true);
+        assert_eq!(on_marks(&h), 2, "an app write marks the checkbox");
+        assert_eq!(attr(&h, rows[0], "aria-checked").as_deref(), Some("true"));
+
+        click(&h, rows[0]);
+        assert!(!on.get(), "a click unchecks it");
+        click(&h, rows[1]);
+        assert_eq!(model.get(), 1, "a click selects the radio option");
+        assert_eq!(attr(&h, rows[1], "aria-checked").as_deref(), Some("true"));
+        assert_eq!(attr(&h, rows[2], "aria-checked").as_deref(), Some("false"));
+        assert_eq!(on_marks(&h), 1);
     }
 }

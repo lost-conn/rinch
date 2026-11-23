@@ -1,6 +1,6 @@
 //! Text selection callbacks, sync, snapshot, and focus request mechanisms.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 
 // ============================================================================
@@ -12,9 +12,9 @@ use std::rc::Rc;
 pub enum SelectionAction {
     /// Set selection with anchor and focus (both node ID + byte offset).
     Set {
-        anchor_node: usize,
+        anchor_node: u64,
         anchor_offset: usize,
-        focus_node: usize,
+        focus_node: u64,
         focus_offset: usize,
     },
     /// Extend selection to a viewport point (for drag-to-select).
@@ -27,12 +27,12 @@ pub enum SelectionAction {
 
 /// Type alias for the text selection callback.
 /// Returns selection ranges for QueryRanges, empty vec otherwise.
-pub type SelectionCallback = Rc<dyn Fn(SelectionAction) -> Vec<(usize, usize, usize)>>;
+pub type SelectionCallback = Rc<dyn Fn(SelectionAction) -> Vec<(u64, usize, usize)>>;
 
 /// The per-document callback map (issue #478) — see
 /// [`DocScopedSlotMap`](crate::reactive::DocScopedSlotMap).
 type SelectionSlots =
-    crate::reactive::DocScopedSlotMap<dyn Fn(SelectionAction) -> Vec<(usize, usize, usize)>>;
+    crate::reactive::DocScopedSlotMap<dyn Fn(SelectionAction) -> Vec<(u64, usize, usize)>>;
 
 /// The per-document saved snapshot, on the same key (issue #478).
 ///
@@ -43,18 +43,48 @@ type SelectionSlots =
 /// instead hand-roll the same resolution rule — own entry first, ownerless
 /// `None` entry as the fallback. The copies must stay in step with the shared
 /// helpers; the fallback-arm pins in the test module hold each one.
-type SnapshotMap = std::collections::BTreeMap<Option<u64>, Vec<(usize, usize, usize)>>;
+///
+/// Swept by document (#2797) by hand rather than as a
+/// [`DocMap`](crate::DocMap): its key is `Option<u64>`, and the `None` entry
+/// (saved outside any dispatch) belongs to no document.
+struct SnapshotMap(std::collections::BTreeMap<Option<u64>, Vec<(u64, usize, usize)>>);
 
-thread_local! {
+impl std::ops::Deref for SnapshotMap {
+    type Target = std::collections::BTreeMap<Option<u64>, Vec<(u64, usize, usize)>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for SnapshotMap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl crate::ForgetDoc for SnapshotMap {
+    fn take_doc(&mut self, doc: u64) -> crate::Removed {
+        self.0
+            .remove(&Some(doc))
+            .map(|ranges| Box::new(ranges) as Box<dyn std::any::Any>)
+            .into_iter()
+            .collect()
+    }
+
+    fn entries_for_doc(&self, doc: u64) -> usize {
+        usize::from(self.0.contains_key(&Some(doc)))
+    }
+}
+
+crate::doc_keyed! {
     /// One callback slot **per document**, plus the ownerless `None` entry —
     /// keyed exactly like the keyboard interceptor (issues #340, #478), so two
     /// documents on one thread keep their own selection delegation.
-    static SELECTION_CALLBACK: RefCell<SelectionSlots> =
-        const { RefCell::new(SelectionSlots::new()) };
+    static SELECTION_CALLBACK: SelectionSlots = SelectionSlots::new();
     /// The saved snapshot, **per document** on the same key (issue #478): one
     /// document's PointerDown saving its selection must not clobber the
     /// snapshot another document's toolbar command is about to fall back to.
-    static SAVED_SELECTION: RefCell<SnapshotMap> = const { RefCell::new(SnapshotMap::new()) };
+    static SAVED_SELECTION: SnapshotMap = SnapshotMap(std::collections::BTreeMap::new());
 }
 
 /// Set the current document's text selection callback, which delegates
@@ -74,7 +104,7 @@ thread_local! {
 /// and so lives for the life of the app, as before.
 pub fn set_selection_callback<F>(cb: F)
 where
-    F: Fn(SelectionAction) -> Vec<(usize, usize, usize)> + 'static,
+    F: Fn(SelectionAction) -> Vec<(u64, usize, usize)> + 'static,
 {
     crate::reactive::install_doc_scoped_slot(&SELECTION_CALLBACK, Rc::new(cb));
 }
@@ -90,9 +120,13 @@ pub fn clear_selection_callback() {
 ///
 /// The `Rc` is cloned out before the call so the callback may re-enter (install
 /// a different callback, query the selection again) without a double borrow.
-pub fn dispatch_selection(action: SelectionAction) -> Vec<(usize, usize, usize)> {
+///
+/// The callback runs untracked (#931): [`query_selection_ranges`] is a query an
+/// app may make from inside an effect, and what the callback reads is not that
+/// effect's dependency.
+pub fn dispatch_selection(action: SelectionAction) -> Vec<(u64, usize, usize)> {
     match crate::reactive::read_doc_scoped_slot(&SELECTION_CALLBACK) {
-        Some(cb) => cb(action),
+        Some(cb) => crate::reactive::untracked_handler(|| cb(action)),
         None => Vec::new(),
     }
 }
@@ -102,8 +136,8 @@ pub fn dispatch_selection(action: SelectionAction) -> Vec<(usize, usize, usize)>
 pub fn save_selection_snapshot() {
     let ranges = dispatch_selection(SelectionAction::QueryRanges);
     let key = crate::context::current_dispatching_doc();
-    SAVED_SELECTION.with(|s| {
-        s.borrow_mut().insert(key, ranges);
+    SAVED_SELECTION.with_mut(|s| {
+        s.insert(key, ranges);
     });
 }
 
@@ -111,8 +145,7 @@ pub fn save_selection_snapshot() {
 /// current document's own if it has one, else the ownerless one.
 pub fn clear_selection_snapshot() {
     let caller = crate::context::current_dispatching_doc();
-    SAVED_SELECTION.with(|s| {
-        let mut map = s.borrow_mut();
+    SAVED_SELECTION.with_mut(|map| {
         if let Some(doc) = caller
             && map.remove(&Some(doc)).is_some()
         {
@@ -124,10 +157,9 @@ pub fn clear_selection_snapshot() {
 
 /// Get the saved selection snapshot — the dispatching document's own, falling
 /// back to the one saved outside any dispatch.
-pub fn get_saved_selection() -> Vec<(usize, usize, usize)> {
+pub fn get_saved_selection() -> Vec<(u64, usize, usize)> {
     let caller = crate::context::current_dispatching_doc();
-    SAVED_SELECTION.with(|s| {
-        let map = s.borrow();
+    SAVED_SELECTION.with(|map| {
         caller
             .and_then(|doc| map.get(&Some(doc)))
             .or_else(|| map.get(&None))
@@ -140,7 +172,7 @@ pub fn get_saved_selection() -> Vec<(usize, usize, usize)> {
 /// Returns Vec<(node_id, start_byte_offset, end_byte_offset)>.
 /// Falls back to the saved snapshot if the live selection is empty
 /// (e.g., the runtime cleared it on mousedown before a toolbar command runs).
-pub fn query_selection_ranges() -> Vec<(usize, usize, usize)> {
+pub fn query_selection_ranges() -> Vec<(u64, usize, usize)> {
     let live = dispatch_selection(SelectionAction::QueryRanges);
     if !live.is_empty() {
         return live;
@@ -155,14 +187,14 @@ pub fn query_selection_ranges() -> Vec<(usize, usize, usize)> {
 
 /// Callback invoked on mouseup to notify that drag selection may have changed.
 /// The callback receives the current selection ranges (block_index, start, end).
-pub type SelectionSyncCallback = Rc<dyn Fn(Vec<(usize, usize, usize)>)>;
+pub type SelectionSyncCallback = Rc<dyn Fn(Vec<(u64, usize, usize)>)>;
 
 /// The per-document sync-callback map (issue #478).
-type SyncSlots = crate::reactive::DocScopedSlotMap<dyn Fn(Vec<(usize, usize, usize)>)>;
+type SyncSlots = crate::reactive::DocScopedSlotMap<dyn Fn(Vec<(u64, usize, usize)>)>;
 
-thread_local! {
+crate::doc_keyed! {
     /// Per-document on the same key as [`SELECTION_CALLBACK`] (issue #478).
-    static SELECTION_SYNC_CALLBACK: RefCell<SyncSlots> = const { RefCell::new(SyncSlots::new()) };
+    static SELECTION_SYNC_CALLBACK: SyncSlots = SyncSlots::new();
 }
 
 /// Set the current document's callback invoked on mouseup to sync drag
@@ -172,7 +204,7 @@ thread_local! {
 /// [`set_selection_callback`] (issue #183).
 pub fn set_selection_sync_callback<F>(cb: F)
 where
-    F: Fn(Vec<(usize, usize, usize)>) + 'static,
+    F: Fn(Vec<(u64, usize, usize)>) + 'static,
 {
     crate::reactive::install_doc_scoped_slot(&SELECTION_SYNC_CALLBACK, Rc::new(cb));
 }
@@ -188,11 +220,12 @@ pub fn clear_selection_sync_callback() {
 /// query_selection_ranges() to avoid the saved-snapshot fallback (which is
 /// only for toolbar commands).
 ///
-/// The `Rc` is cloned out before the call so the callback may re-enter.
+/// The `Rc` is cloned out before the call so the callback may re-enter. It runs
+/// untracked, like [`dispatch_selection`]'s (#931).
 pub fn fire_selection_sync() {
     let ranges = dispatch_selection(SelectionAction::QueryRanges);
     if let Some(cb) = crate::reactive::read_doc_scoped_slot(&SELECTION_SYNC_CALLBACK) {
-        cb(ranges);
+        crate::reactive::untracked_handler(|| cb(ranges));
     }
 }
 
@@ -211,19 +244,19 @@ pub fn fire_selection_sync() {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusRequest {
     /// Focus this node — [`DomDocument::focus_element`](crate::dom::DomDocument::focus_element).
-    Node(usize),
+    Node(u64),
     /// Move focus into this subtree —
     /// [`DomDocument::focus_into`](crate::dom::DomDocument::focus_into).
-    Into(usize, crate::dom::FocusIntoPolicy),
+    Into(u64, crate::dom::FocusIntoPolicy),
     /// Give the keyboard back to `opener` now that the overlay rooted at `root`
     /// has closed, or release it — the decision is the runtime's, at apply
     /// time. [`DomDocument::restore_focus`](crate::dom::DomDocument::restore_focus).
     Restore {
         /// Whoever held the keyboard when the overlay opened, if anyone.
-        opener: Option<usize>,
+        opener: Option<u64>,
         /// The closing overlay's root, which bounds the release: a claim that
         /// has moved *outside* it belongs to the user and is left alone.
-        root: usize,
+        root: u64,
     },
 }
 
@@ -253,36 +286,263 @@ impl FocusRequest {
     }
 }
 
-thread_local! {
-    /// `(doc_key, request)` — the document key scopes the request so a runtime
+/// The one parked focus request, `(doc_key, request, seq)`. Swept by
+/// document (#2797) by hand: one slot for every document, not a map, so a
+/// request is last-wins across documents as it always was; the sweep clears it
+/// when it is the dying document's.
+struct FocusSlot(Option<(u64, FocusRequest, u64)>);
+
+impl crate::ForgetDoc for FocusSlot {
+    fn take_doc(&mut self, doc: u64) -> crate::Removed {
+        match self.0 {
+            Some((key, ..)) if key == doc => {
+                self.0 = None;
+            }
+            _ => {}
+        }
+        // A request is plain data: nothing to drop later.
+        Vec::new()
+    }
+
+    fn entries_for_doc(&self, doc: u64) -> usize {
+        usize::from(matches!(self.0, Some((key, ..)) if key == doc))
+    }
+}
+
+crate::doc_keyed! {
+    /// `(doc_key, request, seq)` — the document key scopes the request so a runtime
     /// driving one document never consumes (and misapplies) a focus request
-    /// posted by another document on the same thread (issue #134).
-    static PENDING_FOCUS_REQUEST: Cell<Option<(u64, FocusRequest)>> = const { Cell::new(None) };
+    /// posted by another document on the same thread (issue #134). `seq` orders
+    /// it against the parked releases ([`post_release_request`]).
+    static PENDING_FOCUS_REQUEST: FocusSlot = FocusSlot(None);
+    /// `(doc_key, node_id, seq)` for every parked release, in posting order: a
+    /// list, swept by its entries' documents, because the order is the order
+    /// they apply in.
+    static PENDING_RELEASES: crate::DocList<(u64, u64, u64)> =
+        crate::DocList::new(|r| Some(r.0));
+}
+
+thread_local! {
+    /// The posting order shared by [`PENDING_FOCUS_REQUEST`] and
+    /// [`PENDING_RELEASES`].
+    static FOCUS_SEQ: Cell<u64> = const { Cell::new(0) };
+}
+
+fn next_focus_seq() -> u64 {
+    FOCUS_SEQ.with(|c| {
+        let seq = c.get().wrapping_add(1);
+        c.set(seq);
+        seq
+    })
 }
 
 /// Request that a specific element be focused, identified by its document's
 /// [`doc_key`](crate::dom::DomDocument::doc_key) and node id.
 /// The runtime will apply this focus before the next event processing cycle.
-pub fn request_focus(doc_key: u64, node_id: usize) {
+pub fn request_focus(doc_key: u64, node_id: u64) {
     post_focus_request(doc_key, FocusRequest::Node(node_id));
 }
 
 /// Park any [`FocusRequest`] for `doc_key`, replacing whatever was parked.
+///
+/// Replaces only the parked *request*: a release parked before it
+/// ([`post_release_request`]) stays, and is applied first.
 pub fn post_focus_request(doc_key: u64, request: FocusRequest) {
-    PENDING_FOCUS_REQUEST.with(|c| c.set(Some((doc_key, request))));
+    let seq = next_focus_seq();
+    PENDING_FOCUS_REQUEST.with_mut(|c| c.0 = Some((doc_key, request, seq)));
 }
 
 /// Consume the pending focus request **if it targets the given document**.
 /// Called by the runtime during event processing with its own document's key;
 /// a request posted by a different document is left in place for that
 /// document's runtime to pick up.
+///
+/// Takes the request alone. A runtime that also honours releases
+/// ([`post_release_request`]) drains both, in posting order, with
+/// [`take_pending_focus_steps`].
 pub fn take_pending_focus_request(doc_key: u64) -> Option<FocusRequest> {
-    PENDING_FOCUS_REQUEST.with(|c| match c.get() {
-        Some((key, request)) if key == doc_key => {
-            c.set(None);
+    PENDING_FOCUS_REQUEST.with_mut(|c| match c.0 {
+        Some((key, request, _)) if key == doc_key => {
+            c.0 = None;
             Some(request)
         }
         _ => None,
+    })
+}
+
+/// Ask the runtime to take the keyboard away from `node_id` **if it holds it**
+/// when the request is applied, leaving nothing focused — what a press on
+/// page content that takes no focus does. If something else holds the
+/// keyboard by then, nothing happens. `EditorHandle::blur` posts one for its
+/// container.
+///
+/// Applied at the same points as a [`FocusRequest`], and **in posting order
+/// with it**: a `focus()` then a release of the same node in one turn leaves
+/// nothing focused, and a release then a `focus()` leaves the node focused.
+/// A release does not take the request slot, so it never discards a parked
+/// request, and a later request never discards it. Releases accumulate: two
+/// editors released in one turn are both released.
+pub fn post_release_request(doc_key: u64, node_id: u64) {
+    let seq = next_focus_seq();
+    PENDING_RELEASES.with_mut(|r| r.push((doc_key, node_id, seq)));
+}
+
+/// One parked piece of focus work, as [`take_pending_focus_steps`] hands it out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusStep {
+    /// The parked [`FocusRequest`].
+    Request(FocusRequest),
+    /// Release the keyboard from this node if it holds it
+    /// ([`post_release_request`]).
+    Release(u64),
+}
+
+/// Whether `doc_key` has a parked [`FocusRequest`] that
+/// [needs a layout](FocusRequest::needs_layout) — the one kind
+/// [`take_pending_focus_steps`] leaves parked for a consumer that has not
+/// laid out. A runtime about to route a key asks this, and lays out first
+/// when it answers `true`, so the key reaches the field the request focuses
+/// rather than going nowhere (issue #2731).
+pub fn pending_focus_request_needs_layout(doc_key: u64) -> bool {
+    PENDING_FOCUS_REQUEST.with(
+        |c| matches!(c.0, Some((key, request, _)) if key == doc_key && request.needs_layout()),
+    )
+}
+
+/// Consume the focus work parked for `doc_key` — its [`FocusRequest`], if the
+/// slot holds one for this document, and every release posted for it — **in
+/// posting order**, for the runtime to apply one after another.
+///
+/// `layout_is_fresh: false` is for a consumer that has not run a layout since
+/// the code that posted (the drains right after an event handler): if the
+/// parked request [needs a layout](FocusRequest::needs_layout), **nothing** is
+/// taken, so the request and the releases around it wait together for a
+/// consumer that has laid out and keep their order. (Taking the releases
+/// alone would apply one posted *after* the request before it.)
+pub fn take_pending_focus_steps(doc_key: u64, layout_is_fresh: bool) -> Vec<FocusStep> {
+    let request = PENDING_FOCUS_REQUEST.with(|c| match c.0 {
+        Some((key, request, seq)) if key == doc_key => Some((request, seq)),
+        _ => None,
+    });
+    if let Some((request, _)) = request
+        && !layout_is_fresh
+        && request.needs_layout()
+    {
+        return Vec::new();
+    }
+    if request.is_some() {
+        PENDING_FOCUS_REQUEST.with_mut(|c| c.0 = None);
+    }
+    let mut steps: Vec<(u64, FocusStep)> = PENDING_RELEASES.with_mut(|r| {
+        let mut mine = Vec::new();
+        r.retain(|&(key, node, seq)| {
+            if key == doc_key {
+                mine.push((seq, FocusStep::Release(node)));
+                false
+            } else {
+                true
+            }
+        });
+        mine
+    });
+    if let Some((request, seq)) = request {
+        steps.push((seq, FocusStep::Request(request)));
+    }
+    // Sequence numbers wrap only after 2^64 posts; a plain sort is the order.
+    steps.sort_by_key(|&(seq, _)| seq);
+    steps.into_iter().map(|(_, step)| step).collect()
+}
+
+// --- Text selection request mechanism (issue #552) ---
+// `NodeHandle::select()` / `set_selection_range()`, posted the same way a
+// `focus()` call posts a `FocusRequest` — a **separate** channel, never
+// folded into `FocusRequest` itself, because a `focus()` and a
+// `select()`/`set_selection_range()` posted from the same effect (the "open a
+// rename box, focused and with its name selected" shape #552 exists for) must
+// both survive to be applied: one slot holding both would let the later post
+// silently discard the earlier one.
+//
+// Keyed per **node**, not a single slot like `PENDING_FOCUS_REQUEST` — only
+// one node can hold the keyboard, so `FocusRequest`'s last-wins slot is
+// right, but two *different* nodes' `set_selection_range` calls posted in the
+// same tick (no `focus()` in between — a form restoring two independent
+// selections) are independent requests and must not clobber each other
+// (review of #1325, finding 2).
+
+/// `(start, end, direction)` — UTF-16 code-unit offsets,
+/// [`DomDocument::set_selection_range`](crate::dom::DomDocument::set_selection_range)'s
+/// unit.
+type TextSelectionRequest = (usize, usize, crate::dom::SelectionDirection);
+
+crate::doc_keyed! {
+    /// `doc_key -> node_id -> request`. The outer map is drained whole by
+    /// [`take_pending_text_selection_requests`]; the inner one is what keeps
+    /// two nodes' posts in the same tick from clobbering each other.
+    static PENDING_TEXT_SELECTIONS: crate::DocMap<std::collections::HashMap<u64, TextSelectionRequest>> =
+        crate::DocMap::new();
+}
+
+/// Park a text-selection request for `doc_key`/`node_id`, replacing whatever
+/// was parked **for that node** (a second `set_selection_range` on the same
+/// node before the first was drained is simply superseded, as two calls to
+/// the DOM's own `setSelectionRange` on one control would be). Called by
+/// [`DomDocument::set_selection_range`](crate::dom::DomDocument::set_selection_range)'s
+/// desktop implementation; the runtime applies it to the node if it already
+/// holds the keyboard, or stashes it for the next time the node is focused
+/// (issue #552).
+pub fn post_text_selection_request(
+    doc_key: u64,
+    node_id: u64,
+    start: usize,
+    end: usize,
+    direction: crate::dom::SelectionDirection,
+) {
+    PENDING_TEXT_SELECTIONS.with_mut(|m| {
+        m.get_or_insert_with(doc_key, Default::default)
+            .insert(node_id, (start, end, direction));
+    });
+}
+
+/// The text-selection request posted for `doc_key`/`node_id` and not yet
+/// drained, without consuming it — what a selection read answers between a
+/// `set_selection_range` and the runtime applying it (issue #1678).
+pub fn peek_pending_text_selection_request(
+    doc_key: u64,
+    node_id: u64,
+) -> Option<(usize, usize, crate::dom::SelectionDirection)> {
+    PENDING_TEXT_SELECTIONS.with(|m| m.get(doc_key)?.get(&node_id).copied())
+}
+
+/// Drop the text-selection request posted for `doc_key`/`node_id`, if any —
+/// a `value` write that changes the control's value overrides a selection set
+/// before it, as a browser's value setter moves the caret to the end (issue
+/// #1678).
+pub fn cancel_pending_text_selection_request(doc_key: u64, node_id: u64) {
+    PENDING_TEXT_SELECTIONS.with_mut(|m| {
+        if let Some(pending) = m.get_mut(doc_key) {
+            pending.remove(&node_id);
+        }
+    });
+}
+
+/// Consume **every** pending text-selection request posted for the given
+/// document, as `(node_id, start, end, direction)` — mirroring
+/// [`take_pending_focus_request`]'s document scoping (issue #134), but
+/// draining the whole per-node map rather than one slot, since a node not
+/// drained here would otherwise wait for the *next* document on this thread
+/// to drain its own (#134's hazard, applied to this channel).
+pub fn take_pending_text_selection_requests(
+    doc_key: u64,
+) -> Vec<(u64, usize, usize, crate::dom::SelectionDirection)> {
+    PENDING_TEXT_SELECTIONS.with_mut(|m| {
+        m.remove(doc_key)
+            .map(|pending| {
+                pending
+                    .into_iter()
+                    .map(|(node_id, (start, end, direction))| (node_id, start, end, direction))
+                    .collect()
+            })
+            .unwrap_or_default()
     })
 }
 
@@ -291,8 +551,9 @@ mod tests {
     use super::*;
 
     use crate::reactive::{Scope, Signal};
+    use std::cell::RefCell;
 
-    fn one_range() -> Vec<(usize, usize, usize)> {
+    fn one_range() -> Vec<(u64, usize, usize)> {
         vec![(1, 2, 3)]
     }
 
@@ -393,7 +654,7 @@ mod tests {
         clear_selection_callback();
         let scope = Scope::new();
         let node = scope.run(|| {
-            let node = Signal::new(1usize);
+            let node = Signal::new(1u64);
             set_selection_callback(move |_| vec![(node.get(), 2, 3)]);
             node
         });
@@ -554,8 +815,8 @@ mod tests {
         assert!(get_saved_selection().is_empty());
     }
 
-    /// A snapshot saved outside any dispatch — the only kind a backend that
-    /// never marks dispatch (rinch-web) can save — is the fallback every
+    /// A snapshot saved outside any dispatch (from `main`, or page script
+    /// outside any rinch-web root) is the fallback every
     /// document reads: the pre-#478 behaviour of this family rests on it.
     ///
     /// Kills: dropping `get_saved_selection`'s fallback to the ownerless
@@ -675,5 +936,110 @@ mod tests {
         fire_selection_sync();
         assert!(replaced.get(), "the replacement ran on the next fire");
         clear_selection_sync_callback();
+    }
+
+    // ── Releases and the focus request, in posting order ──────────────────
+
+    const DOC: u64 = 0xF0C5;
+    const ROOT: u64 = 90;
+
+    fn drain_all() {
+        let _ = take_pending_focus_steps(DOC, true);
+        let _ = take_pending_focus_steps(DOC + 1, true);
+    }
+
+    #[test]
+    fn a_focus_then_a_release_come_out_in_that_order() {
+        drain_all();
+        post_focus_request(DOC, FocusRequest::Node(7));
+        post_release_request(DOC, 7);
+        assert_eq!(
+            take_pending_focus_steps(DOC, true),
+            vec![
+                FocusStep::Request(FocusRequest::Node(7)),
+                FocusStep::Release(7)
+            ]
+        );
+        assert!(take_pending_focus_steps(DOC, true).is_empty(), "consumed");
+    }
+
+    #[test]
+    fn a_release_then_a_focus_come_out_in_that_order() {
+        drain_all();
+        post_release_request(DOC, 7);
+        post_focus_request(DOC, FocusRequest::Node(7));
+        assert_eq!(
+            take_pending_focus_steps(DOC, true),
+            vec![
+                FocusStep::Release(7),
+                FocusStep::Request(FocusRequest::Node(7))
+            ]
+        );
+    }
+
+    #[test]
+    fn releases_accumulate_and_a_later_request_replaces_only_the_request() {
+        drain_all();
+        post_focus_request(DOC, FocusRequest::Node(1));
+        post_release_request(DOC, 2);
+        post_release_request(DOC, 3);
+        post_focus_request(DOC, FocusRequest::Node(4));
+        assert_eq!(
+            take_pending_focus_steps(DOC, true),
+            vec![
+                FocusStep::Release(2),
+                FocusStep::Release(3),
+                FocusStep::Request(FocusRequest::Node(4))
+            ],
+            "the first request is replaced, as before; neither release is"
+        );
+    }
+
+    #[test]
+    fn another_documents_work_is_left_for_it() {
+        drain_all();
+        post_release_request(DOC + 1, 5);
+        post_focus_request(DOC + 1, FocusRequest::Node(6));
+        assert!(take_pending_focus_steps(DOC, true).is_empty());
+        assert_eq!(
+            take_pending_focus_steps(DOC + 1, true),
+            vec![
+                FocusStep::Release(5),
+                FocusStep::Request(FocusRequest::Node(6))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_request_that_needs_layout_holds_back_the_releases_around_it() {
+        drain_all();
+        let into = FocusRequest::Into(ROOT, crate::dom::FocusIntoPolicy::FirstFocusable);
+        post_release_request(DOC, 1);
+        post_focus_request(DOC, into);
+        post_release_request(DOC, 2);
+        assert!(
+            take_pending_focus_steps(DOC, false).is_empty(),
+            "no layout yet: nothing is taken"
+        );
+        assert_eq!(
+            take_pending_focus_steps(DOC, true),
+            vec![
+                FocusStep::Release(1),
+                FocusStep::Request(into),
+                FocusStep::Release(2)
+            ]
+        );
+    }
+
+    #[test]
+    fn take_pending_focus_request_leaves_the_releases() {
+        drain_all();
+        post_release_request(DOC, 1);
+        post_focus_request(DOC, FocusRequest::Node(2));
+        assert_eq!(take_pending_focus_request(DOC), Some(FocusRequest::Node(2)));
+        assert_eq!(
+            take_pending_focus_steps(DOC, true),
+            vec![FocusStep::Release(1)]
+        );
     }
 }

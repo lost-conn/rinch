@@ -1,0 +1,685 @@
+//! Performance regression scenarios for the rich-text editor: what one
+//! keystroke, one caret move and one toolbar command cost in a 30-paragraph
+//! document, and what a focused editor costs while idle.
+//!
+//! Same contract and harness as `perf_regression_tests.rs` (`perf_expect`):
+//! whole frames, every non-timing counter exact, unlisted counters `0`, each
+//! scenario with a positive control that it did what it names.
+//!
+//! The editor's own model work (transactions, the `ViewDesc` diff) has no
+//! counter; what is pinned is what it costs the document — the cascades, the
+//! Taffy computes, the Parley shapes, the repainted area and the effect runs —
+//! which is where a regression in the view shows up.
+
+use super::perf_expect::*;
+use super::*;
+use rinch_dom::perf::Counter::*;
+use rinch_editor_core::{Pos, Selection};
+
+const PARAGRAPHS: usize = 30;
+
+/// "Paragraph number NN" is 19 characters, so paragraph `i`'s text starts at
+/// `1 + 21 * i` (one for the doc's opening, two per paragraph boundary).
+fn para_start(i: usize) -> usize {
+    1 + 21 * i
+}
+
+struct Page {
+    app: RinchApp,
+    handle: crate::editor::EditorHandle,
+}
+
+/// A page: a Bold button (`data-nofocus`, as an editor
+/// toolbar is) above one editor holding 30 paragraphs, focused by a real press
+/// in the first paragraph and settled.
+fn page() -> Page {
+    let slot: Rc<RefCell<Option<crate::editor::EditorHandle>>> = Rc::new(RefCell::new(None));
+    let slot_in = slot.clone();
+    let mut app = new_app(move |scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        let (container, handle) = crate::editor::mount_editor(scope);
+        let mut html = String::new();
+        for i in 0..PARAGRAPHS {
+            html.push_str(&format!("<p>Paragraph number {i:02}</p>"));
+        }
+        handle.load_html(&html);
+
+        let bar = scope.create_element("div");
+        bar.set_attribute("style", "height: 30px; display: flex");
+        bar.set_attribute("data-nofocus", "");
+        let bold = scope.create_element("button");
+        bold.set_attribute(
+            "style",
+            "width: 60px; height: 30px; font-family: sans-serif; font-size: 14px; line-height: 20px",
+        );
+        let h = handle.clone();
+        let id = scope.register_handler(move || {
+            h.command("toggleBold");
+        });
+        bold.set_attribute("data-rid", &id.0.to_string());
+        let label = scope.create_text("B");
+        bold.append_child(&label);
+        bar.append_child(&bold);
+        root.append_child(&bar);
+
+        container.set_attribute(
+            "style",
+            "width: 600px; height: 500px; overflow-y: auto; font-size: 16px; \
+             line-height: 24px; font-family: sans-serif",
+        );
+        root.append_child(&container);
+        *slot_in.borrow_mut() = Some(handle);
+        root
+    });
+    app.mount_component(SIZE.0 as f32, SIZE.1 as f32);
+    settle(&mut app);
+    let handle = slot.borrow_mut().take().expect("captured at mount");
+    let mut page = Page { app, handle };
+    let (x, y, h) = page
+        .app
+        .editor_caret_point(&page.handle, Pos(4))
+        .expect("the first paragraph has a caret");
+    interaction(&mut page.app, |app| click(app, x + 1.0, y + h / 2.0));
+    assert!(
+        matches!(page.app.focus_target, FocusTarget::Editor(_)),
+        "precondition: the editor holds the keyboard"
+    );
+    settle(&mut page.app);
+    page
+}
+
+fn click(app: &mut RinchApp, x: f32, y: f32) {
+    let button = MouseButton::Left;
+    app.handle_event(PlatformEvent::MouseDown { x, y, button }, SIZE, 1.0);
+    app.handle_event(PlatformEvent::MouseUp { x, y, button }, SIZE, 1.0);
+}
+
+fn key(app: &mut RinchApp, key: KeyCode, text: Option<&str>) {
+    app.handle_event(
+        PlatformEvent::KeyDown {
+            key,
+            logical_key: None,
+            text: text.map(str::to_string),
+            modifiers: Modifiers::default(),
+            repeat: KeyRepeat::Fresh,
+        },
+        SIZE,
+        1.0,
+    );
+    app.handle_event(
+        PlatformEvent::KeyUp {
+            key,
+            logical_key: None,
+            modifiers: Modifiers::default(),
+        },
+        SIZE,
+        1.0,
+    );
+}
+
+/// Put the caret at `pos` outside the measured frame.
+fn caret_at(page: &mut Page, pos: usize) {
+    page.handle.set_selection(Selection::cursor(Pos(pos)));
+    settle(&mut page.app);
+}
+
+/// The document's size in positions; typing one character grows it by one.
+fn doc_size(page: &Page) -> usize {
+    page.handle.doc().content_size()
+}
+
+/// A focused editor with its caret blink left out (the blink is the runtime's
+/// timed wake, driven by the clock, not by `AboutToWait`): no frame.
+#[test]
+fn a_focused_editor_idles_for_free_between_blinks() {
+    let mut page = page();
+    let (redraws, total) = idle_turns(&mut page.app, 20);
+    assert_eq!(redraws, 0);
+    expect_frame("editor focused, idle", &total, &[]);
+}
+
+/// One caret blink: the caret's `display` toggles, and that one small box is
+/// repainted (`repainted_px` 280). This is the cost a focused editor pays
+/// twice a second.
+///
+/// **`repainted_px` 280, was 320; `clip_mask_px` 448, was 504.** The caret
+/// is drawn over its text's 20px content area, as Chrome draws a caret,
+/// not over the whole 24px line box, so its rect is 4px shorter.
+///
+/// The toggle is a style write, so the blink is a cascade (with a
+/// `::before`/`::after` pass: the editor's sheet has such rules) and a Taffy
+/// sync, though it takes the paint-only path. Paint builds three stacking
+/// sequences — the body's, the editor container's (`position: relative;
+/// z-index: 0` in the editor's sheet) and the caret's own (`z-index` and a
+/// `transform`) — and visits 37 nodes for those 280 pixels.
+///
+/// **`clip_mask_px` 504 (now 448, above), was 607 320 (#907).** Two clips
+/// are pushed: the frame's damage clip (the caret's rect plus the painter's
+/// two-pixel pad, 504 px then) and the editor's own rounded `overflow-y: auto` clip. The second
+/// used to be filled and then intersected over its whole padded box, twice
+/// about 303k px, to clip a region lying well inside it. The software
+/// painter now skips a clip whose shape fully covers the enclosing clip's
+/// non-zero rect — the intersection would be that mask byte for byte — so it
+/// costs nothing, and takes no second pooled mask (`paint_surface_allocs`
+/// 1 → 0). Every editor scenario below moved the same way.
+#[test]
+fn one_caret_blink_repaints_the_caret() {
+    let mut page = page();
+    let redraw = page.handle.set_caret_blink(false);
+    assert_eq!(redraw, Some(true), "positive control: the caret toggled");
+    let s = paint(&mut page.app);
+    expect_frame(
+        "editor: one caret blink",
+        &s,
+        &[
+            (StyleResolves, 1),
+            (ElementsCascaded, 1),
+            (StyleNodesVisited, 1),
+            (PseudoElementPasses, 1),
+            (StyleInvalidations, 1),
+            (TaffyStyleSyncs, 1),
+            (LayoutResolves, 1),
+            (LayoutSkippedPaintOnly, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 280),
+            (SurfacePx, 480000),
+            // #2137: 5 → 4. The blinked-off caret is `visibility: hidden`
+            // with nothing under it, so paint skips it without a visit.
+            (PaintNodesVisited, 4),
+            (StackingOrderBuilds, 2),
+            (GlyphAtlasHits, 19),
+            (ClipMasks, 2),
+            (ClipMaskPx, 448),
+        ],
+    );
+}
+
+/// Typing one character into a paragraph: one paragraph re-shaped, one region
+/// repainted.
+///
+/// **One Taffy compute (#906, was 2).** The keystroke's layout places the
+/// text; the post-layout caret pass then moves the caret overlay, and the
+/// frame resolves once more for that (`layout_resolves` 2). The caret is
+/// placed by a `transform` (`view.rs`, `overlay_translate`), which is
+/// paint-only, so that second resolve cascades the caret and skips Taffy
+/// (`layout_skipped_paint_only` 1). It used to be a `left`/`top` write, a
+/// Taffy style change that ran a second whole-document root compute. The
+/// second resolve itself cannot go: the caret's position is read off the
+/// text layout the first one produced.
+///
+/// **`repainted_px` 18112, was 18678; `clip_mask_px` 20520, was 21090.** The
+/// caret overlay is drawn on the glyphs now, not one border width right of and
+/// below them (`content_origin_inset` on desktop), so the damage rect, the
+/// union of the reshaped text and the caret's old and new rects, lost the
+/// row and column the caret used to stick out by.
+#[test]
+fn typing_one_character() {
+    let mut page = page();
+    let before = doc_size(&page);
+    let s = interaction(&mut page.app, |app| key(app, KeyCode::KeyX, Some("x")));
+    assert_eq!(doc_size(&page), before + 1, "positive control");
+    expect_frame(
+        "editor: type one character",
+        &s,
+        &[
+            (StyleResolves, 2),
+            (ElementsCascaded, 2),
+            (StyleNodesVisited, 2),
+            (PseudoElementPasses, 2),
+            (StyleInvalidations, 2),
+            (TaffyStyleSyncs, 2),
+            (ShapeMeasureIfc, 1),
+            (ShapeIfcBuild, 1),
+            (IfcMeasureInvalidations, 3),
+            (LayoutResolves, 2),
+            (LayoutSkippedPaintOnly, 1),
+            (TaffyRootComputes, 1),
+            (TaffyMeasureCalls, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 18112),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 5),
+            (StackingOrderBuilds, 2),
+            (GlyphAtlasHits, 19),
+            (GlyphAtlasMisses, 1),
+            (ClipMasks, 2),
+            (ClipMaskPx, 20520),
+        ],
+    );
+}
+
+/// ArrowRight: a selection-only change. Nothing is re-shaped, and the repaint
+/// is the caret's old and new rects (532 px; 608 until the caret was drawn
+/// over its text's 20px content area instead of the 24px line box).
+///
+/// **No Taffy compute (#906, was 1).** The caret overlay moves by a
+/// `transform`, so the one resolve cascades it and skips layout
+/// (`layout_skipped_paint_only` 1). It moved by `left`/`top` until #906: a
+/// Taffy style change, and a root compute over the whole document per arrow
+/// key.
+#[test]
+fn arrow_right() {
+    let mut page = page();
+    let from = page.handle.selection();
+    let s = interaction(&mut page.app, |app| key(app, KeyCode::ArrowRight, None));
+    assert_ne!(page.handle.selection(), from, "positive control");
+    expect_frame(
+        "editor: ArrowRight",
+        &s,
+        &[
+            (StyleResolves, 1),
+            (ElementsCascaded, 1),
+            (StyleNodesVisited, 1),
+            (PseudoElementPasses, 1),
+            (StyleInvalidations, 1),
+            (TaffyStyleSyncs, 1),
+            (LayoutResolves, 1),
+            (LayoutSkippedPaintOnly, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 532),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 5),
+            (StackingOrderBuilds, 2),
+            (GlyphAtlasHits, 19),
+            (ClipMasks, 2),
+            (ClipMaskPx, 736),
+        ],
+    );
+}
+
+/// Enter in the middle of a paragraph: one block becomes two.
+///
+/// Only the two blocks the split touched are shaped (`shape_measure_ifc` 2).
+/// It was every paragraph (31) until #905: the view's child diff was
+/// positional, so the new block shifted every later model block onto its
+/// predecessor's host and rewrote each one's text (`ifc_measure_invalidations`
+/// 92, three per block). The diff now matches the unchanged prefix and suffix
+/// first and inserts the new block between them. Two
+/// resolves, as for a keystroke, the second paint-only since #906 (one
+/// Taffy compute, was 2). The full repaint is legitimate: every block
+/// below the caret moves, which is more than half the window.
+#[test]
+fn enter_splits_a_paragraph() {
+    let mut page = page();
+    let blocks = page.handle.doc().child_count();
+    let s = interaction(&mut page.app, |app| key(app, KeyCode::Enter, None));
+    assert_eq!(
+        page.handle.doc().child_count(),
+        blocks + 1,
+        "positive control"
+    );
+    expect_frame(
+        "editor: Enter",
+        &s,
+        &[
+            (StyleResolves, 3),
+            (ElementsCascaded, 3),
+            (StyleNodesVisited, 3),
+            (PseudoElementPasses, 3),
+            (StyleInvalidations, 2),
+            (TaffyStyleSyncs, 3),
+            (TaffyStyleChanges, 1),
+            (ShapeMeasureIfc, 2),
+            (ShapeIfcBuild, 2),
+            (IfcMeasureInvalidations, 5),
+            (IfcSignatureChanges, 1),
+            (LayoutResolves, 2),
+            (LayoutSkippedPaintOnly, 1),
+            (IfcSetupPasses, 1),
+            (IfcScopedPasses, 1),
+            (IfcScopeContainers, 2),
+            (IfcScopeNodes, 34),
+            (TaffyRootComputes, 1),
+            (TaffyMeasureCalls, 2),
+            (PaintFrames, 1),
+            (RepaintFull, 1),
+            (RepaintFullRegionTooLarge, 1),
+            (RepaintedPx, 480000),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 22),
+            (StackingOrderBuilds, 2),
+            (GlyphAtlasHits, 275),
+            (GlyphAtlasMisses, 11),
+            // #536: the editor's bordered scroll container clips to its
+            // padding box now, a border-width's worth smaller on every side
+            // than the border box the push used to mask — fewer pixels for
+            // the same one push, not an extra one (contrast the `.field`
+            // moves in `perf_regression_tests.rs`, where the clip went from
+            // elided to pushed).
+            (ClipMasks, 1),
+            (ClipMaskPx, 301702),
+        ],
+    );
+}
+
+/// Backspace at the start of the second paragraph joins it to the first.
+///
+/// The mirror of `enter_splits_a_paragraph`: only the joined block is shaped
+/// (`shape_measure_ifc` 1, was 29 until #905, when every block after the join
+/// was shifted onto its neighbour's host). One Taffy compute; the
+/// caret pass's resolve is paint-only since #906 (was 2).
+#[test]
+fn backspace_joins_two_paragraphs() {
+    let mut page = page();
+    caret_at(&mut page, para_start(1));
+    let blocks = page.handle.doc().child_count();
+    let s = interaction(&mut page.app, |app| key(app, KeyCode::Backspace, None));
+    assert_eq!(
+        page.handle.doc().child_count(),
+        blocks - 1,
+        "positive control"
+    );
+    expect_frame(
+        "editor: Backspace across a block boundary",
+        &s,
+        &[
+            (StyleResolves, 2),
+            (ElementsCascaded, 2),
+            (StyleNodesVisited, 2),
+            (PseudoElementPasses, 2),
+            (StyleInvalidations, 2),
+            (TaffyStyleSyncs, 2),
+            (ShapeMeasureIfc, 1),
+            (ShapeIfcBuild, 1),
+            (IfcMeasureInvalidations, 4),
+            (LayoutResolves, 2),
+            (LayoutSkippedPaintOnly, 1),
+            (IfcSetupPasses, 1),
+            (IfcScopedPasses, 1),
+            (IfcScopeContainers, 1),
+            (IfcScopeNodes, 31),
+            (TaffyRootComputes, 1),
+            (TaffyMeasureCalls, 1),
+            (PaintFrames, 1),
+            (RepaintFull, 1),
+            (RepaintFullRegionTooLarge, 1),
+            (RepaintedPx, 480000),
+            (SurfacePx, 480000),
+            // #2734: 4 → 9. The removed paragraph's text keeps the box its
+            // lines gave it (it was flipped to `0x0` by the first relayout
+            // after shaping), so its removal records that painted rect and
+            // walks its clip chain: 1 node + 4 ancestors. The rect is inside
+            // the joined paragraph's own damage; no pixel more is repainted.
+            (RemovalDamageSteps, 9),
+            (PaintNodesVisited, 22),
+            (StackingOrderBuilds, 2),
+            (GlyphAtlasHits, 310),
+            (GlyphAtlasMisses, 14),
+            // #536, see `enter_splits_a_paragraph` above.
+            (ClipMasks, 1),
+            (ClipMaskPx, 301702),
+        ],
+    );
+}
+
+/// The toolbar's Bold button over a selected word: a real click on a
+/// `data-nofocus` button, then the command.
+///
+/// One click runs two hit tests (#908 took it from ten), one layout with one
+/// scoped IFC setup pass, and a partial repaint of the word; the bold mark
+/// re-shapes only its own paragraph. The selection's highlight is already on
+/// screen before the click: the `set_selection` above owes the overlay pass and
+/// `settle` runs it (#1001). Before that, the click itself created the
+/// highlight's `data-pm-selection` div — a second layout, a scoped IFC pass
+/// over 37 nodes, and a full repaint. The hit-test caches are cold at the click
+/// (72 extents) because the overlay pass's resolve in `settle` moved their
+/// generation; a pointer move before the click warms them (36 extents, 6
+/// sequences). #2678: 69 → 72, the press's scrollbar search proving three
+/// subtrees beside the point hold no bar (it used to stop at any ancestor's
+/// box, which hid a bar standing past one). #1719: 8 → 6 sequences built over the frame, because paint
+/// builds none for a stacking context with no children (the editor's caret).
+/// #1727: the scrollbar search is the hit test's own walk, so its extents
+/// are the hit test's (72 → 69) and it visits what the hit test visits
+/// (5 nodes, `scroll_probe_nodes_visited`; the press searches once); it walks the
+/// two sequences with their deferred bars, which the hit test's copies leave
+/// out (6 → 8 built, kept until the next layout).
+#[test]
+fn a_toolbar_bold_over_a_word() {
+    let mut page = page();
+    page.handle
+        .set_selection(Selection::text(Pos(para_start(0)), Pos(para_start(0) + 9)));
+    settle(&mut page.app);
+    let s = interaction(&mut page.app, |app| click(app, 20.0, 15.0));
+    assert!(page.handle.is_mark_active("bold"), "positive control");
+    assert!(
+        matches!(page.app.focus_target, FocusTarget::Editor(_)),
+        "the toolbar did not take the keyboard"
+    );
+    expect_frame(
+        "editor: toolbar toggleBold",
+        &s,
+        &[
+            (StyleResolves, 2),
+            (ElementsCascaded, 1),
+            (StyleNodesVisited, 1),
+            (PseudoElementPasses, 1),
+            (TaffyStyleSyncs, 1),
+            (TaffyStyleChanges, 1),
+            (ShapeMeasureIfc, 1),
+            (ShapeIfcBuild, 1),
+            (IfcMeasureInvalidations, 4),
+            (IfcSignatureChanges, 1),
+            (LayoutResolves, 1),
+            (IfcSetupPasses, 1),
+            (IfcScopedPasses, 1),
+            (IfcScopeContainers, 1),
+            (IfcScopeNodes, 4),
+            (TaffyRootComputes, 1),
+            (TaffyMeasureCalls, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 18112),
+            (SurfacePx, 480000),
+            // #2734: 0 → 5. The text node the bold mark splits away keeps
+            // the box its lines gave it (it was flipped to `0x0` by the first
+            // relayout after shaping), so its removal records that painted
+            // rect and walks its clip chain: 1 node + 4 ancestors. The rect is
+            // inside the paragraph's damage: `repainted_px` is unchanged.
+            (RemovalDamageSteps, 5),
+            // #2137: 6 → 5. Over a range selection the caret is
+            // `visibility: hidden`, and paint skips it without a visit.
+            (PaintNodesVisited, 5),
+            (StackingOrderBuilds, 8),
+            // #2296: 19 hits → 11 hits and 8 misses. The page's sans-serif
+            // is Inter's regular face alone, so the bolded word is drawn
+            // faux bold: its 8 distinct (glyph, bucket) masks are emboldened
+            // ones, keyed apart from the regular masks it used to reuse
+            // (the word drew at regular weight before).
+            (GlyphAtlasHits, 11),
+            (GlyphAtlasMisses, 8),
+            (ClipMasks, 2),
+            (ClipMaskPx, 20520),
+            (HitTests, 2),
+            (HitTestNodesVisited, 10),
+            (HitExtentsComputed, 69),
+            (ScrollProbeNodesVisited, 5),
+        ],
+    );
+}
+
+const TABLE_ROWS: usize = 200;
+const TABLE_COLUMNS: usize = 4;
+
+/// An editor holding one table of 200 rows of 4 one-word cells, no spans, with
+/// the caret in its first cell.
+fn table_page() -> Page {
+    let slot: Rc<RefCell<Option<crate::editor::EditorHandle>>> = Rc::new(RefCell::new(None));
+    let slot_in = slot.clone();
+    let mut app = new_app(move |scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        let (container, handle) = crate::editor::mount_editor(scope);
+        let mut html = String::from("<table>");
+        for r in 0..TABLE_ROWS {
+            html.push_str("<tr>");
+            for c in 0..TABLE_COLUMNS {
+                html.push_str(&format!("<td>r{r}c{c}</td>"));
+            }
+            html.push_str("</tr>");
+        }
+        html.push_str("</table>");
+        handle.load_html(&html);
+        container.set_attribute(
+            "style",
+            "width: 600px; height: 500px; overflow-y: auto; font-size: 16px; \
+             line-height: 24px; font-family: sans-serif",
+        );
+        root.append_child(&container);
+        *slot_in.borrow_mut() = Some(handle);
+        root
+    });
+    app.mount_component(SIZE.0 as f32, SIZE.1 as f32);
+    settle(&mut app);
+    let handle = slot.borrow_mut().take().expect("captured at mount");
+    let mut page = Page { app, handle };
+    // table > row > cell > paragraph: the first cell's text starts at 4.
+    caret_at(&mut page, 4);
+    page
+}
+
+fn table_rows(page: &Page) -> usize {
+    page.handle.doc().child(0).child_count()
+}
+
+/// `addRowBefore` in the first row of a 200x4 table with no spans (#1226).
+///
+/// Every cell below the new row moves down one grid row. Placed by explicit
+/// row lines (#1209) each of their 796 hosts got a new `grid-row` and was
+/// cascaded again (813 elements in all); a table whose rows auto-placement
+/// lays out as the map does is placed by its column lines and row spans, which
+/// a row index does not reach, so only the new row's hosts are written.
+#[test]
+fn add_row_before_the_first_row_of_a_table() {
+    let mut page = table_page();
+    let h = page.handle.clone();
+    let s = interaction(&mut page.app, |_| {
+        assert!(h.command("addRowBefore"));
+    });
+    assert_eq!(table_rows(&page), TABLE_ROWS + 1, "positive control");
+    expect_frame(
+        "editor: addRowBefore the first table row",
+        &s,
+        &[
+            (StyleResolves, 10),
+            // What the new row brings (13, as before #1209); 813 when every
+            // cell below it took a new `grid-row` line (#1226).
+            (ElementsCascaded, 13),
+            (StyleNodesVisited, 17),
+            (PseudoElementPasses, 13),
+            (StyleInvalidations, 4),
+            (TaffyStyleSyncs, 13),
+            (TaffyStyleChanges, 13),
+            (IfcMeasureCacheHits, 28),
+            (IfcMeasureInvalidations, 9),
+            (LayoutResolves, 1),
+            (IfcSetupPasses, 1),
+            (IfcScopedPasses, 1),
+            (IfcScopeContainers, 9),
+            (IfcScopeNodes, 1010),
+            (TaffyRootComputes, 1),
+            (TaffyMeasureCalls, 44),
+            (PaintFrames, 1),
+            (RepaintFull, 1),
+            (RepaintFullRegionTooLarge, 1),
+            (RepaintedPx, 480000),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 99),
+            (StackingOrderBuilds, 2),
+            (GlyphAtlasHits, 144),
+            (ClipMasks, 1),
+            (ClipMaskPx, 301101),
+        ],
+    );
+}
+
+/// `deleteRow` on the first row of a 200x4 table with no spans (#1226): no
+/// surviving cell is written or cascaded (796 were, #1209).
+#[test]
+fn delete_the_first_row_of_a_table() {
+    let mut page = table_page();
+    let h = page.handle.clone();
+    let s = interaction(&mut page.app, |_| {
+        assert!(h.command("deleteRow"));
+    });
+    assert_eq!(table_rows(&page), TABLE_ROWS - 1, "positive control");
+    expect_frame(
+        "editor: deleteRow on the first table row",
+        &s,
+        &[
+            // No cascade at all: `ElementsCascaded` was 796, every surviving
+            // cell re-placed one row line up (#1226).
+            (IfcMeasureCacheHits, 28),
+            (IfcMeasureInvalidations, 1),
+            (LayoutResolves, 1),
+            (IfcSetupPasses, 1),
+            (IfcScopedPasses, 1),
+            (IfcScopeContainers, 1),
+            (IfcScopeNodes, 996),
+            (TaffyRootComputes, 1),
+            (TaffyMeasureCalls, 28),
+            (PaintFrames, 1),
+            (RepaintFull, 1),
+            (RepaintFullRegionTooLarge, 1),
+            (RepaintedPx, 480000),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 99),
+            (RemovalDamageSteps, 84),
+            (StackingOrderBuilds, 2),
+            (GlyphAtlasHits, 164),
+            (ClipMasks, 1),
+            (ClipMaskPx, 301101),
+        ],
+    );
+}
+
+/// The window losing and regaining the keyboard while the editor holds it
+/// repaints nothing (checked for #2763, whose `<input>` twin repainted the
+/// whole field). Delivered as the desktop shell delivers it on Wayland
+/// (`WindowFocus`, then winit's text-input IME events), with the caret blink
+/// ticked as the runtime ticks it after each turn: losing the keyboard stops
+/// the blink with the caret solid, and regaining it restarts the blink from
+/// the solid phase, so a caret that was solid changes nothing. Positive
+/// control: one blink after that repaints the caret alone.
+#[test]
+fn a_window_focus_round_trip_repaints_nothing_in_a_focused_editor() {
+    let mut page = page();
+    let blink = |app: &mut RinchApp| {
+        crate::editor::caret_blink_tick(app.doc_key(), app.blinking_editor_id());
+    };
+    blink(&mut page.app);
+    settle(&mut page.app);
+    let lost = interaction(&mut page.app, |app| {
+        app.handle_event(PlatformEvent::WindowFocus(false), SIZE, 1.0);
+        app.handle_event(PlatformEvent::Ime(ImeEvent::Disabled), SIZE, 1.0);
+        blink(app);
+    });
+    expect_frame(
+        "editor: the window loses the keyboard",
+        &lost,
+        &[(RepaintNone, 1)],
+    );
+    let gained = interaction(&mut page.app, |app| {
+        app.handle_event(PlatformEvent::WindowFocus(true), SIZE, 1.0);
+        app.handle_event(PlatformEvent::Ime(ImeEvent::Enabled), SIZE, 1.0);
+        let empty = ImeEvent::Preedit {
+            text: String::new(),
+            cursor: None,
+        };
+        app.handle_event(PlatformEvent::Ime(empty), SIZE, 1.0);
+        blink(app);
+    });
+    expect_frame(
+        "editor: the window regains the keyboard",
+        &gained,
+        &[(RepaintNone, 1)],
+    );
+    assert_eq!(page.handle.set_caret_blink(false), Some(true));
+    let s = paint(&mut page.app);
+    assert_eq!(s.get(RepaintedPx), 280, "positive control: {s:?}");
+}

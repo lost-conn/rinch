@@ -39,8 +39,16 @@ wasm-bindgen = "0.2"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = [
     "Window", "Document", "Element", "HtmlElement", "HtmlInputElement",
+    # `register_rgba` pixels become a PNG `data:` URL through a canvas.
+    "HtmlCanvasElement", "CanvasRenderingContext2d", "ImageData",
     "HtmlTextAreaElement", "HtmlSelectElement", "HtmlOptionElement", "HtmlHeadElement",
+    # `<video>`/`<audio>`'s live `.muted` property, mirrored from the `muted`
+    # attribute's presence the same way `checked`/`selected` are (#754).
+    "HtmlMediaElement",
     "Node", "NodeList", "Text", "Comment",
+    # `isolate_styles` (#2357): an `HtmlView`'s document goes in a shadow
+    # root, where the page's style sheets do not match it.
+    "ShadowRoot", "ShadowRootInit", "ShadowRootMode", "DocumentFragment",
     "CssStyleDeclaration", "DomRect", "DomRectList",
     "Event", "MouseEvent", "KeyboardEvent",
     # Pointer Events unify mouse + touch + pen so the element drag-and-drop
@@ -49,8 +57,17 @@ web-sys = { version = "0.3", features = [
     # Event constructors, so the browser-driven tests (tests/) can synthesise
     # the pointerdown/click/keydown sequences the delegation gates on (#240).
     "EventInit", "MouseEventInit", "KeyboardEventInit", "PointerEventInit",
+    "WheelEvent", "WheelEventInit",
+    # A non-passive document `wheel` listener, so a consumed `onwheel` can
+    # cancel the scroll.
+    "AddEventListenerOptions",
     "EventTarget", "FocusOptions", "FocusEvent",
     "Range",
+    "ResizeObserver",
+    "ResizeObserverEntry",
+    # A DOM write anywhere can move an element a `bounds_signal()` watches
+    # without resizing it (#1781, `src/bounds.rs`).
+    "MutationObserver", "MutationObserverInit",
     # `Element::scrollIntoView({block, inline})` — the minimal ("nearest") scroll
     # that fulfils the editor view's `ScrollSelectionIntoView` request on the web
     # (`request_scroll_into_view` in web_document.rs).
@@ -71,6 +88,15 @@ web-sys = { version = "0.3", features = [
     "ClipboardEventInit", "InputEventInit",
     "DataTransfer", "DataTransferItem", "DataTransferItemList",
     "Blob", "File", "FileReader",
+    # Every file of a drop, for `ondropfiles` (#1771).
+    "FileList",
+    # Files dragged onto an editor from outside the page, offered to the app's
+    # `EditorHandle::on_image_input` (`on_drop` in editor_input.rs).
+    "DragEvent",
+    # Object URLs over the bytes an app's image loader answers with
+    # (`images.rs`): an `<img>` whose `src` scheme the app registered is shown
+    # from one.
+    "BlobPropertyBag", "Url",
 ] }
 
 # Browser-driven tests for `<style>` injection (#155): they need a real
@@ -91,6 +117,27 @@ wasm-bindgen-test = "0.3"
 # Awaiting a macrotask in the keyboard-activation tests (#240): the pointer-gesture
 # flag clears at the end of the task that consumed the trailing click.
 wasm-bindgen-futures = "0.4"
+# `fetch_async` awaited inside a `spawn_local` task (tests/spawn_local_1767.rs).
+rinch-http = { workspace = true }
+# The freeze fixture (rv6_frozen_keys) forges a peer's oversized-table update through
+# the collab adapter's test seam rather than linking yrs here.
+rinch-editor-collab = { workspace = true, features = ["test-util"] }
+# A synthetic `drop` carrying a `File`, and a `File` to put on a `paste`
+# (tests/editor_image_input.rs); `HTMLImageElement.decode()` / `naturalWidth`
+# in tests/image_sources.rs: that the browser really decodes what an app's
+# image loader answered with. A same-origin `<iframe>` whose permissions policy
+# refuses `clipboard-write` (tests/clipboard_copy_then.rs, #1780). A
+# `BroadcastChannel` (tests/worker_1772.rs).
+web-sys = { version = "0.3", features = ["DragEventInit", "FilePropertyBag", "HtmlImageElement", "HtmlIFrameElement", "Clipboard", "BroadcastChannel"] }
+# `rinch::worker` in a real browser (tests/worker_1772.rs). The browser's
+# message dialogs (tests/confirm_dialog_1773.rs) need no feature on wasm32
+# (#1821): `file-dialogs` stays off here so that test pins it.
+rinch = { workspace = true, default-features = false, features = ["components", "theme", "worker", "html"] }
+# The node-graph canvas's wheel over scrollable node bodies (tests/graph_canvas_wheel.rs).
+rinch-graph-view = { workspace = true }
+# Emitting events at `rinch::init_logging`'s console writer (tests/init_logging_1773.rs).
+tracing.workspace = true
+log = "0.4"
 
 [features]
 # Collaborative editing (M9): forwards to the editor view's collab adapter, which
@@ -99,3 +146,12 @@ wasm-bindgen-futures = "0.4"
 # carries `fastrand/js` itself and builds for wasm32 with no feature shims — see
 # `examples/collab-editor-web`.
 collaboration = ["rinch-editor-view/collaboration"]
+# Split a CJK / Thai run into words with ICU's dictionary for the editor's word
+# motion, word delete and double-click (#939). Off by default: it links ICU's
+# segmentation dictionaries into the wasm (see `docs/src/guide/wasm.md`). Without
+# it such a run is one word, ended by whitespace, punctuation or a change of script.
+word-dictionary = ["rinch-editor-core/word-dictionary"]
+# The GPU render callback on the web (#1768): forwards to `rinch/web-gpu`. An app
+# turns it on through `rinch` directly; here it builds the browser test
+# `tests/render_surface_gpu_1768.rs`.
+web-gpu = ["rinch/web-gpu"]

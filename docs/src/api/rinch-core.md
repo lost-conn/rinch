@@ -34,6 +34,7 @@ pub struct WindowProps {
     pub resizable: bool,
     pub transparent: bool,
     pub always_on_top: bool,
+    pub maximized: bool,
     pub visible: bool,
     pub resize_inset: Option<f32>,
 }
@@ -245,6 +246,10 @@ fn example() -> NodeHandle {
     }
 }
 ```
+
+`show_dom_rebinding` and `match_dom_rebinding` are the variants rsx emits for an `if let` or `match`
+branch whose pattern binds a value: they also rebuild that branch when the condition re-runs and the
+same branch still matches, so the branch reads the new value (issue #2105).
 
 ### `for_each_dom` / `For`
 

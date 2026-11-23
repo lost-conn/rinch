@@ -141,6 +141,10 @@ The runtime uses event delegation (a single document-level listener) that dispat
 
 `NodeHandle` is a stable reference to a DOM node. It remains valid even as the document changes around it. Internally it holds a `NodeId` and a `Weak<RefCell<dyn DomDocument>>`.
 
+A `NodeId` is a `u64` on every target: a 32-bit slot index and a 32-bit generation (`NodeId::new`, `index()`, `generation()`, `NodeId::from_index` for a `usize` slot). Every id is issued at generation 0 today, so `NodeId(4)` is slot 4 and prints as `NodeId(4)`; the generation exists so that a backend which reuses a slot can tell an old id from the new occupant's, and an operation through an id that names no live node does nothing (issue #723; mechanism in `docs/internals/reactive-rendering.md`).
+
+**Migrating from `usize` ids.** `NodeId` wrapped a `usize` before #723, and the public APIs that carried a bare `usize` node id (selection and focus requests, `TextHitInfo`, `InputContext`, the editor-view registry, the debug protocol) take a `u64` now. Write `NodeId::from_index(i)` for a `usize` slot and `id.index()` to get one back; never use `.0` as an index, since it holds the packed bits. A generation-0 id prints as before (`NodeId(4)`, and `4` on the debug wire). The full list is in the guide's [Writing Components](../guide/writing-components.md#migrating-from-usize-ids) page.
+
 ### Text Content
 
 ```rust
@@ -181,6 +185,36 @@ before appending it to its parent — at the write there is no ancestor to walk.
 `crates/rinch-dom/src/attr_name.rs` holds the tag list. The attribute **value**
 is never folded: an `id` still matches `#CamelId` case-sensitively.
 
+### A form control's live text: `live_value`
+
+`get_attribute("value")` reads the `value` **attribute**, and on the web that is
+not what a text field shows once the user has typed: typing moves the element's
+`.value` *property* and leaves the attribute at whatever was last written
+programmatically. `live_value()` asks the question a component usually means —
+"what does the field say right now?" — on either backend (issue #238):
+
+```rust
+if input.live_value().as_deref() != Some(new_text.as_str()) {
+    input.set_attribute("value", &new_text);
+}
+```
+
+- **Desktop** answers with the `value` attribute, which *is* the live text
+  there: the runtime mirrors each edit into it before dispatching `oninput`, and
+  adopts a programmatic write to the focused field back into the text engine.
+- **Web** answers with the `.value` property of an `<input>`, `<textarea>` or
+  `<select>`; any other element answers with its attribute.
+
+`None` means the node carries no value this backend can name — on desktop, a
+control with no `value` attribute yet. A web form control always answers
+`Some`, `""` when empty. Compare against the text you are about to write and
+treat `None` as "differs".
+
+`TextInput`, `PasswordInput`, `Textarea` and `NumberInput` bind `value_fn` with exactly that guard
+(`rinch_components::value_binding::bind_value_fn`), so the echo of the user's own
+keystroke is never written back; a custom component binding a `value_fn` can
+call the same function.
+
 ### Styles
 
 ```rust
@@ -194,6 +228,24 @@ div.set_style("display", "flex");
 // Remove a style
 div.set_style("color", "");  // Empty string removes
 ```
+
+`set_style` means what `style.setProperty` means in a browser: afterwards the
+element's inline style gives the property that value, whatever the attribute
+declared before. On the web it *is* `setProperty`. On desktop the attribute is
+a string of declarations and a property already in it is rewritten where it
+stands — unless a declaration **after** it covers it (a shorthand such as
+`inset` after `left`, a longhand after a shorthand, or a logical twin such as
+`inset-inline-start` after `left`), in which case the write moves to the end so
+that it wins, as the browser's longhand list makes it win
+([issue #470](https://github.com/joeleaver/rinch/issues/470)). A normal write
+also replaces a longhand an `!important` declaration of another property set:
+the important declaration is split into its longhands and the written ones are
+dropped from it, as `setProperty` drops the importance
+([issue #1298](https://github.com/joeleaver/rinch/issues/1298)); one shape
+remains, an important shorthand whose value holds a `var()`, which cannot be
+split into longhands as a string. A property the attribute declares twice is
+collapsed to the one declaration the browser's parse keeps, judged by Stylo
+([issue #1353](https://github.com/joeleaver/rinch/issues/1353)).
 
 ### Classes
 
@@ -243,10 +295,12 @@ item1.replace_with(&new_item);
 ```
 
 > **Removal is a detach; `discard()` is the end of a node's life.** `remove()`
-> and `replace_with()` take a node out of the tree and leave it **re-insertable**
-> on every backend: append the handle again and the whole subtree comes back,
-> and you may read, style or restructure it while it is out. That is what a
-> reactive branch re-showing a *captured* handle rests on (issue #719).
+> and `replace_with()` (for the node it displaces) take a node out of the tree
+> and leave it **re-insertable** on every backend: append the handle again and
+> the whole subtree comes back, and you may read, style or restructure it while
+> it is out. That is what a reactive branch re-showing a *captured* handle rests
+> on (issue #719). It lasts as long as the `RenderScope` that minted the node: a
+> node still detached when that scope goes is discarded with it (issue #1508).
 >
 > Because a removed node is still the backend's to keep, tell it when you are
 > finished with the subtree for good:
@@ -265,6 +319,20 @@ item1.replace_with(&new_item);
 > through `set_inner_html` and pseudo-element pruning, and those *are* recycled —
 > issue #304, live today and independent of this API.)
 >
+> **A subtree you cache from inside a `for` body, a branch or a `render_fn`**
+> must not be built through the scope that closure is handed: that scope owns
+> what it builds, and the helper discards it when the row or branch goes. Build
+> it with `scope.build_cached(..)` and keep the `Cached` it returns: it owns the
+> node and everything built with it, and dropping it — or the cache it sits in,
+> when its owner unmounts — evicts both (issue #1454). See
+> [A cache filled from inside a `for`](../guide/rsx-syntax.md#a-cache-filled-from-inside-a-for)
+> (issue #733).
+>
+> **`remove()` is re-insertable while the scope that minted the node lives.**
+> A node still detached when that scope goes — its branch hides, its row
+> leaves, its component unmounts — is discarded then (issue #1508); putting it
+> back with any insertion verb first keeps it.
+>
 > **Which to use.** If the same handle can be inserted again, `remove()`. If it
 > cannot — a pool shrunk, a glyph replaced, a panel rebuilt — `discard()`.
 > Reaching for `remove()` where you meant `discard()` costs memory; reaching for
@@ -282,19 +350,21 @@ item1.replace_with(&new_item);
 >
 > Two edges of that rule. The verb is chosen **before** the scope is disposed, so
 > an `on_cleanup` that re-parents a scope-built node cannot rescue it — build it
-> outside the closure and hand it in instead. And ownership answers for nodes in
+> outside the closure and hand it in instead. The verb is *applied* **after** the
+> scope is disposed, in all four helpers (a `for` or `virtual_list` row since
+> issue #356), so an `on_cleanup` still sees its own node live and mounted — on
+> `rinch-web` a node already discarded answers every read with `None`. And
+> ownership answers for nodes in
 > a subtree: a node attached to nothing is reached by no walk, which is what
 > `rinch_core::dom::release_scratch_container` exists for.
 >
-> **`remove()`'s post-condition is the same on both backends; `discard()`'s is
-> not.** `rinch-web` holds a strong `web_sys::Node` in two page-global maps, so a
+> **`remove()` and `discard()` each have one post-condition on both backends.**
+> `rinch-web` holds a strong `web_sys::Node` in two page-global maps, so a
 > `discard()` is what releases the browser node against GC (issue #184).
-> `rinch-dom` reclaims nothing: a discarded node there still re-inserts, still
-> keeps its subtree and still takes writes, because its slab is per-document and
-> freeing the slot would recycle the id (issue #304) — so the desktop slab only
-> grows, which is issue #723. The contract is therefore one-sided: a `discard()`
-> is *at least* a `remove()` and may be much more, and you may not rely on it
-> being less.
+> `rinch-dom` frees the node's slab slots and Taffy nodes (issue #723) and
+> reuses each slot under a new generation, so a stale handle names nothing
+> rather than the slot's next occupant (issue #304). A discarded node does not
+> re-insert, keeps no subtree and takes no writes, on either backend.
 
 ### Focus
 
@@ -351,17 +421,47 @@ describes the behaviour it builds.
 | `toggle_class(name: &str)` | Toggle a CSS class |
 | `append_child(child: &NodeHandle)` | Append a child node |
 | `insert_before(node: &NodeHandle, reference: &NodeHandle)` | Insert before reference |
-| `remove()` | Remove this node from its parent — a **detach**; the handle and its subtree stay re-insertable |
-| `replace_with(new_node: &NodeHandle)` | Replace this node with another — also a detach; the displaced handle stays re-insertable |
+| `remove()` | Remove this node from its parent — a **detach**; the handle and its subtree stay re-insertable while the scope that minted it lives, and are discarded with that scope if still detached (#1508) |
+| `replace_with(new_node: &NodeHandle)` | Replace this node with another — also a detach; the displaced handle stays re-insertable on the same terms as `remove()` |
 | `discard()` | Remove this node and release the backend's bookkeeping for its whole subtree — **retires** the ids |
 | `focus()` | Give focus to this element |
 | `active_element() -> Option<NodeHandle>` | Who holds the keyboard in this node's document |
 | `focus_into(policy: FocusIntoPolicy)` | Move focus into this subtree (`showModal()`'s focusing steps) |
 | `restore_focus(opener: Option<&NodeHandle>)` | This overlay has closed: hand the keyboard back, or release it |
 | `children() -> Vec<NodeHandle>` | Get child nodes as NodeHandles |
+| `query_selector(selector: &str) -> Option<NodeHandle>` | The first element **under** this node matching a CSS selector (`Element.querySelector`) |
+| `query_selector_all(selector: &str) -> Vec<NodeHandle>` | Every element under this node matching it, in document order |
 | `is_valid() -> bool` | Check if this handle still points to a valid node |
 | `node_id() -> NodeId` | Get the internal node ID |
 | `clone() -> NodeHandle` | Clone the handle (same underlying node) |
+
+### Querying a subtree
+
+`query_selector` and `query_selector_all` follow `Element.querySelector{,All}`
+on both backends (#1796): the candidates are the node's descendants in
+document order (the node itself never), the selector is matched against the
+whole tree, so `panel.query_selector(".app .body")` finds a `.body` under
+`panel` whose `.app` ancestor is above it, and `:scope` is the node
+(`:scope > li` = its own `li` children). Any CSS selector works —
+descendant/child/sibling combinators, compounds (`button.primary`), lists
+(`.a, .b`, answered in document order), `:not()`, attribute operators
+(`[data-kind^=x]`, `[x=Y i]`), and the pseudo-classes the backend matches.
+The web asks the browser; desktop runs Stylo's parser and matcher, the ones
+its cascade uses, read-only (no restyle, no layout). Two differences remain:
+`:has()` does not parse on desktop (Stylo's servo build, #680), and a
+pseudo-class desktop does not match (see the
+[theming guide](../guide/theming.md)) matches nothing there.
+
+An invalid selector answers `None` / an empty list on both backends, where a
+browser's own `querySelector` throws a `SyntaxError`, and logs one
+`tracing::warn!` per distinct string (the first 32). Generated `::before`,
+`::after` and list-marker boxes, which are nodes in desktop's tree, are never
+matched.
+
+Until #1796 both methods searched the **whole document** whatever node they
+were called on, and desktop took only one simple selector (`#id`, `.class`,
+`[attr]`, `[attr=value]`, a tag), answering nothing for anything else. The
+document-wide search is still `DomDocument::query_selector{,_all}`.
 
 ### Watching a subtree change
 
@@ -379,12 +479,26 @@ Both call **every** registered ancestor, nearest first, synchronously with the
 mutation, so a patch is in place before the frame that shows the change is laid
 out. Both are released by the ambient scope's `on_cleanup` and by
 `discard()` on the container, and dispatch is suppressed for the duration of a
-callback so a container's own edits do not call it back.
+callback so a container's own edits do not call it back. The scope's cleanup
+releases the registration it made and no other: one that replaced it since (a
+second call on the node, or another container on a node id `rinch-dom`
+re-issued) stays (issue #1490).
 
 The removal half is handed the parent rather than the node that went because
 that node is detached by then, and after a `discard()` the backend may have
 retired it — there is nothing left to walk. A **move** fires both halves, unless
 it is a reorder inside one parent, which fires only the insertion.
+
+`NodeHandle::set_text` on an element that has children, and
+`NodeHandle::set_inner_html`, replace the node's whole child list: each fires
+the removal half once, for that node (issue #1440), and neither fires the
+insertion half for the text or the parsed markup. `set_text` only detaches the
+children; the ones the element's own render built — minted by the scope that
+minted the element or one descended from it — are discarded when that scope
+goes, if they are still detached then (issue #1487). Until then a handle to one
+re-inserts. `UpdateBatch::apply` calls the
+backend with the document already borrowed and fires neither half, so a
+`DomUpdate::SetText` should target a text node.
 
 `crates/rinch-components/src/late_children.rs` wraps both with the
 boundary rule a nested container of the same kind needs.

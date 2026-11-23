@@ -8,7 +8,7 @@ This page lists every prop for every component in `rinch-components`. All compon
 
 **Float literals:** Float literals are auto-wrapped: `value: 30.0` becomes `Some(30.0)` for `Option<f32>` fields.
 
-**Universal props:** All components support `style:` and `class:` in RSX, which are applied to the component's root DOM element. These support reactive closures `{|| expr}`.
+**Universal props:** All components support `style:` and `class:` in RSX, which are applied to the component's root DOM element. These support reactive closures `{|| expr}`. So does any **hyphenated attribute** — `data-nofocus: ""`, `aria-label: "…"` — and any **quoted** name — `"title": "…"`, `"id": "…"`, `"role": "…"` (#1653) — which are written on the root the way they would be on an HTML element; a bare `title:` is the component's own field (a heading on `Alert`, `Modal`, …). See [Attributes on a component](rsx-syntax.md#attributes-on-a-component).
 
 Both **merge** with what the component itself put on that root rather than replacing it: `class:` is added to the component's own classes, and `style:` is laid over the component's own inline declarations, last-wins per property. That matters because a component's inline style is not decoration — it is how a component publishes a prop to its own stylesheet, and every overlay's `z_index` is a custom property written there. `style:` used to write the whole attribute, which erased all of them ([issue #647](https://github.com/joeleaver/rinch/issues/647)).
 
@@ -119,7 +119,7 @@ Empty spacing element.
 
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
-| `variant` | `String` | `""` | "filled", "outline", "light", "subtle", "transparent", "white", "default", "gradient" |
+| `variant` | `String` | `""` | "filled", "outline", "light", "subtle", "transparent", "white", "default", "gradient". `light` (and the hover fill of `outline`/`subtle`) paints the scheme-aware `--rinch-<color>-light` tokens (see theming.md, Variant Colors) |
 | `size` | `String` | `""` | xs, sm, md, lg, xl |
 | `color` | `String` | `""` | Theme color name |
 | `disabled` | `bool` | `false` | |
@@ -141,6 +141,7 @@ Icon-only button. For text-based action buttons, use `Button` with compact styli
 | `radius` | `String` | `""` | |
 | `disabled` | `bool` | `false` | |
 | `loading` | `bool` | `false` | |
+| `title` | `String` | `""` | The `title` attribute on the root `<button>`: its tooltip (on desktop too, #1646) and the accessible name an icon-only button otherwise lacks. Empty writes none. A reactive value re-renders the button; `"title": {|| …}` rewrites only the attribute (#1653) |
 | `onclick` | `Option<Callback>` | `None` | Click handler |
 
 ### CloseButton
@@ -155,17 +156,21 @@ and no stylesheet in the workspace matches that class.
 | `radius` | `String` | `""` | |
 | `disabled` | `bool` | `false` | |
 | `icon_size` | `Option<u32>` | `None` | The X's edge length in px. Unset, it follows `size`: 12 / 14 / 16 / 20 / 24 for xs…xl |
+| `title` | `String` | `""` | The `title` attribute on the root `<button>` (its tooltip); empty writes none. The accessible name stays `aria-label="Close"`. A reactive value re-renders the button; `"title": {|| …}` rewrites only the attribute (#1653) |
 | `onclick` | `Option<Callback>` | `None` | Click handler |
 
 ---
 
 ## Form Inputs
 
+The rich-text `Editor`'s props (`editor`, `content`, `read_only`, `spellcheck`) are listed in the [ContentEditable guide](./contenteditable.md).
+
 ### TextInput
 
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
 | `label` | `String` | `""` | |
+| `id` | `String` | `""` | The field's `id` (Mantine's `id`); empty generates a unique `rinch-field-{n}`. The label's `for` names it — so a press on the label focuses the field — and the description/error are `{id}-description`/`{id}-error`, named by the field's `aria-describedby` (#2034). A quoted `"id"` root attribute goes on the wrapper instead |
 | `placeholder` | `String` | `""` | |
 | `description` | `String` | `""` | Help text below input |
 | `error` | `String` | `""` | Error message; shows error styling |
@@ -179,25 +184,28 @@ and no stylesheet in the workspace matches that class.
 | `oninput` | `Option<InputCallback>` | `None` | Receives `String` |
 | `onchange` | `Option<InputCallback>` | `None` | Commit boundary (#226): fires once with the final value when the gesture ends (blur after a modification, or Enter); only if the value changed since focus |
 | `onsubmit` | `Option<Callback>` | `None` | Fires on Enter key |
+| `spellcheck` | `Option<bool>` | `None` | Spellchecking for the field (#2862): `false` turns it off, `true` turns it on inside a subtree that turned it off, `None` inherits the nearest ancestor's `spellcheck` (on by default). See [Spellcheck](./spellcheck.md) |
 
 ### Textarea
 
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
 | `label` | `String` | `""` | |
+| `id` | `String` | `""` | The field's `id` (Mantine's `id`); empty generates a unique `rinch-field-{n}`. The label's `for` names it — so a press on the label focuses the field — and the description/error are `{id}-description`/`{id}-error`, named by the field's `aria-describedby` (#2034). A quoted `"id"` root attribute goes on the wrapper instead |
 | `description` | `String` | `""` | |
 | `error` | `String` | `""` | |
 | `placeholder` | `String` | `""` | |
 | `size` | `String` | `""` | |
 | `disabled` | `bool` | `false` | |
 | `required` | `bool` | `false` | |
-| `autosize` | `bool` | `false` | Auto-resize textarea |
+| `autosize` | `bool` | `false` | Grows `rows` to the controlled value's `\n`-line count, clamped to `[min_rows, max_rows]` (issue #715). Reactive only through `value_fn` |
 | `min_rows` | `Option<u32>` | `None` | Visible rows; sizes the control to that many lines. Defaults to 2 (HTML default) when unset. A larger CSS `min-height` wins |
-| `max_rows` | `Option<u32>` | `None` | **Declared and inert on desktop (#715).** A textarea has no content height, so its used height is exactly the `min-height` its `rows` and the sheet's 60–120px floor give it — and `min-height` beats `max-height`, so no cap can bind at any value. On the allowlist in `no_dead_props.rs` until a textarea's height can follow its content |
+| `max_rows` | `Option<u32>` | `None` | Caps the control's height at that many lines via `max-height` (issue #715, fixed: the control's `rows` is a Taffy measure, not a `min-height`, so the cap can bind). The sheet's 60–120px size-step `min-height` still wins when it is taller than the cap — ordinary CSS `min` over `max`, not a bug |
 | `value` | `String` | `""` | |
 | `value_fn` | `Option<ReactiveString>` | `None` | Reactive value binding (auto-wrapped) |
 | `oninput` | `Option<InputCallback>` | `None` | Receives `String` |
 | `onchange` | `Option<InputCallback>` | `None` | Commit boundary (#226): fires once with the final value when the gesture ends (blur after a modification); only if the value changed since focus |
+| `spellcheck` | `Option<bool>` | `None` | Spellchecking for the field (#2862): `false` turns it off, `true` turns it on inside a subtree that turned it off, `None` inherits the nearest ancestor's `spellcheck` (on by default). See [Spellcheck](./spellcheck.md) |
 
 ### PasswordInput
 
@@ -206,6 +214,7 @@ Custom Default: `toggle_visibility` defaults to `true`.
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
 | `label` | `String` | `""` | |
+| `id` | `String` | `""` | The field's `id` (Mantine's `id`); empty generates a unique `rinch-field-{n}`. The label's `for` names it — so a press on the label focuses the field — and the description/error are `{id}-description`/`{id}-error`, named by the field's `aria-describedby` (#2034). A quoted `"id"` root attribute goes on the wrapper instead |
 | `description` | `String` | `""` | |
 | `error` | `String` | `""` | |
 | `placeholder` | `String` | `""` | |
@@ -228,6 +237,7 @@ Custom Default: `toggle_visibility` defaults to `true`.
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
 | `label` | `String` | `""` | |
+| `id` | `String` | `""` | The field's `id` (Mantine's `id`); empty generates a unique `rinch-field-{n}`. The label's `for` names it — so a press on the label focuses the field — and the description/error are `{id}-description`/`{id}-error`, named by the field's `aria-describedby` (#2034). A quoted `"id"` root attribute goes on the wrapper instead |
 | `description` | `String` | `""` | |
 | `error` | `String` | `""` | |
 | `placeholder` | `String` | `""` | |
@@ -281,6 +291,7 @@ Custom Default: `toggle_visibility` defaults to `true`.
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
 | `label` | `String` | `""` | |
+| `id` | `String` | `""` | The trigger's `id`; empty generates a unique `rinch-field-{n}`. The trigger is a `div`, which a `for` cannot reach, so it names its label (`{id}-label`) in `aria-labelledby` and a press on the label focuses it; description/error as for `TextInput` (#2034) |
 | `description` | `String` | `""` | |
 | `error` | `String` | `""` | |
 | `placeholder` | `String` | `""` | |
@@ -290,13 +301,34 @@ Custom Default: `toggle_visibility` defaults to `true`.
 | `value` | `String` | `""` | |
 | `value_fn` | `Option<ReactiveString>` | `None` | Reactive value binding (auto-wrapped) |
 | `onchange` | `Option<InputCallback>` | `None` | Receives selected value as `String` |
+| `data` | `Vec<SelectOption>` | `[]` | The list of selectable options |
 
-Options are passed as children: `option { value: "us", "United States" }`
+**Keyboard (#251, #434).** The trigger is focusable; Enter or Space opens the
+list, and while it is open ArrowUp/ArrowDown move the highlight (wrapping),
+Home/End jump, Enter commits (Space too, unless it is part of a type-ahead
+prefix), Escape closes without committing, Tab closes, and typing jumps to the
+first matching label. The trigger keeps the focus throughout, a pointer pick
+included; focus moving anywhere else closes the list.
+
+Options are passed via `data`, not as children — the trigger's `_children` param
+is unused. Build a `Vec<SelectOption>` with `SelectOption::new(value, label)` (a
+`SelectOption` is `{ value: String, label: String }`; an empty `label` falls back
+to displaying `value`):
+
+```rust
+Select {
+    data: vec![
+        SelectOption::new("us", "United States"),
+        SelectOption::new("ca", "Canada"),
+    ],
+    value_fn: move || country.get(),
+    onchange: move |v: String| country.set(v),
+}
+```
 
 The trigger is a Tab stop (`tabindex="0"`, `role="combobox"`,
 `aria-haspopup="listbox"`, and an `aria-expanded` that tracks the open state).
-Enter and Space on it toggle the dropdown. Arrow/Enter/Escape navigation of the
-**open** option list is issue #434.
+Enter and Space on it toggle the dropdown; the open list's keys are above.
 
 ### Radio / RadioGroup
 
@@ -418,9 +450,15 @@ emission could not have spelled folds as an echo, in both directions: on an
 chroma, where it does not move the rendered colour by an 8-bit step, while an
 inbound `hsl()` value that shares a spelling with the picker's current colour
 folds even where 8-bit could tell them apart (a normalizing store re-spelling
-the picker's own hex emission as `hsl()` is indistinguishable from it). The
-text field's write-back guard judges at the same resolution, so field, thumbs
-and store stay in step.
+the picker's own hex emission as `hsl()` is indistinguishable from it). A
+store that re-spells the emission in another notation may also round a *tie*
+its own way — `#797e81`'s hue is exactly 202.5°, which rinch writes as 202 and
+an exact converter as 203 — so an inbound value compared against what the
+picker emits (not what it holds) is accepted at either rounding of the
+emission's exact value, and at nothing farther: `#797e82`'s hue is 206⅔°, so a
+peer's `hsl(206, …)` under a `hex` display still applies. The text field's
+write-back guard judges at the same resolution, so field, thumbs and store stay
+in step.
 
 **Accepted colour notations** (everywhere a colour string is read — `value`,
 `value_fn`, typed text, swatches): hex in 3, 4, 6, or 8 digits (`#rgb`,
@@ -445,6 +483,13 @@ holds, so an attribute-reading consumer never sees a stale shorthand outlive
 the gesture that typed it. `ColorInput`'s text field follows the same
 contract.
 
+"The field's text" here is the field's **live** text, read through
+`NodeHandle::live_value` (issue #238) — on the web the `.value` property the
+user types into, never the `value` attribute, which there holds only what was
+last written programmatically. It is the same read the `value_fn` binding of
+`TextInput`, `PasswordInput`, `Textarea` and `NumberInput` makes before
+writing, so the echo of a keystroke is not written back there either.
+
 ### ColorInput
 
 Text input with inline color preview and dropdown ColorPicker.
@@ -452,6 +497,7 @@ Text input with inline color preview and dropdown ColorPicker.
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
 | `label` | `String` | `""` | Input label |
+| `id` | `String` | `""` | The field's `id` (Mantine's `id`); empty generates a unique `rinch-field-{n}`. The label's `for` names it — so a press on the label focuses the field — and the description/error are `{id}-description`/`{id}-error`, named by the field's `aria-describedby` (#2034). A quoted `"id"` root attribute goes on the wrapper instead |
 | `description` | `String` | `""` | Description text below the input |
 | `error` | `String` | `""` | Error message (shows error styling) |
 | `placeholder` | `String` | `""` | Placeholder text |
@@ -466,7 +512,9 @@ Text input with inline color preview and dropdown ColorPicker.
 | `swatches` | `Vec<String>` | `[]` | Preset swatch colors |
 | `swatches_per_row` | `Option<usize>` | `7` | Swatches per row |
 | `disallow_input` | `bool` | `false` | Disallow typing (picker only) |
-| `close_on_click_outside` | `bool` | `true` | Dismiss the dropdown when a click lands outside it (#465). Off mounts no backdrop at all, so no click outside the field dismisses it — the pointer half of the pre-#465 behaviour. Escape closes the dropdown either way |
+| `close_on_click_outside` | `bool` | `true` | Mount a backdrop that takes a click outside the field and dismisses the dropdown (#465). Off mounts none, so the click reaches the page under it; the dropdown still closes if that click moves the focus out of the field (#1572). Escape closes the dropdown either way |
+| `z_index` | `Option<i32>` | `None` | Stacking level of the open picker's panel; its click-catching backdrop stays one below and the field one above (defaults 100 / 99 / 101, #801) |
+| `spellcheck` | `Option<bool>` | `None` | Spellchecking for the colour text field (#2862), as `TextInput`'s. A code with a digit is never checked (the default skip rules) |
 
 `size` and `radius` were declared but unread until #263. **`size` always
 resolves to a step, `radius` does not**: an unrecognised `size` falls back to
@@ -476,13 +524,25 @@ resizes by upgrading. An unrecognised `radius` emits no class at all and leaves
 the base `--rinch-radius-sm` standing, which is what `DropdownMenu`, `Modal` and
 `Card` do.
 
-**The dropdown is dismissed three ways** (#465): clicking the field again,
-clicking anywhere outside it, and Escape. The outside click is the one that is
-optional — `close_on_click_outside` is `true` by default, matching every other
-popover in the library, and turning it off mounts no backdrop at all, so the
-field is the only thing a *click* dismisses the dropdown with. Escape is not
-gated by it, so `false` is the pointer half of the behaviour `ColorInput` had
-until #465 rather than a return to it in full. (The prop was
+**The open picker sits at the library's overlay level** (#801): panel 100,
+backdrop 99, field 101 — `DropdownMenu`'s and `Popover`'s numbers. It used to
+be 1000 / 999 / 1001, which put the backdrop above every `Modal`, `Drawer`,
+`Notification` and `Select` popup, so one of those appearing without a click
+while the picker was open lost its first press to the backdrop. A `ColorInput`
+opened *inside* a modal still orders, because the three levels are compared in
+the modal's stacking context. `z_index` raises all three together.
+
+**The dropdown is dismissed four ways**: clicking the field again, clicking
+anywhere outside it, and Escape (#465), and the focus leaving the field —
+Tab away, a programmatic focus elsewhere, or the window losing focus (#1572),
+as Mantine closes it in the input's `onBlur`. Opening puts the keyboard on the
+text field, and a press inside the picker panel or on the preview swatch takes
+the click but not the keyboard, so picking a colour does not count as leaving.
+`close_on_click_outside` is `true` by default, matching every other popover in
+the library; turning it off mounts no backdrop at all, so a click outside
+reaches whatever is under it rather than being swallowed — and that click still
+closes the dropdown when it moves the focus out of the field (a press on a
+`data-nofocus` region leaves it open). Escape is not gated by it. (The prop was
 declared and read by nothing before that; #263 *removed* it rather than wire it,
 because unlike `size` and `radius` there was no behaviour behind it to connect,
 and it came back here with the interaction it names.)
@@ -581,7 +641,7 @@ when alpha must be externally drivable.
 
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
-| `color` | `String` | `""` | Highlight background color |
+| `color` | `String` | `""` | Highlight background color (a palette name, its shade 2). Unset, it is `--rinch-color-mark`, which follows the scheme |
 
 ### Highlight
 
@@ -591,7 +651,7 @@ Custom Default: `ignore_case` defaults to `true`.
 |------|------|---------|-------------|
 | `text` | `String` | `""` | Full text to display |
 | `highlight` | `String` | `""` | Substring(s) to highlight |
-| `color` | `String` | `""` | Highlight color |
+| `color` | `String` | `""` | Highlight color. Unset, it is `--rinch-color-mark`, which follows the scheme |
 | `ignore_case` | `bool` | **`true`** | Case-insensitive matching |
 
 ---
@@ -712,13 +772,23 @@ item) and will not touch a value the child asked for itself.
 `rinch_core::dom::on_child_removed` is the other half, and a container takes it
 only if its per-item answer depends on a sibling's **position** (issue #745).
 `Stepper` does — a step that goes moves every step behind it backwards, which
-renumbers it and can restate it — so it registers both; `List` and `RadioGroup`
+renumbers it and can restate it — so it registers both (and on either event
+re-derives only the steps that moved: one it has already settled at the position
+it still holds costs three attribute reads, issue #748); `List` and `RadioGroup`
 register only the insertion half, since no row going away can change the icon or
 the size the next one should have. It is fired by the four verbs that take a
 node out of a tree (`remove_child`, `remove`, `discard`, and `replace_with` for
 the node it displaces) and by the implicit detach an insertion verb performs when
 handed a node that already has a parent, which is what tells the container a
-child **moved away**.
+child **moved away**. `set_text` on an element that has children and
+`set_inner_html` replace the whole child list, and fire it as well (issue
+#1440). A batched `DomUpdate::SetText` (`UpdateBatch::apply`) does not.
+
+Because of that, a step's `state`, `step` and `disabled` are read when the step
+arrives or moves, not on every change to the list: change them through the
+`StepperStep` props (which re-renders the step), not by writing `data-state`,
+`data-step` or `disabled` on a mounted step by hand or through a reactive root
+attribute.
 
 The removal half is handed the node the subtree *left* — its former parent —
 rather than the node that went, because a removed node is detached and after a
@@ -811,7 +881,7 @@ Custom Default: `animate` and `visible` default to `true`.
 ## Overlays
 
 **`z_index` on an overlay** (issue #474). `Modal`, `Drawer`, `Popover`,
-`DropdownMenu` and `Notification` each paint more than one box, and the boxes
+`DropdownMenu`, `Notification` and `ColorInput` (#801) each paint more than one box, and the boxes
 have to stay ordered against each other: a modal's panel above its overlay, a
 menu's backdrop below its panel. `z_index` therefore names the level of the
 component's *base* layer — the one whose stylesheet number the per-component
@@ -861,14 +931,19 @@ A custom overlay of your own joins the same stack with
 [`push_dismiss_handler`](./focus.md#the-dismiss-stack) — reach for that rather
 than an interceptor, which is one slot per document and so cannot nest. **When**
 to join it is a real choice and these three overlays make the opposite one from
-`ColorInput`'s dropdown and the `<select>` popup; see
+`ColorInput`'s dropdown and the `<select>` popup (they register at mount, anchored
+at their root, so one written inside another still answers Escape first, #803); see
 [Register at mount, or at open](./focus.md#the-dismiss-stack).
 
 *Outside clicks* are caught by an invisible full-viewport backdrop the component
 renders while it is open, one stacking level under its own panel, so a click on
 the overlay's own content still reaches the content. `Modal` and `Drawer` use
 their dimming overlay for this and always have; `Popover` gained one with the
-same PR.
+same PR. Each such backdrop carries `data-backdrop`
+(`rinch_core::events::BACKDROP_ATTRIBUTE`), so a press of **any** button outside
+dismisses, not only a left one. A custom overlay's own backdrop needs it too, or
+a right or middle press outside it is swallowed by the backdrop and does nothing
+(#1093): a `data-rid` without it runs for a left press only.
 
 *`auto_close`* arms a timer when the notification **opens** and cancels it if
 the notification closes — or unmounts — first, so a toast the user dismisses by
@@ -916,7 +991,11 @@ has a web equivalent:
   left to keep scrolling the page while the button is held.
 - The native `<select>` popup is **exempt**: its option list is appended to
   `<body>`, so it is not inside any overlay's root, and a long list inside a
-  dialog would otherwise be unscrollable. See [Focus](./focus.md#locking-the-page-behind-an-overlay).
+  dialog would otherwise be unscrollable. A scroll container of your own that
+  sits outside the overlay and must keep scrolling while it is open (a popup
+  portalled to `<body>`, a panel that paints over the dialog) says so with
+  **`data-scroll-lock-exempt`**; the DOM menu bar's dropdowns carry it. See
+  [Focus](./focus.md#a-scroll-container-outside-the-overlay-data-scroll-lock-exempt).
 
 On the web the lock is the whole page even in island mode — there is one
 `<html>` — so a rinch `Modal` inside an island freezes its host page too.
@@ -961,6 +1040,26 @@ Custom Default: `with_overlay`, `close_on_click_outside`, `close_on_escape`, `wi
 
 Positioned with `top: var(--rinch-window-top-inset, 0px)`, so it clears any window chrome rinch draws (the Linux in-app menu bar, the `BorderlessWindow` titlebar) and is flush with the top of a plain window. See [Theming](./theming.md#window-chrome-inset).
 
+A modal taller than the window fits inside it (#2508): the panel shrinks to the area below the inset, keeping the `xl` gaps, and its body scrolls, so the title and close button stay in view. Content you put in the body scrolls with it.
+
+**`footer` pins a row below the body** that never scrolls, for the dialog's buttons. It takes the same renderer as `BorderlessWindow`'s `left_section`/`right_section` (`SectionRenderer`, an `Rc<dyn Fn(&mut RenderScope) -> NodeHandle>`, passed as `footer: Some(renderer)`). The panel is a column of header, body and footer; the header and footer keep their height and the body takes the rest and scrolls, so in a very short window the body gives way first, down to its own padding. The footer is `.rinch-modal__footer`: a flex row ending its children (`justify-content: flex-end`) with a `gap` of `--rinch-spacing-sm`, padded like the body (the `padding` prop applies to both), with a 1px top border. The border is always drawn, not only while the body is scrolled away from its bottom: that would need the body's overflow at open, after a resize and after a content change, and rinch has no post-layout signal for it. Restyle any of it on the class, e.g. `.rinch-modal__footer { border-top: none; }`. The footer is inside the modal, so `trap_focus` includes its buttons, and Tab runs header (close button), body, footer. Without a footer (the default) no footer element is rendered.
+
+```rust
+let footer: SectionRenderer = Rc::new(move |__scope| rsx! {
+    Fragment {
+        Button { variant: "default", onclick: move || open.set(false), "Cancel" }
+        Button { onclick: move || { save(); open.set(false) }, "Save" }
+    }
+});
+
+rsx! {
+    Modal { opened_fn: move || open.get(), onclose: move || open.set(false),
+        title: "Edit profile", footer: Some(footer),
+        TextInput { label: "Name" }
+    }
+}
+```
+
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
 | `opened` | `bool` | `false` | |
@@ -980,6 +1079,7 @@ Positioned with `top: var(--rinch-window-top-inset, 0px)`, so it clears any wind
 | `lock_scroll` | `bool` | **`true`** | Holds the page still while open. Desktop refuses the gesture, web sets `overflow: hidden` on `<html>` — see [Overlays](#overlays) |
 | `trap_focus` | `bool` | **`true`** | Tab cycles inside the overlay while it is open (#474) |
 | `onclose` | `Option<Callback>` | `None` | |
+| `footer` | `Option<SectionRenderer>` | `None` | A pinned row below the scrolling body (`.rinch-modal__footer`), for the dialog's buttons. Pass `Some(renderer)` |
 
 ### Drawer
 
@@ -987,7 +1087,7 @@ Custom Default: `with_overlay`, `close_on_click_outside`, `close_on_escape`, `wi
 
 Positioned with `top: var(--rinch-window-top-inset, 0px)`, so it clears any window chrome rinch draws (the Linux in-app menu bar, the `BorderlessWindow` titlebar) and is flush with the top of a plain window. See [Theming](./theming.md#window-chrome-inset).
 
-**Opening slides the panel in over 300ms; closing is instant.** The closed drawer is `visibility: hidden`, not `display: none` (issue #751), which is what lets the slide run: an element that was not being rendered has no before-change style, so a `display` flip and a `transform` retarget in one style pass animate nothing — on either backend, since a browser refuses the same shape. See [The before-change style, and who has one](../architecture/rendering-pipeline.md). Hidden this way the drawer is still excluded from paint, from hit testing and from the Tab order. The close is instant because sliding *out* needs the root to stay visible for the 300ms, i.e. a transition on `visibility`, which rinch's transition engine does not carry (issue #759) — one behaviour on both backends is worth more than the slide-out.
+**Opening slides the panel in over 300ms, and closing slides it back out.** The closed drawer is `visibility: hidden`, not `display: none` (issue #751), which is what lets the slide run: an element that was not being rendered has no before-change style, so a `display` flip and a `transform` retarget in one style pass animate nothing — on either backend, since a browser refuses the same shape. See [The before-change style, and who has one](../architecture/rendering-pipeline.md). Hidden this way the drawer is still excluded from paint — its title and body text included, which desktop drew until issue #829 — from hit testing and from the Tab order. The slide-out keeps the root visible for the 300ms with `transition: visibility 0s linear 300ms` on the closed state (issues #413, #759), so for those 300ms the closing drawer paints, takes clicks and is reachable by Tab, as it is in a browser; its focus trap is released at the close itself. Reopening part way through cancels the pending hide. An app that wants the old instant close can declare `.rinch-drawer__root--hidden { transition: none !important; }`.
 
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
@@ -1058,11 +1158,26 @@ Sub-components: **PopoverTarget** (no props), **PopoverDropdown** (no props).
 
 ### ContextMenu
 
-A right-click context menu. No props on the wrapper — state is managed internally.
+A right-click context menu. Its open state is managed internally; its props are
+the keyboard options below (#2170).
+
+| Prop | Type | Default | Description |
+|------|------|---------|-------------|
+| `close_on_escape` | `bool` | **`true`** | Escape closes the menu and returns the focus to the element that held it when the menu opened. An open `DropdownMenuSub` takes Escape first and closes only itself |
+| `keyboard_nav` | `bool` | **`true`** | ArrowUp/ArrowDown/Home/End and type-ahead while open (see [Menus › Keyboard](menus.md#keyboard-in-rendered-menus)) |
+| `loop_focus` | `bool` | **`true`** | The arrows wrap at the ends (Chrome's menus: `arrow_key_selection_wraps`) |
+| `typeahead` | `bool` | **`true`** | A letter or digit moves to the next item whose label starts with it; a single match is activated (Chrome's `SelectByChar`) |
+| `on_key` | `Option<MenuKeyHook>` | `None` | Escape hatch: `Rc<dyn Fn(&KeyEventData) -> bool>` offered every key the open menu would see, first; `true` consumes it |
+
+The dropdown opens at the pointer and is kept inside the viewport: if it would
+run past the bottom or right edge it is shifted back by the overflow, 4px from
+the edge, and a menu taller than the viewport scrolls. The placement is CSS (a
+viewport-sized flex frame with spacers around the dropdown), so it is the same
+on the desktop and in a browser and costs no extra layout.
 
 Sub-components: **ContextMenuTarget** (no props), **ContextMenuDropdown** (no props).
 
-Use `DropdownMenuItem` and `DropdownMenuDivider` as children of `ContextMenuDropdown`.
+Use `DropdownMenuItem`, `DropdownMenuDivider` and `DropdownMenuSub` as children of `ContextMenuDropdown`.
 
 ### DropdownMenu
 
@@ -1120,6 +1235,8 @@ Two consequences of that spelling:
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
 | `opened` | `bool` | `false` | |
+| `opened_fn` | `Option<ReactiveBool>` | `None` | Reactive opened getter — use this for fine-grained updates |
+| `on_close` | `Option<Callback>` | `None` | Fired when the user clicks outside the menu or clicks a menu item (with `close_on_click_outside`/`close_on_item_click`); the caller should set their `opened_fn` source to `false` from here |
 | `position` | `String` | `""` | |
 | `offset` | `Option<i32>` | `None` | |
 | `radius` | `String` | `""` | |
@@ -1128,6 +1245,12 @@ Two consequences of that spelling:
 | `close_on_item_click` | `bool` | **`true`** | |
 | `width` | `String` | `""` | |
 | `z_index` | `Option<i32>` | `None` | Stacking level of the menu panel; its click-catching backdrop stays one below (defaults 100 / 99) |
+| `close_on_escape` | `bool` | **`true`** | Escape closes the menu (through `on_close`, so it needs one) and returns the focus to the element that held it when the menu opened. An open `DropdownMenuSub` takes Escape first and closes only itself |
+| `close_on_focus_leave` | `bool` | **`true`** | The menu closes (through `on_close`) when the focus leaves its target and panel — Tab past the last item, a focus move elsewhere — or the window loses the keyboard, as a WAI-ARIA menu button's menu and Chrome's menus do. `false` keeps it open |
+| `keyboard_nav` | `bool` | **`true`** | ArrowUp/ArrowDown/Home/End and type-ahead while open (see [Menus › Keyboard](menus.md#keyboard-in-rendered-menus)) |
+| `loop_focus` | `bool` | **`true`** | The arrows wrap at the ends (Chrome's menus: `arrow_key_selection_wraps`) |
+| `typeahead` | `bool` | **`true`** | A letter or digit moves to the next item whose label starts with it; a single match is activated (Chrome's `SelectByChar`) |
+| `on_key` | `Option<MenuKeyHook>` | `None` | Escape hatch: `Rc<dyn Fn(&KeyEventData) -> bool>` offered every key the open menu would see, first; `true` consumes it |
 
 **DropdownMenuTarget**, **DropdownMenuDropdown**, **DropdownMenuLabel**, **DropdownMenuDivider**: No props.
 
@@ -1140,6 +1263,40 @@ Two consequences of that spelling:
 | `color` | `String` | `""` | |
 | `disabled` | `bool` | `false` | |
 | `onclick` | `Option<Callback>` | `None` | |
+
+**DropdownMenuSub** (#2214) — a cascading submenu row; its children are the
+flyout's items. Works in `DropdownMenuDropdown`, `ContextMenuDropdown` and
+another `DropdownMenuSub`, to any depth. Choosing an item anywhere in the tree
+closes the whole menu. Defaults are Chrome's own menus' (`ui/views/controls/menu`).
+
+| Prop | Type | Default | Description |
+|------|------|---------|-------------|
+| `label` | `String` | `""` | The row's text |
+| `left_section` | `Option<TablerIcon>` | `None` | As `DropdownMenuItem`'s |
+| `color` | `String` | `""` | As `DropdownMenuItem`'s |
+| `disabled` | `bool` | `false` | Never opens, by pointer or key |
+| `chevron` | `Option<TablerIcon>` | `None` | The trailing icon; `None` is `ChevronRight` |
+| `hide_chevron` | `bool` | `false` | No trailing icon |
+| `open_delay` | `u32` | **`400`** | Hover time before it opens, ms (`MenuConfig::show_delay`) |
+| `close_delay` | `u32` | **`400`** | Time on another row of the same panel before it closes, ms (Chrome switches on the same show timer) |
+| `open_on_hover` | `bool` | **`true`** | |
+| `open_on_click` | `bool` | **`true`** | A press opens it at once |
+| `safe_triangle` | `bool` | `false` | Hold it open (and hold sibling rows back) while the pointer moves inside the triangle toward the flyout. Chrome has none; pair it with a short `close_delay` |
+| `flip` | `bool` | **`true`** | Open on the panel's left when there is no room on its right |
+| `shift` | `bool` | **`true`** | Move it back inside the window at an edge, 4px in; cap and scroll one taller than the window |
+| `offset` | `Option<i32>` | `None` | Gap from the parent panel in px, negative overlaps; writes `--rinch-dropdown-menu-sub-offset` on the submenu (default `-3px`, Chromium's `submenu_horizontal_overlap`) |
+| `close_on_resize` | `bool` | **`true`** | A window resize or a display scale change closes it (Chrome closes its menus on either); `false` places it again. A page scrollbar appearing is not a resize |
+
+Styling goes through the cascade, so a class or custom property on the menu, any
+ancestor or the submenu reaches its flyout: `--rinch-dropdown-menu-sub-offset`,
+`--rinch-dropdown-menu-sub-width`, `--rinch-dropdown-menu-sub-z-index`, and the
+classes `.rinch-dropdown-menu__sub` (`--opened` while open, `--left` while flipped),
+`.rinch-dropdown-menu__sub-trigger`, `.rinch-dropdown-menu__sub-chevron` and
+`.rinch-dropdown-menu__sub-dropdown`. The flyout's own `left`, `top` and
+`max-height` (and `width`, only for one wider than the window) are written by its
+placement, which runs again when its content changes size. Rows carry
+`role="menuitem"` (a submenu row also `aria-haspopup`/`aria-expanded`), panels and
+flyouts `role="menu"`.
 
 ### HoverCard
 
@@ -1223,10 +1380,9 @@ can style against them too, with two things to know:
 The `default` variant's underline is a real element, `.rinch-tabs__tab-indicator`,
 appended to each tab button; it carries `transition: background-color 150ms
 ease`, so switching tabs animates it. The tab button's own `transition: color`
-starts on a switch as well, but what it animates differs by backend: in a
-browser the label text inherits the animated colour and fades, while on desktop
-a transition on an inherited property does not reach descendants, so the label
-text — which lives in a child span — snaps to its new colour.
+starts on a switch as well, and the label text — which lives in a child span —
+inherits the animated colour and fades with it, in a browser and on desktop
+alike (on desktop since #777; before it the label snapped to its new colour).
 
 None of these hooks was live before [issue
 #760](https://github.com/joeleaver/rinch/issues/760): the component set neither
@@ -1314,7 +1470,8 @@ Custom Default: `total`, `value`, `siblings`, `boundaries` default to `1`; `with
 | `color` | `String` | `""` | |
 | `radius` | `String` | `""` | |
 | `icon_size` | `String` | `""` | |
-| `allow_next_steps_select` | `bool` | `false` | Makes each step past `active` clickable (#707), a step that arrives later included (#716). Grants only: a step's own `allow_step_click` / `allow_step_select` is never taken away. **Decorative** — `Stepper` registers no click handler and takes no callback (#737) |
+| `allow_next_steps_select` | `bool` | `false` | Makes each step past `active` clickable (#707), a step that arrives later included (#716). Grants only: a step's own `allow_step_click` / `allow_step_select` is never taken away. With no `on_step_click` set, this grants only the class — exactly as before #737 |
+| `on_step_click` | `Option<ValueCallback<u32>>` | `None` | Fired with a step's 0-based position when it is clicked or activated (Enter/Space) on a step the stepper considers reachable (#737). Mantine's default: a strictly **completed** step (`position < active`) is clickable without `allow_next_steps_select`; the active step itself and every step past it need that flag or its own `allow_step_click`/`allow_step_select` (Mantine's active state is `'stepProgress'`, not `'stepCompleted'`, so it is not reachable by default either). `Stepper` does not move `active` itself — the caller does, from this callback, as `Tabs` moves its own selection. The index is read from the step's current position **at click time**, not baked in when the handler was wired (#714's pattern), since a later insertion or removal can renumber a step (#716, #745) — and the clickable class is removed the moment a shift makes a step unreachable, unless the step's own ask keeps it. A step moved into another `Stepper` calls **that** stepper's callback, with its position there (#1428); moved into one with no `on_step_click` it is no longer wired (no `data-rid`, `tabindex` or `role`), and keeps the clickable class only if it asked for it itself or that stepper's `allow_next_steps_select` grants it. A wired step moved out of every stepper keeps its wiring (#1453) |
 | `completed_icon` | `Option<TablerIcon>` | `None` | Default completed icon for the steps that set none (#707); the step's own wins, and a step that arrives later takes this one as it lands (#716) |
 | `progress_icon` | `Option<TablerIcon>` | `None` | Default in-progress icon for the steps that set none (#707). It stands in for the *`progress_icon`* the step did not set, so it outranks that step's plain `icon`. A step that arrives later takes it as it lands (#716) |
 
@@ -1327,9 +1484,10 @@ Custom Default: `total`, `value`, `siblings`, `boundaries` default to `1`; `with
 | `icon` | `Option<TablerIcon>` | `None` | Default icon |
 | `completed_icon` | `Option<TablerIcon>` | `None` | Per-step override |
 | `progress_icon` | `Option<TablerIcon>` | `None` | Per-step override |
-| `allow_step_click` | `bool` | `false` | |
-| `allow_step_select` | `bool` | `false` | |
+| `allow_step_click` | `bool` | `false` | Grants this step the clickable class regardless of its position against `active`. With `Stepper::on_step_click` set, also grants the wiring (handler, `tabindex="0"`, `data-rid`) unless `disabled` is set (#737) |
+| `allow_step_select` | `bool` | `false` | The same grant as `allow_step_click` — Mantine keeps both names, so rinch does too |
 | `loading` | `bool` | `false` | |
+| `disabled` | `bool` | `false` | Never clickable, never focusable, whatever else grants it (#737) — the plain HTML `disabled` attribute, read tag-agnostically |
 | `state` | `String` | `""` | `"completed"` or `"progress"`; anything else is inactive. Leave it unset and the parent `Stepper` derives it from this step's position against `active` (#709). Set it to override that for this one step: what a step names, it keeps |
 | `step` | `Option<u32>` | `None` | Step index, 0-based. Set by the parent `Stepper` from this step's position unless named here, in which case that is the index shown — and the number in the icon box, one higher. An index named here changes the label, **not** the position the state derives from |
 
@@ -1357,11 +1515,122 @@ Custom Default: `level_offset` defaults to `"md"`, `expand_on_click` defaults to
 | `expand_on_click` | `bool` | **`true`** | Click expands/collapses |
 | `select_on_click` | `bool` | `false` | Click selects |
 | `render_node` | `Option<RenderTreeNode>` | `None` | Custom node renderer |
-| `onselect` | `Option<ValueCallback<String>>` | `None` | |
+| `onselect` | `Option<ValueCallback<String>>` | `None` | A row was selected: by a plain click or Enter, by Space, or by the cursor in a single-select tree with `keyboard`. Not by a Ctrl-click, a Shift run or Ctrl+A |
 | `onexpand` | `Option<ValueCallback<String>>` | `None` | |
 | `oncollapse` | `Option<ValueCallback<String>>` | `None` | |
+| `data_source` | `Option<Rc<dyn Fn() -> Vec<TreeNodeData>>>` | `None` | Reactive data source — when provided, root nodes update when this changes |
+| `indent` | `Option<f32>` | `None` | Indentation per level in pixels; overrides `level_offset`. Also the unit the pointer's column is read in when a drag picks a depth. Without it the tree measures one level's width from its rendered rows, once per drag |
+| `draggable` | `bool` | `false` | Rows drag before, into or after other rows (needs `tree`). Only a draggable tree's rows are `position: relative` |
+| `drag_values` | `Option<DragValues>` | `None` | What a drag from a row carries (its own value when not given), e.g. the whole selection or app ids. In a `multiple` tree it is called for each row the drag or key move takes (the selected rows when the pressed row is one of several), each value kept once. It never decides which rows a key move moves |
+| `judge_drop` | `Option<JudgeDrop>` | `None` | The app's verdict on each drop on offer; a refused drop is drawn in the error color and not delivered. Allowed when not given |
+| `accepts_children` | `Option<AcceptsChildren>` | `None` | Which rows take children by a drop. A row that does not has no "inside": its top half is before it, its bottom half after it, and hovering never expands it. Every row takes children when not given |
+| `ondropchange` | `Option<ValueCallback<Option<(TreeDrop, DropVerdict)>>>` | `None` | The drop on offer and its verdict, each time it changes; `None` when none is on offer (over a row that offers none, once the pointer has left the rows, at the drag's end). Moving from one row onto the next reports only the next row's drop |
+| `ondrop` | `Option<ValueCallback<TreeDrop>>` | `None` | An allowed drop, at the release |
+| `ondragstart` | `Option<ValueCallback<Vec<String>>>` | `None` | A drag from a row started, carrying these values |
+| `ondragend` | `Option<ValueCallback<()>>` | `None` | The drag ended, dropped anywhere or cancelled; after any drop |
+| `hover_expand_ms` | `u32` | **`600`** | How long a drag rests inside a collapsed row with children before it expands; `0` never expands |
+| `guides` | `bool` | `false` | A faint line down each expanded row's children, at `--tree-guide-offset` |
+| `keyboard` | `bool` | `false` | Keyboard navigation (needs `tree`): a cursor moved by the arrows, Home/End, PageUp/PageDown, Right/Left (expand or step in, collapse or step out), `*` (expand the cursor row's siblings) and type-ahead. The tree is one Tab stop (roving tabindex) |
+| `handle_key` | `Option<TreeKeyHandler>` | `None` | Every key a row of the tree gets, before the tree's own; `true` consumes it |
+| `oncursor` | `Option<ValueCallback<String>>` | `None` | The cursor came to rest on a row, `cursor_delay_ms` after the last move |
+| `cursor_delay_ms` | `u32` | **`120`** | How long the cursor rests before `oncursor`; `0` reports every move at once |
+| `label_of` | `Option<LabelOf>` | `None` | The text type-ahead matches for a row (its label when not given) |
+| `onselectionchange` | `Option<ValueCallback<Vec<String>>>` | `None` | The selection, top to bottom, each time a click or a key changes it, in a `multiple` tree only (see [Selecting several rows](components.md#selecting-several-rows)). Not called when nothing changed; a value whose row left the data is not reported |
+
+`drag_values`, `judge_drop`, `accepts_children`, `handle_key` and `label_of`
+are `Rc` closures and are not `on*` props, so `rsx!` does not wrap them:
+write `judge_drop: Some(Rc::new(|drop: &TreeDrop| …))`.
+
+**Drop types:**
+
+- `TreeDrop { dragged: Vec<String>, parent: Option<String>, slot: TreeSlot, over: String, zone: DropZone }` — where the dragged rows would land. `dragged` is in the order the drag started with (as `drag_values` returned it), not tree order. `parent` is `None` for the top level. `over` and `zone` are the row under the pointer and the part of it.
+- `TreeSlot` — `First`, `Last`, or `After(value)`: an anchor among `parent`'s children, not an index. `After(v)` can name a dragged row (a drop that leaves it where it is); it is delivered as allowed unless `judge_drop` refuses it.
+- `DropZone` — `Before`, `Inside`, `After`: the top quarter, middle half and bottom quarter of a row (halves without `Inside` for a row `accepts_children` refuses).
+- `DropVerdict` — `Allowed` or `Refused`. A drop into a dragged row's own subtree is always refused.
+- `DragValues` = `Rc<dyn Fn(&str) -> Vec<String>>`, `JudgeDrop` = `Rc<dyn Fn(&TreeDrop) -> DropVerdict>`, `AcceptsChildren` = `Rc<dyn Fn(&TreeNodeData) -> bool>`.
+
+A draggable row's click (select, expand) runs on the release, once the drag
+has failed to start, on both backends. It is the click of what was pressed:
+the chevron expands without selecting the row.
+
+**Keyboard types:**
+
+- `TreeKey { key, ctrl, shift, alt, meta, cursor, parent, above, below }` — a key a row got, offered to `handle_key`: the key as `KeyEventData::key` names it, the cursor row, its parent (`None` at the top level), and the rows drawn right above and below it — or, when the cursor row is one of several selected rows of a `multiple` tree, the rows drawn right above and below that block.
+- `TreeKey::carried() -> &[String]` — what a key move acts on: the selection top to bottom when the cursor row is one of several selected rows (rows inside other selected rows left out), the cursor row alone otherwise; through `drag_values` when it is set (called for each of those rows, each value kept once).
+- `TreeKey::drop_for(TreeMove) -> Option<TreeDrop>` — the drop a structural move would be, carrying `carried()`: the rows moved are the cursor row, or the selected rows in tree order when it is one of several (never what `drag_values` names), as one block (several rows must share a parent, else `None`; `Up` goes before the row above the first, `Down` after the row below the last), for the app to deliver as it delivers a dropped one. `None` when there is nowhere to go, and whenever a drag would refuse the same drop: into a row `accepts_children` refuses, into a carried row or its subtree, or refused by `judge_drop`.
+- `TreeMove` — `Indent` (into the previous sibling, last), `Outdent` (out of the parent, right after it), `Up` (before the previous sibling), `Down` (after the next sibling). `#[non_exhaustive]`.
+- `TreeKeyHandler` = `Rc<dyn Fn(&TreeKey) -> bool>`, `LabelOf` = `Rc<dyn Fn(&str) -> String>`.
+- `TreeController::set_selection(values)` — make exactly these rows the selection (from code; `onselectionchange` is not called).
+- `TreeController::set_anchor(Option<&str>)` / `anchor()` — set, clear or read the row the next Shift run (Shift-click, Shift with a move key, Shift+Space) starts at; no selection change and no callback. A value not in the data behaves as a deleted anchor (the run starts at the cursor or clicked row).
+- `UseTreeReturn::cursor: Signal<Option<String>>`; `TreeController::set_cursor(value)` (when a row of the tree has the keyboard, it moves to the cursor row), `cursor()`, and `focus()` (gives the cursor row, or the first row, the keyboard).
 
 **TreeNodeData:** `value: String`, `label: String`, `children: Vec<TreeNodeData>`, `disabled: bool`, `icon: Option<TablerIcon>`, `payload: Option<Rc<dyn Any>>`.
+
+### SortableList, SortableItem, SortableHandle
+
+Lists whose items drag within and between lists of the same `group`, by
+pointer or keyboard (guide: [Sortable Lists](sortable.md)).
+
+**SortableList** — a flex row or column of items.
+
+| Prop | Type | Default | Description |
+|------|------|---------|-------------|
+| `group` | `String` | `""` | The kind of thing the list holds. A drag only targets lists of its own group, so nested lists of other groups never fight |
+| `id` | `String` | `""` | The list's id, as `SortMove::from_list` / `to_list` name it |
+| `axis` | `SortAxis` | `Vertical` | `Vertical` or `Horizontal`: which way the items run, and which axis the place is read along |
+| `label` | `String` | `""` | The list's name in keyboard announcements (its `id` when empty) |
+| `disabled` | `bool` | `false` | Read-only: no drag starts from its items, none lands in it, no lift |
+| `lift_keys` | `Vec<String>` | `[]` | The `KeyEventData::key` values that lift and drop; Space and Enter when empty (`vec![" ".into()]` leaves Enter to the app) |
+| `judge` | `Option<SortJudge>` | `None` | Whether a move into this list may happen, asked live for every place on offer and again at the drop; a refusal's reason is drawn at the caret. Accepted when not given |
+| `ondrop` | `Option<ValueCallback<SortMove>>` | `None` | An accepted drop into this list. The component moves nothing: the app applies it to its data |
+| `ondropchange` | `Option<ValueCallback<Option<(SortMove, SortVerdict)>>>` | `None` | For a drag that started in this list: the move on offer and its verdict each time it changes; `None` when nothing is on offer and when the drag ends |
+| `drag_keys` | `Option<SortKeys>` | `None` | What a drag from an item of this list carries, in order (a selection). The item alone when not given, or when the answer leaves the item out. Not checked against any list; `from_list` names the pressed item's list only |
+| `preview` | `SortPreview` | `Clone` | What follows the pointer in a drag from this list: `Clone` (a translucent copy at the grab offset), `None`, `Snapshot` (the runtime's picture; desktop only), `Custom(SortPreviewFn)` |
+| `indicator` | `SortIndicator` | `Caret` | How a place in this list is shown: `Caret`, `Gap` (the items slide apart), `Both`, `None`. A refused place never opens a gap |
+| `source` | `SortSource` | `Unchanged` | How this list's items look while a pointer drags them: `Unchanged`, `Dim`, `Collapse` (hidden, followers slide over), `Hide` |
+
+**SortableItem** — one item; focusable (`tabindex="0"`).
+
+| Prop | Type | Default | Description |
+|------|------|---------|-------------|
+| `value` | `String` | `""` | The item's key. (In a `for`, `key:` is the loop's key; give both) |
+| `handle` | `bool` | `false` | Drag only by a `SortableHandle` inside the item. The whole item drags otherwise |
+| `label` | `String` | `""` | The item's name in keyboard announcements (its key when empty) |
+| `disabled` | `bool` | `false` | No drag source (no `draggable`, no lift); it keeps its place and takes drops around it |
+
+**SortableHandle** — the part of a `handle: true` item a pointer drags it by. No props.
+
+`judge` and `drag_keys` are `Rc` closures, not `on*` props: write
+`judge: Some(Rc::new(|m: &SortMove| …) as SortJudge)`.
+
+**Types:**
+
+- `SortMove { group, keys: Vec<String>, from_list, to_list, place: SortPlace }`.
+- `SortPlace { after: Option<String>, before: Option<String>, index: usize }` — the carried items' neighbours by key once they are taken out of `to_list`; `is_first()` (no `after`), `is_last()` (no `before`); both `None` in an empty list. Settled again at the drop: found by `after`, with `before` and `index` read off the list as it is then.
+- `SortVerdict` — `Accept` or `Refuse(reason)`; `is_accept()`.
+- `SortAxis` — `Vertical` (default), `Horizontal`.
+- `SortJudge` = `Rc<dyn Fn(&SortMove) -> SortVerdict>`, `SortKeys` = `Rc<dyn Fn(&str) -> Vec<String>>`.
+- `sortable_drag_group() -> Option<String>` — the group of the drag in progress, pointer or keyboard.
+- `SortPreviewFn` = `Rc<dyn Fn(&mut RenderScope, &str) -> NodeHandle>` (gets the dragged item's key).
+- `sortable_drag() -> Option<SortDragState>` — reactive: `{ group, keys, source_key, from_list, keyboard, over: Option<SortTarget>, target: Option<SortTarget>, verdict: Option<SortVerdict> }`, `SortTarget { list, index }`.
+- `sortable_drag_pointer() -> Option<SortPointer>` — reactive, pointer drags: `{ x, y, grab_x, grab_y, width, height }`.
+
+**Custom properties** (inherited, with fallbacks; set them inline on a list —
+see [Sortable Lists](sortable.md#styling)): `--rinch-sortable-gap`,
+`-caret-color`, `-caret-size`, `-refused-color`, `-dragging-opacity`,
+`-reflow-duration`, `-reflow-easing`, `-ghost-opacity`, `-ghost-tilt`,
+`-ghost-scale`, `-ghost-shadow`, `-ghost-duration`, `-ghost-easing`,
+`-ghost-z-index` (the `-ghost-` ones read where the item is),
+`-reason-bg`, `-reason-color`, `-reason-font-size`, `-reason-radius`,
+`-reason-inset`, `-reason-padding`, `-reason-white-space`, `-reason-max-width`
+(each `--rinch-sortable-…`).
+
+**Classes**:
+`rinch-sortable` (`--vertical` / `--horizontal`, `--drop-into` and
+`--refused` on an empty list on offer), `rinch-sortable__item` (`--grab`,
+`--dragging`, `--lifted`, `--drop-before`, `--drop-after`,
+`--drop-horizontal`, `--refused`), `rinch-sortable__reason`
+(`--shown`, `--above`), `rinch-sortable__handle`, `rinch-sortable__live`.
 
 ---
 
@@ -1383,6 +1652,45 @@ Custom Default: `show_minimize`, `show_maximize`, `show_close` all default to `t
 | `on_minimize` | `Option<Callback>` | `None` | |
 | `on_maximize` | `Option<Callback>` | `None` | |
 | `on_close` | `Option<Callback>` | `None` | |
+
+### FloatingPanel
+
+A draggable, resizable floating panel for desktop app patterns — tool panels,
+property inspectors, floating toolbars. Position and size are controlled via
+`Signal<f32>` props (each defaults to an internal signal when not given —
+`x`/`y` default to `50.0`, `width` to `300.0`, `height` to `200.0`); the panel
+writes back to them during drag/resize.
+
+| Prop | Type | Default | Description |
+|------|------|---------|-------------|
+| `title` | `String` | `""` | Displayed in the panel header; header renders no title span when empty |
+| `x` | `Option<Signal<f32>>` | `None` | X position (viewport px) |
+| `y` | `Option<Signal<f32>>` | `None` | Y position (viewport px) |
+| `width` | `Option<Signal<f32>>` | `None` | Width (viewport px) |
+| `height` | `Option<Signal<f32>>` | `None` | Height (viewport px) |
+| `min_width` | `Option<f32>` | `None` | Minimum width constraint (falls back to `200.0`) |
+| `min_height` | `Option<f32>` | `None` | Minimum height constraint (falls back to `100.0`) |
+| `resizable` | `bool` | **`true`** | Whether the panel can be resized |
+| `on_close` | `Option<Callback>` | `None` | Shows a close button in the header when set |
+
+```rust
+let x = Signal::new(100.0);
+let y = Signal::new(100.0);
+let w = Signal::new(300.0);
+let h = Signal::new(200.0);
+
+rsx! {
+    FloatingPanel {
+        title: "Properties",
+        x: x,
+        y: y,
+        width: w,
+        height: h,
+        on_close: move || { /* hide panel */ },
+        div { "Panel content here" }
+    }
+}
+```
 
 ---
 

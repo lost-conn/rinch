@@ -2,6 +2,8 @@
 
 Rinch provides native menu support through the `muda` library. Menus use a unified builder API (`Menu` / `MenuItem`) shared between native window menus and system tray context menus.
 
+A build without the `native-menus` feature (`windowing` alone) has no muda and uses the same DOM bar on every platform; see [Without native menus](#without-native-menus).
+
 The builder API itself needs no windowing at all. Two targets have no native menu bar to attach a menu to — Linux, where muda wants a GTK window, and the browser, where there is no window menu — so both render the same menus out of DOM nodes instead. On the desktop that is automatic; on the web it is `rinch_web::mount_with_menu_bar`, covered in [Running on WASM](./wasm.md#mounting-with-a-menu-bar).
 
 ## Native Menus
@@ -75,6 +77,47 @@ let item = MenuItem::new("Save")
 | `shortcut(s)` | `impl Into<String>` | Keyboard shortcut |
 | `enabled(e)` | `bool` | Whether the item is clickable |
 | `on_click(cb)` | `impl Fn() + 'static` | Callback when activated |
+| `checkbox(label, signal)` | `Signal<bool>` | A checkbox item; see below |
+| `radio(label, signal, value)` | `Signal<T>`, `T` | One option of a radio group; see below |
+| `checked()` | | `Some(state)` for a checkbox or radio item, `None` otherwise |
+
+### Checkbox and radio items
+
+A checkbox or radio item is built over a `Signal`, and the signal *is* its
+state in both directions (issue #1520):
+
+```rust
+use rinch::menu::{Menu, MenuItem};
+
+let sounds = Signal::new(true);
+let speed = Signal::new("fast");
+
+let menu = Menu::new()
+    .item(MenuItem::checkbox("Play sounds", sounds))
+    .separator()
+    .item(MenuItem::radio("Fast", speed, "fast"))
+    .item(MenuItem::radio("Accurate", speed, "accurate"));
+
+// Read it back:  sounds.get(), speed.get()
+// Set it:        sounds.set(false) moves the check mark in every menu built
+//                from these items.
+```
+
+- **Activating** the item (a click, its shortcut, a tray menu) flips a
+  checkbox's signal, or writes a radio option's value to the group's signal,
+  *before* its `on_click` callback runs, so the callback reads the new state.
+  Activating the option that is already selected leaves it selected.
+- **Writing** the signal from anywhere moves the mark: in the native window
+  menu bar and a tray menu on Windows and macOS (muda `CheckMenuItem`s), in a
+  Linux tray menu (ksni), and in the DOM menu bar on Linux and in the browser
+  (a `rinch-app-menu-entry__check` mark before the label, with
+  `role="menuitemcheckbox"`/`"menuitemradio"` and `aria-checked`).
+- Every item built over one signal is one radio group. Keep a group's options
+  next to each other: the Linux tray draws a run of adjacent options of one
+  group as a single radio group.
+- The item follows the same lifetime rule as a callback: built during a render,
+  it belongs to that component, and once the component unmounts (freeing a
+  signal it created) the item stops toggling and its mark stops following.
 
 ## Menu Callbacks
 
@@ -96,7 +139,7 @@ Callbacks fire both when the user clicks the menu item and when the keyboard sho
 
 ### Callback lifetime
 
-A callback belongs to the component that **created** it — the scope that was rendering when you called `on_click`, which is where the closure captured its `Signal`s. When that component unmounts its signals are freed, so the item stops firing rather than reading freed state (reading a freed signal panics). The callback also runs *inside* that component, so a `Signal` it creates belongs there too.
+A callback belongs to the component that **created** it — the scope that was rendering when you called `on_click`, which is where the closure captured its `Signal`s. When that component unmounts its signals are freed, so the item stops firing rather than reading freed state (reading a freed signal panics). The callback also runs *inside* that component, so a `Signal` it creates belongs there too — and under the document (and, in an embedded `RinchContext`, the store namespace) that was current where the item was made, so an interceptor it registers is that window's, wherever the click arrives from. An item built outside any component (in `main`) belongs to no document and the thread-global store namespace, wherever it is shown: clicked in an embedded `RinchContext`'s DOM bar it does not see that context's stores (`use_store` panics for a store only the context created), so build such an item inside the context's component.
 
 Ownership is per item, not per menu: one `Menu` may collect items contributed by several components, and each item's callback stops on its own component's unmount. This holds however the item is activated — a native menu click, a tray click, the DOM menu bar on Linux or on the web, or the keyboard shortcut.
 
@@ -120,9 +163,15 @@ fn main() {
 
 A callback may rebuild the menu it was dispatched from — including registering new items and shortcuts — from inside its own handler.
 
-Menu ids are also released when the menu that registered them goes away: building a new native menu bar releases the previous bar's, and dropping a `TrayIcon` releases that tray's. Keep the `TrayIcon` for as long as you want its menu to work.
+Menu ids are also released when the menu that registered them goes away: building a new native menu bar releases the previous bar's, and dropping a `TrayIcon` releases that tray's after taking its icon off the panel. Keep the `TrayIcon` for as long as you want the tray. See [System Tray](platform.md#lifetime-and-threads) for why it has to stay on the thread that built it.
 
 A shortcut consumes the keystroke only when a callback actually runs. A chord belonging to a disabled item, to an item given a `shortcut` but no `on_click`, or to a component that has since unmounted falls through to the app instead of being swallowed — and never shadows a live duplicate of the same chord.
+
+**A shortcut with no Ctrl, Cmd or Alt leaves its key to a focused text field.** While an `<input>` that takes text, a `<textarea>`, the rich-text `Editor` (read-only included) or a custom text target (a `register_focus_target` entry with `on_ime`) holds the keyboard, a chord such as `"/"`, `"N"`, `"Shift+/"`, `"Space"` or `"Delete"` matches nothing: the field types or edits with the key, and the item fires once focus is elsewhere. The keys that yield are letters, digits, punctuation, `Space`, and `Enter`, `Backspace`, `Delete`, `Home`, `End`, `PageUp`, `PageDown` and the arrows. `Escape`, `Tab` and `F1`–`F12` do not, so a bare `"F5"` item still fires from inside a field, and neither does any chord holding Ctrl, Cmd or Alt — except, on Windows, a key AltGr typed: Windows reports AltGr as Ctrl+Alt, so a `"Ctrl+Alt+Q"` item leaves the `@` a German layout types with AltGr+Q to the field, and fires on a real Ctrl+Alt+Q (a press whose text is just the key's own character). On Linux and macOS AltGr is not Ctrl+Alt, and every Ctrl+Alt press is a chord. In the browser, "a text field" is the element the key event is dispatched at (`composedPath()[0]`, so a field inside a shadow root counts), and an element with `contenteditable` counts.
+
+**Other focused controls keep the keys they act on, too** (issue #1290): a closed `<select>` its arrows, `Home`, `End`, `PageUp`, `PageDown`, letters and digits (type-ahead), `Space` and `Enter`; a button, link, checkbox or `tabindex` control `Space` and `Enter`; a focused `RenderSurface` (in the browser, a `<canvas>`) and an open `<select>` popup every key pressed without Ctrl, Cmd or Alt — a game's `W` and `Escape`. A chord with Ctrl, Cmd or Alt still fires from all of them. `App::chord_yield(ChordYield::TextOnly)` (on the web, `rinch::menu::set_chord_yield` before mounting) turns this off: only text fields keep their keys, as before.
+
+**Native accelerators.** On macOS and Windows the window's native menu bar installs each item's accelerator, which the operating system matches before rinch sees the key — so it could not leave a key to a focused control. An item whose chord a control could keep (every chord without Ctrl, Cmd or Alt by default; under `TextOnly`, only the text-field keys) is therefore given **no native accelerator** and is matched by rinch, which asks the focused control first (issue #1284). On Windows the same goes for a Ctrl+Alt chord on a key AltGr can type with (letters, digits, punctuation). On Windows such an item's label still shows its key in the accelerator column; on macOS the label shows no key. This has not been measured on real macOS or Windows hardware.
 
 ## Submenus
 
@@ -141,18 +190,25 @@ let view_menu = Menu::new()
     );
 ```
 
+For a submenu inside a rendered `ContextMenu` or `DropdownMenu`, see
+[Submenus in rendered menus](#submenus-in-rendered-menus).
+
 ## Keyboard Shortcuts
 
 Shortcuts are specified as strings combining modifiers and a key, separated by `+`.
 
 ### Modifiers
 
-| Modifier | macOS | Windows/Linux |
-|----------|-------|---------------|
-| `Cmd` | Command | Ctrl |
-| `Ctrl` | Control | Ctrl |
-| `Alt` | Option | Alt |
+| Spelling | macOS | Windows / Linux |
+|----------|-------|-----------------|
+| `Ctrl`, `Cmd`, `Control`, `Meta`, `CmdOrCtrl`, `Command`, `Super`, `CommandOrControl` (also `CommandOrCtrl`, `CmdOrControl`) | one modifier: the native menu shows ⌘; the chord fires with Command **or** Control held | Ctrl; the chord also fires with the Windows/Super key held |
+| `Alt`, `Option` | Option | Alt |
 | `Shift` | Shift | Shift |
+
+rinch has no way to bind Control and Command separately on macOS: `"Ctrl+K"` and `"Cmd+K"` are the same shortcut.
+
+Modifiers come first and the key last, and a shortcut has exactly one key: `"Ctrl+Shift+C+A"`,
+`"Ctrl+N+Shift"` and an unknown modifier such as `"Hyper+N"` are not shortcuts (they warn, below).
 
 ### Supported Keys
 
@@ -178,6 +234,63 @@ Shortcuts are specified as strings combining modifiers and a key, separated by `
 **Symbols:**
 - `=`, `Equal`, `Plus`
 - `-`, `Minus`
+- `/`, `Slash` · `,`, `Comma` · `.`, `Period` · `;`, `Semicolon` · `'`, `Quote`
+- `[`, `BracketLeft` · `]`, `BracketRight` · `\`, `Backslash` · `` ` ``, `Backquote`
+
+**A shortcut names a key, not the character it types.** A character that needs
+Shift is spelled as its key plus `Shift`: `"Ctrl+Shift+/"`, not `"Ctrl+?"`.
+(Chrome 153 reports that keystroke as `key: "?"`, `code: "Slash"`,
+`shiftKey: true`.) The same holds for `Plus`, which is the `=` key *without*
+Shift. Punctuation and digit chords are always matched by the physical key and
+the modifiers held — the desktop by winit's `KeyCode`, the browser by
+`KeyboardEvent.code` — named by where it sits on a US layout; on another
+layout such a chord follows the key position, not the printed character.
+
+**A letter chord follows the character, not the physical position (issue
+#1170).** `"Ctrl+Z"` fires from whichever key is *labelled* Z, wherever the
+active keyboard layout put it — QWERTZ's Y/Z swap, AZERTY's A/Q swap — not
+necessarily from the US physical `KeyZ` position. Desktop reads this from
+winit's `key_without_modifiers` (ignoring Shift and Caps Lock); the browser
+reads `KeyboardEvent.key`, lowercased. When the active layout types no Latin
+letter at all for the pressed key — Cyrillic, Thai, Armenian, … — the chord
+falls back to the physical key instead, which is the only way such a layout
+can reach `Ctrl+C`/`Ctrl+V` at all (the same fix GNOME/GTK have discussed for
+their own non-Latin-layout bug). Digit and punctuation chords are never
+affected by any of this.
+
+An app (or a user) who wants shortcut *positions* to stay fixed regardless of
+the active layout can turn the character matching off:
+`App::shortcut_matching(ShortcutMatching::Physical)` on desktop, or
+`rinch_web::set_shortcut_matching(ShortcutMatching::Physical)` before mounting
+on the web — the same escape hatch VS Code's `keyboard.dispatch` setting and
+JetBrains' "use national layout for shortcuts" toggle offer. It affects only
+rinch's own chord matching; see the note on macOS/Windows below.
+
+**On macOS and Windows, a window menu bar's item stops going through rinch's
+own chord matching once its native accelerator has actually attached to the
+window** — the OS then resolves and matches the accelerator muda installs
+for it (`NSMenu` on macOS, an accelerator table on Windows) ahead of rinch
+ever seeing the key, so matching it a second time would risk firing the
+callback twice. That "actually attached" is a recorded fact, not a guess
+from which platform the build targets: a window whose handle was not a
+Win32 one, whose accelerator table failed to install, or that never attaches
+a native bar at all (a borderless window using the DOM bar instead) keeps
+matching through rinch's own registry, so its shortcuts are never silently
+unreachable. `ShortcutMatching::Physical` has no effect on an item once its
+accelerator has attached: the OS, not rinch, decides what counts as "the Z
+key" there, following its own per-layout accelerator resolution (character-
+based on both platforms, like rinch's default). Linux has no such OS-level
+menu-accelerator integration and never attaches one, so its native bar,
+every system-tray item, and the DOM menu bar (the browser, and Linux's own
+in-app bar) all go through rinch's chord matching — and the override —
+exactly as described above. An item whose chord a focused control could keep gets no native accelerator
+at all and is matched by rinch (see "Native accelerators" above, #1284).
+
+A shortcut string that names no key (`"Ctrl+?"`, a typo) registers no chord and
+logs one `tracing` warning per distinct string. The DOM menu bar (Linux, the
+browser) still prints the string beside the item; the native menu on macOS and
+Windows derives its accelerator from the same parse as the chord, so it shows
+one exactly when a chord is armed.
 
 ### Examples
 
@@ -218,7 +331,7 @@ so a `top: 0` overlay slides underneath the bar. The bar publishes its height as
 `--rinch-window-top-inset`, and full-height overlays should offset by it:
 
 ```rust
-div { style: "position: fixed; top: var(--rinch-window-top-inset, 0px); bottom: 0;" }
+div { style: "position: fixed; top: var(--rinch-window-top-inset, 0px); bottom: 0; left: 0; right: 0;" }
 ```
 
 `Drawer`, `Modal`, and top-anchored `Notification`s already handle this. See
@@ -256,6 +369,45 @@ a root-level overlay behind a borderless window's container sat above the bar at
 *any* `z-index`, because the two numbers were never compared at all. Code that
 relied on that asymmetry needs a real `z-index` now.
 
+### Without native menus
+
+The native menus are the `native-menus` feature, which `desktop` turns on. On
+Linux muda links GTK 3 and libxdo, though a Linux window never shows a native
+menu, so an app that shows no OS menu bar (a layer-shell panel or dock, a
+borderless overlay, a game) can leave it out (#2435):
+
+```toml
+rinch = { version = "…", default-features = false, features = ["windowing", "gpu-renderer"] }
+```
+
+`windowing` is `desktop` without `native-menus`, and `gpu-renderer` is the GPU
+renderer on it (`gpu` is `desktop` plus `gpu-renderer`). Such a build links no
+muda, and on Linux no GTK 3 and no libxdo; it needs neither `libgtk-3-dev` nor
+`libxdo-dev` to build.
+
+The whole menu API stays: `Menu`, `MenuItem`, `App::menu`, shortcuts,
+callbacks, checkbox and radio items, `render_with_menu_bar` and
+`register_menu_shortcuts`. What a `Menu` set on a window does:
+
+| | with `native-menus` | without |
+|---|---|---|
+| Linux | the DOM bar | the DOM bar, the same |
+| Windows | the Win32 menu bar (the DOM bar in a borderless window) | the DOM bar |
+| macOS | the application menu bar | the DOM bar |
+
+Without native menus the bar's chords and callbacks are armed the way the web
+arms them, through `register_menu_shortcuts`, when the window's content mounts,
+and released when it is torn down; with them, building the native bar arms
+them before the event loop starts. On Windows and macOS the DOM bar is logged
+once at `debug` level. A tray (`system-tray`) shows muda's menus, so it turns
+`native-menus` on.
+
+`a11y`, `collaboration` and `global-hotkeys` imply `windowing`, not `desktop`:
+none of them needs the native menus. So an app that lists one of the three
+with neither `desktop` nor `native-menus` (with `default-features = false`)
+gets the DOM bar for `App::menu` on macOS and Windows too. Add `native-menus`
+(or `desktop`) to keep the OS menu bar there.
+
 ## Context Menus
 
 ### Rendered Context Menu
@@ -280,9 +432,88 @@ ContextMenu {
 
 The `ContextMenu` component automatically:
 - Wires up the `oncontextmenu` handler on the target
-- Positions the dropdown at the click coordinates using `position: fixed`
+- Positions the dropdown at the click coordinates: it hangs from the pointer, or
+  stands on it when there is little room below, and starts at the pointer, or
+  ends there when its minimum width does not fit to the right
+- Closes on Escape and answers the arrow keys (see below)
+- Keeps it inside the window: a menu that would run past the bottom or right edge
+  is shifted back by its overflow, 4px from the edge, as native menus are; a menu
+  taller than the whole window starts 4px below the top and scrolls
 - Shows an invisible overlay for click-outside-to-close
 - Reuses `DropdownMenuItem` and `DropdownMenuDivider` for consistent styling
+
+### Submenus in rendered menus
+
+`DropdownMenuSub` is a row that opens a cascading submenu (a *flyout*) beside
+it. It goes in a `ContextMenuDropdown`, a `DropdownMenuDropdown` or another
+`DropdownMenuSub`, to any depth; its children are the flyout's items:
+
+```rust
+ContextMenuDropdown {
+    DropdownMenuItem { onclick: || open(), "Open" }
+    DropdownMenuSub { label: "New", left_section: TablerIcon::Plus,
+        DropdownMenuItem { onclick: || new_file(), "File" }
+        DropdownMenuItem { onclick: || new_folder(), "Folder" }
+        DropdownMenuSub { label: "From template",
+            DropdownMenuItem { onclick: || from_template("report"), "Report" }
+        }
+    }
+    DropdownMenuSub { label: "Sync", disabled: true,
+        DropdownMenuItem { "Now" }
+    }
+}
+```
+
+It behaves like Chrome's own context menu, and every choice is a prop
+(see [Component Props › DropdownMenuSub](component-props.md)):
+
+- Hovering the row opens the flyout after 400ms (`open_delay`); a press opens it
+  at once (`open_on_click`); `open_on_hover: false` leaves only the press and the
+  keys.
+- Moving onto another row of the same menu closes it after 400ms
+  (`close_delay`), so a diagonal move across a neighbouring row on the way into
+  the flyout keeps it, and a submenu row merely crossed on the way (into a
+  flyout, or out of the menu) does not open. Leaving the menu altogether keeps an
+  open submenu open, as Chrome does.
+  `safe_triangle: true` adds a pointer-direction tolerance instead (pair it with a
+  short `close_delay`).
+- It opens to the right of its menu, overlapping it by 3px, its first row level
+  with the row that opened it; at the window's right edge it opens on the left
+  (`flip`), and at the bottom it moves up (`shift`). It is never clipped by its
+  menu's own overflow, on the desktop or in a browser. A flyout whose content
+  changes size while open is placed again; a window resize or a display scale
+  change closes it, as Chrome
+  closes its menus (`close_on_resize: false` places it again instead). A page
+  scrollbar appearing is not a resize.
+- Choosing an item anywhere in the tree closes the whole menu, `ContextMenu`
+  included. A `disabled` submenu never opens.
+- Style it per menu through the cascade: `--rinch-dropdown-menu-sub-offset`,
+  `--rinch-dropdown-menu-sub-width`, the `.rinch-dropdown-menu__sub-chevron`
+  icon (or `chevron` / `hide_chevron`), and the `.rinch-dropdown-menu__sub--opened`
+  state class all reach the flyout from a class on the menu or any ancestor.
+
+### Keyboard in rendered menus
+
+While a `ContextMenu` or `DropdownMenu` is open it takes the keys Chrome's menus
+do (`keyboard_nav`, on by default):
+
+| Key | Does |
+|-----|------|
+| ArrowDown / ArrowUp | Next / previous item of the menu the focus is in, wrapping (`loop_focus`). With the focus outside the menu (opened with the mouse), the first / last item |
+| Home / End | First / last item |
+| A letter or digit | Type-ahead (`typeahead`): the next item whose label starts with it; a single match is activated |
+| Enter / Space | Activate the focused item |
+| ArrowRight / Enter / Space on a submenu row | Open it and focus its first item |
+| ArrowLeft in a submenu | Close that submenu; the focus goes back to its row |
+| Escape | Close the innermost open submenu, else the menu (`close_on_escape`); the focus goes back to where it was |
+
+A text field keeps its own keys: nothing is taken while one holds the focus.
+`on_key` is offered every key first, as an escape hatch.
+
+A `DropdownMenu` closes (through `on_close`) when the focus leaves it — its
+trigger and its panel — or the window loses the keyboard: Tab past its last
+item closes it and moves on, as a WAI-ARIA menu button's menu does
+(`close_on_focus_leave: false` turns it off).
 
 ### oncontextmenu Event
 

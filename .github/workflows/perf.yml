@@ -1,0 +1,437 @@
+name: Perf
+
+# Instruction-count regression check (`crates/rinch-bench`).
+#
+# It runs the Gungraun/Callgrind benchmarks on a commit and on that commit's
+# FIRST PARENT, and compares Callgrind's `Ir` (instructions executed by each
+# measured operation) per benchmark. Two events run it (see
+# `instruction-counts` below; every other run reports the job as skipped):
+#
+#   * a PUSH to `main` (a batch's merge commit): head `github.sha`, base its
+#     first parent, the `main` it landed on. So each batch's cost is measured
+#     exactly once, after it lands. There is no label escape hatch here: a
+#     failure is a red `main`, which the lead fixes forward or reverts. The
+#     report is the job summary only.
+#   * a BATCH pull request (head branch `batch/…`) that carries the `perf`
+#     label, an opt-in for measuring before merging: head is the merge commit
+#     GitHub builds for the PR (`refs/pull/N/merge`), base its first parent,
+#     the tip of `main` it was merged onto. So the Δ answers "what does merging
+#     this do to main as it is now". Every re-run, label event included,
+#     re-bases on the main of that moment. Comparing against
+#     `pull_request.base.sha` instead would be wrong: that is the base recorded
+#     at the PR's last push, so once main moves, other PRs' changes count as
+#     this one's (review of #903, D1). A component PR, and a batch PR without
+#     the label, skip the job.
+#
+# Instruction counts, not wall time: a hosted runner's timings move with its
+# neighbours' load, and a count moves only when the code does. Two runs of one
+# binary agree to within about 0.03%. The bench arena in
+# `crates/rinch-bench/src/alloc.rs` is what makes that true: without it, glibc's
+# free lists moved one benchmark by 7% between identical runs.
+#
+# The base run first uses the HEAD's benchmark sources: `crates/rinch-bench`
+# is copied over the base checkout before it builds, so both sides run exactly
+# the same scenarios against two versions of the library. If those sources do
+# not build or run on the base -- usually a PR adding a benchmark that calls an
+# API the same PR introduces (#1036) -- the base runs its OWN copy instead
+# (`.github/scripts/perf_bench_base.sh`), so every benchmark both copies define
+# is still compared and one only the head defines shows as `new`. The report
+# lists which benchmarks were compared and which were not. In that fallback, a
+# head copy that EDITS an existing scenario (rather than only adding) fails the
+# check unless labelled, since a cheaper scenario could hide a regression
+# (`.github/scripts/perf_bench_changes.py`). Only if neither copy
+# runs is there no baseline:
+#   * base has no `crates/rinch-bench` yet (the PR that adds it): the report
+#     shows the head alone and passes;
+#   * base HAS the crate and neither copy ran (its own benchmarks panic, or
+#     the base is broken): the check FAILS, since otherwise breaking the
+#     benchmarks would be a way past the gate. The `perf-regression-accepted`
+#     label downgrades this to a warning, as it does a regression.
+#
+# Reading it, running it locally and the escape hatch:
+# `docs/src/guide/performance.md#ci-regression-job`.
+#
+#   * threshold — `vars.PERF_REGRESSION_THRESHOLD` (a repository variable,
+#     percent; default 3). A benchmark whose `Ir` grows by more than that fails
+#     the job.
+#   * escape hatch (pull requests only) — the `perf-regression-accepted` label
+#     turns that failure into a warning. Adding or removing THAT label or
+#     `perf` re-runs the check; any other label does nothing (the job's `if` skips, and its concurrency group is
+#     job-level, so a skipped run cannot cancel a real one — D2).
+#   * report — the job summary always. For a same-repository PR, also one PR
+#     comment, updated in place, from the separate `comment` job: the only job
+#     with `pull-requests: write`. The comment is found by its
+#     `<!-- rinch-perf-bench -->` marker AND the github-actions bot as author.
+#     A PR from a fork gets a read-only token, so its report is the job
+#     summary only.
+#
+# Cache (D3). Only the registry dependencies are worth caching. Cargo judges a
+# workspace crate's freshness by source mtimes, and a fresh checkout makes
+# every workspace crate look stale, so those crates rebuild on every run
+# whatever the cache holds. `Swatinem/rust-cache` caches the dependency
+# artifacts and prunes the workspace crates' ones before saving, which keeps the
+# entry to one dependency tree rather than two full release target dirs. That
+# matters because this entry shares the repository's 10 GB Actions cache with
+# ci.yml's. Only a push to `main` writes it (`seed-cache`), and only when
+# the key misses. The key hashes every Cargo.lock/Cargo.toml, the toolchain
+# and the compiler env, so a main push that changes none of them finishes in
+# about a minute on an exact hit. PR runs only read it, which gives every PR the main-scoped entry and no
+# PR can evict it with its own. PR runs restore it into the head's target dir
+# and copy that to the base's: both sides build the same dependency graph
+# unless the PR changes Cargo.lock.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    # A docs-only PR changes no benchmarked code (S4). NB: if `Perf` is ever made
+    # a REQUIRED check, replace this with a changes-filter job, since a
+    # paths-filtered required check stays pending forever on a skipped PR.
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+  # Called by `base-changed.yml` when a PR's base branch becomes `main` (#448):
+  # a base change fires only `edited`, which is not listed above on purpose.
+  # `paths-ignore` does not apply to a call.
+  workflow_call:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # One target dir PER CHECKOUT, never shared. Cargo hashes a path
+  # dependency's identity relative to its workspace root, so `base/` and
+  # `head/` produce the same artifact names in one target dir. Its freshness
+  # check compares source mtimes with the artifact's, so whichever checkout
+  # builds first leaves artifacts newer than the other checkout's files, and
+  # cargo reuses them. Measured on #903's second run, once `main` had moved: the
+  # head's `rinch` compiled against the base's `rinch-editor-view` and failed
+  # with ten "not found" errors.
+  CARGO_TARGET_DIR_BASE: ${{ github.workspace }}/target-base
+  CARGO_TARGET_DIR_HEAD: ${{ github.workspace }}/target-head
+  # Ir only. The cache simulation is ~1.6x slower and adds nothing this check
+  # reads. The per-bench parallelism is safe because every benchmark is its own
+  # Valgrind process.
+  BENCH_ARGS: --output-format=json --callgrind-args=--cache-sim=no --parallel=auto
+  ACCEPT_LABEL: perf-regression-accepted
+
+jobs:
+  # Push to main: build the dependency graph and save it for PRs. No benchmarks.
+  seed-cache:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          path: head
+          persist-credentials: false
+
+      # The head's pin, exported as RUSTUP_TOOLCHAIN (`override`), so the key
+      # below is for the same compiler `instruction-counts` asks for.
+      - name: Install Rust toolchain
+        uses: ./head/.github/actions/rust-toolchain
+        with:
+          path: head
+          override: true
+
+      - name: Restore cargo cache
+        id: cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: perf
+          workspaces: head -> ../target-head
+          save-if: true
+
+      - name: Free disk space
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Install system dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        # Cached .debs, and the Google Chrome apt source dropped first
+        # (.github/actions/apt-install explains both, #1792).
+        uses: ./head/.github/actions/apt-install
+        with:
+          packages: >-
+            libgtk-3-dev libglib2.0-dev libatk1.0-dev libcairo2-dev
+            libpango1.0-dev libgdk-pixbuf-2.0-dev libxdo-dev
+
+      # An exact hit means the dependency tree is already cached for this
+      # Cargo.lock and toolchain: there is nothing to build or save.
+      - name: Build the benchmarks (fills the cache)
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: head
+        run: CARGO_TARGET_DIR="$CARGO_TARGET_DIR_HEAD" cargo bench -p rinch-bench --no-run
+
+  instruction-counts:
+    # Batched merges (docs/internals/ci.md): a push to `main` is always
+    # measured, against its first parent. A pull request is measured only when
+    # its head branch starts with `batch/` AND it carries the `perf` label. Any
+    # other run skips this job by this job-level `if`, so the required
+    # `instruction-counts` check reports as skipped (which passes) rather than
+    # pending; never move this into a trigger path filter. Put the `perf` and
+    # `perf-regression-accepted` labels on the BATCH PR. `github.head_ref` is
+    # the caller's inside a call from `base-changed.yml`, so a retargeted
+    # labelled batch PR is measured too.
+    #
+    # A label event re-runs the check only for a label that changes whether it
+    # runs (`perf`) or its verdict (`perf-regression-accepted`). Removing
+    # `perf` gives a skipped run, which is the newest check of that name.
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' &&
+       startsWith(github.head_ref, 'batch/') &&
+       contains(github.event.pull_request.labels.*.name, 'perf') &&
+       ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+        github.event.label.name == 'perf' ||
+        github.event.label.name == 'perf-regression-accepted'))
+    # Job-level, not workflow-level: a run whose job is skipped (an unrelated
+    # label) never enters the group, so it cannot cancel a real run (D2).
+    # A PR's superseded run is cancelled. Each push to `main` has a group of
+    # its own (keyed on `github.sha`), so no push waits for, cancels or
+    # replaces another: every batch merge is measured. Keying on the ref would
+    # not do that, since GitHub keeps one PENDING run per group and a third
+    # push would replace the waiting one. Parallel runs are fine: instruction
+    # counts do not depend on the runner's load.
+    concurrency:
+      group: perf-${{ github.event_name == 'push' && github.sha || github.event.pull_request.number }}
+      cancel-in-progress: ${{ github.event_name != 'push' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      # A PR's merge commit (`refs/pull/N/merge`), or on a push the pushed
+      # commit (`github.sha`): the default ref of each event.
+      - name: Check out the head
+        uses: actions/checkout@v4
+        with:
+          path: head
+          # HEAD^1, the first parent, is the base this run compares against.
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Resolve the base (the head's first parent)
+        id: refs
+        run: |
+          head_sha=$(git -C head rev-parse HEAD)
+          base_sha=$(git -C head rev-parse HEAD^1)
+          echo "head=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "base=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "merge $head_sha, first parent $base_sha"
+
+      # The scripts this job runs, against fakes: seconds, and before any build.
+      - name: Self-test the Perf scripts
+        run: python3 head/.github/scripts/test_perf_scripts.py
+
+      # The head's pinned version, exported as RUSTUP_TOOLCHAIN (`override`) so
+      # that BOTH sides are compiled by it. Without that each `cargo` would read
+      # the `rust-toolchain.toml` of the checkout it runs in, and a PR that
+      # moves the pin would compare the base under the old compiler with the
+      # head under the new one: a table of codegen differences that reads as a
+      # regression of the PR's source (#736). So this job never measures what a
+      # toolchain bump itself costs; compare two `main` runs for that.
+      - name: Install Rust toolchain
+        uses: ./head/.github/actions/rust-toolchain
+        with:
+          path: head
+          override: true
+
+      # BEFORE the base checkout: rust-cache hashes every Cargo.toml/Cargo.lock
+      # under the workspace into its key, and the seed job has only `head/`.
+      # With `base/` present too, no key could ever match the seeded one.
+      - name: Restore cargo cache (read-only; `seed-cache` writes it)
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: perf
+          workspaces: head -> ../target-head
+          save-if: false
+
+      - name: Check out the base
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.refs.outputs.base }}
+          path: base
+          persist-credentials: false
+
+      # Same reclaim as ci.yml's `test` job: a release build of this workspace
+      # needs the headroom (see the debug-info note in ci.yml's `env`).
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Install system dependencies
+        # Cached .debs, and the Google Chrome apt source dropped first
+        # (.github/actions/apt-install explains both, #1792).
+        # `rinch` is built with `desktop` (the software shell), which links GTK
+        # through muda; valgrind runs the benchmarks.
+        uses: ./head/.github/actions/apt-install
+        with:
+          packages: >-
+            valgrind libgtk-3-dev libglib2.0-dev libatk1.0-dev libcairo2-dev
+            libpango1.0-dev libgdk-pixbuf-2.0-dev libxdo-dev
+
+      - name: Check valgrind
+        run: valgrind --version
+
+      - name: Seed the base's target dir from the same cache
+        run: |
+          if [ -d "$CARGO_TARGET_DIR_HEAD" ]; then
+            cp -a "$CARGO_TARGET_DIR_HEAD" "$CARGO_TARGET_DIR_BASE"
+          fi
+
+      - name: Resolve the Gungraun version
+        id: gungraun
+        run: |
+          # The runner binary must be exactly the library's version, or the
+          # harness refuses to run. The head's Cargo.lock says which that is.
+          version=$(grep -A1 '^name = "gungraun"$' head/Cargo.lock | grep '^version' | head -1 | cut -d'"' -f2)
+          # It comes from the PR's own Cargo.lock: accept a version, nothing else.
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::unexpected gungraun version '$version' in Cargo.lock"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "gungraun $version"
+
+      - name: Cache gungraun-runner
+        id: runner-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/gungraun-runner
+          key: ${{ runner.os }}-gungraun-runner-${{ steps.gungraun.outputs.version }}
+
+      - name: Install gungraun-runner
+        if: steps.runner-cache.outputs.cache-hit != 'true'
+        env:
+          GUNGRAUN_VERSION: ${{ steps.gungraun.outputs.version }}
+        run: cargo install gungraun-runner --version "$GUNGRAUN_VERSION" --locked
+
+      # Head's benchmark sources first, the base's own if those do not build or
+      # run there (#1036); `.github/scripts/perf_bench_base.sh` says why.
+      - name: Benchmark base
+        id: base
+        env:
+          BASE_DIR: base
+          HEAD_DIR: head
+          OUT: ${{ runner.temp }}/base.jsonl
+          DIFF_OUT: ${{ runner.temp }}/base.sources-diff
+        run: |
+          CARGO_TARGET_DIR="$CARGO_TARGET_DIR_BASE" GUNGRAUN_HOME="$RUNNER_TEMP/gungraun-base" \
+            bash head/.github/scripts/perf_bench_base.sh
+
+      - name: Benchmark head
+        id: head
+        working-directory: head
+        run: |
+          CARGO_TARGET_DIR="$CARGO_TARGET_DIR_HEAD" GUNGRAUN_HOME="$RUNNER_TEMP/gungraun-head" \
+            cargo bench -p rinch-bench -- $BENCH_ARGS > "$RUNNER_TEMP/head.jsonl"
+
+      # Runs even when a benchmark step failed, so the report (and the PR
+      # comment) never keeps a previous run's green table (S2).
+      - name: Compare
+        id: compare
+        if: always() && steps.refs.outcome == 'success'
+        env:
+          THRESHOLD: ${{ vars.PERF_REGRESSION_THRESHOLD || '3' }}
+          # Always false on a push: main has no escape hatch.
+          ACCEPTED: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'perf-regression-accepted') }}
+          BASE_SHA: ${{ steps.refs.outputs.base }}
+          HEAD_SHA: ${{ steps.refs.outputs.head }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_HAS_CRATE: ${{ steps.base.outputs.has_crate }}
+          BASE_RAN: ${{ steps.base.outputs.ran }}
+          BASE_SOURCES: ${{ steps.base.outputs.sources }}
+          BASE_SOURCES_CHANGED: ${{ steps.base.outputs.sources_changed }}
+          HEAD_OUTCOME: ${{ steps.head.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        # The flag wiring lives in the script so the self-test can run it with
+        # THIS env block (it parses the `steps.base.outputs.*` lines above).
+        run: bash head/.github/scripts/perf_compare_step.sh
+
+      - name: Upload the report for the comment job
+        if: always() && steps.compare.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-report
+          path: ${{ runner.temp }}/report.md
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Fail on a regression or a broken comparison
+        if: always() && steps.compare.outcome == 'success' && steps.compare.outputs.status != '0'
+        env:
+          STATUS: ${{ steps.compare.outputs.status }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          case "$STATUS" in
+            1) echo "A benchmark regressed past the threshold, the base ran its own benchmark sources and this change edits an existing scenario, or neither copy ran on a base that has them; see the job summary."
+               if [ "$EVENT" = "push" ]; then
+                 echo "This is main: fix it forward or revert the batch (no label applies to a push)."
+               else
+                 echo "If that is intended, add the '${ACCEPT_LABEL}' label."
+               fi ;;
+            2) echo "perf_compare.py failed (a malformed input or a crash in the script). That is a bug in this workflow, not a regression, and the label cannot fix it." ;;
+            3) echo "The head's benchmarks did not build or run; see the 'Benchmark head' step." ;;
+            *) echo "Unexpected status $STATUS." ;;
+          esac
+          exit 1
+
+  # Posts the report. The only job that can write to the PR, and it runs no PR code.
+  comment:
+    needs: instruction-counts
+    if: >-
+      always() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (needs.instruction-counts.result == 'success' || needs.instruction-counts.result == 'failure')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Download the report
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: perf-report
+          path: report
+
+      - name: Post or update the PR comment
+        if: steps.download.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'report/report.md';
+            if (!fs.existsSync(path)) { core.info('no report to post'); return; }
+            const body = fs.readFileSync(path, 'utf8');
+            const marker = '<!-- rinch-perf-bench -->';
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments,
+              { owner, repo, issue_number, per_page: 100 });
+            // Ours only: a human comment quoting the marker is not ours to edit (S3).
+            const mine = comments.find(c =>
+              c.user && c.user.login === 'github-actions[bot]' &&
+              c.body && c.body.startsWith(marker));
+            if (mine) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }

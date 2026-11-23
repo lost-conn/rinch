@@ -8,12 +8,18 @@ description = "Cross-platform audio/video device access for rinch"
 [dependencies]
 # Always available
 rinch-core = { workspace = true }
+# The processor an output's audio thread runs (`audio::dsp`); dependency-free, so the same crate
+# compiles into the raw module an AudioWorklet instantiates.
+rinch-dsp = { workspace = true }
 tracing = { workspace = true }
 thiserror = "2"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # Audio (desktop)
-cpal = { version = "0.15", optional = true }
+cpal = { version = "0.18", optional = true }
+# `audio::dsp`: the bounded, preallocated single-producer rings between the app and the output's
+# audio thread (no allocation or lock there). Zero dependencies.
+rtrb = { version = "0.3", optional = true }
 # Camera (desktop)
 nokhwa = { version = "0.10", features = ["input-native"], optional = true }
 
@@ -32,6 +38,7 @@ web-sys = { version = "0.3", features = [
     "MediaTrackConstraints",
     "MediaTrackConstraintSet",
     "HtmlVideoElement",
+    "HtmlMediaElement",
     "HtmlCanvasElement",
     "HtmlElement",
     "CssStyleDeclaration",
@@ -50,9 +57,55 @@ web-sys = { version = "0.3", features = [
     "AudioBuffer",
     "GainNode",
     "GainOptions",
+    "AudioContextState",
+    "BaseAudioContext",
+    "EventTarget",
+    "AddEventListenerOptions",
+    # `audio::dsp` on the web: the processor runs in an AudioWorklet.
+    "AudioWorklet",
+    "AudioWorkletNode",
+    "AudioWorkletNodeOptions",
+    "Worklet",
+    "MessagePort",
+    "MessageEvent",
+    "Event",
+    "Blob",
+    "BlobPropertyBag",
+    "Url",
 ] }
 
 [features]
 default = []
-audio = ["dep:cpal"]
+audio = ["dep:cpal", "dep:rtrb"]
 camera = ["dep:nokhwa"]
+# `rinch_av::testing`: count device opens and deny them, for an app's test
+# that its UI opens no device until asked. Off by default, so no build an
+# app ships has the switch; turn it on from a dev-dependency.
+test-util = []
+
+# Browser tests, synthetic sources only (an OscillatorNode, a canvas
+# stream): no camera, no microphone, no permission prompt. Run with
+#     CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+#     cargo test -p rinch-av --features audio,camera --target wasm32-unknown-unknown
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+web-sys = { version = "0.3", features = [
+    "OscillatorNode",
+    "ChannelMergerNode",
+    "console",
+    "AudioContextOptions",
+    "AudioParam",
+    "AudioScheduledSourceNode",
+    "MediaStreamAudioDestinationNode",
+    "MediaStreamTrackState",
+    "AudioContextState",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "Window",
+    "Document",
+    "NodeList",
+    "Node",
+    "HtmlMediaElement",
+    # `audio::dsp`'s sample test renders through an offline context.
+    "OfflineAudioContext",
+] }

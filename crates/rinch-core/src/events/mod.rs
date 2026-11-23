@@ -3,9 +3,12 @@
 //! This module provides the event handler registry that maps element IDs
 //! to Rust callbacks, enabling reactive event handling in the UI.
 
+mod app_key;
 mod configuration;
 mod dismiss;
+mod display;
 mod drag;
+mod drag_auto_scroll;
 mod drag_context;
 mod handlers;
 mod keyboard;
@@ -14,15 +17,58 @@ mod paste;
 mod selection;
 
 // Re-export all public items so external code continues to work.
+pub use app_key::*;
 pub use configuration::*;
 pub use dismiss::*;
+pub use display::*;
 pub use drag::*;
+pub use drag_auto_scroll::*;
 pub use drag_context::*;
 pub use handlers::*;
 pub use keyboard::*;
 pub use modifier::*;
 pub use paste::*;
 pub use selection::*;
+
+/// Marks a `data-rid` element as an **outside-press backdrop** (issue #1093).
+///
+/// A `data-rid` is a `click`, and a click is a primary-button press only: a
+/// right or middle press runs no `data-rid`, on either backend. A backdrop is
+/// the exception. Dismissing an overlay on a press outside it is a `mousedown`
+/// of **any** button — a native menu closes on a right press outside it, and so
+/// does Mantine's `useClickOutside` — so a `data-rid` element that also carries
+/// this attribute is dispatched for every button. It is one of rinch's `data-`
+/// boolean attributes: on unless its value is `false` (any case), read with
+/// [`crate::dom::data_attr_is_on`], and written by presence from a `bool`
+/// ([`crate::dom::is_boolean_attribute`]), so a reactive `false` removes it. Every dismiss
+/// backdrop in `rinch-components` and the DOM menu bar carries it; a custom
+/// overlay's backdrop should too.
+pub const BACKDROP_ATTRIBUTE: &str = "data-backdrop";
+
+/// Exempts a subtree from an overlay's **scroll lock** (issue #701).
+///
+/// While a `Modal`/`Drawer` with `lock_scroll` is open — or any overlay that
+/// called [`NodeHandle::set_scroll_locked`](crate::dom::NodeHandle::set_scroll_locked)
+/// — desktop refuses a wheel or scrollbar gesture on a scroll container that is
+/// not inside the locking overlay's root. That is right for the page behind the
+/// overlay and wrong for a scroll container that is neither: a popup or menu
+/// that paints over the overlay from outside its root (a `<body>` portal, window
+/// chrome). Such a container carries this attribute, on itself or on an
+/// ancestor, and keeps its own wheel and its own scrollbar. The mark exempts
+/// everything under the marked node, with one exception: on a node that
+/// contains a locking overlay's root (`<body>`, an app wrapper) it is ignored,
+/// so it cannot unlock the page behind that overlay. It is not checked against
+/// paint order: a marked scroller the overlay covers scrolls too when the
+/// wheel is over it.
+///
+/// One of rinch's `data-` boolean attributes: on unless its value is `false`
+/// (any case), read with [`crate::dom::data_attr_is_on`], and written by
+/// presence from a `bool` ([`crate::dom::is_boolean_attribute`]), so a reactive
+/// `false` removes it. The DOM menu bar's dropdowns and submenu flyouts carry
+/// it. It has no reader on the web and needs none: the lock there is
+/// `overflow: hidden` on `<html>`, which stops the page and no scroll container
+/// inside it.
+pub const SCROLL_LOCK_EXEMPT_ATTRIBUTE: &str = "data-scroll-lock-exempt";
 
 use std::cell::RefCell;
 
@@ -37,7 +83,7 @@ pub struct TextHitInfo {
     /// Byte offset within the block's text content.
     pub byte_offset: usize,
     /// The DOM node ID of the inline root element.
-    pub inline_root_node_id: usize,
+    pub inline_root_node_id: u64,
     /// Whether this hit info is valid (was actually resolved from layout).
     pub valid: bool,
 }
@@ -171,6 +217,23 @@ impl AncestorBounds {
 thread_local! {
     pub(crate) static CLICK_ANCESTORS: RefCell<Vec<AncestorBounds>> =
         const { RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    pub(crate) static CLICK_LINK: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// The link the click being dispatched went through: the `href` of the
+/// nearest `<a href>` from the element pressed up to the element whose
+/// handler runs (that element included). `None` outside a click handler, for
+/// a press on no link, and for a keyboard activation.
+///
+/// This is how a handler on a container learns which link inside it was
+/// clicked, for HTML it did not build itself (`set_inner_html`): read it in
+/// the container's `onclick`. The `href` is as written; check its scheme
+/// before acting on it.
+pub fn click_link() -> Option<String> {
+    CLICK_LINK.with(|c| c.borrow().clone())
 }
 
 /// Ancestors of the most recently dispatched click target, ordered from

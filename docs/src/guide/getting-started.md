@@ -4,9 +4,21 @@ From zero to window in about ninety seconds.
 
 ## Prerequisites
 
-- **Rust nightly** (Rinch uses a few unstable features — `let_chains`, etc.)
+- **Stable Rust**, edition 2024. Rinch itself is built and tested with the one
+  version its `rust-toolchain.toml` names (1.99.0 today); no nightly feature is
+  needed.
 - A C/C++ compiler (Stylo has native dependencies)
 - On Linux: `libfontconfig-dev` and `pkg-config` (for font discovery)
+
+Building the repository's own examples needs more. `ui-zoo-desktop` and
+`video-call` use real-time audio and video (rinch-rtc's `media` feature:
+H.264 and Opus, built from source, which needs cmake), so on Debian or
+Ubuntu they also need `libclang-dev` (bindgen, for the camera bindings) and
+`libasound2-dev` (audio); `nasm` is optional (openh264's assembly). VP8 is
+opt-in (rinch-rtc's `media-vp8`, which neither example turns on) and needs
+`libvpx-dev` as well. rinch-rtc's tests and
+`cargo clippy --workspace --all-targets` also need `libssl-dev`, for the
+test-only interop peer, which links the system OpenSSL.
 
 ## Create a Project
 
@@ -24,12 +36,27 @@ rinch = { git = "https://github.com/joeleaver/rinch.git", features = ["desktop",
 ```
 
 **What the features do:**
-- `"desktop"` — windowing, event loop, software renderer. Required for desktop apps.
+- `"desktop"` — windowing, event loop, software renderer and the native menus. Required for desktop apps: it is `"windowing"` and `"native-menus"` together.
+- `"windowing"` — `"desktop"` without the native menus: an app that never shows an OS menu bar (a layer-shell panel, a borderless overlay, a game) takes this with `default-features = false`, and on Linux links no GTK 3 and no libxdo. A `Menu` set on its window is the in-document bar on every platform (see [Menus](menus.md#without-native-menus)).
+- `"native-menus"` — the OS menu bar (Windows, macOS) and the menus a tray shows, through muda; implies `"windowing"`. On Linux muda links GTK 3 and libxdo.
 - `"components"` — the 60+ component library (Button, TextInput, Modal, etc.).
 - `"theme"` — CSS variable generation, color palettes, dark mode. Auto-enabled by `"components"`.
-- `"gpu"` — GPU rendering via Vello/wgpu instead of the software renderer. Optional.
+- `"gpu"` — adds GPU rendering via Vello/wgpu beside the software renderer; the window uses the GPU and falls back to software when it will not start or is only a software driver such as lavapipe (see [Rendering Backends](windows.md#rendering-backends)). Optional. It is `"desktop"` and `"gpu-renderer"` together.
+- `"gpu-renderer"` — the same GPU renderer on `"windowing"` alone, with no native menus. Optional.
 - `"clipboard"` — clipboard read/write. Optional.
 - `"file-dialogs"` — native open/save dialogs. Optional.
+
+**No `[patch]` lines at all.** rinch depends on crates.io wgpu 30, on Vello
+0.11 from `joeleaver/vello-fork` and on winit 0.31.0-beta.4 from
+`joeleaver/winit-fork`, each fork at a pinned rev, as ordinary dependencies, so
+an app copies no patch for any of them. Delete any old `[patch.crates-io]`
+lines for winit (`winit`, `winit-core`, `winit-common`, `winit-wayland`,
+`winit-x11`, `dpi`) and for wgpu (`wgpu`, `wgpu-core`, `wgpu-hal`,
+`wgpu-types`, `naga`): the winit ones now point Cargo at a branch rinch no
+longer uses. Use `rinch::wgpu` and `rinch::vello` rather than a `wgpu`/`vello`
+dependency of your own, so the versions never drift; add `wgpu = "30"`
+yourself only to turn on an extra feature (e.g. `webgpu`), and Cargo unifies
+it with rinch's.
 
 ## Write Your App
 
@@ -93,4 +120,4 @@ Your `app` function ran exactly once. It will never run again. The closures hand
 - [Components](./components.md) — The full component library.
 - [Theming](./theming.md) — Colors, dark mode, CSS variables.
 - [Writing Components](./writing-components.md) — Build your own.
-- [WASM](./wasm.md) — Run in the browser.
+- [WASM](./wasm.md) — Run in the browser: the same `App` chain runs there through `rinch_web::AppExt`.

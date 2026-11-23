@@ -1,0 +1,758 @@
+//! Issue #1546 on a live X server: a window the user moved and resized,
+//! hidden with `hide_current_window` and shown with `show_current_window`,
+//! comes back at the same place and size — and a non-activating window is
+//! still shown without taking the input focus.
+//!
+//! Needs an X server and `xdotool`/`xwininfo`/`xprop`, so every test is
+//! `#[ignore]`d. Run it on an X server of its own with no window manager,
+//! inside an isolated session (`scripts/isolated-session.sh`, issue #2429):
+//! never on your desktop's server, and not on an `Xwayland -rootless` started
+//! from the desktop (that is a client of the desktop's compositor). Here the
+//! server is a windowed (not rootless) Xwayland on the session's own headless
+//! KWin, which does not manage that server's windows (`-geometry`: its
+//! screen is otherwise 640x480, smaller than the positions the tests use;
+//! `-noreset`: a server that resets when its last client leaves refuses the
+//! next test's probe while it does).
+//! `WAYLAND_DISPLAY` is unset for the tests, so the probe takes the X11
+//! backend:
+//!
+//! ```sh
+//! cargo build -p rinch --example hide_show_geometry
+//! cargo test -p rinch --test hide_show_geometry --no-run
+//! scripts/isolated-session.sh --kwin -- sh -c '
+//!   Xwayland -geometry 1920x1080 -noreset -displayfd 3 3> "$RINCH_SESSION_DIR/x" &
+//!   until [ -s "$RINCH_SESSION_DIR/x" ]; do sleep 0.1; done
+//!   env -u WAYLAND_DISPLAY DISPLAY=:$(cat "$RINCH_SESSION_DIR/x") \
+//!     cargo test -p rinch --test hide_show_geometry -- --ignored --test-threads=1 \
+//!       --skip wm_ --skip wayland_'
+//! ```
+//!
+//! (`Xvfb -displayfd 3` without `--kwin` serves as well, where Xvfb is installed.)
+//!
+//! The probe is found beside this test binary (see `debug_event_latency.rs`
+//! for why it is not built from here). With no window manager the server
+//! places a window exactly where it asks, so the geometry read back is the
+//! geometry the shell requested.
+#![cfg(all(feature = "windowing", target_os = "linux"))]
+
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::{Duration, Instant};
+
+const TITLE: &str = "rinch-geom-probe";
+
+fn probe_binary() -> PathBuf {
+    let exe = std::env::current_exe().expect("this test binary's own path");
+    let profile_dir = exe
+        .parent()
+        .and_then(|deps| deps.parent())
+        .expect("a test binary lives in <target>/<profile>/deps/");
+    let probe = profile_dir.join("examples").join("hide_show_geometry");
+    assert!(
+        probe.is_file(),
+        "probe not found at {} — build it first:\n  \
+         cargo build -p rinch --example hide_show_geometry",
+        probe.display()
+    );
+    probe
+}
+
+struct Probe {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl Probe {
+    fn spawn(envs: &[(&str, &str)]) -> Self {
+        let mut cmd = Command::new(probe_binary());
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .env("RINCH_RENDERER", "software")
+            // Logical = physical unless a test says otherwise, so the
+            // expected numbers are the ones written.
+            .env("WINIT_X11_SCALE_FACTOR", "1");
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().expect("spawn the probe");
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        Probe {
+            child,
+            stdin,
+            stdout,
+        }
+    }
+
+    /// [`Self::spawn`], with the probe's stderr written to `log`.
+    fn spawn_logging(envs: &[(&str, &str)], log: &std::path::Path) -> Self {
+        let file = std::fs::File::create(log).expect("create the probe's log");
+        let mut cmd = Command::new(probe_binary());
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(file)
+            .env("RINCH_RENDERER", "software")
+            .env("WINIT_X11_SCALE_FACTOR", "1");
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().expect("spawn the probe");
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        Probe {
+            child,
+            stdin,
+            stdout,
+        }
+    }
+
+    fn send(&mut self, line: &str) {
+        writeln!(self.stdin, "{line}").unwrap();
+        self.stdin.flush().unwrap();
+    }
+
+    /// `current_window_position` and `current_window_size`, as the probe
+    /// prints them.
+    fn geom(&mut self) -> Vec<f64> {
+        self.send("geom");
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert!(
+                self.stdout.read_line(&mut line).unwrap() > 0,
+                "probe exited"
+            );
+            if let Some(rest) = line.trim().strip_prefix("geom ") {
+                return rest.split(' ').map(|w| w.parse().unwrap()).collect();
+            }
+        }
+    }
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn run(cmd: &str, args: &[&str]) -> String {
+    let out = Command::new(cmd)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("run {cmd}: {e}"));
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    text
+}
+
+/// The probe's mapped window, waiting for it to appear.
+fn visible_window() -> Option<String> {
+    run("xdotool", &["search", "--onlyvisible", "--name", TITLE])
+        .lines()
+        .next()
+        .map(str::to_string)
+}
+
+fn wait_for<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(v) = f() {
+            return v;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// `(x, y, width, height)` of a window, from `xwininfo`.
+fn geometry(wid: &str) -> (i32, i32, i32, i32) {
+    let info = run("xwininfo", &["-id", wid]);
+    let field = |name: &str| -> i32 {
+        info.lines()
+            .find_map(|l| l.trim().strip_prefix(name))
+            .unwrap_or_else(|| panic!("no `{name}` in xwininfo:\n{info}"))
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    (
+        field("Absolute upper-left X:"),
+        field("Absolute upper-left Y:"),
+        field("Width:"),
+        field("Height:"),
+    )
+}
+
+/// Wait until the window reports `want`.
+fn settle(wid: &str, want: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let got = geometry(wid);
+        if got == want || Instant::now() > deadline {
+            return got;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Hide, wait until no window is mapped, show, and return the new window.
+fn hide_and_show(probe: &mut Probe) -> String {
+    probe.send("hide");
+    wait_for("the window to go", || {
+        visible_window().is_none().then_some(())
+    });
+    probe.send("show");
+    wait_for("the window to come back", visible_window)
+}
+
+fn moved_and_resized_comes_back(envs: &[(&str, &str)]) -> (Probe, String) {
+    moved_and_resized_comes_back_at(envs, (220, 224, 560, 280), (300, 378, 700, 200))
+}
+
+/// Start (expecting `start`, physical), move and resize to `to` (physical)
+/// from outside, hide, show, and expect `to` again. Returns the probe (alive)
+/// and the re-shown window.
+fn moved_and_resized_comes_back_at(
+    envs: &[(&str, &str)],
+    start: (i32, i32, i32, i32),
+    to: (i32, i32, i32, i32),
+) -> (Probe, String) {
+    let mut probe = Probe::spawn(envs);
+    let wid = wait_for("the probe's window", visible_window);
+    // Positive control: the window starts where WindowProps put it.
+    assert_eq!(settle(&wid, start), start);
+
+    // The user moves and resizes it.
+    let (x, y, w, h) = to;
+    run(
+        "xdotool",
+        &["windowmove", &wid, &x.to_string(), &y.to_string()],
+    );
+    run(
+        "xdotool",
+        &["windowsize", &wid, &w.to_string(), &h.to_string()],
+    );
+    assert_eq!(
+        settle(&wid, to),
+        to,
+        "positive control: the move and resize reached the window"
+    );
+    std::thread::sleep(Duration::from_millis(300));
+
+    let shown = hide_and_show(&mut probe);
+    assert_eq!(
+        settle(&shown, to),
+        to,
+        "the re-shown window is back where it was hidden, at its size"
+    );
+    (probe, shown)
+}
+
+#[test]
+#[ignore = "needs an X server and xdotool; see module docs"]
+fn a_moved_and_resized_window_comes_back_at_its_geometry() {
+    moved_and_resized_comes_back(&[]);
+}
+
+/// At a fractional scale the position comes back in desktop pixels and the
+/// size through logical pixels, both to the pixel (701 / 1.5 is not whole).
+#[test]
+#[ignore = "needs an X server and xdotool; see module docs"]
+fn at_a_fractional_scale_it_comes_back_to_the_pixel() {
+    moved_and_resized_comes_back_at(
+        &[("WINIT_X11_SCALE_FACTOR", "1.5")],
+        (330, 336, 840, 420),
+        (301, 377, 701, 201),
+    );
+}
+
+#[test]
+#[ignore = "needs an X server and xdotool; see module docs"]
+fn a_non_activating_window_comes_back_at_its_geometry_without_the_focus() {
+    let (_probe, shown) = moved_and_resized_comes_back(&[("PROBE_NON_ACTIVATING", "1")]);
+    let hints = run("xprop", &["-id", &shown, "WM_HINTS"]);
+    assert!(
+        hints.contains("Client accepts input or input focus: False"),
+        "the re-shown window still refuses the input focus: {hints}"
+    );
+    let state = run("xprop", &["-id", &shown, "_NET_WM_STATE"]);
+    assert!(
+        state.contains("_NET_WM_STATE_SKIP_TASKBAR"),
+        "still off the taskbar: {state}"
+    );
+    let focus = run("xdotool", &["getwindowfocus"]);
+    assert_ne!(
+        focus.trim(),
+        shown,
+        "the re-shown window did not take focus"
+    );
+}
+
+/// The getters and setters (#1546): they report the live window, keep the
+/// geometry while it is hidden, and a geometry set while hidden is where the
+/// window comes back.
+#[test]
+#[ignore = "needs an X server and xdotool; see module docs"]
+fn the_geometry_api_reads_and_sets_the_window() {
+    let mut probe = Probe::spawn(&[]);
+    let wid = wait_for("the probe's window", visible_window);
+    settle(&wid, (220, 224, 560, 280));
+    // The window maps as it is created, a moment before the shell publishes
+    // its geometry (`note_geometry`), and the probe reads it from another
+    // thread: wait for the first reading.
+    wait_for("the first published geometry", || {
+        (!probe.send_geom_raw().contains("none")).then_some(())
+    });
+    assert_eq!(probe.geom(), [220.0, 224.0, 560.0, 280.0]);
+
+    probe.send("move 260 300");
+    probe.send("size 640 360");
+    assert_eq!(settle(&wid, (260, 300, 640, 360)), (260, 300, 640, 360));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(probe.geom(), [260.0, 300.0, 640.0, 360.0]);
+
+    probe.send("hide");
+    wait_for("the window to go", || {
+        visible_window().is_none().then_some(())
+    });
+    assert_eq!(
+        probe.geom(),
+        [260.0, 300.0, 640.0, 360.0],
+        "kept while hidden"
+    );
+    probe.send("move 120 140");
+    probe.send("size 500 250");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(probe.geom(), [120.0, 140.0, 500.0, 250.0]);
+    probe.send("show");
+    let shown = wait_for("the window to come back", visible_window);
+    assert_eq!(settle(&shown, (120, 140, 500, 250)), (120, 140, 500, 250));
+}
+
+/// A hidden start (#1520) still appears at the requested position, and is
+/// then restored like any other window.
+#[test]
+#[ignore = "needs an X server and xdotool; see module docs"]
+fn a_hidden_start_appears_at_the_requested_position() {
+    let mut probe = Probe::spawn(&[("PROBE_HIDDEN", "1")]);
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        visible_window().is_none(),
+        "positive control: started hidden"
+    );
+    probe.send("show");
+    let wid = wait_for("the first show", visible_window);
+    assert_eq!(settle(&wid, (220, 224, 560, 280)), (220, 224, 560, 280));
+    run("xdotool", &["windowmove", &wid, "333", "111"]);
+    assert_eq!(settle(&wid, (333, 111, 560, 280)), (333, 111, 560, 280));
+    std::thread::sleep(Duration::from_millis(300));
+    let shown = hide_and_show(&mut probe);
+    assert_eq!(settle(&shown, (333, 111, 560, 280)), (333, 111, 560, 280));
+}
+
+// ── Under a window manager ──────────────────────────────────────────────────
+//
+// A reparenting window manager puts a frame around the window, so the
+// position a client asks for is the frame's and `xwininfo` reports the
+// client's: these compare the window with itself before the hide rather than
+// with fixed numbers. Run them inside a headless KWin in an isolated session
+// (`scripts/isolated-session.sh`, issue #2429); `WAYLAND_DISPLAY` is unset so
+// the probe takes the X11 backend (Xwayland):
+//
+// ```sh
+// scripts/isolated-session.sh --kwin --xwayland -- sh -c 'unset WAYLAND_DISPLAY;
+//   cargo test -p rinch --test hide_show_geometry -- --ignored --test-threads=1 wm_'
+// ```
+
+/// The window `_NET_ACTIVE_WINDOW` names, as `xdotool` spells ids (decimal).
+fn active_window() -> String {
+    let out = run("xprop", &["-root", "_NET_ACTIVE_WINDOW"]);
+    let hex = out
+        .rsplit("# ")
+        .next()
+        .map(str::trim)
+        .unwrap_or_else(|| panic!("no _NET_ACTIVE_WINDOW: {out}"));
+    u64::from_str_radix(hex.trim_start_matches("0x"), 16)
+        .unwrap_or_else(|_| panic!("unreadable _NET_ACTIVE_WINDOW: {out}"))
+        .to_string()
+}
+
+fn wm_moved_and_resized_comes_back(envs: &[(&str, &str)]) -> (Probe, String) {
+    let wm = run("xprop", &["-root", "_NET_SUPPORTING_WM_CHECK"]);
+    assert!(
+        wm.contains("window id"),
+        "positive control: a window manager runs on this display: {wm}"
+    );
+    let mut probe = Probe::spawn(envs);
+    let wid = wait_for("the probe's window", visible_window);
+    std::thread::sleep(Duration::from_millis(500));
+    run("xdotool", &["windowmove", &wid, "300", "378"]);
+    run("xdotool", &["windowsize", &wid, "700", "200"]);
+    std::thread::sleep(Duration::from_millis(700));
+    let before = geometry(&wid);
+    assert_eq!(
+        (before.2, before.3),
+        (700, 200),
+        "positive control: the resize reached the window"
+    );
+    assert!(
+        before.0 > 250 && before.1 > 330,
+        "positive control: the move reached the window: {before:?}"
+    );
+    let shown = hide_and_show(&mut probe);
+    assert_eq!(
+        settle(&shown, before),
+        before,
+        "the re-shown window is where it was hidden, at its size"
+    );
+    (probe, shown)
+}
+
+#[test]
+#[ignore = "needs an X server with a window manager; see the section docs"]
+fn wm_an_ordinary_window_comes_back_at_its_geometry_and_active() {
+    let (_probe, shown) = wm_moved_and_resized_comes_back(&[]);
+    let active = wait_for("the re-shown window to be activated", || {
+        let a = active_window();
+        (a == shown).then_some(a)
+    });
+    assert_eq!(active, shown, "an ordinary show still activates");
+}
+
+#[test]
+#[ignore = "needs an X server with a window manager; see the section docs"]
+fn wm_a_non_activating_window_comes_back_at_its_geometry_inactive() {
+    let (_probe, shown) = wm_moved_and_resized_comes_back(&[("PROBE_NON_ACTIVATING", "1")]);
+    std::thread::sleep(Duration::from_millis(700));
+    assert_ne!(
+        active_window(),
+        shown,
+        "the re-shown panel was not activated"
+    );
+    let hints = run("xprop", &["-id", &shown, "WM_HINTS"]);
+    assert!(
+        hints.contains("Client accepts input or input focus: False"),
+        "{hints}"
+    );
+}
+
+// ── review-1548 fixtures ────────────────────────────────────────────────────
+
+fn net_state(wid: &str) -> String {
+    run("xprop", &["-id", wid, "_NET_WM_STATE"])
+}
+
+/// No WM: a window at a negative position comes back there, while its top
+/// is still within reach (`window_geometry::reachable`, #1884: a 64 x 12
+/// grip in the window's top 24 pixels must be on a monitor). At y = -10 the
+/// top strip spans -10..14, so 14 rows of it are on the screen. A window
+/// moved further up — y = -30, its whole strip above the screen — is out of
+/// reach and is placed by the system at the show instead, as
+/// `rv2_off_screen_no_wm` checks for one off to the side.
+#[test]
+#[ignore = "review"]
+fn rv_negative_position_round_trips() {
+    moved_and_resized_comes_back_at(&[], (220, 224, 560, 280), (-50, -10, 600, 300));
+}
+
+/// Under a WM: three hide/show cycles do not drift (frame extents subtracted
+/// exactly once each time).
+#[test]
+#[ignore = "review wm"]
+fn rv_wm_three_cycles_do_not_drift() {
+    let (mut probe, mut shown) = wm_moved_and_resized_comes_back(&[]);
+    let before = geometry(&shown);
+    for _ in 0..3 {
+        std::thread::sleep(Duration::from_millis(400));
+        shown = hide_and_show(&mut probe);
+        assert_eq!(settle(&shown, before), before, "cycle drifted");
+    }
+}
+
+/// Under a WM: what the setter asks is what the getter answers (both are the
+/// frame's top-left).
+#[test]
+#[ignore = "review wm"]
+fn rv_wm_setter_and_getter_agree() {
+    let wm = run("xprop", &["-root", "_NET_SUPPORTING_WM_CHECK"]);
+    assert!(wm.contains("window id"), "{wm}");
+    let mut probe = Probe::spawn(&[]);
+    let wid = wait_for("window", visible_window);
+    std::thread::sleep(Duration::from_millis(600));
+    let g0 = probe.geom();
+    eprintln!("initial geom {g0:?} xwininfo {:?}", geometry(&wid));
+    probe.send("move 260 300");
+    std::thread::sleep(Duration::from_millis(800));
+    let g = probe.geom();
+    eprintln!("after move geom {g:?} xwininfo {:?}", geometry(&wid));
+    assert_eq!(&g[..2], &[260.0, 300.0], "setter/getter disagree");
+    // And set while hidden lands there.
+    probe.send("hide");
+    wait_for("gone", || visible_window().is_none().then_some(()));
+    probe.send("move 140 160");
+    std::thread::sleep(Duration::from_millis(300));
+    probe.send("show");
+    let shown = wait_for("back", visible_window);
+    std::thread::sleep(Duration::from_millis(800));
+    let g = probe.geom();
+    eprintln!("after show geom {g:?} xwininfo {:?}", geometry(&shown));
+    assert_eq!(&g[..2], &[140.0, 160.0], "set-while-hidden position");
+}
+
+/// Under a WM: maximize, hide, show → maximized; un-maximize → the geometry
+/// it had before maximizing.
+#[test]
+#[ignore = "review wm"]
+fn rv_wm_maximized_round_trip() {
+    let (mut probe, shown) = wm_moved_and_resized_comes_back(&[]);
+    let before = geometry(&shown);
+    probe.send("max");
+    wait_for("maximized", || {
+        net_state(&shown).contains("MAXIMIZED_VERT").then_some(())
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let maxed = geometry(&shown);
+    eprintln!("before {before:?} maxed {maxed:?}");
+    let shown = hide_and_show(&mut probe);
+    std::thread::sleep(Duration::from_millis(800));
+    let st = net_state(&shown);
+    eprintln!("after show state {st} geom {:?}", geometry(&shown));
+    assert!(st.contains("MAXIMIZED_VERT"), "comes back maximized: {st}");
+    assert_eq!(geometry(&shown), maxed, "maximized geometry");
+    probe.send("max");
+    wait_for("unmaximized", || {
+        (!net_state(&shown).contains("MAXIMIZED_VERT")).then_some(())
+    });
+    assert_eq!(settle(&shown, before), before, "restore geometry");
+}
+
+/// Under a WM: minimize, then hide and show → comes back on screen where it
+/// was (Windows records -32000 for a minimized window; X11 reference).
+#[test]
+#[ignore = "review wm"]
+fn rv_wm_minimized_then_hidden() {
+    let (mut probe, shown) = wm_moved_and_resized_comes_back(&[]);
+    let before = geometry(&shown);
+    probe.send("min");
+    std::thread::sleep(Duration::from_millis(800));
+    eprintln!(
+        "minimized geom {:?} state {}",
+        probe.geom(),
+        net_state(&shown)
+    );
+    probe.send("hide");
+    std::thread::sleep(Duration::from_millis(800));
+    probe.send("show");
+    let shown = wait_for("back", visible_window);
+    assert_eq!(settle(&shown, before), before);
+}
+
+/// Under a WM: hide/show once at A, move to B, maximize, hide, show,
+/// un-maximize → where should it go? The WM's own restore geometry was B.
+#[test]
+#[ignore = "review wm"]
+fn rv_wm_maximize_after_a_move_restores_the_latest_geometry() {
+    let (mut probe, shown) = wm_moved_and_resized_comes_back(&[]);
+    std::thread::sleep(Duration::from_millis(400));
+    run("xdotool", &["windowmove", &shown, "120", "140"]);
+    std::thread::sleep(Duration::from_millis(700));
+    let b = geometry(&shown);
+    eprintln!("B = {b:?}");
+    probe.send("max");
+    wait_for("maximized", || {
+        net_state(&shown).contains("MAXIMIZED_VERT").then_some(())
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let shown = hide_and_show(&mut probe);
+    std::thread::sleep(Duration::from_millis(800));
+    probe.send("max");
+    wait_for("unmaximized", || {
+        (!net_state(&shown).contains("MAXIMIZED_VERT")).then_some(())
+    });
+    let got = settle(&shown, b);
+    eprintln!("restored to {got:?}");
+    assert_eq!(got, b, "restore geometry is the latest one, B");
+}
+
+/// Under a WM: first hide while maximized (nothing recorded before).
+#[test]
+#[ignore = "review wm"]
+fn rv_wm_first_hide_while_maximized() {
+    let mut probe = Probe::spawn(&[]);
+    let wid = wait_for("window", visible_window);
+    std::thread::sleep(Duration::from_millis(600));
+    let start = geometry(&wid);
+    probe.send("max");
+    wait_for("maximized", || {
+        net_state(&wid).contains("MAXIMIZED_VERT").then_some(())
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let shown = hide_and_show(&mut probe);
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(net_state(&shown).contains("MAXIMIZED_VERT"));
+    probe.send("max");
+    wait_for("unmaximized", || {
+        (!net_state(&shown).contains("MAXIMIZED_VERT")).then_some(())
+    });
+    let got = settle(&shown, start);
+    eprintln!("start {start:?} restored {got:?}");
+    assert_eq!(got, start, "un-maximize after a first maximized hide");
+}
+
+/// Wayland: `current_window_position` is documented "always None on
+/// Wayland", and a position set while hidden is not published either.
+///
+/// A Wayland test, not an X11 one: it needs a Wayland compositor, named by
+/// `RV_WL`, and is skipped (`--skip wayland_`) with the X11 tests above. Run
+/// it on a headless KWin of its own:
+///
+/// ```sh
+/// scripts/isolated-session.sh --kwin -- sh -c 'RV_WL=$WAYLAND_DISPLAY \
+///   cargo test -p rinch --test hide_show_geometry -- --ignored wayland_'
+/// ```
+#[test]
+#[ignore = "needs a Wayland compositor (RV_WL); see the test's docs"]
+fn wayland_position_stays_none() {
+    let wl = std::env::var("RV_WL")
+        .expect("RV_WL names the Wayland display this test runs on; see its docs");
+    let mut probe = Probe::spawn(&[("WAYLAND_DISPLAY", &wl)]);
+    std::thread::sleep(Duration::from_millis(1500));
+    let g = probe.send_geom_raw();
+    eprintln!("live: {g}");
+    probe.send("hide");
+    std::thread::sleep(Duration::from_millis(800));
+    probe.send("move 10 20");
+    std::thread::sleep(Duration::from_millis(500));
+    let g2 = probe.send_geom_raw();
+    eprintln!("hidden after set: {g2}");
+    assert!(g.starts_with("geom none none"), "live: {g}");
+    assert!(g2.starts_with("geom none none"), "hidden after set: {g2}");
+}
+
+impl Probe {
+    fn send_geom_raw(&mut self) -> String {
+        self.send("geom");
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert!(
+                self.stdout.read_line(&mut line).unwrap() > 0,
+                "probe exited"
+            );
+            if line.starts_with("geom") {
+                return line.trim().to_string();
+            }
+        }
+    }
+}
+
+// ── review-1548 round 2 ─────────────────────────────────────────────────────
+
+/// No WM (the server places windows exactly): off every monitor → placed by
+/// the system on show; partly on screen → kept.
+#[test]
+#[ignore = "review2"]
+fn rv2_off_screen_no_wm() {
+    let mut probe = Probe::spawn(&[]);
+    let wid = wait_for("window", visible_window);
+    settle(&wid, (220, 224, 560, 280));
+    let root = run("xwininfo", &["-root"]);
+    eprintln!(
+        "{}",
+        root.lines()
+            .filter(|l| l.contains("Width") || l.contains("Height"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    run("xdotool", &["windowmove", &wid, "5000", "4000"]);
+    let off = settle(&wid, (5000, 4000, 560, 280));
+    assert_eq!(off, (5000, 4000, 560, 280), "positive control");
+    std::thread::sleep(Duration::from_millis(300));
+    let shown = hide_and_show(&mut probe);
+    std::thread::sleep(Duration::from_millis(500));
+    let back = geometry(&shown);
+    eprintln!("off-screen back {back:?}");
+    assert!(back.0 < 1000 && back.1 < 700, "on screen: {back:?}");
+    // Partly on screen (overlaps the right edge) is kept.
+    run("xdotool", &["windowmove", &shown, "900", "100"]);
+    settle(&shown, (900, 100, 560, 280));
+    std::thread::sleep(Duration::from_millis(300));
+    let shown = hide_and_show(&mut probe);
+    assert_eq!(settle(&shown, (900, 100, 560, 280)), (900, 100, 560, 280));
+}
+
+// ── #2545: a show after a hide keeps the GPU renderer ──────────────────────
+
+/// The frames a `RINCH_PERF` log has ended, and the sum of one counter over
+/// them.
+fn perf_log(log: &std::path::Path, counter: &str) -> (usize, u64) {
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let key = format!(" {counter}=");
+    let mut frames = 0;
+    let mut sum = 0;
+    for line in text.lines().filter(|l| l.starts_with("[PERF] frame ")) {
+        frames += 1;
+        if let Some(rest) = line.split(&key).nth(1) {
+            sum += rest
+                .split(' ')
+                .next()
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0);
+        }
+    }
+    (frames, sum)
+}
+
+/// A GPU window hidden and shown again presents with the renderer it had,
+/// on a surface made for the new window (#2545): Vello's renderer is built
+/// once, at the first window, and `gpu_renderers_built` stays at 1 over two
+/// hide / show cycles. Each show is followed by a presented frame.
+///
+/// Needs a Vulkan device the X server's windows can present to (lavapipe
+/// does), and runs with the X11 tests above:
+///
+/// ```sh
+/// cargo build -p rinch --features gpu --example hide_show_geometry
+/// cargo test -p rinch --features gpu --test hide_show_geometry --no-run
+/// # then the X11 recipe in the module docs, with the filter `gpu_`
+/// ```
+#[test]
+#[ignore = "needs an X server and a Vulkan device; see the test's docs"]
+fn gpu_a_show_after_a_hide_keeps_the_renderer() {
+    let log = std::env::temp_dir().join(format!("rinch-2545-{}.log", std::process::id()));
+    let mut probe = Probe::spawn_logging(&[("RINCH_RENDERER", "gpu"), ("RINCH_PERF", "1")], &log);
+    wait_for("the probe's window", visible_window);
+    // Positive control: the window presents on the GPU, and the counter
+    // counts the renderer that took.
+    wait_for("the first GPU renderer", || {
+        (perf_log(&log, "gpu_renderers_built").1 == 1).then_some(())
+    });
+    for cycle in 0..2 {
+        let before = perf_log(&log, "gpu_renderers_built").0;
+        hide_and_show(&mut probe);
+        wait_for("a frame after the show", || {
+            (perf_log(&log, "gpu_renderers_built").0 > before).then_some(())
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let (_, built) = perf_log(&log, "gpu_renderers_built");
+        assert_eq!(
+            built,
+            1,
+            "show {}: the renderer is kept, not built again",
+            cycle + 1
+        );
+        // The kept UI texture never saw what changed while hidden: the
+        // first frame on the new surface is a full one, as a new
+        // renderer's first is.
+        assert_eq!(
+            perf_log(&log, "repaint_full_first_frame").1,
+            cycle as u64 + 2,
+            "show {}: a full first frame",
+            cycle + 1
+        );
+    }
+    let _ = std::fs::remove_file(&log);
+}

@@ -5,7 +5,7 @@
 //!
 //! - **Native** (`cfg(not(target_arch = "wasm32"))`): a synchronous
 //!   [`tungstenite`] client runs its read/write loop on a spawned `std::thread`.
-//! - **Web** (`cfg(target_arch = "wasm32")`): a browser [`web_sys::WebSocket`]
+//! - **Web** (`cfg(target_arch = "wasm32")`): a browser `web_sys::WebSocket`
 //!   runs on the single web thread.
 //!
 //! On **both** platforms every callback (`on_open`, `on_message`, `on_close`,
@@ -105,6 +105,7 @@ use wasm as backend;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rinch_core::reactive::{Owner, current_owner, unowned};
@@ -146,13 +147,20 @@ pub struct WsClose {
     pub reason: String,
 }
 
-/// An event produced by the platform backend and delivered to the registry on
-/// the main thread. `Send` (only plain data), so it can hop worker→main on
-/// native.
-pub(crate) enum WsEvent {
+/// Something that happened on a connection: what the four callbacks are told,
+/// as one value. A [`WsStream`] yields these (issue #1767).
+///
+/// Plain data and `Send`; the backend also uses it to carry an event from the
+/// native worker thread to the main thread.
+#[derive(Debug, Clone)]
+pub enum WsEvent {
+    /// The connection is open (`on_open`).
     Open,
+    /// A frame arrived (`on_message`).
     Message(WsMessage),
+    /// The connection closed (`on_close`).
     Close(WsClose),
+    /// Something failed (`on_error`).
     Error(WsError),
 }
 
@@ -172,6 +180,15 @@ struct Slot<T> {
     /// since been disposed means the component is gone and [`invoke`] must prune
     /// rather than call. `Owner` is a `Weak`, so this keeps nothing alive.
     owner: Option<Owner>,
+    /// The document whose code registered this callback (issue #963) and the
+    /// context root it was registered in (issue #1032), re-entered around every
+    /// call. Delivery is
+    /// drained between events on native and comes straight from the socket on
+    /// the web, so without it the callback ran under no document — or another
+    /// embedded context's — and an interceptor it registered or cleared
+    /// reached every document on the thread; and without the root it resolved
+    /// the thread-global store namespace, not its embedded context's.
+    frame: rinch_core::CallbackFrame,
     cb: Box<dyn FnMut(T)>,
 }
 
@@ -184,6 +201,7 @@ impl<T> Slot<T> {
     fn new(cb: Box<dyn FnMut(T)>) -> Self {
         Self {
             owner: current_owner(),
+            frame: rinch_core::CallbackFrame::current(),
             cb,
         }
     }
@@ -254,27 +272,49 @@ pub(crate) fn dispatch(id: u64, event: WsEvent) {
 /// nested inside.
 fn invoke<T: 'static>(id: u64, arg: T, select: impl Fn(&mut Handlers) -> &mut Option<Slot<T>>) {
     let taken = HANDLERS.with(|h| h.borrow_mut().get_mut(&id).and_then(|hs| select(hs).take()));
-    let Some(Slot { owner, mut cb }) = taken else {
+    let Some(Slot {
+        owner,
+        frame,
+        mut cb,
+    }) = taken
+    else {
         return;
     };
 
     if owner.as_ref().is_some_and(|owner| !owner.is_alive()) {
+        // Worded like `rinch_core::main_thread::resume_main_callback`'s line for
+        // the same prune: without it, a socket whose frames still arrive but
+        // reach nothing after a route change says so nowhere (issue #374).
+        tracing::debug!(
+            "dropping socket callback on connection {}: the component that registered it was unmounted",
+            id
+        );
         // Dropped here, outside the borrow above, and deliberately NOT put back.
         drop(cb);
         sweep_dead(id);
         return;
     }
 
-    match &owner {
-        Some(owner) => owner.run(|| cb(arg)),
-        None => unowned(|| cb(arg)),
+    // One reactive transaction per callback, like every event handler
+    // (`rinch_core::batch`). On native this is already inside the main-thread
+    // drain's batch and joins it; on the web `dispatch` is called straight from
+    // the socket's JS callback, so this is the only one.
+    //
+    // It runs under the document that registered it (issue #963), in its
+    // context root (issue #1032).
+    {
+        let _frame = frame.enter();
+        match &owner {
+            Some(owner) => rinch_core::batch(|| owner.run(|| cb(arg))),
+            None => rinch_core::batch(|| unowned(|| cb(arg))),
+        }
     }
 
     HANDLERS.with(|h| {
         if let Some(hs) = h.borrow_mut().get_mut(&id) {
             let slot = select(hs);
             if slot.is_none() {
-                *slot = Some(Slot { owner, cb });
+                *slot = Some(Slot { owner, frame, cb });
             }
         }
     });
@@ -345,29 +385,160 @@ fn install<T: 'static>(
 /// so no event can be missed between `connect` and callback registration.
 ///
 /// A synchronous `Err` is returned only when the request is rejected outright
-/// (a non-`ws`/`wss` URL, or a browser that refuses to construct the socket).
+/// (a non-`ws`/`wss` URL, or one the platform cannot parse: the browser's
+/// constructor, or on native the `http` crate — `ws://` with no host).
+///
+/// To offer subprotocols (or, on native, send headers) build a [`WsRequest`]
+/// instead; `connect(url)` is `WsRequest::new(url).connect()`.
 ///
 /// Must be called on the main (UI) thread; see the [module docs](crate).
 pub fn connect(url: impl Into<String>) -> Result<WsHandle, WsError> {
-    let url = url.into();
-    if !(url.starts_with("ws://") || url.starts_with("wss://")) {
-        return Err(WsError::InvalidUrl(format!(
-            "URL must be absolute and start with ws:// or wss:// (got {url:?})"
-        )));
-    }
+    WsRequest::new(url).connect()
+}
 
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    HANDLERS.with(|h| h.borrow_mut().insert(id, Handlers::default()));
+/// A WebSocket connection request: the URL, the subprotocols to offer and, on
+/// native, extra handshake headers (issue #1773).
+///
+/// ```ignore
+/// let mut feed = rinch_ws::WsRequest::new("wss://example.com/feed")
+///     .protocol("feed.v2")
+///     .protocol(format!("token.{token}"))
+///     .connect()?
+///     .into_stream();
+/// if let Some(WsEvent::Open) = feed.next().await {
+///     assert_eq!(feed.protocol(), "feed.v2");
+/// }
+/// ```
+///
+/// With callbacks, `on_open` reads it through the handle, held weakly so the
+/// callback does not keep the connection alive:
+///
+/// ```ignore
+/// let ws = Rc::new(WsRequest::new(url).protocol("feed.v2").connect()?);
+/// let weak = Rc::downgrade(&ws);
+/// ws.on_open(move || if let Some(ws) = weak.upgrade() { chosen.set(ws.protocol()) });
+/// ```
+///
+/// The subprotocols are sent in the `Sec-WebSocket-Protocol` header in the order
+/// given; the server picks at most one, which [`WsHandle::protocol`] reports
+/// once the connection is open.
+#[derive(Debug, Clone)]
+pub struct WsRequest {
+    url: String,
+    protocols: Vec<String>,
+    #[cfg(not(target_arch = "wasm32"))]
+    headers: Vec<(String, String)>,
+}
 
-    match backend::connect(&url, id) {
-        Ok(backend) => Ok(WsHandle { id, backend }),
-        Err(e) => {
-            HANDLERS.with(|h| {
-                h.borrow_mut().remove(&id);
-            });
-            Err(e)
+impl WsRequest {
+    /// A request for `url` (an absolute `ws://` or `wss://` URL), offering no
+    /// subprotocol.
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            protocols: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            headers: Vec::new(),
         }
     }
+
+    /// Offer one more subprotocol, after those already offered (the order is
+    /// the order of preference the server sees).
+    ///
+    /// Each must be a non-empty HTTP token (no spaces, commas or other
+    /// separators) and appear once; otherwise [`connect`](Self::connect) fails
+    /// with [`WsError::InvalidUrl`], on both targets, as a browser's `WebSocket`
+    /// constructor does.
+    pub fn protocol(mut self, protocol: impl Into<String>) -> Self {
+        self.protocols.push(protocol.into());
+        self
+    }
+
+    /// Offer several subprotocols, after those already offered.
+    pub fn protocols<I, S>(mut self, protocols: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.protocols.extend(protocols.into_iter().map(Into::into));
+        self
+    }
+
+    /// Add a header to the opening handshake. **Native only**: a browser's
+    /// `WebSocket` cannot send headers, so this method does not exist on
+    /// `wasm32` (authenticate with a subprotocol, a cookie or the URL there).
+    ///
+    /// A name given twice is sent twice, in order. An invalid header name or
+    /// value makes [`connect`](Self::connect) fail with
+    /// [`WsError::InvalidUrl`], and so does a header the handshake writes
+    /// itself (`Host`, `Upgrade`, `Connection`, `Sec-WebSocket-Key`,
+    /// `Sec-WebSocket-Version`, `Sec-WebSocket-Protocol`, in any case): offer
+    /// subprotocols with [`protocol`](Self::protocol).
+    ///
+    /// Headers go to the URL's host only: a redirect answer is not followed (a
+    /// browser does not follow one for a WebSocket either); it fails the
+    /// connect.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Open the connection; see [`connect`] for how it is
+    /// reported. Fails synchronously for a URL that is not `ws://`/`wss://`, an
+    /// invalid or repeated subprotocol, an invalid or reserved header, or a URL
+    /// the platform cannot parse — the browser's `WebSocket` constructor, or on
+    /// native the `http` crate's URI parser (`ws://` with no host, say), which
+    /// before #1773 was reported later through `on_error`.
+    ///
+    /// Must be called on the main (UI) thread; see the [module docs](crate).
+    pub fn connect(self) -> Result<WsHandle, WsError> {
+        if !(self.url.starts_with("ws://") || self.url.starts_with("wss://")) {
+            return Err(WsError::InvalidUrl(format!(
+                "URL must be absolute and start with ws:// or wss:// (got {:?})",
+                self.url
+            )));
+        }
+        validate_protocols(&self.protocols)?;
+
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        HANDLERS.with(|h| h.borrow_mut().insert(id, Handlers::default()));
+
+        match backend::connect(&self, id) {
+            Ok(backend) => Ok(WsHandle { id, backend }),
+            Err(e) => {
+                HANDLERS.with(|h| {
+                    h.borrow_mut().remove(&id);
+                });
+                Err(e)
+            }
+        }
+    }
+}
+
+/// The browser's rule for the subprotocol list (the WHATWG `WebSocket`
+/// constructor's `SyntaxError`), applied on both targets so a request is
+/// refused the same way everywhere: each a non-empty RFC 7230 token, none
+/// repeated (compared exactly).
+fn validate_protocols(protocols: &[String]) -> Result<(), WsError> {
+    for (i, p) in protocols.iter().enumerate() {
+        if p.is_empty() || !p.bytes().all(is_tchar) {
+            return Err(WsError::InvalidUrl(format!(
+                "subprotocol {p:?} is not an HTTP token"
+            )));
+        }
+        if protocols[..i].contains(p) {
+            return Err(WsError::InvalidUrl(format!(
+                "subprotocol {p:?} is offered twice"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// An RFC 7230 `tchar`.
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
 /// A handle to an open (or opening) WebSocket connection.
@@ -405,7 +576,9 @@ impl WsHandle {
     /// Register the connection-closed callback (replaces any previous one).
     ///
     /// Fires once, whether the close was initiated locally, by the peer, or by an
-    /// abnormal drop (reported with code `1006`).
+    /// abnormal drop (reported with code `1006`). A connect that fails (nothing
+    /// listening, a refused handshake) fires `on_error` and then `on_close` with
+    /// `1006`, on both targets, as a browser does.
     pub fn on_close(&self, cb: impl FnMut(WsClose) + 'static) -> &Self {
         install(self.id, |h| &mut h.on_close, Box::new(cb));
         self
@@ -432,14 +605,156 @@ impl WsHandle {
     pub fn close(&self) {
         self.backend.close();
     }
+
+    /// The subprotocol the server chose from those the [`WsRequest`] offered,
+    /// or `""` when none was offered or chosen, or before the connection is
+    /// open — what a browser's `WebSocket.protocol` says. It is set before the
+    /// open is delivered, so `on_open` (and a stream's [`WsEvent::Open`]) can
+    /// read it.
+    pub fn protocol(&self) -> String {
+        self.backend.protocol()
+    }
+}
+
+impl WsHandle {
+    /// Read this connection's events by awaiting them instead of through
+    /// callbacks (issue #1767).
+    ///
+    /// ```ignore
+    /// let mut feed = rinch_ws::connect(url)?.into_stream();
+    /// feed.send_text("subscribe");
+    /// while let Some(event) = feed.next().await {
+    ///     if let WsEvent::Message(msg) = event { log.update(|l| l.push(msg)) }
+    /// }
+    /// ```
+    ///
+    /// The stream takes the connection's four callback slots (whatever was
+    /// registered on them is replaced) and owns the handle, so dropping the
+    /// stream — or the task awaiting it, which is what a component's unmount
+    /// does to a task it spawned — closes the connection.
+    pub fn into_stream(self) -> WsStream {
+        let queue: Rc<RefCell<StreamQueue>> = Rc::default();
+        // Unowned: these only fill the queue; the stream's holder decides how
+        // long the connection lives, and dropping the stream removes them.
+        unowned(|| {
+            let q = queue.clone();
+            self.on_open(move || q.borrow_mut().push(WsEvent::Open));
+            let q = queue.clone();
+            self.on_message(move |m| q.borrow_mut().push(WsEvent::Message(m)));
+            let q = queue.clone();
+            self.on_close(move |c| q.borrow_mut().push(WsEvent::Close(c)));
+            let q = queue.clone();
+            self.on_error(move |e| q.borrow_mut().push(WsEvent::Error(e)));
+        });
+        WsStream {
+            handle: self,
+            queue,
+        }
+    }
+}
+
+/// What a [`WsStream`] has received and not yet yielded.
+#[derive(Default)]
+struct StreamQueue {
+    events: std::collections::VecDeque<WsEvent>,
+    opened: bool,
+    /// No event after this is yielded: a close arrived, or an error before the
+    /// connection opened.
+    ended: bool,
+    waker: Option<std::task::Waker>,
+}
+
+impl StreamQueue {
+    fn push(&mut self, event: WsEvent) {
+        if self.ended {
+            return;
+        }
+        match &event {
+            WsEvent::Open => self.opened = true,
+            WsEvent::Close(_) => self.ended = true,
+            // A failed connect: the native backend reports only the error, the
+            // browser an error and then a close. Ending at the error makes the
+            // two the same stream.
+            WsEvent::Error(_) if !self.opened => self.ended = true,
+            _ => {}
+        }
+        self.events.push_back(event);
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
+    }
+}
+
+/// A connection read by awaiting its events — made with
+/// [`WsHandle::into_stream`].
+///
+/// Not `Send`: poll it on the main (UI) thread, inside
+/// [`spawn_local`](rinch_core::spawn_local) say. Dropping it closes the
+/// connection.
+pub struct WsStream {
+    handle: WsHandle,
+    queue: Rc<RefCell<StreamQueue>>,
+}
+
+impl WsStream {
+    /// The next event, in the order the callbacks would have seen them.
+    ///
+    /// `None` once the stream has ended: after the [`WsEvent::Close`], or after
+    /// a [`WsEvent::Error`] that came before the connection opened (a failed
+    /// connect; on the web the close that follows it is not yielded).
+    pub async fn next(&mut self) -> Option<WsEvent> {
+        std::future::poll_fn(|cx| {
+            let mut queue = self.queue.borrow_mut();
+            match queue.events.pop_front() {
+                Some(event) => std::task::Poll::Ready(Some(event)),
+                None if queue.ended => std::task::Poll::Ready(None),
+                None => {
+                    queue.waker = Some(cx.waker().clone());
+                    std::task::Poll::Pending
+                }
+            }
+        })
+        .await
+    }
+
+    /// Queue a text frame; see [`WsHandle::send_text`].
+    pub fn send_text(&self, text: impl Into<String>) {
+        self.handle.send_text(text);
+    }
+
+    /// Queue a binary frame; see [`WsHandle::send_bytes`].
+    pub fn send_bytes(&self, bytes: Vec<u8>) {
+        self.handle.send_bytes(bytes);
+    }
+
+    /// Begin a graceful close; [`next`](Self::next) then yields the
+    /// [`WsEvent::Close`] and ends.
+    pub fn close(&self) {
+        self.handle.close();
+    }
+
+    /// The subprotocol the server chose; see [`WsHandle::protocol`]. Set by the
+    /// time [`next`](Self::next) yields [`WsEvent::Open`].
+    pub fn protocol(&self) -> String {
+        self.handle.protocol()
+    }
 }
 
 impl Drop for WsHandle {
     fn drop(&mut self) {
         self.backend.close();
-        HANDLERS.with(|h| {
-            h.borrow_mut().remove(&self.id);
-        });
+        // `try_with`: a handle dropped while the thread's locals are torn down
+        // (held in an app's own `thread_local!`, or by another connection's
+        // callback, which this table drops as it is destroyed) finds the table
+        // gone and has nothing left to unregister. `with` panicked there, and a
+        // panic in a thread-local destructor aborts the process (#1952).
+        // The callbacks drop outside the borrow: they are user code whose
+        // `Drop` may re-enter (a captured handle unregistering itself).
+        let gone = HANDLERS
+            .try_with(|h| h.borrow_mut().remove(&self.id))
+            .ok()
+            .flatten();
+        drop(gone);
     }
 }
 
@@ -664,6 +979,88 @@ mod tests {
         });
     }
 
+    /// The callback runs under the document whose code registered it (issue
+    /// #963), not under whichever document the delivery happens to be nested in
+    /// — so an interceptor it registers or clears is that document's. Delivered
+    /// here from inside document 2, off the fixed point where "inherit" and
+    /// "record" agree; a registration made outside any document answers none.
+    #[test]
+    fn a_callback_runs_under_the_document_that_registered_it() {
+        use rinch_core::{current_dispatching_doc, push_dispatching_doc};
+
+        let seen: Rc<RefCell<Vec<Option<u64>>>> = Rc::new(RefCell::new(Vec::new()));
+        for (id, doc) in [(424_250u64, 1u64), (424_251, 0)] {
+            HANDLERS.with(|h| h.borrow_mut().insert(id, Handlers::default()));
+            let _registrar = push_dispatching_doc(doc);
+            let s = seen.clone();
+            install(
+                id,
+                |h| &mut h.on_open,
+                Box::new(move |()| s.borrow_mut().push(current_dispatching_doc())),
+            );
+        }
+        {
+            let _deliverer = push_dispatching_doc(2);
+            // Twice each: the slot is taken out for the call and put back
+            // after it, and the second delivery must still carry the document.
+            for id in [424_250, 424_250, 424_251, 424_251] {
+                dispatch(id, WsEvent::Open);
+            }
+            assert_eq!(current_dispatching_doc(), Some(2));
+        }
+        assert_eq!(*seen.borrow(), [Some(1), Some(1), None, None]);
+
+        HANDLERS.with(|h| {
+            h.borrow_mut().remove(&424_250);
+            h.borrow_mut().remove(&424_251);
+        });
+    }
+
+    /// The callback also re-enters the **context root** it was registered in
+    /// (issue #1032), as an effect does (#136), so a socket opened by an
+    /// embedded `RinchContext`'s component resolves that context's stores.
+    /// Delivered from inside root 4, off the fixed point.
+    #[test]
+    fn a_callback_runs_in_the_context_root_that_registered_it() {
+        type Seen = Rc<RefCell<Vec<(u64, Option<u64>)>>>;
+        use rinch_core::{
+            current_context_root, current_dispatching_doc, push_context_root, push_dispatching_doc,
+        };
+
+        let seen: Seen = Rc::new(RefCell::new(Vec::new()));
+        for (id, root, doc) in [(424_260u64, 9u64, 1u64), (424_261, 0, 0)] {
+            HANDLERS.with(|h| h.borrow_mut().insert(id, Handlers::default()));
+            let _root = push_context_root(root);
+            let _registrar = push_dispatching_doc(doc);
+            let s = seen.clone();
+            install(
+                id,
+                |h| &mut h.on_open,
+                Box::new(move |()| {
+                    s.borrow_mut()
+                        .push((current_context_root(), current_dispatching_doc()))
+                }),
+            );
+        }
+        {
+            let _root = push_context_root(4);
+            let _deliverer = push_dispatching_doc(2);
+            for id in [424_260, 424_260, 424_261] {
+                dispatch(id, WsEvent::Open);
+            }
+            assert_eq!(
+                (current_context_root(), current_dispatching_doc()),
+                (4, Some(2))
+            );
+        }
+        assert_eq!(*seen.borrow(), [(9, Some(1)), (9, Some(1)), (0, None)]);
+
+        HANDLERS.with(|h| {
+            h.borrow_mut().remove(&424_260);
+            h.borrow_mut().remove(&424_261);
+        });
+    }
+
     /// The owner is per **callback**, not per connection. Two components may
     /// share one handle — a message list and a connection-status badge — and the
     /// badge staying mounted must not keep the list's dead `on_message` armed.
@@ -777,5 +1174,143 @@ mod tests {
         HANDLERS.with(|h| {
             h.borrow_mut().remove(&id);
         });
+    }
+
+    /// The twin of `main_thread`'s pin (issue #374): an ownerless socket
+    /// callback dispatched from inside a live one runs under `unowned`, so what
+    /// it allocates is not attributed to the live one's component. #373 made
+    /// the change; nothing pinned it.
+    #[test]
+    fn an_ownerless_callback_dispatched_inside_a_live_one_does_not_allocate_under_it() {
+        let (outer, inner) = (424_250, 424_251);
+        HANDLERS.with(|h| {
+            let mut h = h.borrow_mut();
+            h.insert(outer, Handlers::default());
+            h.insert(inner, Handlers::default());
+        });
+
+        install(
+            inner,
+            |h| &mut h.on_message,
+            Box::new(|_| {
+                let _app_lifetime = Signal::new(0u32);
+            }),
+        );
+        let component = Scope::new();
+        component.run(|| {
+            install(
+                outer,
+                |h| &mut h.on_message,
+                Box::new(move |_| {
+                    dispatch(inner, WsEvent::Message(WsMessage::Text("in".to_string())))
+                }),
+            );
+        });
+
+        let before = component.owned_counts().signals;
+        dispatch(outer, WsEvent::Message(WsMessage::Text("out".to_string())));
+        assert_eq!(
+            component.owned_counts().signals,
+            before,
+            "the ownerless callback's signal must not be attributed to the \
+             component whose callback happened to dispatch it"
+        );
+
+        component.dispose();
+        HANDLERS.with(|h| {
+            let mut h = h.borrow_mut();
+            h.remove(&outer);
+            h.remove(&inner);
+        });
+    }
+
+    /// A dead callback is pruned *audibly* (issue #374): an app whose socket
+    /// messages stop arriving after a route change — the handler's component
+    /// unmounted, the `WsHandle` stayed parked in a store — has one `debug!`
+    /// line to find, worded like `resume_main_callback`'s for the same reason.
+    #[test]
+    fn pruning_a_dead_callback_logs_why() {
+        let id = 424_249;
+        HANDLERS.with(|h| h.borrow_mut().insert(id, Handlers::default()));
+
+        let scope = Scope::new();
+        scope.run(|| {
+            install(id, |h| &mut h.on_message, Box::new(|_| {}));
+        });
+
+        // Positive control first: a live dispatch logs nothing, so the
+        // capture below is attributable to the prune and not to dispatch.
+        let live = capture_debug(|| {
+            dispatch(id, WsEvent::Message(WsMessage::Text("live".to_string())));
+        });
+        assert!(live.is_empty(), "a live dispatch must not log: {live:?}");
+
+        scope.dispose();
+        let lines = capture_debug(|| {
+            dispatch(id, WsEvent::Message(WsMessage::Text("dead".to_string())));
+        });
+        assert_eq!(
+            lines,
+            vec![format!(
+                "dropping socket callback on connection {id}: the component that \
+                 registered it was unmounted"
+            )],
+            "pruning must say what it dropped and why"
+        );
+
+        HANDLERS.with(|h| {
+            h.borrow_mut().remove(&id);
+        });
+    }
+
+    /// Every `DEBUG`-or-louder event's message emitted while `f` runs on this
+    /// thread. A hand-rolled subscriber rather than `tracing-subscriber`, so
+    /// this wasm-clean crate gains no dev-dependency for one assertion.
+    fn capture_debug(f: impl FnOnce()) -> Vec<String> {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::{Event, Level, Metadata, Subscriber, subscriber::Interest};
+
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        struct Message(String);
+        impl Visit for Message {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        impl Subscriber for Capture {
+            fn register_callsite(&self, _: &'static Metadata<'static>) -> Interest {
+                Interest::always()
+            }
+            fn enabled(&self, m: &Metadata<'_>) -> bool {
+                *m.level() <= Level::DEBUG
+            }
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn event(&self, e: &Event<'_>) {
+                let mut m = Message(String::new());
+                e.record(&mut m);
+                self.0.lock().unwrap().push(m.0);
+            }
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+        }
+
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(Capture(lines.clone()), || {
+            // Another test thread can cache a callsite's interest as "never"
+            // (no subscriber there) while this scoped subscriber is being
+            // registered, and the event is then skipped here too. Rebuilding
+            // the cache inside the scope counts this subscriber's `always`.
+            tracing::callsite::rebuild_interest_cache();
+            f()
+        });
+        lines.lock().unwrap().clone()
     }
 }

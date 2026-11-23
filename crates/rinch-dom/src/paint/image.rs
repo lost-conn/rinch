@@ -3,7 +3,7 @@
 use peniko::Fill;
 use peniko::kurbo::{Affine, Rect};
 
-use super::painter::{PaintImage, Painter};
+use super::painter::{ImageSampling, PaintImage, Painter};
 use crate::computed_style::ObjectFitValue;
 use crate::image_cache::DecodedImage;
 
@@ -15,6 +15,11 @@ use crate::image_cache::DecodedImage;
 /// - `Cover`: uniform scale to cover rect (clips overflow)
 /// - `None`: no scaling, image centered at natural size
 /// - `ScaleDown`: like `Contain`, but never scales up
+///
+/// `sampling` is the element's `image-rendering` (#2098).
+///
+/// `true` when a draw was issued (the `image_draws` counter's test, #2769):
+/// `false` for an empty rect or an image with nothing to draw.
 pub fn paint_image(
     painter: &mut dyn Painter,
     decoded: &DecodedImage,
@@ -22,17 +27,70 @@ pub fn paint_image(
     scale: f64,
     object_fit: ObjectFitValue,
     node_transform: Affine,
-) {
-    paint_image_data(
+    sampling: ImageSampling,
+) -> bool {
+    if let Some(vector) = decoded.vector() {
+        return paint_vector_image(painter, vector, rect, object_fit, node_transform, sampling);
+    }
+    paint_image_pixels(
         painter,
         &decoded.data,
+        Some(decoded),
+        None,
+        false,
         decoded.width,
         decoded.height,
         rect,
         scale,
         object_fit,
         node_transform,
+        sampling,
+    )
+}
+
+/// An SVG file (#2111): placed by `object_fit` as its
+/// [`concrete`](crate::svg_image::VectorImage::concrete) size, and drawn from
+/// a raster made at the size that covers on the device (`node_transform` and
+/// the DPI scale included), so it is as sharp as the device allows. The
+/// raster's pixels are the device's, so on a whole-pixel origin it is copied
+/// rather than resampled.
+fn paint_vector_image(
+    painter: &mut dyn Painter,
+    vector: &crate::svg_image::VectorImage,
+    rect: Rect,
+    object_fit: ObjectFitValue,
+    node_transform: Affine,
+    sampling: ImageSampling,
+) -> bool {
+    let (iw, ih) = vector.concrete();
+    let Some((img_transform, needs_clip)) = fit_image(iw, ih, rect, object_fit, node_transform)
+    else {
+        return false;
+    };
+    let Some(raster) = vector.raster_for(iw, ih, img_transform) else {
+        return false;
+    };
+    let (dw, dh) = raster.drawn;
+    let image = &raster.image;
+    if needs_clip {
+        painter.push_clip(Fill::NonZero, node_transform, &rect.into());
+    }
+    painter.draw_image(
+        &PaintImage {
+            data: &image.data,
+            width: image.width,
+            height: image.height,
+            decoded: Some(image),
+            frame: None,
+            opaque: false,
+            sampling,
+        },
+        img_transform * Affine::scale_non_uniform(iw / dw, ih / dh),
     );
+    if needs_clip {
+        painter.pop_layer();
+    }
+    true
 }
 
 /// The same, over borrowed RGBA8 pixels rather than a [`DecodedImage`].
@@ -52,8 +110,75 @@ pub fn paint_image_data(
     object_fit: ObjectFitValue,
     node_transform: Affine,
 ) {
+    let _ = paint_image_pixels(
+        painter,
+        data,
+        None,
+        None,
+        false,
+        width,
+        height,
+        rect,
+        _scale,
+        object_fit,
+        node_transform,
+        ImageSampling::Auto,
+    );
+}
+
+/// [`paint_image_data`] for a live frame whose producer says whether every
+/// pixel is opaque ([`crate::paint::SurfacePixelData::opaque`]). An opaque
+/// frame skips the per-draw premultiply and, drawn onto whole pixels (at any
+/// positive scale, unrotated), is copied into the surface row by row (#361).
+/// `shared` is the buffer `data` comes from ([`PaintImage::frame`]).
+#[allow(clippy::too_many_arguments)]
+pub fn paint_frame_data(
+    painter: &mut dyn Painter,
+    data: &[u8],
+    shared: &std::sync::Arc<Vec<u8>>,
+    width: u32,
+    height: u32,
+    opaque: bool,
+    rect: Rect,
+    scale: f64,
+    object_fit: ObjectFitValue,
+    node_transform: Affine,
+) {
+    let _ = paint_image_pixels(
+        painter,
+        data,
+        None,
+        // The buffer stands for the frame only when it holds exactly the
+        // frame's pixels.
+        (shared.len() == data.len()).then_some(shared),
+        opaque,
+        width,
+        height,
+        rect,
+        scale,
+        object_fit,
+        node_transform,
+        ImageSampling::Auto,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_image_pixels(
+    painter: &mut dyn Painter,
+    data: &[u8],
+    decoded: Option<&DecodedImage>,
+    frame: Option<&std::sync::Arc<Vec<u8>>>,
+    opaque: bool,
+    width: u32,
+    height: u32,
+    rect: Rect,
+    _scale: f64,
+    object_fit: ObjectFitValue,
+    node_transform: Affine,
+    sampling: ImageSampling,
+) -> bool {
     if width == 0 || height == 0 {
-        return;
+        return false;
     }
 
     let iw = width as f64;
@@ -62,9 +187,92 @@ pub fn paint_image_data(
     let rh = rect.height();
 
     if rw <= 0.0 || rh <= 0.0 {
-        return;
+        return false;
     }
 
+    let Some((img_transform, needs_clip)) = fit_image(iw, ih, rect, object_fit, node_transform)
+    else {
+        return false;
+    };
+
+    if needs_clip {
+        painter.push_clip(Fill::NonZero, node_transform, &rect.into());
+    }
+
+    // At half its natural size or less, a decoded image is drawn from its mipmap
+    // level (#2456, #2534), as Chrome draws it, so its thin lines survive.
+    let minified = match decoded {
+        Some(d) if sampling == ImageSampling::Auto => {
+            crate::image_minify::minified(d, img_transform)
+        }
+        _ => None,
+    };
+    if let Some(small) = &minified {
+        painter.draw_image(
+            &PaintImage {
+                data: &small.data,
+                width: small.width,
+                height: small.height,
+                decoded: Some(small),
+                frame: None,
+                opaque,
+                sampling: ImageSampling::Smooth,
+            },
+            img_transform
+                * Affine::scale_non_uniform(
+                    iw / f64::from(small.width),
+                    ih / f64::from(small.height),
+                ),
+        );
+    } else {
+        // Drawn from the image itself: bilinearly when it is minified (as
+        // Chrome samples level 0), where the software painter's own `Auto`
+        // (nearest) would drop a 1px line in three at 0.6x.
+        let sampling = match decoded {
+            Some(d)
+                if sampling == ImageSampling::Auto
+                    && d.vector().is_none()
+                    && crate::image_minify::smooth(img_transform) =>
+            {
+                ImageSampling::Smooth
+            }
+            _ => sampling,
+        };
+        painter.draw_image(
+            &PaintImage {
+                data,
+                width,
+                height,
+                decoded,
+                frame,
+                opaque,
+                sampling,
+            },
+            img_transform,
+        );
+    }
+
+    if needs_clip {
+        painter.pop_layer();
+    }
+    true
+}
+
+/// The transform that places an `iw` x `ih` image into `rect` by
+/// `object_fit` (under `node_transform`), and whether the result must be
+/// clipped to `rect`. `None` for an empty rect.
+pub(crate) fn fit_image(
+    iw: f64,
+    ih: f64,
+    rect: Rect,
+    object_fit: ObjectFitValue,
+    node_transform: Affine,
+) -> Option<(Affine, bool)> {
+    let rw = rect.width();
+    let rh = rect.height();
+    if rw <= 0.0 || rh <= 0.0 {
+        return None;
+    }
     // Compute the transform to map image pixels into the layout rect.
     // Image pixels are in their own coordinate space (0,0)-(iw,ih).
     // We need to scale and position them into (rect.x0, rect.y0)-(rect.x1, rect.y1).
@@ -113,18 +321,34 @@ pub fn paint_image_data(
 
     let img_transform =
         node_transform * Affine::translate((tx, ty)) * Affine::scale_non_uniform(sx, sy);
+    Some((img_transform, needs_clip))
+}
 
+/// Paint a GPU texture registered with the renderer (a `RenderSurface` GPU
+/// frame, #1768) into `rect` by `object_fit`, as an image is.
+pub fn paint_gpu_image(
+    painter: &mut dyn Painter,
+    image: &peniko::ImageData,
+    rect: Rect,
+    object_fit: ObjectFitValue,
+    node_transform: Affine,
+) {
+    if image.width == 0 || image.height == 0 {
+        return;
+    }
+    let Some((img_transform, needs_clip)) = fit_image(
+        image.width as f64,
+        image.height as f64,
+        rect,
+        object_fit,
+        node_transform,
+    ) else {
+        return;
+    };
     if needs_clip {
         painter.push_clip(Fill::NonZero, node_transform, &rect.into());
     }
-
-    let paint_image = PaintImage {
-        data,
-        width,
-        height,
-    };
-    painter.draw_image(&paint_image, img_transform);
-
+    painter.draw_gpu_image(image, img_transform);
     if needs_clip {
         painter.pop_layer();
     }

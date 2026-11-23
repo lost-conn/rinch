@@ -14,9 +14,16 @@
 //!    the identity of the leading reconciled blocks (so a split keeps block N's text
 //!    object and only *adds* the tail block).
 //!
-//! A changed top-level *list* reconciles recursively (same diff, one level down), so a
-//! keystroke inside one list item re-splices only that item's text object. Any node
-//! outside the supported scope (a non-list nested block, a table) anywhere in
+//! A changed top-level *container* (a list, a quote) reconciles recursively (same diff,
+//! one level down), so a keystroke inside one list item re-splices only that item's
+//! text object. Every child list, the top level's included, is addressed through its
+//! **visible** children ([`crate::projection::read_children`]): a container emptied by
+//! concurrent deletions reads as absent, so it is skipped by the diff and by the count
+//! gate alike. The top level finds its void containers only when a remote merge has
+//! left one (`CollabDoc::top_void`), so a keystroke in a document without one reads the
+//! block it changed and nothing else (`tests/projection_cost.rs`). A keystroke in a
+//! cell of a top-level table reads and writes that cell's blocks, not the table
+//! (`CollabDoc::project_cell_edit`, #1241). Any node outside the supported scope (a task list, a ragged table) anywhere in
 //! `before` or `after` fails loud ([`CollabError::Unsupported`], design A22).
 //!
 //! The diff trusts `before` to describe what the CRDT holds — which is the invariant —
@@ -29,14 +36,20 @@
 //! carries a starter paragraph the CRDT does not. That case skips the diff entirely and
 //! inserts the whole of `after`.
 
+use std::collections::BTreeSet;
+
 use yrs::{Array, Transact};
 
 use rinch_editor_core::{Node, Transaction};
 
+use crate::atoms::{carry_over, find_atoms, overlay_scope};
 use crate::error::{CollabError, Result};
 use crate::projection::{
-    CollabDoc, check_index, insert_node, read_node, read_node_data, reconcile_node,
+    CollabDoc, RawIndex, child_map, child_maps, common_runs, identity_runs, insert_node,
+    model_atom_scope, model_atoms, node_content, one_pass_cheaper, read_map_data, read_node,
+    reconcile_child_list, visible_indices, write_child_diff,
 };
+use crate::remote::holds_atoms;
 
 impl CollabDoc {
     /// Project a freshly-applied local transaction onto the CRDT. A no-op for a
@@ -55,6 +68,12 @@ impl CollabDoc {
     /// Project an arbitrary `before → after` document change (also the building block
     /// for loading content). Both must be within the projected scope.
     pub fn project_change(&mut self, before: &Node, after: &Node) -> Result<()> {
+        // The `atoms` map is read at most once for the whole change (review of #1503,
+        // F4).
+        let _overlay = overlay_scope(&self.overlay);
+        let epoch = self.epoch.load(std::sync::atomic::Ordering::Relaxed);
+        // Until a path below says otherwise (`CollabDoc::touched_atoms`).
+        self.touched_atoms = true;
         // A CRDT holding zero blocks is a legitimate converged state (issue #192: two
         // peers deleting *different* blocks concurrently deletes every block), and the
         // model cannot mirror it — the schema requires at least one block, so `to_doc`
@@ -64,7 +83,30 @@ impl CollabDoc {
         // to wedge the session permanently: nothing projected, nothing broadcast, no
         // recovery). With no blocks in the CRDT every block of `after` is an insert, and
         // that restores `model ≡ project(model)` exactly.
-        let crdt_blocks = self.content.len(&self.doc.transact());
+        //
+        // "Zero blocks" means zero *visible* blocks: a void container (one emptied by
+        // concurrent deletions, see `projection::is_void`) reads as absent, so a CRDT
+        // holding only those reads as the starter paragraph too.
+        //
+        // The diff below runs over the blocks the model sees and writes where each one
+        // lives. While the top level holds no void container (`top_void`, which only a
+        // remote merge can set) those are the same index and nothing is read here, so a
+        // keystroke reads the one block it changed. While it holds one, the raw index of
+        // every visible block is found by one sequential pass over the top-level
+        // *shapes* — no text is read — which is the linear cost of a document a merge
+        // left a void container in. The read transaction is scoped so it drops before
+        // `transact_mut` opens (yrs cannot nest transaction acquisitions).
+        let mapped: Option<Vec<u32>>;
+        let raw = {
+            let txn = self.doc.transact();
+            if self.top_void {
+                mapped = Some(visible_indices(&txn, &self.content));
+                RawIndex::Mapped(mapped.as_deref().unwrap_or_default())
+            } else {
+                RawIndex::Identity(self.content.len(&txn))
+            }
+        };
+        let crdt_blocks = raw.len();
         if crdt_blocks == 0 {
             return self.project_whole_doc(after);
         }
@@ -81,39 +123,75 @@ impl CollabDoc {
         // finding 5). Both directions are the same broken invariant, so both fail loud
         // here, before any write. The zero-block CRDT is the one legitimate mismatch and
         // returned above.
-        if crdt_blocks as usize != bn {
+        if crdt_blocks != bn {
             return Err(CollabError::schema(format!(
                 "model/CRDT out of step: the model document holds {bn} block(s) but the \
                  CRDT holds {crdt_blocks}"
             )));
         }
 
-        // Unchanged leading blocks (Rc identity — O(1) per block).
-        let mut prefix = 0;
-        while prefix < bn && prefix < an && before.child(prefix).same_ref(after.child(prefix)) {
-            prefix += 1;
+        // Unchanged leading and trailing blocks, by Rc identity (O(1) per block). A
+        // before and after that share no block at all carry no identity (a load while
+        // collaborating, a re-base on the CRDT's read-back): there the runs are taken by
+        // the blocks' values, as a nested list does (`reconcile_child_list`).
+        //
+        // A caller that proves its atoms without naming their old nodes
+        // (`record_local_keeping`) and whose before and after share no block but share
+        // an inline node (a one-block document whose block an edit rebuilt) is taken as
+        // one document edited: matched by value, a picture pasted over an equal one
+        // would read as no change at all and the old char would keep its identity
+        // (decision (f)).
+        //
+        // An editor's transaction (`record_local_edit`, `proof_is_an_edit`) keeps the
+        // value rule for a level that shares no block — Enter at the start of a lone
+        // paragraph shares only its text node, and pairing the two paragraphs by index
+        // would move a peer's concurrent typing to the new empty line (the round-3
+        // review of #1595, F1) — but under its proof an atom is equal only to itself or
+        // to a pair the proof keeps (`equal_under_proof`): the picture that was a
+        // one-paragraph document's only content, replaced by an equal fresh copy, is a
+        // change, not "no change" (review 2 of #1595, G3).
+        let mut runs = identity_runs(before, after);
+        let edit = crate::projection::proof_is_an_edit();
+        let shares_a_block = runs != (0, 0)
+            || crate::projection::shares_a_child(before, after)
+            || (!edit
+                && crate::projection::kept_atoms_known()
+                && shares_any_inline_node(before, after));
+        if !shares_a_block {
+            runs = common_runs(bn, an, |i, j| {
+                crate::projection::equal_under_proof(before.child(i), after.child(j))
+            });
         }
-        // Unchanged trailing blocks.
-        let mut suffix = 0;
-        while suffix < bn - prefix
-            && suffix < an - prefix
-            && before
-                .child(bn - 1 - suffix)
-                .same_ref(after.child(an - 1 - suffix))
-        {
-            suffix += 1;
-        }
+        let (prefix, suffix) = runs;
 
         let pre_mid = bn - prefix - suffix; // changed pre blocks
         let post_mid = an - prefix - suffix; // changed post blocks
         let common = pre_mid.min(post_mid);
 
+        // One cell of one table changed (a keystroke in a cell): only that cell's
+        // blocks are read, validated and written (#1241).
+        if pre_mid == 1
+            && post_mid == 1
+            && crate::table::cell_path_enabled()
+            && let Some(cell) =
+                crate::table::one_changed_cell(before.child(prefix), after.child(prefix))
+            && let Some(at) = raw.get(prefix)
+            && self.project_cell_edit(
+                at,
+                (before.child(prefix), after.child(prefix)),
+                &cell,
+                shares_a_block || edit,
+            )?
+        {
+            return Ok(());
+        }
+
         // Pre-pass gate 2, model side (design A22 fail-loud must be all-or-nothing):
         // read and validate EVERY model block this change will touch — the `after`
         // blocks to reconcile/insert, and the `before` blocks to delete — BEFORE
         // issuing any CRDT write, and before the write transaction is even opened. A
-        // mixed in-scope/out-of-scope change (e.g. pasting or loading a table while
-        // collaborating) then leaves the CRDT *exactly* at the prior converged state
+        // mixed in-scope/out-of-scope change (e.g. pasting or loading a task list
+        // while collaborating) then leaves the CRDT *exactly* at the prior converged state
         // and returns `Unsupported`, instead of partially mutating it and wedging the
         // session in a half-projected state.
         //
@@ -128,24 +206,74 @@ impl CollabDoc {
             // Validate (and discard) each block being deleted — fail loud if out of scope.
             read_node(before.child(idx))?;
         }
+        // The non-inclusive marks the reconciled blocks carry, on either side: their
+        // formatting is resynced per char, not per span (see `resync_marks`).
+        let mut per_char = BTreeSet::new();
+        for k in 0..common {
+            non_inclusive_marks(before.child(prefix + k), &mut per_char);
+            non_inclusive_marks(after.child(prefix + k), &mut per_char);
+        }
+        // The inline atoms of the blocks the change touches, before and after it. An
+        // atom in both (`Node::same_ref`) is one the change kept or moved: then the
+        // CRDT's atoms are read on both sides of the write, so one it moved keeps its
+        // identity (`atoms::carry_over`).
+        let mut model_before = Vec::new();
+        for i in prefix..prefix + pre_mid {
+            model_atoms(before.child(i), &mut model_before);
+        }
+        let mut model_after = Vec::new();
+        for i in prefix..prefix + post_mid {
+            model_atoms(after.child(i), &mut model_after);
+        }
+        let moves_atoms = model_after
+            .iter()
+            .any(|a| model_before.iter().any(|b| b.node.same_ref(&a.node)));
 
         // Pre-pass gate 3, CRDT side (issue #194): read back every CRDT node the write
         // phase will read — the blocks being reconciled in place, recursively (a
         // container's whole subtree, at least what `reconcile_node` walks: on the
         // kind-mismatch wholesale-replace path this reads a superset, which is
-        // over-strict in the safe direction, never a hole). This
-        // surfaces every CRDT-side failure the model-side gates cannot see — an embed
-        // parked in a block's text, a corrupt mark value, a node that is neither
-        // text-block nor container — before the first write. Blocks being *deleted*
-        // are not read back: removal never reads their content. The read transaction
-        // is scoped so it drops before `transact_mut` opens (yrs cannot nest
-        // transaction acquisitions).
-        {
+        // over-strict in the safe direction, never a hole). This surfaces every
+        // CRDT-side failure the model-side gates cannot see — an embed parked in a
+        // block's text, a corrupt mark value, a node that is neither text-block nor
+        // container — before the first write. Blocks being *deleted* are not read back:
+        // removal never reads their content.
+        //
+        // The same read finds the atoms in the blocks the change touches, raw indices
+        // `span` of the top level (void containers between them included, so the span
+        // after the change is this one grown by what it inserts).
+        let (span, atoms_before) = {
             let txn = self.doc.transact();
-            for k in 0..common {
-                read_node_data(&txn, &self.content, (prefix + k) as u32)?;
+            let at_of = |k: usize| {
+                raw.get(prefix + k).ok_or_else(|| {
+                    CollabError::schema("model/CRDT out of step: a changed block is missing")
+                })
+            };
+            // In one pass when that is cheaper: a lookup by index walks the array from
+            // its start (#2526).
+            let mut nodes = None;
+            if common > 1 && one_pass_cheaper(common, at_of(0)?, at_of(common - 1)?) {
+                let ats = (0..common).map(at_of).collect::<Result<Vec<_>>>()?;
+                nodes = Some(child_maps(&txn, &self.content, &ats).into_iter());
             }
-        }
+            for k in 0..common {
+                let at = at_of(k)?;
+                let node = match nodes.as_mut() {
+                    Some(nodes) => nodes.next().flatten(),
+                    None => child_map(&txn, &self.content, at),
+                }
+                .ok_or_else(|| CollabError::schema("read_node_data: missing node"))?;
+                read_map_data(&txn, &node)?;
+            }
+            if moves_atoms {
+                let len = self.content.len(&txn);
+                let start = raw.get(prefix).unwrap_or(len);
+                let end = raw.get(prefix + pre_mid).unwrap_or(len);
+                (start..end, find_atoms(&txn, &self.content, start..end))
+            } else {
+                (0..0, None)
+            }
+        };
 
         // Writes — one transaction for the whole change, which yrs commits on drop:
         // there is no rollback primitive, so the pre-pass above is the *only*
@@ -156,28 +284,137 @@ impl CollabDoc {
         // error returns below are therefore unreachable for a change the pre-pass
         // admitted; they stay as defense in depth against a projection bug, not as a
         // supported failure path.
+        //
+        // The changed blocks are reconciled in place (keeping identity; a changed
+        // top-level container reconciles recursively, touching only the edited
+        // descendant), then the extra post blocks are inserted (the tail of a split) or
+        // the extra pre blocks deleted (a join, a block deletion) — the same child-list
+        // write a container's own content gets, addressed through the raw indices.
         let content = self.content.clone();
+        // Whether `before` and `after` are one document edited (they share a block, or
+        // an inline node of the blocks the change touches, or the editor says so —
+        // `record_local_edit`) rather than two documents (a load, a re-base): only then
+        // does the model say which atom is which.
+        let related = shares_a_block
+            || edit
+            || share_an_inline_node(
+                &before.content().children()[prefix..prefix + pre_mid],
+                &after.content().children()[prefix..prefix + post_mid],
+            );
+        let _atoms = model_atom_scope(&model_before, &model_after, related);
         let mut txn = self.doc.transact_mut();
-        // Reconcile the overlapping changed blocks in place (keeps identity). A changed
-        // top-level list reconciles recursively, touching only the edited descendant.
-        for (k, target) in targets.iter().take(common).enumerate() {
-            reconcile_node(&mut txn, &content, (prefix + k) as u32, target)?;
+        write_child_diff(
+            &mut txn,
+            &content,
+            raw,
+            prefix..prefix + pre_mid,
+            &targets,
+            Some((before, after)),
+            &per_char,
+        )?;
+        // An atom this change moved (Enter before an image deletes its char and writes
+        // a new one in the new block) keeps its identity, so a peer's concurrent change
+        // of its attrs applies to it where it now is.
+        if let Some(atoms_before) = atoms_before {
+            let end = (span.end + post_mid as u32).saturating_sub(pre_mid as u32);
+            if let Some(atoms_after) = find_atoms(&txn, &content, span.start..end) {
+                carry_over(
+                    &mut txn,
+                    &atoms_before,
+                    &atoms_after,
+                    &model_before,
+                    &model_after,
+                );
+            }
         }
-        // Insert the extra post blocks (e.g. the tail of a split). `targets` has
-        // exactly `post_mid` entries, so skipping `common` yields indices
-        // `common..post_mid`.
-        for (k, target) in targets.iter().enumerate().skip(common) {
-            insert_node(&mut txn, &content, (prefix + k) as u32, target)?;
-        }
-        // Delete the extra pre blocks (e.g. a join, or a block deletion). `common` is
-        // the min, so at most one of insert/delete runs; when this runs the CRDT
-        // indices still match `before`'s. Delete from the end so earlier indices stay
-        // valid.
-        for idx in (prefix + common..prefix + pre_mid).rev() {
-            check_index(&txn, &content, idx as u32, false)?;
-            content.remove(&mut txn, idx as u32);
-        }
+        drop(txn);
+        self.touched_atoms = (prefix..prefix + pre_mid).any(|i| holds_atoms(before.child(i)))
+            || (prefix..prefix + post_mid).any(|i| holds_atoms(after.child(i)));
+        // A table's cell index stays true through a change that left the table alone:
+        // every top-level table outside the blocks it changed (#1241), so a keystroke
+        // in a paragraph does not cost the next keystroke in a table, mine or a peer's,
+        // a read of the table.
+        let written = self.epoch.load(std::sync::atomic::Ordering::Relaxed);
+        crate::table::carry_cell_indexes(self.uid, epoch, written, |_, table| {
+            (!(prefix..prefix + pre_mid).any(|i| before.child(i).same_ref(table)))
+                .then(|| table.clone())
+        });
         Ok(())
+    }
+
+    /// Project an edit of one cell of the table at raw index `at` of the top level
+    /// (`table`, before and after; [`crate::table::one_changed_cell`]): what the
+    /// whole-table reconcile writes for it, read and written in that cell alone, so a
+    /// keystroke in a cell costs what one in a paragraph costs whatever the table's size
+    /// (#1241). `false`, having written nothing, when the edit is not one this path
+    /// takes; the whole-table reconcile then runs, and answers what it always did.
+    ///
+    /// The whole-table reconcile, for such an edit, pairs every row and column with
+    /// itself, leaves every other cell alone, and reconciles the cell's blocks as a
+    /// child list with the cell's model before and after ([`reconcile_child_list`]),
+    /// which is the call made here, on the cell map [`crate::table::locate_cell`]
+    /// finds. The rest is what `project_change` hands that call: the cell's blocks as
+    /// targets (read and validated before anything is written, as gate 2 reads the
+    /// table's), the non-inclusive marks of the cell before and after (the table's
+    /// other cells' marks are on blocks this write does not touch), and an atom scope
+    /// with no atom in it, since `model_atoms` does not descend into a table. Its
+    /// `related` is the change's: `related` here is the part of it known without
+    /// walking the table (a block or the editor's proof), and otherwise the cell
+    /// itself sharing an inline node — which the table then shares too; a cell that
+    /// shares none leaves the answer to the whole-table path. The CRDT side of gate 3
+    /// is `reconcile_child_list`'s own first read: every block of the cell, before any
+    /// write.
+    fn project_cell_edit(
+        &mut self,
+        at: u32,
+        (before, after): (&Node, &Node),
+        cell: &crate::table::CellEdit<'_>,
+        related: bool,
+    ) -> Result<bool> {
+        if !(related || shares_an_inline_node(cell.before, cell.after)) {
+            return Ok(false);
+        }
+        // Gate 2 for the cell. An error is left to the whole-table path, which meets
+        // it in its own read and reports it as it always has.
+        let Ok(targets) = (0..cell.after.child_count())
+            .map(|i| read_node(cell.after.child(i)))
+            .collect::<Result<Vec<_>>>()
+        else {
+            return Ok(false);
+        };
+        let epoch = self.epoch.load(std::sync::atomic::Ordering::Relaxed);
+        let content = {
+            let txn = self.doc.transact();
+            let Some(node) = child_map(&txn, &self.content, at) else {
+                return Ok(false);
+            };
+            let Some(map) = crate::table::locate_cell(&txn, self.uid, epoch, &node, before, cell)
+            else {
+                return Ok(false);
+            };
+            match node_content(&txn, &map) {
+                Some(content) => content,
+                None => return Ok(false),
+            }
+        };
+        let mut per_char = BTreeSet::new();
+        non_inclusive_marks(cell.before, &mut per_char);
+        non_inclusive_marks(cell.after, &mut per_char);
+        let _atoms = model_atom_scope(&[], &[], true);
+        {
+            let mut txn = self.doc.transact_mut();
+            reconcile_child_list(
+                &mut txn,
+                &content,
+                &targets,
+                Some((cell.before, cell.after)),
+                &per_char,
+            )?;
+        }
+        let written = self.epoch.load(std::sync::atomic::Ordering::Relaxed);
+        crate::table::rekey_cell_index(self.uid, before, after, epoch, written);
+        self.touched_atoms = holds_atoms(cell.before) || holds_atoms(cell.after);
+        Ok(true)
     }
 
     /// Insert every block of `doc` into a CRDT that holds **no** blocks — the recovery
@@ -198,6 +435,110 @@ impl CollabDoc {
             insert_node(&mut txn, &content, i as u32, nd)?;
         }
         Ok(())
+    }
+}
+
+/// Whether `before` and `after` hold one inline node (`Node::same_ref`) anywhere:
+/// one pass over each, by node key.
+fn shares_any_inline_node(before: &Node, after: &Node) -> bool {
+    fn inline(n: &Node, out: &mut dyn FnMut(&Node) -> bool) -> bool {
+        for i in 0..n.child_count() {
+            let c = n.child(i);
+            let hit = if c.node_type().is_block() {
+                inline(c, out)
+            } else {
+                out(c)
+            };
+            if hit {
+                return true;
+            }
+        }
+        false
+    }
+    let mut keys = std::collections::HashSet::new();
+    inline(before, &mut |c| {
+        keys.insert(crate::projection::node_key(c));
+        false
+    });
+    !keys.is_empty()
+        && inline(after, &mut |c| {
+            keys.contains(&crate::projection::node_key(c))
+        })
+}
+
+/// Whether any block of `before` and any of `after` hold one inline node
+/// (`Node::same_ref`) anywhere below them: [`shares_an_inline_node`] over every pair,
+/// in one pass over each side by node key. Comparing the pairs cost (blocks × blocks)
+/// for a change that rewrote every block (#2526).
+fn share_an_inline_node(before: &[Node], after: &[Node]) -> bool {
+    fn inline(n: &Node, out: &mut dyn FnMut(&Node) -> bool) -> bool {
+        for i in 0..n.child_count() {
+            let c = n.child(i);
+            crate::steps::count_work(1);
+            let hit = if c.node_type().is_block() {
+                inline(c, out)
+            } else {
+                out(c)
+            };
+            if hit {
+                return true;
+            }
+        }
+        false
+    }
+    let mut keys = crate::steps::KeySet::default();
+    for b in before {
+        inline(b, &mut |c| {
+            keys.insert(crate::projection::node_key(c));
+            false
+        });
+    }
+    !keys.is_empty()
+        && after
+            .iter()
+            .any(|a| inline(a, &mut |c| keys.contains(&crate::projection::node_key(c))))
+}
+
+/// Whether two blocks hold one inline node (`Node::same_ref`) anywhere below them: a
+/// text run or an atom an edit kept.
+fn shares_an_inline_node(a: &Node, b: &Node) -> bool {
+    fn inline(n: &Node, out: &mut Vec<Node>) {
+        for i in 0..n.child_count() {
+            let c = n.child(i);
+            if c.node_type().is_block() {
+                inline(c, out);
+            } else {
+                out.push(c.clone());
+            }
+        }
+    }
+    let (mut x, mut y) = (Vec::new(), Vec::new());
+    inline(a, &mut x);
+    inline(b, &mut y);
+    x.iter().any(|n| y.iter().any(|m| n.same_ref(m)))
+}
+
+/// Add the name of every non-inclusive mark ([`MarkSpec::inclusive`] `false`, the
+/// starter kit's `link`) found anywhere in `node` to `out`.
+///
+/// The CRDT carries mark *names* only, so this is where the projection learns which of
+/// them are non-inclusive: from the model's own mark types. yrs extends a formatted
+/// range over an insert at its end, so a char typed right after a link lands inside the
+/// link's range in the CRDT while the model holds it as plain text. Resynced per span,
+/// that clears the whole link and writes it again, and the fresh write reverts a peer's
+/// concurrent change to it (the #193 shape). Resynced per char, only the typed char is
+/// cleared — and a char typed right after one is inserted outside the range to begin
+/// with (`splice_min_with_marks`), so usually there is nothing left to clear.
+///
+/// [`MarkSpec::inclusive`]: rinch_editor_core::MarkSpec::inclusive
+fn non_inclusive_marks(node: &Node, out: &mut BTreeSet<String>) {
+    for m in node.marks() {
+        if !m.typ.spec().inclusive {
+            out.insert(m.type_name().to_string());
+        }
+    }
+    for i in 0..node.child_count() {
+        non_inclusive_marks(node.child(i), out);
     }
 }
 
@@ -290,6 +631,34 @@ mod tests {
             "the embed must fail loud as Unsupported, got {err:?}"
         );
         assert_untouched(&mut cdoc, &base, "embed in CRDT text");
+    }
+
+    #[test]
+    fn an_embed_behind_an_unchanged_prefix_does_not_partially_mutate() {
+        // The same as above with an unchanged leading block, so the changed blocks sit
+        // at raw 1 and 2: gate 3 must read them at `prefix + k`, not at `k`.
+        let s = schema();
+        let before = doc_of(
+            &s,
+            vec![para(&s, "keep"), para(&s, "alpha"), para(&s, "beta")],
+        );
+        let mut cdoc = CollabDoc::from_doc(&before).unwrap();
+        {
+            let mut txn = cdoc.doc.transact_mut();
+            let Some(Out::YMap(node)) = cdoc.content.get(&txn, 2) else {
+                panic!("block 2 must be a node map");
+            };
+            let Some(Out::YText(text)) = node.get(&txn, "text") else {
+                panic!("block 2 must carry a text");
+            };
+            text.insert_embed(&mut txn, 2, Any::Bool(true));
+        }
+        let base = baseline(&mut cdoc);
+        let keep = before.child(0).clone();
+        let after = doc_of(&s, vec![keep, para(&s, "ALPHA"), para(&s, "BETA")]);
+        let err = cdoc.project_change(&before, &after).unwrap_err();
+        assert!(matches!(err, CollabError::Unsupported(_)), "{err:?}");
+        assert_untouched(&mut cdoc, &base, "embed behind a prefix");
     }
 
     #[test]

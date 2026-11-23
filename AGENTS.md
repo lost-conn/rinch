@@ -1,7 +1,7 @@
 # AGENTS.md
 
-Guidance for AI agents working on the rinch codebase. `CLAUDE.md` is the detailed API
-and usage reference — read it for *how to write rinch code*. This file is about
+Guidance for AI agents working on the rinch codebase. `CLAUDE.md` is the short orientation and
+index, and `docs/internals/` holds the detailed reference it points to — read them for *how to write rinch code*. This file is about
 *working on rinch itself*: where things live, which invariants you must not break, and
 how to verify a change.
 
@@ -14,8 +14,10 @@ re-renders.
 
 **Desktop pipeline:** component → `RenderScope`/`NodeHandle` → `RinchDocument`
 (Stylo CSS + Taffy layout + Parley text) → `Painter` → window.
-The `Painter` is **tiny-skia + softbuffer by default**; the `gpu` feature swaps in
-Vello + wgpu.
+The `Painter` is **tiny-skia + softbuffer by default**; the `gpu` feature (or
+`gpu-renderer`, the same renderer without the native menus) adds
+Vello + wgpu beside it, and the window chooses one at run time, falling back to
+software when the GPU will not start (`shell/renderer.rs`).
 
 **Web pipeline:** the same component code → `WebDocument` (`rinch-web`) → real browser
 DOM. No Taffy/Parley/Vello — the browser lays out, shapes and paints.
@@ -39,8 +41,7 @@ list if something looks off.
 | `rinch-macros` | `rsx!` and `#[component]`. |
 | `rinch-platform` | Platform abstraction traits: `PlatformWindow`, `PlatformRenderer`, `PlatformEventLoop`, `PlatformMenu`, plus `PlatformEvent` / `AppAction`. |
 | `rinch-dom` | CSS + layout + paint engine (Stylo, Taffy, Parley, Vello/tiny-skia). The heaviest crate. |
-| `stylo-taffy` | Vendored Stylo↔Taffy interop. Pins Taffy alongside `rinch-dom`. |
-| `rinch-renderer` | Near-empty stub (two empty modules). Optional dep of `rinch` under `gpu`; nothing meaningful lives here yet. |
+| `rinch-renderer` | Near-empty stub (two empty modules). Optional dep of `rinch` under `gpu-renderer`; nothing meaningful lives here yet. |
 
 **UI**
 
@@ -57,7 +58,8 @@ list if something looks off.
 | `rinch-editor-core` | The pure model: document tree, `Pos`, schema/`ContentMatch`, `Step`s, `EditorState`/`Transaction`, commands, plugins, serialization. **wasm-clean; no renderer, no CRDT.** |
 | `rinch-editor-view` | Renderer-agnostic view: `RinchDomEditorView`, `EditorHandle`, the `Editor {}` component, the mounted-editor registry. Shared by desktop and web. |
 | `rinch-editor-collab` | Optional (`collaboration` feature) CRDT adapter over **yrs**. The only crate in the workspace that links a CRDT engine. |
-| `rinch-editable` | **Unrelated** engine for single-line `<input>`/`<textarea>`. Shares no code or types with the rich editor despite overlapping names (`Selection`, `Position`). |
+| `rinch-editable` | **Unrelated** engine for single-line `<input>`/`<textarea>`. Shares no types with the rich editor despite overlapping names (`Selection`, `Position`); the only code the two share is the word segmentation in `rinch-words` (#1619). |
+| `rinch-words` | Word segmentation (what a word motion, word delete or double-click steps over), shared by `rinch-editor-core` and `rinch-editable`. A leaf crate: regex + optional ICU dictionary (`dictionary`), no rinch crate. |
 
 **Web**
 
@@ -73,16 +75,16 @@ list if something looks off.
 
 **Media**
 
-`rinch-video` · `rinch-av` · `rinch-webrtc` (str0m / web_sys) · `rinch-signaling` ·
-`rinch-signaling-server` · `rinch-screen-capture`.
+`rinch-video` · `rinch-av` · `rinch-rtc` (WebRTC data channels, and audio and video
+tracks behind its `media` feature; webrtc-rs / the browser) · `rinch-screen-capture`.
 
 **Tooling**
 
 | Crate | Role |
 |---|---|
-| `rinch-debug` | TCP IPC server embedded in an app (`debug` feature); writes `~/.rinch/debug/{pid}.json`. |
+| `rinch-debug` | TCP IPC server embedded in an app (`debug` feature, started with `RINCH_DEBUG=1`); writes `~/.rinch/debug/{pid}.json` (0600, with the session token a client must send). |
 | `rinch-mcp-server` | Standalone MCP server Claude talks to; discovers and drives running apps. |
-| `rinch-test` / `rinch-test-cli` | MCP-based test harness ("Playwright for rinch") and its CLI (binary name `rinch-test`). |
+| `rinch-test` | MCP-based test harness ("Playwright for rinch"), MCP over stdio inside the app. |
 | `rinch-visual-test` | Visual regression testing. **Excluded from the workspace.** |
 
 **Examples.** `ui-zoo-desktop` (+ the shared `ui-zoo` library) is the primary
@@ -98,22 +100,27 @@ own directory. Others of note: `markdown-editor`, `collab-editor-demo`, `game-em
 rinch (facade)
   ├── rinch-core, rinch-macros, rinch-platform   (always)
   ├── rinch-dom, rinch-editable, rinch-editor-core, rinch-editor-view,
-  │   winit, muda, parley, softbuffer            (desktop feature)
-  ├── vello, wgpu, rinch-renderer                (gpu feature → implies desktop)
+  │   winit, parley, softbuffer                  (windowing feature)
+  ├── muda (on Linux: GTK 3 with GLib, GIO,      (native-menus → implies windowing)
+  │   ATK, Cairo, Pango, gdk-pixbuf, + libxdo)   (desktop = windowing + native-menus)
+  │                                              (a11y, collaboration, global-hotkeys
+  │                                               → imply windowing, not desktop)
+  ├── vello, wgpu, rinch-renderer                (gpu-renderer → implies windowing;
+  │                                               gpu = desktop + gpu-renderer)
   ├── rinch-theme                                (theme feature)
   ├── rinch-components                           (components feature → implies theme)
   ├── rinch-clipboard / rfd / tray-icon / rinch-debug / rinch-video / rinch-http
   │                                              (clipboard / file-dialogs /
   │                                               system-tray / debug / video /
   │                                               image-network)
-  └── rinch-editor-view/collaboration            (collaboration → implies desktop)
+  └── rinch-editor-view/collaboration            (collaboration → implies windowing)
 
-rinch-dom            → rinch-core + stylo, stylo_taffy, taffy, parley, vello,
+rinch-dom            → rinch-core + stylo, taffy, parley, vello,
                        tiny-skia (software-renderer), cssparser
 rinch-components     → rinch-core, rinch-theme, rinch-macros, rinch-tabler-icons
 rinch-web            → rinch-core, rinch (no default features), rinch-editor-core,
                        rinch-editor-view, wasm-bindgen/js-sys/web-sys
-rinch-editor-core    → thiserror, regex (+ optional serde, pulldown-cmark, accesskit)
+rinch-editor-core    → thiserror, regex, rinch-words (+ optional serde, pulldown-cmark, accesskit)
 rinch-editor-view    → rinch-core, rinch-editor-core (+ optional rinch-editor-collab)
 rinch-editor-collab  → rinch-editor-core, yrs
 ```
@@ -258,8 +265,9 @@ tiny-skia backends), `layout_engine.rs` + `layout.rs` (Taffy), `computed_style/`
 - Stylo integration has many trait impls with subtle requirements — read before editing.
 - Paint order matters; layout measurement and paint must use the same font stack or
   text clips.
-- Taffy is pinned at **0.12** in two places (`rinch-dom` and the vendored
-  `stylo-taffy`) which must move together.
+- Taffy is pinned at **0.14** in one place, `crates/rinch-dom/Cargo.toml` (its
+  `[dependencies]` and `[dev-dependencies]` lines must agree). The vendored
+  `stylo-taffy` crate that used to pin it too was unused and was deleted (#1236).
 
 ### rinch-macros (proc macros)
 
@@ -322,6 +330,19 @@ feature-gated set), `clippy`, `clippy-wasm` (per-crate `wasm32` lint for
 `rinch-http`, `rinch-ws`, `rinch-web`), `test-wasm` (headless Chrome, for
 `rinch-storage` and `rinch-web`), and `fmt`.
 
+**Live tests that need a compositor or a D-Bus bus run in an isolated session,
+always** (issue #2429): `scripts/isolated-session.sh [--kwin [KWIN_OPTION...]] --
+COMMAND` gives the command private XDG directories and `HOME` under `/tmp`, no
+`WAYLAND_DISPLAY`/`DISPLAY`/`DBUS_SESSION_BUS_ADDRESS` of the desktop's, a
+`dbus-daemon` of its own with no service activation, optionally a headless KWin
+(`--kwin`, `--xwayland` for X11), and one process group it ends and checks for
+leftovers. Never `dbus-run-session`, `dbus-launch`, a bare `kwin_wayland
+--virtual` or an `Xwayland -rootless` from the desktop: on 2026-11-10 such
+sessions started the desktop portals and the secret service with the real
+session's environment (its runtime directory, Wayland display and home); one
+of them crashed 391 times, and orphans were left running. The recipes in the code (`hide_show_geometry.rs`,
+`tray.rs`, `hotkey/backend/portal.rs`) use it.
+
 **Feature-gated tests are a trap.** A test file whose `cfg` is false compiles to an
 *empty* binary that still prints `Running tests/x.rs` — only the test **count** reveals
 it. And `cargo test --workspace` unifies features across members, so a gated test can
@@ -331,12 +352,21 @@ assume the workspace run covers it. (`--all-features` is not an option — it pu
 transitive `ashpd` that fails to build.)
 
 **System deps (Linux):** GTK3, GLib, ATK, Cairo, Pango, gdk-pixbuf, libxdo, libmpv
-development packages.
+development packages. All but libmpv come with muda (`native-menus`, in `desktop`):
+GTK 3 brings GLib, ATK, Cairo, Pango and gdk-pixbuf with it, and muda adds libxdo. A
+`windowing` build without the native menus needs none of them (#2435).
 
-**wgpu fork:** the workspace patches wgpu crates from `joeleaver/wgpu-fork` (branch
-`rinch-patch`) for transparent-window support. Cargo patches are not transitive, so
-downstream consumers must copy the `[patch.crates-io]` section into their own
-workspace.
+**No `[patch]` lines at all.** rinch depends on crates.io wgpu 30, on Vello
+0.11 from `joeleaver/vello-fork` and on winit 0.31.0-beta.4 from
+`joeleaver/winit-fork`, each fork at a pinned rev, as ordinary dependencies, so
+an app copies no patch for any of them. Delete any old `[patch.crates-io]`
+lines for winit (`winit`, `winit-core`, `winit-common`, `winit-wayland`,
+`winit-x11`, `dpi`) and for wgpu (`wgpu`, `wgpu-core`, `wgpu-hal`,
+`wgpu-types`, `naga`): the winit ones now point Cargo at a branch rinch no
+longer uses. Use `rinch::wgpu` and `rinch::vello` rather than a `wgpu`/`vello`
+dependency of your own, so the versions never drift; add `wgpu = "30"`
+yourself only to turn on an extra feature (e.g. `webgpu`), and Cargo unifies
+it with rinch's.
 
 ## Common Pitfalls
 
@@ -346,7 +376,8 @@ workspace.
    `Callback::new(...)` inside `rsx!` produces confusing type errors.
 3. **Missing `desktop` feature.** The workspace dependency sets
    `default-features = false`, so `run()` and the rendering APIs are unavailable
-   without `features = ["desktop"]`.
+   without `features = ["desktop"]` (or `["windowing"]`, which is `desktop`
+   without the native menus).
 4. **Cross-thread signal writes.** `set()`/`update()` panic off the main thread; use
    `send()`/`update_send()`.
 5. **Using a disposed reactive handle.** Since #141, a freed `Signal`/`Memo` panics on
@@ -389,12 +420,15 @@ Node geometry is reported twice: `layout` is **parent-relative**, `absolute` is
 on-screen — pass `absolute` coordinates to `click()`. Headless: run under Xvfb with
 `DISPLAY` set (`launch_app` forwards it).
 
-The app under test needs `features = ["debug"]`; the server auto-starts and can be
-disabled at runtime with `RINCH_DEBUG=0`.
+The app under test needs `features = ["debug"]`, and the server starts only when
+asked: `RINCH_DEBUG=1` in its environment (`launch_app` sets it) or
+`App::debug_interface(true)`; `RINCH_DEBUG=0` keeps it off either way. A client
+needs the per-session token in the app's discovery file (0600), so only the
+user running the app can drive it (#2481).
 
 ## Documentation Expectations
 
 User-facing changes must update the docs in the same change: the relevant page under
 `docs/src/guide/`, `docs/src/architecture/` for structural changes, doc comments on new
-public APIs, and `CLAUDE.md` when adding a reactive primitive, an element type, or an
-architectural boundary. Add new pages to `docs/src/SUMMARY.md`.
+public APIs, and the matching `docs/internals/` page for how a mechanism works (not
+`CLAUDE.md`, which stays a short index). Add new pages to `docs/src/SUMMARY.md`.

@@ -25,6 +25,46 @@ pub(super) fn length_percentage_from_stylo(
     lp_value_from_stylo(&lp.0)
 }
 
+/// `vertical-align` (#724). Since stylo 0.21 it is a shorthand
+/// (css-inline-3) of `alignment-baseline`, `baseline-shift` and
+/// `baseline-source`, so the value is read back from the first two: the eight
+/// keywords and a `<length-percentage>` stylo 0.11 computed land as they did
+/// (`baseline`, `middle`, `text-top` and `text-bottom` in `alignment-baseline`;
+/// `sub`, `super`, `top`, `bottom` and a length in `baseline-shift`).
+///
+/// Two inputs that 0.11 rejected now parse: `center` (a `baseline-shift`
+/// keyword), which folds to `Baseline`, the value an invalid declaration left
+/// before; and a combination such as `middle 4px`, where the
+/// `alignment-baseline` keyword wins, a combination 0.11 could not express.
+/// `vertical-align: 0` is now `baseline-shift: 0`, the initial value, and
+/// reads as `Baseline`, which lays out the same as a zero length.
+pub(super) fn vertical_align_from_stylo(
+    alignment: style::values::computed::AlignmentBaseline,
+    shift: &style::values::computed::BaselineShift,
+) -> VerticalAlignValue {
+    use style::values::computed::AlignmentBaseline;
+    use style::values::generics::box_::{BaselineShiftKeyword, GenericBaselineShift};
+    match alignment {
+        AlignmentBaseline::Middle => return VerticalAlignValue::Middle,
+        AlignmentBaseline::TextTop => return VerticalAlignValue::TextTop,
+        AlignmentBaseline::TextBottom => return VerticalAlignValue::TextBottom,
+        _ => {}
+    }
+    match shift {
+        GenericBaselineShift::Keyword(BaselineShiftKeyword::Sub) => VerticalAlignValue::Sub,
+        GenericBaselineShift::Keyword(BaselineShiftKeyword::Super) => VerticalAlignValue::Super,
+        GenericBaselineShift::Keyword(BaselineShiftKeyword::Top) => VerticalAlignValue::Top,
+        GenericBaselineShift::Keyword(BaselineShiftKeyword::Bottom) => VerticalAlignValue::Bottom,
+        GenericBaselineShift::Keyword(BaselineShiftKeyword::Center) => VerticalAlignValue::Baseline,
+        GenericBaselineShift::Length(lp) if style::Zero::is_zero(lp) => {
+            VerticalAlignValue::Baseline
+        }
+        GenericBaselineShift::Length(lp) => {
+            VerticalAlignValue::LengthPercentage(lp_value_from_stylo(lp))
+        }
+    }
+}
+
 pub(super) fn margin_from_stylo_generic(
     margin: &style::values::computed::Margin,
 ) -> LengthPercentageAutoValue {
@@ -78,11 +118,19 @@ pub(super) fn inset_from_stylo_generic(
 pub(super) fn border_radius_from_stylo(
     radius: &style::values::computed::BorderCornerRadius,
 ) -> LengthPercentageValue {
-    // BorderCornerRadius is a Size with width and height for elliptical radii
-    // We just take the width (horizontal radius) for simplicity.
+    // BorderCornerRadius is a Size: `width` is the horizontal radius and
+    // `height` the vertical one (#977; [`border_radius_y_from_stylo`]).
     // Percentages (and the percentage part of a calc) are resolved at paint
-    // time when dimensions are known.
+    // time when dimensions are known, each against its own axis.
     lp_value_from_stylo(&radius.0.width.0)
+}
+
+/// The **vertical** radius of a corner — `BorderCornerRadius`'s `height`
+/// (#977). See [`border_radius_from_stylo`] for the horizontal one.
+pub(super) fn border_radius_y_from_stylo(
+    radius: &style::values::computed::BorderCornerRadius,
+) -> LengthPercentageValue {
+    lp_value_from_stylo(&radius.0.height.0)
 }
 
 /// Check if a border style is 'none' or 'hidden' (meaning no border should be painted).
@@ -102,8 +150,10 @@ pub(super) fn border_style_from_stylo(
         BorderStyle::Dotted => BorderStyleValue::Dotted,
         BorderStyle::Double => BorderStyleValue::Double,
         BorderStyle::Hidden => BorderStyleValue::Hidden,
-        // groove, ridge, inset, outset -> render as solid
-        _ => BorderStyleValue::Solid,
+        BorderStyle::Inset => BorderStyleValue::Inset,
+        BorderStyle::Outset => BorderStyleValue::Outset,
+        BorderStyle::Groove => BorderStyleValue::Groove,
+        BorderStyle::Ridge => BorderStyleValue::Ridge,
     }
 }
 

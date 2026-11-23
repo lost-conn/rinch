@@ -12,7 +12,7 @@
 //! Measured in Chrome 150, opening a `--md` (380px) left drawer, reading the
 //! panel's computed `transform` and its own `getAnimations()`:
 //!
-//! | `.rinch-drawer__root--hidden` | closed root `display` | closed panel `transform` | `getAnimations()` | frame 1 | +120ms |
+//! | `.rinch-drawer__root--hidden` | closed root `display` | closed panel `transform` | `getAnimations()` | frame 1 | +120ms (wall clock, once started) |
 //! |---|---|---|---|---|---|
 //! | `display: none !important` | `none` | `none` | **0** | `matrix(1, 0, 0, 1, 0, 0)` | `matrix(1, 0, 0, 1, 0, 0)` |
 //! | `visibility: hidden !important` | `block` | `matrix(1, 0, 0, 1, -380, 0)` | **1** | `matrix(1, 0, 0, 1, -380, 0)` | `matrix(1, 0, 0, 1, -126.775, 0)` |
@@ -156,16 +156,35 @@ async fn next_frame() {
     wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
 }
 
-/// Resolve after `ms` milliseconds.
-async fn after_ms(ms: i32) {
-    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-        web_sys::window()
-            .unwrap()
-            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms)
-            .unwrap();
-    });
-    wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
+/// The element's first running animation — the panel's slide.
+fn first_animation(el: &web_sys::Element) -> JsValue {
+    let f = js_sys::Reflect::get(el, &JsValue::from_str("getAnimations")).unwrap();
+    let f: js_sys::Function = f.dyn_into().unwrap();
+    let arr: js_sys::Array = f.call0(el).unwrap().dyn_into().unwrap();
+    arr.get(0)
 }
+
+/// `v[key]`, or `undefined` when `v` is not an object — so a failure message
+/// about a missing animation reports it rather than throwing.
+fn prop(v: &JsValue, key: &str) -> JsValue {
+    if !v.is_object() {
+        return JsValue::UNDEFINED;
+    }
+    js_sys::Reflect::get(v, &JsValue::from_str(key)).unwrap()
+}
+
+/// Call the zero-argument method `name` on `v`.
+fn call(v: &JsValue, name: &str) -> JsValue {
+    let f: js_sys::Function = prop(v, name).dyn_into().unwrap();
+    f.call0(v).unwrap()
+}
+
+/// How long to wait for the slide to start moving on the browser's own clock.
+///
+/// Generous on purpose (issue #945): a loaded CI runner can take longer than
+/// the whole 300ms slide to commit the frame that starts it, and nothing below
+/// depends on how long that takes. A healthy run moves within a frame or two.
+const START_DEADLINE_MS: f64 = 2_000.0;
 
 /// Opening the drawer runs the 300ms slide in Chrome.
 #[wasm_bindgen_test]
@@ -212,15 +231,55 @@ async fn the_drawer_slides_in() {
          A refused transition reads 0 here"
     );
 
-    after_ms(120).await;
-    let later = translate_x(&panel);
+    // The slide advances on the browser's own clock — waited for, not slept for
+    // (issue #945). A `transform` transition is composited, so Chrome holds it
+    // *pending* — `currentTime` 0, the panel at its start value — until the
+    // compositor commits the frame that starts it. Measured in Chrome 153: after
+    // 150ms of busy wall clock plus one task with no frame committed between
+    // them, the animation was still `pending` at `currentTime` 0 and the panel
+    // still read -380, which is CI's `-380 -> -380` exactly; it moved one frame
+    // later. So poll frame by frame up to a deadline no healthy run comes near.
+    // On the `display: none` spelling there is no animation and the panel sits
+    // at its open position from frame 1, so this never moves and fails at the
+    // deadline, as well as at the two assertions above.
+    let anim = first_animation(&panel);
+    let start = js_sys::Date::now();
+    let mut later = translate_x(&panel);
+    while later <= first && js_sys::Date::now() - start < START_DEADLINE_MS {
+        next_frame().await;
+        later = translate_x(&panel);
+    }
     assert!(
         later > first,
-        "the slide advances: {first} -> {later} (moving right, towards 0)"
+        "the slide advances: {first} -> {later} (moving right, towards 0) within \
+         {START_DEADLINE_MS}ms; the animation is pending={:?} at currentTime={:?}",
+        prop(&anim, "pending"),
+        prop(&anim, "currentTime"),
     );
+
+    // And it is the 300ms slide, sampled mid-way on the animation's own
+    // timeline rather than the wall clock, which a stalled runner can overshoot
+    // in either direction: paused and sought to 120ms, the panel is strictly
+    // between where it started and where it lands. An instant transition reads
+    // 0 here and an unstarted one -380.
+    let timing = call(&prop(&anim, "effect"), "getComputedTiming");
+    assert_eq!(
+        prop(&timing, "duration").as_f64(),
+        Some(300.0),
+        "the slide is the sheet's 300ms transition"
+    );
+    call(&anim, "pause");
+    js_sys::Reflect::set(
+        &anim,
+        &JsValue::from_str("currentTime"),
+        &JsValue::from_f64(120.0),
+    )
+    .unwrap();
+    let mid = translate_x(&panel);
     assert!(
-        later < 0.0,
-        "and it has not finished yet 120ms into a 300ms slide: got {later}"
+        closed_tx < mid && mid < 0.0,
+        "120ms into the 300ms slide the panel is on its way: got {mid}, strictly \
+         between {closed_tx} and 0"
     );
 }
 
@@ -289,5 +348,123 @@ async fn the_closed_drawer_is_out_of_the_way() {
         bdoc.active_element().map(|e| e.is_same_node(Some(&close))),
         Some(true),
         "positive control: the open drawer's close button does take focus"
+    );
+}
+
+/// Resolve after `ms` of wall clock.
+async fn sleep_ms(ms: i32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        web_sys::window()
+            .unwrap()
+            .set_timeout_with_callback_and_timeout_and_arguments_0(resolve.unchecked_ref(), ms)
+            .unwrap();
+    });
+    wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
+}
+
+/// Wait for every animation on `el` to finish, on the browser's own clock.
+async fn all_finished(el: &web_sys::Element) {
+    let f = js_sys::Reflect::get(el, &JsValue::from_str("getAnimations")).unwrap();
+    let f: js_sys::Function = f.dyn_into().unwrap();
+    let arr: js_sys::Array = f.call0(el).unwrap().dyn_into().unwrap();
+    for a in arr.iter() {
+        let finished: js_sys::Promise = prop(&a, "finished").dyn_into().unwrap();
+        let _ = wasm_bindgen_futures::JsFuture::from(finished).await;
+    }
+}
+
+/// Opening, then letting the slide land, so the close starts from rest.
+async fn open_and_settle(opened: Signal<bool>, panel: &web_sys::Element) {
+    opened.set(true);
+    next_frame().await;
+    all_finished(panel).await;
+    next_frame().await;
+    assert_eq!(
+        computed(panel, "visibility"),
+        "visible",
+        "precondition: the drawer opened"
+    );
+}
+
+/// Closing the drawer slides it out in Chrome, and then hides it (#413, #759).
+///
+/// The closed state's `transition: visibility 0s linear 300ms` holds the root
+/// — and the panel, which inherits the held value — visible for the slide. With
+/// the sheet's old instant hide the panel read `hidden` on the first frame of
+/// the close and the slide ran unseen.
+#[wasm_bindgen_test]
+async fn the_drawer_slides_out_and_then_hides() {
+    let (opened, panel) = mount_closed_drawer();
+    let bdoc = browser_document();
+    let root = bdoc.query_selector(".rinch-drawer__root").unwrap().unwrap();
+    open_and_settle(opened, &panel).await;
+
+    opened.set(false);
+    next_frame().await;
+
+    assert_eq!(
+        computed(&panel, "visibility"),
+        "visible",
+        "one frame into the close the panel is still visible — the root's hide \
+         waits out the 300ms slide"
+    );
+    assert_eq!(
+        running_animations(&root),
+        1,
+        "the root is running its delayed `visibility` transition"
+    );
+    assert_eq!(
+        running_animations(&panel),
+        1,
+        "and the panel its slide back out"
+    );
+
+    all_finished(&root).await;
+    all_finished(&panel).await;
+    next_frame().await;
+    assert_eq!(
+        computed(&panel, "visibility"),
+        "hidden",
+        "once the slide is over the drawer is hidden again"
+    );
+    assert!(
+        translate_x(&panel) < -100.0,
+        "and back off-screen: {}",
+        translate_x(&panel)
+    );
+}
+
+/// Reopening part way through the slide-out cancels the pending hide: the open
+/// state declares no `visibility` transition, so the browser cancels the
+/// running one (css-transitions-1 §3 item 3) — the rule rinch-dom now follows
+/// too (#693).
+#[wasm_bindgen_test]
+async fn reopening_mid_slide_out_keeps_the_drawer_open() {
+    let (opened, panel) = mount_closed_drawer();
+    let bdoc = browser_document();
+    let root = bdoc.query_selector(".rinch-drawer__root").unwrap().unwrap();
+    open_and_settle(opened, &panel).await;
+
+    opened.set(false);
+    next_frame().await;
+    assert_eq!(
+        running_animations(&root),
+        1,
+        "precondition: the delayed hide is running"
+    );
+
+    opened.set(true);
+    next_frame().await;
+    assert_eq!(
+        running_animations(&root),
+        0,
+        "reopening cancels the pending hide"
+    );
+
+    sleep_ms(500).await;
+    assert_eq!(
+        computed(&panel, "visibility"),
+        "visible",
+        "and the drawer is still open well after the close would have ended"
     );
 }

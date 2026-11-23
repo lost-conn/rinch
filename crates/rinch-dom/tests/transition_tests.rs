@@ -408,6 +408,7 @@ fn animated_div(keyframes: &str) -> (rinch_dom::RinchDocument, rinch_core::dom::
     use rinch_core::dom::DomDocument;
 
     let mut doc = rinch_dom::RinchDocument::new();
+    doc.set_animation_clock_ms(Some(1_000_000.0)); // pinned: exact samples (#2267)
     let body = doc.body();
     doc.set_attribute(body, "style", "color: rgb(7, 8, 9)");
 
@@ -515,6 +516,7 @@ fn transitioning_div(css: &str) -> (rinch_dom::RinchDocument, rinch_core::dom::N
     use rinch_core::dom::DomDocument;
 
     let mut doc = rinch_dom::RinchDocument::new();
+    doc.set_animation_clock_ms(Some(1_000_000.0)); // pinned: exact samples (#2267)
     let body = doc.body();
     let style_el = doc.create_element("style");
     let text = doc.create_text(css);
@@ -625,17 +627,18 @@ fn a_centring_offset_survives_a_transform_transition() {
 /// The interpolation itself, and the write-back that used to zero it.
 #[test]
 fn transform_interpolation_carries_the_percentage_coefficients() {
-    let identity = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-    let from = AnimatableValue::Transform(AnimatableTransform {
-        matrix: identity,
-        pct_translate_w: [-1.0, 0.0],
-        pct_translate_h: [0.0, -0.5],
-    });
-    let to = AnimatableValue::Transform(AnimatableTransform {
-        matrix: identity,
-        pct_translate_w: [0.0, 0.0],
-        pct_translate_h: [0.0, -0.5],
-    });
+    // `translate(-100%, -50%)` → `translate(0, -50%)`.
+    let translate = |x: f64, y: f64| {
+        AnimatableValue::Transform(AnimatableTransform {
+            functions: vec![TransformOp::Translate {
+                px: [0.0, 0.0],
+                pct: [x, y],
+                z: 0.0,
+            }],
+        })
+    };
+    let from = translate(-1.0, -0.5);
+    let to = translate(0.0, -0.5);
 
     let mid = from
         .interpolate(&to, 0.25)
@@ -643,15 +646,16 @@ fn transform_interpolation_carries_the_percentage_coefficients() {
     let AnimatableValue::Transform(tf) = &mid else {
         panic!("interpolating two transforms should give a transform");
     };
+    let tf = tf.composed();
     assert!(
-        (tf.pct_translate_w[0] + 0.75).abs() < 1e-9,
+        (tf.pct_w[0] + 0.75).abs() < 1e-9,
         "a quarter of the way from -100% to 0 is -75%, got {:?}",
-        tf.pct_translate_w
+        tf.pct_w
     );
     assert!(
-        (tf.pct_translate_h[1] + 0.5).abs() < 1e-9,
+        (tf.pct_h[1] + 0.5).abs() < 1e-9,
         "an unchanging coefficient must survive, got {:?}",
-        tf.pct_translate_h
+        tf.pct_h
     );
 
     // And it reaches the computed style rather than being zeroed on write-back.
@@ -668,7 +672,7 @@ fn transform_interpolation_carries_the_percentage_coefficients() {
 /// implicit keyframe stop stylo synthesises for an animation that does not
 /// declare `transform` itself.
 ///
-/// `extract_base_style_values` builds that stop from the computed style, and a
+/// `base_style_value` builds that stop from the computed style, and a
 /// stop that carries only `matrix` zeroes the percentage translate for the
 /// whole animation. So a centred popup with `animation: fade …` on it jumped
 /// half its own width the moment the animation started — with nothing in the
@@ -680,6 +684,7 @@ fn an_animation_that_ignores_transform_keeps_the_base_percentage_translate() {
     use rinch_core::dom::DomDocument;
 
     let mut doc = rinch_dom::RinchDocument::new();
+    doc.set_animation_clock_ms(Some(1_000_000.0)); // pinned: exact samples (#2267)
     let body = doc.body();
     let style_el = doc.create_element("style");
     let css = doc.create_text(
@@ -890,11 +895,11 @@ fn keyframes_border_width_em_and_keyword_stops_animate() {
     );
 }
 
-/// `font-size` in `rem` is exact — its base is the root. `em` and `%` are
-/// declined rather than resolved against the element's own (already-resolved)
-/// size, which would be the wrong base.
+/// `font-size` in `rem` is exact — its base is the root. `em` and `%` resolve
+/// against the parent's size (#2056; they used to be declined); the parent's
+/// own-size distinction is pinned in `keyframe_stop_basis_tests.rs`.
 #[test]
-fn keyframes_font_size_rem_animates_and_em_declines() {
+fn keyframes_font_size_rem_and_em_animate() {
     let (doc, div) = animated_div("from { font-size: 1rem; } to { font-size: 2rem; }");
     assert_eq!(
         animated_px(&doc, div, 500.0, TransitionProperty::FontSize),
@@ -902,9 +907,12 @@ fn keyframes_font_size_rem_animates_and_em_declines() {
     );
 
     let (doc, div) = animated_div("from { font-size: 1em; } to { font-size: 2em; }");
-    assert!(
-        animated_value(&doc, div, 500.0, TransitionProperty::FontSize).is_none(),
-        "em on font-size needs the parent's size, which the extractor lacks"
+    let parent = doc.tree.get(div.0).unwrap().parent.unwrap();
+    let p = doc.tree.get(parent).unwrap().computed_style.font_size;
+    assert_eq!(
+        animated_px(&doc, div, 500.0, TransitionProperty::FontSize),
+        Some(1.5 * p),
+        "halfway from 1em to 2em of the parent's {p}px"
     );
 }
 
@@ -916,16 +924,11 @@ fn animated_transform(
     ms: f64,
 ) -> ([f64; 6], [f64; 2], [f64; 2]) {
     match animated_value(doc, div, ms, TransitionProperty::Transform) {
-        Some(AnimatableValue::TransformComponents {
-            ops,
-            pct_translate_w,
-            pct_translate_h,
-        }) => (
-            rinch_dom::transition::compose_matrices(&ops),
-            pct_translate_w,
-            pct_translate_h,
-        ),
-        other => panic!("expected transform components, got {other:?}"),
+        Some(AnimatableValue::Transform(tf)) => {
+            let c = tf.composed();
+            (c.matrix, c.pct_w, c.pct_h)
+        }
+        other => panic!("expected a transform, got {other:?}"),
     }
 }
 
@@ -1148,8 +1151,8 @@ fn a_finished_width_transition_reaches_the_layout() {
     doc.resolve_layout(800.0, 600.0);
 
     // Back-date the running transition past its own duration so the next tick
-    // completes it. This is what keeps the test clock-free —
-    // `RinchDocument::tick_transitions` reads `SystemTime::now()` itself.
+    // completes it. `RinchDocument::tick_transitions` reads the document.s
+    // animation clock, pinned here (#2267).
     let running = doc
         .tree
         .active_transitions
@@ -1176,6 +1179,7 @@ fn animated_width_div(css: &str) -> (rinch_dom::RinchDocument, rinch_core::dom::
     use rinch_core::dom::DomDocument;
 
     let mut doc = rinch_dom::RinchDocument::new();
+    doc.set_animation_clock_ms(Some(1_000_000.0)); // pinned: exact samples (#2267)
     let body = doc.body();
     let style_el = doc.create_element("style");
     let text = doc.create_text(css);
@@ -1198,17 +1202,13 @@ fn animated_width_div(css: &str) -> (rinch_dom::RinchDocument, rinch_core::dom::
 /// `forwards` is what makes the end state observable — without a fill mode the
 /// completed animation is dropped having applied nothing.
 ///
-/// **The duration is 100s and the opening assertion is a range, deliberately.**
-/// An animation's clock starts at the cascade that first styles the node, which
-/// for a freshly appended element is `append_child`, not the layout pass — so a
-/// few milliseconds of DOM construction have already elapsed by the time the
-/// first layout measures the box. That was invisible here until #762, because
-/// the first cascade did not start animations at all and the clock began inside
-/// `resolve_layout`; it is how every *post*-mount insertion has always
-/// behaved. Over the 150ms this fixture used to declare, the gap measured 4px
-/// on an idle machine, and on a loaded one it could run a 150ms animation out
-/// entirely before the first assertion — a fixture flaky by construction.
-/// Issue #768.
+/// **The duration is 100s**, from when an animation's clock started at the
+/// cascade that first styles the node — `append_child`, for a freshly appended
+/// element — so a few milliseconds of DOM construction had elapsed by the first
+/// layout, and a 150ms animation could run out on a loaded machine before the
+/// first assertion. Since #2267 the clock is pinned, and since #768 an
+/// animation is pending until the first frame renders it, so the opening width
+/// is exactly the `from` width either way.
 #[test]
 fn a_finished_width_animation_reaches_the_layout() {
     let (mut doc, div) = animated_width_div(
@@ -1216,15 +1216,14 @@ fn a_finished_width_animation_reaches_the_layout() {
          .grow { animation: grow 100000ms linear forwards; width: 100px; height: 40px; }",
     );
     let start_width = doc.tree.get(div.0).unwrap().layout.width;
-    assert!(
-        (100.0..101.0).contains(&start_width),
-        "near the start of a 100s animation the box should still be at (or a \
-         hair past) the `from` width, got {start_width}"
+    assert_eq!(
+        start_width, 100.0,
+        "at the start of the animation the box is at the `from` width"
     );
 
     // Back-date past the duration so the next tick lands in the `forwards`
-    // fill, clock-free — `RinchDocument::tick_animations` reads
-    // `SystemTime::now()` itself.
+    // fill — `RinchDocument::tick_animations` reads the document's pinned
+    // clock (#2267).
     for anim in doc
         .tree
         .active_animations
@@ -1250,6 +1249,7 @@ fn texted_div(css: &str, class: &str) -> (rinch_dom::RinchDocument, rinch_core::
     use rinch_core::dom::DomDocument;
 
     let mut doc = rinch_dom::RinchDocument::new();
+    doc.set_animation_clock_ms(Some(1_000_000.0)); // pinned: exact samples (#2267)
     let body = doc.body();
     let style_el = doc.create_element("style");
     let sheet = doc.create_text(css);
@@ -1356,8 +1356,8 @@ fn width_transition(
 }
 
 /// Move the node's running `width` transition `by_ms` into the past, so that
-/// "now" — which `resolve_layout` reads off the wall clock itself — sits that
-/// far along the curve. Returns the back-dated start time.
+/// "now" — which `resolve_layout` reads off the document's pinned clock
+/// (#2267) — sits exactly that far along the curve. Returns the back-dated start time.
 fn backdate_width_transition(
     doc: &mut rinch_dom::RinchDocument,
     id: rinch_core::dom::NodeId,
@@ -1373,7 +1373,7 @@ fn backdate_width_transition(
     t.start_time_ms
 }
 
-/// A `width` transition from `css`, back-dated so the wall clock now reads
+/// A `width` transition from `css`, back-dated so the pinned clock now reads
 /// `elapsed_ms` into it. Returns the document, the node, and the (back-dated)
 /// start time.
 fn running_width_transition(
@@ -1397,11 +1397,12 @@ const LINEAR_20_TO_30: &str = ".slider { width: 20px; height: 40px; \
 /// seconds instead of milliseconds.
 ///
 /// For the one fixture that reads an **interpolated value** after a second
-/// `resolve_layout`. That resolve reads `SystemTime::now()` itself, so the
-/// progress it interpolates at is `back-dated elapsed + δ` for a δ of real wall
-/// time; scaling the ramp by 1000 divides what δ is worth by 1000. See
-/// [`a_reversals_delay_still_holds_the_box_still`] for the measurement (issue
-/// #710).
+/// `resolve_layout`. That resolve used to read the wall clock, so the progress
+/// it interpolated at was `back-dated elapsed + δ` for a δ of real wall time,
+/// and scaling the ramp by 1000 divided what δ was worth by 1000 (issue #710).
+/// The document's animation clock is pinned now (#2267), so δ is zero and the
+/// sample is exact; the scale stays, since `150s` is an exact `f32` where
+/// `0.15s` is not.
 const LINEAR_20_TO_30_SECONDS: &str = ".slider { width: 20px; height: 40px; \
      transition: width 150s linear; } \
      .slider.wide { width: 30px; }";
@@ -1462,14 +1463,16 @@ fn running(
     active
 }
 
-/// **(a) The bug.** An unrelated restyle — here a `data-` attribute nobody's
-/// selector reads — re-resolves the node, and the resolved `width` is still the
+/// **(a) The bug.** An unrelated restyle — here an inline `outline-width`
+/// write, which re-cascades the node and moves no box (a `data-` attribute no
+/// selector reads used to serve, until attribute changes stopped restyling
+/// what no selector depends on) — re-resolves the node, and the resolved `width` is still the
 /// same 30px the running transition is already heading for. The transition must
 /// be left exactly as it is.
 ///
-/// The clock assertion is exact and jitter-free: the restyle happens at some
-/// wall-clock time strictly after the back-dated start, so a restart is
-/// *always* observable as a different `start_time_ms`.
+/// The clock assertion is exact and jitter-free: the restyle happens at the
+/// pinned "now", 50ms after the back-dated start, so a restart is *always*
+/// observable as a different `start_time_ms`.
 ///
 /// Kills two mutants: the unconditional `insert` this replaced, and a guard
 /// that compares the running transition's `from` (20) rather than its `to` (30)
@@ -1480,7 +1483,7 @@ fn an_unrelated_restyle_leaves_a_running_transition_alone() {
 
     let (mut doc, div, start) = running_width_transition(LINEAR_20_TO_30, 50.0);
 
-    doc.set_attribute(div, "data-probe", "1");
+    doc.set_style(div, "outline-width", "1px");
     doc.resolve_layout(800.0, 600.0);
 
     let t = width_transition(&doc, div).expect("the transition must still be running");
@@ -1520,20 +1523,18 @@ fn the_leave_alone_path_keeps_the_interpolated_value_in_the_computed_style() {
 
     let (mut doc, div, _start) = running_width_transition(LINEAR_20_TO_30_SECONDS, 50_000.0);
 
-    doc.set_attribute(div, "data-probe", "1");
+    doc.set_style(div, "outline-width", "1px");
     doc.resolve_layout(800.0, 600.0);
 
-    // 50s into 150s of 20 → 30 is 23.333px. The restyle costs wall clock the
-    // test cannot control — `resolve_layout` reads the real clock to start and
-    // interpolate transitions — so the value drifts up by 10px per 150s of it.
-    // On the millisecond timings this fixture used to carry that was 10px per
-    // 150ms, and the old `(23.0..24.5)` bound tolerated only ~17.5ms of it;
-    // measured, a loaded host reaches 15.6ms. In seconds the same drift costs a
-    // thousandth as much, so the tolerance below is both **tighter** than the
-    // range it replaces and worth ~750ms of slack (issue #710).
+    // 50s into 150s of 20 → 30 is 23.333px. `resolve_layout` reads the
+    // document's animation clock to start and interpolate transitions; it used
+    // to be the wall clock, so the restyle's own cost drifted the value (issue
+    // #710, which moved the ramp to seconds to shrink the drift). It is pinned
+    // now (#2267): no time passes during the restyle, and the sample is exact
+    // to the `f32` it is stored in.
     let w = computed_width_px(&doc, div);
     assert!(
-        (w - 23.3333).abs() < 0.05,
+        (w - 23.333_334).abs() < 1e-4,
         "the restyle must leave the interpolated width in place, not the 30px \
          target it resolved, got {w}"
     );
@@ -1550,7 +1551,7 @@ fn repeated_restyles_do_not_extend_a_transitions_declared_duration() {
     let (mut doc, div, start) = running_width_transition(LINEAR_20_TO_30, 50.0);
 
     for i in 0..10 {
-        doc.set_attribute(div, "data-probe", &i.to_string());
+        doc.set_style(div, "outline-width", &format!("{}px", i + 1));
         doc.resolve_layout(800.0, 600.0);
     }
 
@@ -1591,7 +1592,7 @@ fn repeated_restyles_do_not_extend_an_ease_transition_either() {
     );
 
     for i in 0..10 {
-        doc.set_attribute(div, "data-probe", &i.to_string());
+        doc.set_style(div, "outline-width", &format!("{}px", i + 1));
         doc.resolve_layout(800.0, 600.0);
     }
 
@@ -1630,7 +1631,7 @@ fn an_unrelated_restyle_during_a_transitions_delay_does_not_restart_it() {
         50.0,
     );
 
-    doc.set_attribute(div, "data-probe", "1");
+    doc.set_style(div, "outline-width", "1px");
     doc.resolve_layout(800.0, 600.0);
 
     assert_eq!(
@@ -1970,12 +1971,13 @@ fn a_reversal_does_shorten_a_negative_delay() {
 /// # Why the timings are in seconds (issue #710)
 ///
 /// Every other transition fixture here drives a manual clock, but this one
-/// cannot drive the whole path: the **reversal** is started by
-/// `resolve_layout`, which reads `SystemTime::now()` itself
-/// (`style_resolution::current_time_ms`). So the running transition's progress
+/// drives the whole path: the **reversal** is started by `resolve_layout`,
+/// which used to read the wall clock itself. So the running transition's progress
 /// at the moment it is reversed is `175ms + δ`, where δ is however long the
 /// host took to get from the first `resolve_layout` to the second — and that
-/// is wall time, not test time.
+/// is wall time, not test time. (Since #2267 the document's animation clock
+/// is pinned, so δ is zero; the history below is why the fixture is in
+/// seconds.)
 ///
 /// On the original 150ms/100ms timings δ moved the box by 10px/150ms, so the
 /// 0.3px tolerance bought **4.5ms** of slack, and a loaded host exceeded it: 60
@@ -1994,8 +1996,8 @@ fn a_reversal_does_shorten_a_negative_delay() {
 /// The assertion that actually pins the behaviour carries no δ at all: during
 /// its delay a transition reports `from` **verbatim** (`ActiveTransition::value_at`),
 /// so the box is compared against the reversal's own recorded start value
-/// rather than against a constant. The 25px check below is a separate, loose
-/// check that the reversal happened where the fixture meant it to.
+/// rather than against a constant. The 25px check below is a separate check
+/// that the reversal happened where the fixture meant it to.
 #[test]
 fn a_reversals_delay_still_holds_the_box_still() {
     use rinch_core::dom::DomDocument;
@@ -2028,10 +2030,10 @@ fn a_reversals_delay_still_holds_the_box_still() {
     let reversed_at = px_of(&reversal.from);
 
     // The regime check: the reversal really did happen half way up the ramp,
-    // and not at an endpoint where a held box and a moving one agree. This is
-    // the one assertion δ can reach, and at these timings it has 4.5s of room.
+    // and not at an endpoint where a held box and a moving one agree. On the
+    // pinned clock it is exact.
     assert!(
-        (reversed_at - 25.0).abs() < 0.3,
+        (reversed_at - 25.0).abs() < 1e-4,
         "the reversal should have been taken half way up the ramp, at 25px, \
          got {reversed_at}"
     );
@@ -2168,4 +2170,49 @@ fn a_combined_duration_of_zero_or_less_starts_no_transition() {
         "a running transition must be cancelled, not retargeted, got {active:?}"
     );
     assert!(transitioning.is_empty());
+}
+
+// ── visibility: the discrete-with-a-twist rule (#759) ─────────────────
+
+/// css-values-4: with a `visible` end, every progress strictly between 0 and 1
+/// is `visible`, and 0 and 1 are the endpoints. Sampled at 0.1 and 0.9, where
+/// the plain discrete rule (flip at 50%) gives the other answer.
+#[test]
+fn visibility_with_a_visible_end_is_visible_strictly_inside() {
+    use VisibilityValue::{Hidden, Visible};
+    assert_eq!(interpolate_visibility(Visible, Hidden, 0.0), Visible);
+    assert_eq!(interpolate_visibility(Visible, Hidden, 0.9), Visible);
+    assert_eq!(interpolate_visibility(Visible, Hidden, 1.0), Hidden);
+    assert_eq!(interpolate_visibility(Hidden, Visible, 0.0), Hidden);
+    assert_eq!(interpolate_visibility(Hidden, Visible, 0.1), Visible);
+    assert_eq!(interpolate_visibility(Hidden, Visible, 1.0), Visible);
+}
+
+/// An overshooting curve maps outside `0..=1` to the closer endpoint.
+#[test]
+fn visibility_outside_the_unit_interval_is_the_closer_endpoint() {
+    use VisibilityValue::{Hidden, Visible};
+    assert_eq!(interpolate_visibility(Visible, Hidden, 1.2), Hidden);
+    assert_eq!(interpolate_visibility(Hidden, Visible, -0.2), Hidden);
+}
+
+/// Without a `visible` end it is the ordinary discrete rule: flip at 50%.
+#[test]
+fn visibility_without_a_visible_end_flips_half_way() {
+    use VisibilityValue::{Collapse, Hidden};
+    assert_eq!(interpolate_visibility(Hidden, Collapse, 0.4), Hidden);
+    assert_eq!(interpolate_visibility(Hidden, Collapse, 0.6), Collapse);
+}
+
+/// And through `AnimatableValue`, which is what a running transition calls.
+#[test]
+fn visibility_interpolates_through_animatable_value() {
+    let from = AnimatableValue::Visibility(VisibilityValue::Visible);
+    let to = AnimatableValue::Visibility(VisibilityValue::Hidden);
+    match from.interpolate(&to, 0.9) {
+        Some(AnimatableValue::Visibility(v)) => assert_eq!(v, VisibilityValue::Visible),
+        other => panic!("expected a visibility value, got {other:?}"),
+    }
+    assert!(to.same_computed_value(&AnimatableValue::Visibility(VisibilityValue::Hidden)));
+    assert!(!to.same_computed_value(&from));
 }

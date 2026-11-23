@@ -6,10 +6,10 @@ use peniko::Brush;
 use peniko::color::{AlphaColor, Srgb};
 
 use crate::RinchDocument;
-use crate::layout;
+use crate::node::RawNodeId;
 use crate::node::{LayoutResult, NodeContext, NodeKind};
 
-/// The parent-inherited text properties a text node's [`TextMeasure`] carries.
+/// The parent-inherited text properties a text node's `TextMeasure` carries.
 ///
 /// A named struct rather than the wide tuple this used to be, because **two
 /// functions fill it and they must agree field for field**:
@@ -30,9 +30,14 @@ struct TextContextFields {
     line_height_css: String,
     color: AlphaColor<Srgb>,
     no_wrap: bool,
+    white_space: crate::computed_style::WhiteSpaceValue,
     letter_spacing: f32,
     word_spacing: f32,
     overflow_wrap: crate::computed_style::OverflowWrapValue,
+    word_break: crate::computed_style::WordBreakValue,
+    line_break: crate::computed_style::LineBreakValue,
+    hyphens_none: bool,
+    text_indent: crate::computed_style::TextIndentValue,
     text_overflow: crate::computed_style::TextOverflowValue,
     parent_overflow_hidden: bool,
 }
@@ -50,9 +55,14 @@ impl TextContextFields {
                 line_height_css: String::new(),
                 color: AlphaColor::<Srgb>::from_rgba8(0, 0, 0, 255),
                 no_wrap: false,
+                white_space: WhiteSpaceValue::Normal,
                 letter_spacing: 0.0,
                 word_spacing: 0.0,
                 overflow_wrap: crate::computed_style::OverflowWrapValue::default(),
+                word_break: crate::computed_style::WordBreakValue::default(),
+                line_break: crate::computed_style::LineBreakValue::default(),
+                hyphens_none: false,
+                text_indent: crate::computed_style::TextIndentValue::default(),
                 text_overflow: crate::computed_style::TextOverflowValue::default(),
                 parent_overflow_hidden: false,
             };
@@ -79,9 +89,14 @@ impl TextContextFields {
                 cs.white_space,
                 WhiteSpaceValue::NoWrap | WhiteSpaceValue::Pre
             ),
+            white_space: cs.white_space,
             letter_spacing: cs.letter_spacing,
             word_spacing: cs.word_spacing,
             overflow_wrap: cs.overflow_wrap,
+            word_break: cs.word_break,
+            line_break: cs.line_break,
+            hyphens_none: cs.hyphens_none,
+            text_indent: cs.text_indent,
             text_overflow: cs.text_overflow,
             parent_overflow_hidden: matches!(
                 cs.overflow_x,
@@ -91,7 +106,7 @@ impl TextContextFields {
     }
 
     /// Write them into the Taffy node context a text node measures out of.
-    fn apply_to(self, tm: &mut crate::node::TextMeasure, node_id: usize) {
+    fn apply_to(self, tm: &mut crate::node::TextMeasure, node_id: RawNodeId) {
         tm.font_size = self.font_size;
         tm.font_weight = self.font_weight;
         tm.font_family = self.font_family;
@@ -99,9 +114,14 @@ impl TextContextFields {
         tm.node_id = node_id;
         tm.color = self.color;
         tm.no_wrap = self.no_wrap;
+        tm.white_space = self.white_space;
         tm.letter_spacing = self.letter_spacing;
         tm.word_spacing = self.word_spacing;
         tm.overflow_wrap = self.overflow_wrap;
+        tm.word_break = self.word_break;
+        tm.line_break = self.line_break;
+        tm.hyphens_none = self.hyphens_none;
+        tm.text_indent = self.text_indent;
         tm.text_overflow = self.text_overflow;
         tm.parent_overflow_hidden = self.parent_overflow_hidden;
     }
@@ -146,31 +166,58 @@ impl RinchDocument {
     /// then reads layout results back into each node's `layout` field.
     /// Text nodes are measured using Parley for accurate text layout.
     pub fn resolve_layout(&mut self, width: f32, height: f32) {
-        let perf = std::env::var("RINCH_PERF").is_ok();
+        use crate::perf::Counter;
+        // Layout time is this call's wall clock minus the style time spent
+        // inside it (`resolve_styles` / `apply_stylo_styles_to_taffy` time
+        // themselves), so the two phases never double count.
         let t0 = web_time::Instant::now();
+        let style_before = self.tree.perf.get(Counter::TimeStyleNs);
+        self.tree.perf.bump(Counter::LayoutResolves);
+        let epoch = self.tree.layout_epoch;
+        self.resolve_layout_inner(width, height);
+        self.align_table_cells();
+        // Outside list markers are placed from the finished lines (#1356). An
+        // item that gained or lost the marker's minimum line is laid out
+        // again, once: the second pass cannot change what the first found
+        // (the floor only grows a box that has no line).
+        if self.tree.layout_epoch != epoch && self.place_list_markers() {
+            self.tree.layout_dirty = true;
+            self.resolve_layout_inner(width, height);
+            self.align_table_cells();
+            self.place_list_markers();
+        }
+        let total = t0.elapsed().as_nanos() as u64;
+        let style = self
+            .tree
+            .perf
+            .get(Counter::TimeStyleNs)
+            .wrapping_sub(style_before);
+        self.tree
+            .perf
+            .add(Counter::TimeLayoutNs, total.saturating_sub(style));
+    }
+
+    fn resolve_layout_inner(&mut self, width: f32, height: f32) {
+        use crate::perf::Counter;
 
         let old_viewport = self.tree.viewport;
         self.tree.viewport = crate::layout::Viewport { width, height };
 
-        // When viewport changes, update Stylo's Device and invalidate all cached styles
-        // so that vh/vw units are recomputed with the new viewport dimensions
-        if (old_viewport.width - width).abs() > 0.5 || (old_viewport.height - height).abs() > 0.5 {
-            self.set_stylist_viewport(width, height);
+        // The hit tester's memo describes the boxes as they are, so every path
+        // below that can move one drops it. The one that cannot — the
+        // paint-only skip, which runs no Taffy compute and rebuilds no text
+        // layout — keeps it (#911): a scroll notch's frame takes that path, and
+        // dropping the memo there made every notch rebuild every row's extent.
+        // A restyle on that path invalidates in `resolve_styles`, and a
+        // background image landing in `push_dirty`.
+        let viewport_changed =
+            (old_viewport.width - width).abs() > 0.5 || (old_viewport.height - height).abs() > 0.5;
 
-            // Invalidate all cached stylo_element_data so styles are recomputed with new viewport
-            for (node_id, _) in self.tree.nodes.iter() {
-                *self.tree.nodes[node_id].stylo_element_data.borrow_mut() = None;
-            }
-            self.tree.style_roots.clear(); // Force full tree walk
-            self.tree.styles_dirty = true;
-            // The viewport IS the root's available space. A size change must
-            // force a Taffy recompute even when no node's Taffy *style* changed
-            // (e.g. an all-`auto`/fixed tree): otherwise auto-sized content stays
-            // laid out at the previous viewport width. Without this, the early
-            // `if !layout_dirty { return }` below strands the tree at its old
-            // size — visible as prose that keeps a narrow first-layout width
-            // (often min-content) after the window grows.
-            self.tree.layout_dirty = true;
+        // A viewport change restyles only what the new size reaches — a
+        // flipped media query restyles everything, a viewport unit its users —
+        // and always re-runs layout. See `restyle_for_viewport_change`.
+        if viewport_changed {
+            self.restyle_for_viewport_change(width, height);
         }
 
         // Drain completed image loads and update intrinsic dimensions.
@@ -188,29 +235,62 @@ impl RinchDocument {
         if self.drain_pending_images() {
             self.tree.layout_dirty = true;
         }
+        // A picture the last paint could not afford to filter is painted
+        // again (#2456).
+        self.tree.drain_deferred_minify();
 
         // Resolve Stylo styles and apply to Taffy nodes (only if dirty)
+        // The nodes a tick moved a `color` / `font-size` sample on (#777,
+        // #787) are restyled by this frame's one cascade.
+        for id in std::mem::take(&mut self.tree.animated_recascade) {
+            self.mark_recascade(id);
+        }
         if self.tree.styles_dirty {
-            let t = web_time::Instant::now();
             self.resolve_styles();
-            if perf {
-                eprintln!(
-                    "  [PERF] resolve_styles: {:.2}ms",
-                    t.elapsed().as_secs_f64() * 1000.0
-                );
-            }
-            let t = web_time::Instant::now();
             self.apply_stylo_styles_to_taffy();
-            if perf {
-                eprintln!(
-                    "  [PERF] apply_to_taffy: {:.2}ms",
-                    t.elapsed().as_secs_f64() * 1000.0
-                );
-            }
             self.tree.styles_dirty = false;
+        }
+        // A `color` / `font-size` transition or animation that pass started
+        // or ended is cascaded once more, with its samples (#777, #787), so
+        // this frame's descendants and `em` lengths already see it. Once: the
+        // second pass starts nothing the first did not.
+        if !self.tree.animated_recascade.is_empty() {
+            for id in std::mem::take(&mut self.tree.animated_recascade) {
+                self.mark_recascade(id);
+            }
+            self.resolve_styles();
+            self.apply_stylo_styles_to_taffy();
+            self.tree.styles_dirty = false;
+            self.tree.animated_recascade.clear();
+        }
+        // Stylo frees an unused rule node only through the rule tree's GC,
+        // which its own traversal runs and rinch's hand-rolled cascade did
+        // not. Every frame of a `color` / `font-size` animation mints rule
+        // nodes for its samples (#777, #787), so without this they and their
+        // declaration blocks piled up for as long as it ran (review of
+        // #2564: +14.8 MB over 30k frames). Single-threaded here, which
+        // `maybe_gc` requires; it collects once ~300 nodes are free.
+        self.stylist.rule_tree().maybe_gc();
+        // A table whose rows came or went with no restyle — a removal, a row
+        // moved in from elsewhere — still owes a rebuild.
+        self.resolve_tables();
+        // Everything styled so far is rendered by this frame; a later
+        // cascade has a before-change style to transition from.
+        for id in std::mem::take(&mut self.tree.styled_unrendered) {
+            if let Some(n) = self.tree.nodes.get_mut(id) {
+                n.styled_unrendered = false;
+            }
+        }
+        // …and every animation minted so far starts its clock with it
+        // (#768).
+        if !self.tree.active_animations.is_empty() {
+            let now = self.animation_now_ms();
+            self.tree.start_pending_animations(now);
         }
 
         // Trigger loads for any background-image URLs not yet in the cache
+        // (on wasm32 only queued: the host runs them outside this borrow,
+        // `image_cache::run_queued_loads`).
         self.request_background_image_loads();
 
         // Skip full layout recompute when no layout-affecting properties changed.
@@ -221,68 +301,102 @@ impl RinchDocument {
         // However, text-affecting style changes (font-size, font-weight, font-style,
         // text-decoration) don't change Taffy styles so layout_dirty won't be set.
         // For these, skip Taffy but still rebuild the affected IFC text layouts.
+        //
+        // A `<textarea>` whose value changed owes its scroll range and clamp
+        // whichever way this goes: here when layout is skipped, and in
+        // `clamp_scroll_offsets` (which refreshes every textarea) when it runs.
+        if self.tree.layout_dirty {
+            self.tree.textarea_extent_dirty.clear();
+        } else {
+            self.refresh_value_changed_textareas();
+        }
         if !self.tree.layout_dirty {
-            if !self.tree.dirty_ifc_text_roots.is_empty() {
-                let t = web_time::Instant::now();
+            // A relative inline's inset change (#2412) takes this path too:
+            // `build_ifc_layouts` keeps its lines and moves their spans.
+            if !self.tree.dirty_ifc_text_roots.is_empty()
+                || !self.tree.relative_offset_roots.is_empty()
+            {
+                self.tree.hit_cache.invalidate();
+                self.tree.layout_epoch = self.tree.layout_epoch.wrapping_add(1);
+                self.tree.perf.bump(Counter::LayoutSkippedTextOnly);
                 self.sync_dirty_text_contexts();
+                let t = web_time::Instant::now();
                 let mut temp_layout_cx = std::mem::take(&mut self.layout_cx);
                 self.build_ifc_layouts(&mut temp_layout_cx);
                 self.layout_cx = temp_layout_cx;
+                self.tree.perf.add_elapsed(Counter::TimeBuildIfcNs, t);
                 self.tree.dirty_ifc_text_roots.clear();
-                if perf {
-                    eprintln!(
-                        "  [PERF] layout SKIPPED (text-only IFC rebuild) {:.2}ms",
-                        t.elapsed().as_secs_f64() * 1000.0
-                    );
+                // The rebuild may have moved an
+                // atomic inline along its line (`text-align`), and no
+                // read-back runs on this path. It moves an inline span the
+                // same way, and a box whose containing block that span is
+                // (#631) with it; nothing but a second look says so.
+                if self.tree.abs_inline_cb_seen {
+                    self.measure_inline_containing_blocks();
+                    self.tree.abs_late_moves = true;
                 }
-            } else if perf {
-                eprintln!(
-                    "  [PERF] layout SKIPPED (paint-only) {:.2}ms",
-                    t0.elapsed().as_secs_f64() * 1000.0
-                );
+                crate::out_of_flow::replace_all(&mut self.tree);
+                // The rebuild may also have moved the static position of a
+                // box that is shrunk to fit from it (`text-align` moves its
+                // line, or an atomic inline it sits in): its width is owed a
+                // compute after all (#1404).
+                if !self.resolve_static_shrink_to_fit() {
+                    return;
+                }
+            } else {
+                if viewport_changed {
+                    self.tree.hit_cache.invalidate();
+                    self.tree.layout_epoch = self.tree.layout_epoch.wrapping_add(1);
+                }
+                self.tree.perf.bump(Counter::LayoutSkippedPaintOnly);
+                return;
             }
-            return;
         }
+        self.tree.hit_cache.invalidate();
+        self.tree.layout_epoch = self.tree.layout_epoch.wrapping_add(1);
         self.tree.layout_dirty = false;
 
         let root_taffy = match self.tree.nodes[self.tree.root_id].taffy_id {
             Some(id) => id,
             None => return,
         };
-
         // IFC setup passes only need to run when tree structure or display modes
         // changed. Text-only changes (e.g. slider label "50%" → "19%") preserve the
         // existing IFC structure and Taffy's internal cache — only the dirty text
         // node gets re-measured, avoiding the 80ms full-tree Parley rebuild.
         if self.tree.ifc_dirty {
-            // Structural change — invalidate all cached IFC measures and
-            // clear dirty_ifc_text_roots so build_ifc_layouts rebuilds ALL
-            // IFC roots. Without this, stale entries from set_text_content
-            // calls during rendering (before setup_inline_formatting_contexts
-            // assigns correct ifc_root values) cause build_ifc_layouts to
-            // skip newly created IFC roots — making their text invisible.
-            self.tree.ifc_measure_cache.clear();
+            self.tree.ifc_setup_passes += 1;
+            self.tree.perf.bump(Counter::IfcFullPasses);
+            match self.tree.ifc_full_reason.take() {
+                Some(reason) => self.tree.perf.bump(reason.counter()),
+                None => self.tree.perf.bump(Counter::IfcFullUnattributed),
+            }
+            // A whole-document pass covers every seed recorded since the last.
+            self.tree.ifc_seeds.clear();
+            // Structural change — clear dirty_ifc_text_roots so
+            // build_ifc_layouts considers ALL IFC roots (and rebuilds every
+            // one without a valid `text_layout`). Without this, stale entries
+            // from set_text_content calls during rendering (before
+            // setup_inline_formatting_contexts assigns correct ifc_root
+            // values) cause build_ifc_layouts to skip newly created IFC roots
+            // — making their text invisible.
+            //
+            // The measure cache is **not** cleared any more. Every insert
+            // into `dirty_ifc_text_roots` dropped that root's sizes when it
+            // was made, so forgetting the set loses nothing; and which roots'
+            // *content* this change touched is answered below, by
+            // `refresh_ifc_signatures`, once the passes that decide it have
+            // run. Clearing the whole cache here re-shaped every IFC root in
+            // the document to measure one appended row.
+            let t_ifc = web_time::Instant::now();
+            self.tree.perf.bump(Counter::IfcSetupPasses);
             self.tree.dirty_ifc_text_roots.clear();
 
             // Handle display:contents by rebuilding taffy children for affected nodes
-            let t = web_time::Instant::now();
-            self.sync_display_contents();
-            if perf {
-                eprintln!(
-                    "  [PERF] sync_display_contents: {:.2}ms",
-                    t.elapsed().as_secs_f64() * 1000.0
-                );
-            }
+            self.sync_display_contents(None);
 
             // Detect and set up inline formatting contexts
-            let t = web_time::Instant::now();
-            self.setup_inline_formatting_contexts();
-            if perf {
-                eprintln!(
-                    "  [PERF] setup_ifc: {:.2}ms",
-                    t.elapsed().as_secs_f64() * 1000.0
-                );
-            }
+            self.setup_inline_formatting_contexts(None);
 
             // Sync font-size and the rest of the inherited text properties from
             // parent elements into text node contexts.
@@ -307,37 +421,54 @@ impl RinchDocument {
             // measured, by putting the two calls back in their old order with
             // everything else in #592 kept: `inline-block` stays correct and the
             // other two regress to 211x22.
-            let t = web_time::Instant::now();
             self.sync_text_contexts();
-            if perf {
-                eprintln!(
-                    "  [PERF] sync_text_contexts: {:.2}ms",
-                    t.elapsed().as_secs_f64() * 1000.0
-                );
-            }
 
             // Pre-compute layout for inline-block children that were detached from Taffy.
             // They need their own subtree measured so walk_inline_children can read dimensions.
-            let t = web_time::Instant::now();
             self.compute_inline_block_layouts();
-            if perf {
-                eprintln!(
-                    "  [PERF] inline_block_layouts: {:.2}ms",
-                    t.elapsed().as_secs_f64() * 1000.0
-                );
-            }
+
+            // Which roots did this change actually reach? Last, because the
+            // signature folds in each atomic inline's size, which the line
+            // above has only just decided.
+            self.refresh_ifc_signatures(None);
 
             self.tree.ifc_dirty = false;
+            self.tree.perf.add_elapsed(Counter::TimeIfcSetupNs, t_ifc);
+        } else if !self.tree.ifc_seeds.is_empty() {
+            // The scoped structural pass (`crate::ifc_scope`): the same passes,
+            // in the same order, over only the formatting containers the
+            // recorded mutations reached. Everything else keeps its splices,
+            // boxes, marks and measures, and so its Taffy cache.
+            let t_ifc = web_time::Instant::now();
+            let scope = self.compute_ifc_scope();
+            if !scope.is_empty() {
+                self.tree.ifc_setup_passes += 1;
+                self.tree.perf.bump(Counter::IfcSetupPasses);
+                self.tree.perf.bump(Counter::IfcScopedPasses);
+                self.tree
+                    .perf
+                    .add(Counter::IfcScopeContainers, scope.containers.len() as u64);
+                self.tree
+                    .perf
+                    .add(Counter::IfcScopeNodes, scope.nodes.len() as u64);
+                self.sync_display_contents(Some(&scope));
+                self.setup_inline_formatting_contexts(Some(&scope));
+                // Before the atomic inlines are sized, for #625's reason (see
+                // the whole-document branch above).
+                self.sync_scoped_text_contexts(&scope);
+                self.measure_scoped_atomic_inlines(&scope);
+                self.refresh_ifc_signatures(Some(&scope));
+            } else {
+                self.sync_dirty_text_contexts();
+            }
+            // What the scope queued (the atomic inlines around its
+            // containers), what `refresh_ifc_signatures` queued, and what any
+            // other change queued since the last pass.
+            self.remeasure_dirty_atomic_inlines();
+            self.tree.perf.add_elapsed(Counter::TimeIfcSetupNs, t_ifc);
         } else {
             // IFC structure unchanged — only sync text contexts for dirty nodes
-            let t = web_time::Instant::now();
             self.sync_dirty_text_contexts();
-            if perf {
-                eprintln!(
-                    "  [PERF] sync_dirty_text_contexts: {:.2}ms",
-                    t.elapsed().as_secs_f64() * 1000.0
-                );
-            }
 
             // An atomic inline is detached from its parent's Taffy child list,
             // so the compute below cannot reach it and the branch above — the
@@ -345,14 +476,7 @@ impl RinchDocument {
             // ones something actually changed under (issue #661), before the
             // compute, because the enclosing IFC line-breaks against the box
             // this produces.
-            let t = web_time::Instant::now();
-            let moved = self.remeasure_dirty_atomic_inlines();
-            if perf && moved {
-                eprintln!(
-                    "  [PERF] remeasure_atomic_inlines: {:.2}ms",
-                    t.elapsed().as_secs_f64() * 1000.0
-                );
-            }
+            self.remeasure_dirty_atomic_inlines();
         }
 
         let available_space = taffy::Size {
@@ -360,7 +484,9 @@ impl RinchDocument {
             height: taffy::AvailableSpace::Definite(height),
         };
 
-        let mut text_layout_cache = self.run_taffy_compute(root_taffy, available_space, perf);
+        self.tidy_tables();
+        self.sync_float_avoidance();
+        let mut text_layout_cache = self.run_taffy_compute(root_taffy, available_space);
 
         // #120: an inline-block with a percentage main size is pre-measured detached
         // from Taffy under `MaxContent` (see `compute_inline_block_layouts`), where it
@@ -369,10 +495,33 @@ impl RinchDocument {
         // has run. Re-measure those inline-blocks against that width now, and if any
         // changed size, re-run the compute so the enclosing IFCs line-break against the
         // corrected boxes. Costs nothing when no percentage inline-block exists.
-        if self.resolve_percentage_inline_blocks() {
-            text_layout_cache = self.run_taffy_compute(root_taffy, available_space, perf);
+        //
+        // More than once only for #1476: a compute that met an `auto` box
+        // too wide for a line, in a container sized from its content, lined
+        // it up at its max-content width for want of its min-content one;
+        // the pass measures that, the next compute sizes the container from
+        // it, and the pass after caps the box in it.
+        // A pass that measured no such size is followed by one compute and
+        // no further pass, as before.
+        let mut inline_rounds_left = crate::ifc::MAX_INLINE_ROUNDS;
+        while inline_rounds_left > 0 && self.resolve_percentage_inline_blocks() {
+            text_layout_cache = self.run_taffy_compute(root_taffy, available_space);
+            inline_rounds_left -= 1;
+            if !self.tree.atomic_contributions_changed {
+                break;
+            }
         }
 
+        // #386: an absolute box whose containing block is an ancestor that is
+        // not its layout parent is sized against that ancestor's padding box,
+        // which only the compute above has produced (`crate::out_of_flow`).
+        // Each such box whose Taffy style was baked for another size is
+        // rewritten and the compute re-run: once, plus once per level of a
+        // containing block that is itself such a box. Costs one `is_empty`
+        // when the document holds no such box — an absolute child of its own
+        // positioned parent is not one — and no compute when every one of
+        // them is already baked for the size its ancestor came out at.
+        //
         // #278: a mixed `calc(%, px)` value has no Taffy representation (see
         // `calc_layout.rs`), so its style carries a seed until the containing
         // block has a size. Resolve every such value against the sizes the
@@ -387,87 +536,179 @@ impl RinchDocument {
         // definite axis): a capped run lays out from the last iterate — a
         // wrong but bounded answer after 8 extra computes — and says so on
         // stderr once per process rather than hiding it.
-        let mut calc_passes = 0;
-        while self.resolve_layout_calcs() {
-            text_layout_cache = self.run_taffy_compute(root_taffy, available_space, perf);
-            calc_passes += 1;
-            if calc_passes >= 8 {
-                static CAP_WARNING: std::sync::Once = std::sync::Once::new();
-                CAP_WARNING.call_once(|| {
-                    eprintln!(
-                        "[rinch] calc() layout fixpoint hit its iteration cap; a mixed                          calc() in this document is feeding back into its own basis and                          its layout is approximate (reported once per process)"
-                    );
-                });
-                break;
+        //
+        // The two share one loop because each can move the other's basis (a
+        // calc-sized containing block; a calc inside a re-sized absolute), and
+        // the absolutes go first so a `Calc` on one resolves against the
+        // containing block this pass baked it for. An absolute nested more
+        // than 8 containing blocks deep in *non-parent* ones stops at the cap
+        // the same way.
+        //
+        // The outer loop runs once. It runs a second time only when the
+        // read-back finds an absolute box whose containing block is not the
+        // one the style sites recorded for it (`out_of_flow::note_kind_at_read`
+        // — a box between the two started or stopped generating a box, with
+        // no restyle of the absolute one): the box is then resolved, computed
+        // and read again before anything is painted from it.
+        //
+        // #631: the outermost loop runs once, too. A containing block that is
+        // an inline span has no size until the lines are built, which is
+        // after the read-back; a box sized from one is checked against it
+        // then, and a rewrite sends the layout round again — compute, read,
+        // lines. Only a document holding such a box asks
+        // (`abs_inline_cb_seen`), and only a box whose **size** depends on a
+        // span whose fragment changed size this layout goes round: once,
+        // plus once per level of such a box inside another.
+        let mut inline_rounds = 0;
+        // Styles the check after the lines rewrote: a compute is owed.
+        let mut rebaked = false;
+        // Boxes a block line clamp changed after the lines (#2581): a
+        // compute is owed.
+        let mut reclamped = false;
+        loop {
+            let mut reread = false;
+            loop {
+                let mut fixpoint_passes = 0;
+                loop {
+                    let absolutes = self.resolve_ancestor_absolutes(false) || rebaked;
+                    rebaked = false;
+                    let clamps = std::mem::take(&mut reclamped);
+                    let (calcs, calcs_in_atomic) = self.resolve_layout_calcs();
+                    if !absolutes && !calcs && !clamps {
+                        break;
+                    }
+                    // A rewritten calc inside an atomic inline is in that box's
+                    // own detached compute too (#2136): the same re-measure.
+                    if absolutes || calcs_in_atomic || clamps {
+                        if absolutes {
+                            self.tree.perf.bump(Counter::AbsContainingBlockPasses);
+                        }
+                        // A re-baked box inside an atomic inline is in that box's own
+                        // detached compute, which the root compute does not reach.
+                        self.remeasure_dirty_atomic_inlines();
+                    }
+                    if calcs {
+                        self.tree.perf.bump(Counter::CalcFixpointPasses);
+                    }
+                    text_layout_cache = self.run_taffy_compute(root_taffy, available_space);
+                    // The re-measure above sized a percentage atomic inline with no
+                    // containing block, as the pass before the first compute does.
+                    if absolutes || calcs_in_atomic || clamps {
+                        let mut inline_rounds_left = crate::ifc::MAX_INLINE_ROUNDS;
+                        while inline_rounds_left > 0 && self.resolve_percentage_inline_blocks() {
+                            text_layout_cache = self.run_taffy_compute(root_taffy, available_space);
+                            inline_rounds_left -= 1;
+                            if !self.tree.atomic_contributions_changed {
+                                break;
+                            }
+                        }
+                    }
+                    fixpoint_passes += 1;
+                    if fixpoint_passes >= 8 {
+                        static CAP_WARNING: std::sync::Once = std::sync::Once::new();
+                        CAP_WARNING.call_once(|| {
+                        eprintln!(
+                            "[rinch] layout fixpoint hit its iteration cap; a mixed calc() in                          this document is feeding back into its own basis (or absolute                          boxes are nested more than 8 non-parent containing blocks deep)                          and its layout is approximate (reported once per process)"
+                        );
+                    });
+                        break;
+                    }
+                }
+
+                // Read layout results back into nodes
+                crate::out_of_flow::begin_read(&mut self.tree);
+                self.read_layout_results(self.tree.root_id);
+                // The walk above is over the **element** tree, and an anonymous block
+                // box is not in it (#566) — so nothing above visits one, and its
+                // `layout` would stay at the origin while its line is measured and
+                // painted from it. Read them back here rather than teaching the
+                // recursion a second child list: the recursion must keep visiting the
+                // run's *members* (their IFC-assigned position is preserved inside it),
+                // so a box tree walk that replaced them would lose that, and a walk
+                // that unioned them would cost every node a merge for the sake of a
+                // handful of boxes. This is O(boxes) and off the per-node path.
+                for anon_id in self.tree.anonymous_block_boxes.clone() {
+                    self.read_layout_results_for_box(anon_id);
+                }
+                if reread || !std::mem::take(&mut self.tree.abs_resolve_owed) {
+                    self.tree.abs_resolve_owed = false;
+                    break;
+                }
+                reread = true;
             }
+
+            // Build inline layouts for IFC roots (rebuild with final widths and store)
+            // Temporarily take layout_cx out to avoid borrow conflict
+            let t = web_time::Instant::now();
+            let mut temp_layout_cx = std::mem::take(&mut self.layout_cx);
+            self.build_ifc_layouts(&mut temp_layout_cx);
+            self.layout_cx = temp_layout_cx;
+            self.tree.perf.add_elapsed(Counter::TimeBuildIfcNs, t);
+            self.tree.dirty_ifc_text_roots.clear();
+
+            if self.tree.abs_inline_cb_seen {
+                self.measure_inline_containing_blocks();
+            }
+            let spans_changed = self.tree.abs_inline_cb_seen
+                && inline_rounds < 8
+                && self.resolve_ancestor_absolutes(true);
+            // #1404: a box shrunk to fit from its static position has the
+            // room its containing block leaves after that position, which
+            // the lines (a place in one, an atomic inline on the way up)
+            // have only now settled. One `is_empty` without such a box.
+            let statics_changed = inline_rounds < 8 && self.resolve_static_shrink_to_fit();
+            // A `-webkit-line-clamp` counted through block children ends
+            // where its Nth line, only now built, ends (#2581). One `is_empty`
+            // without a clamp.
+            let clamps_changed = inline_rounds < 8 && self.resolve_block_line_clamps();
+            if spans_changed || statics_changed || clamps_changed {
+                inline_rounds += 1;
+                rebaked = spans_changed || statics_changed;
+                reclamped = clamps_changed;
+                continue;
+            }
+            break;
         }
 
-        // Read layout results back into nodes
-        let t = web_time::Instant::now();
-        self.read_layout_results(self.tree.root_id);
-        // The walk above is over the **element** tree, and an anonymous block
-        // box is not in it (#566) — so nothing above visits one, and its
-        // `layout` would stay at the origin while its line is measured and
-        // painted from it. Read them back here rather than teaching the
-        // recursion a second child list: the recursion must keep visiting the
-        // run's *members* (their IFC-assigned position is preserved inside it),
-        // so a box tree walk that replaced them would lose that, and a walk
-        // that unioned them would cost every node a merge for the sake of a
-        // handful of boxes. This is O(boxes) and off the per-node path.
-        for anon_id in self.tree.anonymous_block_boxes.clone() {
-            self.read_layout_results_for_box(anon_id);
-        }
-        if perf {
-            eprintln!(
-                "  [PERF] read_layout: {:.2}ms",
-                t.elapsed().as_secs_f64() * 1000.0
-            );
-        }
-
-        // Clamp scroll offsets to valid range after layout.
-        // When a scroll container shrinks (e.g., window resize makes max-height
-        // smaller) or grows (content now fits), the old scroll offset may exceed
-        // the new max. Clamping here ensures paint and hit-testing use valid values.
-        self.clamp_scroll_offsets();
-
-        // Build inline layouts for IFC roots (rebuild with final widths and store)
-        // Temporarily take layout_cx out to avoid borrow conflict
-        let t = web_time::Instant::now();
-        let mut temp_layout_cx = std::mem::take(&mut self.layout_cx);
-        self.build_ifc_layouts(&mut temp_layout_cx);
-        self.layout_cx = temp_layout_cx;
-        self.tree.dirty_ifc_text_roots.clear();
-        if perf {
-            eprintln!(
-                "  [PERF] build_ifc: {:.2}ms",
-                t.elapsed().as_secs_f64() * 1000.0
-            );
-        }
-
-        // Copy cached text layouts to nodes (use the exact layouts from measurement)
-        let t = web_time::Instant::now();
+        // Copy cached text layouts to nodes (use the exact layouts from
+        // measurement) — the root compute's text leaves and, since #904, the
+        // ones the detached atomic-inline computes measured this pass (an
+        // `inline-flex` label), which the root compute never reaches.
+        let mut text_layout_cache = text_layout_cache;
+        text_layout_cache.extend(std::mem::take(&mut self.tree.atomic_leaf_layouts));
         self.copy_cached_text_layouts(text_layout_cache);
-        if perf {
-            eprintln!(
-                "  [PERF] copy_text_layouts: {:.2}ms",
-                t.elapsed().as_secs_f64() * 1000.0
-            );
-        }
 
-        if perf {
-            eprintln!(
-                "  [PERF] resolve_layout TOTAL: {:.2}ms",
-                t0.elapsed().as_secs_f64() * 1000.0
-            );
+        // Clamp scroll offsets to the valid range after layout. When a scroll
+        // container shrinks (e.g., window resize makes max-height smaller) or
+        // grows (content now fits), the old scroll offset may exceed the new
+        // max; clamping here ensures paint and hit-testing use valid values.
+        // **After** the two text passes above: the range is `content_extents`,
+        // which reads an IFC root's and an anonymous box's `text_layout`, and
+        // before them that is last pass's lines or none (review of #1045 — a
+        // bottom-pinned text scroller snapped to 0 when text was appended).
+        self.clamp_scroll_offsets();
+        // An absolute box was placed from its ancestors' layouts as it was
+        // read back (#386), and two things on the way to its containing block
+        // have only now been written: where `build_ifc_layouts` put an atomic
+        // inline on its line, and the scroll offsets as clamped. Place again
+        // the ones that moves. (No box placed here is in any scroll range —
+        // `contributes_to_scrollable_overflow` — so the clamp above did not
+        // need this first.) A third: the lines themselves, which are what an
+        // inline span's fragments — a containing block with no box of its
+        // own, #631 — are measured in; a box resolved against one was read
+        // back before this layout's lines existed.
+        if self.tree.abs_inline_cb_seen {
+            self.tree.abs_late_moves = true;
         }
+        crate::out_of_flow::replace_all(&mut self.tree);
 
         // Arm transitions now that the first layout has completed, so nothing
         // transitions into existence on page load.
         //
         // `Node::has_been_styled` is not enough on its own: a tree is cascaded
         // more than once before its first layout — appending a `<style>`
-        // element re-resolves the whole document on the spot
-        // (`maybe_load_style_css`) — so a component that appends its own
+        // element restyles every element its rules reach on the spot
+        // (`flush_stylist`, #884) — so a component that appends its own
         // stylesheet after building its markup leaves every node already
         // styled, and the next rule it loads is a *change* on an already-styled
         // node.
@@ -572,35 +813,141 @@ impl RinchDocument {
     /// `(node_id, wrap_width_bits)`, so paint can reuse the exact layouts that
     /// measurement produced. Safe to call more than once per frame — see the
     /// percentage inline-block second pass in `resolve_layout`.
-    fn run_taffy_compute(
+    pub(crate) fn run_taffy_compute(
         &mut self,
         root_taffy: taffy::NodeId,
         available_space: taffy::Size<taffy::AvailableSpace>,
-        perf: bool,
-    ) -> HashMap<(usize, u32), parley::layout::Layout<Brush>> {
+    ) -> HashMap<(RawNodeId, u32), parley::layout::Layout<Brush>> {
+        self.run_taffy(root_taffy, available_space)
+    }
+
+    fn run_taffy(
+        &mut self,
+        root_taffy: taffy::NodeId,
+        available_space: taffy::Size<taffy::AvailableSpace>,
+    ) -> MeasuredTextLayouts {
+        use crate::perf::Counter;
         self.tree.taffy_computes += 1;
+        self.tree.perf.bump(Counter::TaffyRootComputes);
+        // The measure closure borrows `self.tree.nodes` while the compute
+        // borrows `self.tree.taffy` mutably, so it counts into locals that are
+        // folded into `self.tree.perf` after the compute.
+        let measure_calls = std::cell::Cell::new(0u64);
+        let shape_ifc = std::cell::Cell::new(0u64);
+        let rebreaks = std::cell::Cell::new(0u64);
+        let hang = std::cell::Cell::new(crate::ifc::HangStats::default());
+        let shape_text = std::cell::Cell::new(0u64);
+        let cache_hits = std::cell::Cell::new(0u64);
+        let font_family_resolves = std::cell::Cell::new(0u64);
         let font_cx = &mut self.font_cx;
         let layout_cx = &mut self.layout_cx;
         let nodes = &self.tree.nodes;
-        let dirty_ifc_text_roots = &self.tree.dirty_ifc_text_roots;
+        let (min_content, resolved_at, percent_resolved_at, min_requests) = (
+            &self.tree.atomic_min_content,
+            &self.tree.keyword_inline_cb_width,
+            &self.tree.percent_inline_cb_width,
+            &self.tree.atomic_min_requests,
+        );
+        // A root in `dirty_ifc_text_roots` must not be answered from a size
+        // measured before it went dirty. That used to be spelled as a bypass —
+        // every measure of a dirty root shaped, however many times Taffy asked
+        // it the same width in one compute (four shapes for one edited row
+        // where one would do). Dropping the dirty roots' old sizes here says
+        // the same thing and lets this compute reuse what it shapes itself.
+        // (Most routes into the set already dropped them; the virtualized
+        // editor's materialisation is one that does not.)
+        for root in &self.tree.dirty_ifc_text_roots {
+            if let Some(entry) = self.tree.ifc_measure_cache.get_mut(root) {
+                entry.sizes.clear();
+            }
+        }
 
         // Cache for text layouts built during measurement.
         // Key: (node_id, wrap_width as bits) - wrap width is part of key since layout depends on it
         // Value: Parley layout
         use std::cell::RefCell;
-        let text_layout_cache: RefCell<HashMap<(usize, u32), parley::layout::Layout<Brush>>> =
+        let text_layout_cache: RefCell<HashMap<(RawNodeId, u32), parley::layout::Layout<Brush>>> =
             RefCell::new(HashMap::new());
         // Persistent IFC measure cache — survives across frames.
         // Only invalidated when an IFC root's text content changes.
         let ifc_measure_cache = RefCell::new(std::mem::take(&mut self.tree.ifc_measure_cache));
+        // The bands each IFC root was finally laid out beside, for the paint
+        // layout; a root laid out with no float beside it drops its entry.
+        let ifc_float_bands = RefCell::new(std::mem::take(&mut self.tree.ifc_float_bands));
 
         let t = web_time::Instant::now();
-        self.tree
-            .taffy
-            .compute_layout_with_measure(
-                root_taffy,
-                available_space,
-                |known_dims, avail_space, _node_id, context, _style| {
+        let measure = measure_fn(|inputs, measured_id, context, style, block_ctx| {
+            // The block context of an IFC root's leaf: the room its
+            // floats leave the lines, read before the leaf algorithm
+            // takes `inputs`, and the floats left for the paragraph
+            // to place as its lines reach them (`float_wrap`).
+            let block_ctx =
+                block_ctx.filter(|_| matches!(context, Some(NodeContext::InlineRoot(_))));
+            // Asked only its width beside its own floats (#2326): its lines
+            // are broken with no float placed, and the floats added to the
+            // lines they stand in after.
+            let (block_ctx, intrinsic) = match block_ctx {
+                Some(ctx) if ctx.is_intrinsic() => (None, Some(&*ctx)),
+                other => (other, None),
+            };
+            let leaf_box = block_ctx
+                .as_ref()
+                .and_then(|_| crate::float_wrap::LeafBox::of(&inputs, style));
+            let floats = block_ctx
+                .as_deref()
+                .map(|ctx| crate::float_wrap::FloatBands::of_leaf(ctx, &inputs, style))
+                .filter(|bands| !bands.is_empty());
+            let places_floats = block_ctx
+                .as_deref()
+                .is_some_and(|ctx| !ctx.pending_floats().is_empty());
+            // Taffy 0.14's measure returns a `LayoutOutput`; the leaf
+            // algorithm (box-sizing, min/max clamps) is what Taffy 0.12's
+            // `TaffyView` ran around the size this body returns, with the
+            // same `0.0` calc resolver. The body also says where its
+            // first line's baseline is, from the content-box top, and
+            // `with_first_baseline` hands it to Taffy (#1013).
+            // Whether its containing block's height is definite, as this
+            // final layout takes it (#2427).
+            crate::ifc::note_containing_block_height(
+                nodes,
+                measured_id,
+                context.as_deref(),
+                &inputs,
+            );
+            let mut first_baseline: Option<f32> = None;
+            // Offered a room, not given a width (#2425): no width known to
+            // the caller and none of the box's own, so its width is its
+            // content's, clamped by nothing of its own. (In a layout run the
+            // leaf algorithm hands the measure no known width, the width it
+            // is laid out at being its available width.)
+            let sized_by_content = inputs.known_dimensions.width.is_none() && {
+                use taffy::CoreStyle;
+                style.size().width.is_auto()
+                    && style.min_size().width.is_auto()
+                    && style.max_size().width.is_auto()
+            };
+            // A compressible replaced box asked its min-content width is
+            // computed with its percentages resolved against zero, a length
+            // `width` included (`replaced::min_content_style`).
+            // The box whose lines a measure breaks has no width yet: it is
+            // being sized to fit them (`AtomicContributions::fits_compressible`).
+            let sizing_to_fit = crate::replaced::sizing_to_fit(&inputs, style);
+            // A percentage of the box's width counts 0 in a measure sizing it
+            // (`AtomicContributions::percent_cyclic`).
+            let percent_cyclic = sizing_to_fit;
+            let compressed = match context {
+                Some(NodeContext::Replaced { .. } | NodeContext::Image { .. }) => {
+                    crate::replaced::min_content_style(&inputs, style)
+                }
+                _ => None,
+            };
+            let style = compressed.as_ref().unwrap_or(style);
+            let out = taffy::compute_leaf_layout(
+                inputs,
+                style,
+                |_, _| 0.0,
+                |known_dims, avail_space| {
+                    measure_calls.set(measure_calls.get() + 1);
                     let max_width = match avail_space.width {
                         taffy::AvailableSpace::Definite(w) => Some(w),
                         taffy::AvailableSpace::MaxContent => None,
@@ -625,104 +972,52 @@ impl RinchDocument {
                                 return taffy::Size::ZERO;
                             }
 
-                            let mut builder =
-                                layout_cx.ranged_builder(font_cx, &text.content, 1.0, true);
-                            builder.push_default(parley::style::StyleProperty::FontSize(
-                                text.font_size,
-                            ));
-                            if (text.font_weight - 400.0).abs() > 1.0 {
-                                builder.push_default(parley::style::StyleProperty::FontWeight(
-                                    parley::style::FontWeight::new(text.font_weight),
-                                ));
-                            }
-                            if let Some(lh) =
-                                layout::css_line_height_to_parley(&text.line_height_css)
-                            {
-                                builder.push_default(parley::style::StyleProperty::LineHeight(lh));
-                            }
-                            let font_stack = if !text.font_family.is_empty() {
-                                std::borrow::Cow::Owned(text.font_family.clone())
-                            } else {
-                                std::borrow::Cow::Borrowed("sans-serif")
-                            };
-                            builder.push_default(parley::style::StyleProperty::FontFamily(
-                                parley::style::FontFamily::Source(font_stack),
-                            ));
-                            // Add brush so the cached layout can be rendered with color
-                            builder.push_default(parley::style::StyleProperty::Brush(
-                                Brush::Solid(text.color),
-                            ));
-                            // Apply overflow-wrap for emergency line-breaking
-                            builder.push_default(parley::style::StyleProperty::OverflowWrap(
-                                text.overflow_wrap.to_parley(),
-                            ));
-                            // letter-/word-spacing (#698). The builder's scale
-                            // is 1.0 here, so these are CSS pixels either way.
-                            builder.push_default(parley::style::StyleProperty::LetterSpacing(
-                                text.letter_spacing,
-                            ));
-                            builder.push_default(parley::style::StyleProperty::WordSpacing(
-                                text.word_spacing,
-                            ));
-                            let mut layout = builder.build(&text.content);
+                            shape_text.set(shape_text.get() + 1);
                             // If no_wrap is set (white-space: nowrap), don't constrain width
                             let wrap_width = if text.no_wrap {
                                 None
                             } else {
                                 known_dims.width.or(max_width)
                             };
-                            layout.break_all_lines(wrap_width);
+                            let leaf = crate::ifc::shape_text_leaf(
+                                font_cx,
+                                layout_cx,
+                                text,
+                                wrap_width,
+                                known_dims.width.unwrap_or(0.0),
+                            );
+                            let mut h = hang.get();
+                            h.add(leaf.hang);
+                            hang.set(h);
 
                             // Cache the layout for use during paint
                             // Use wrap_width bits as part of the key since layout depends on it
                             let wrap_bits = wrap_width.map(|w| w.to_bits()).unwrap_or(u32::MAX);
+                            first_baseline = leaf.first_baseline();
                             text_layout_cache
                                 .borrow_mut()
-                                .insert((text.node_id, wrap_bits), layout);
+                                .insert((text.node_id, wrap_bits), leaf.layout);
 
                             taffy::Size {
-                                width: known_dims.width.unwrap_or_else(|| {
-                                    text_layout_cache
-                                        .borrow()
-                                        .get(&(text.node_id, wrap_bits))
-                                        .map(|l| l.width())
-                                        .unwrap_or(0.0)
-                                }),
-                                height: known_dims.height.unwrap_or_else(|| {
-                                    text_layout_cache
-                                        .borrow()
-                                        .get(&(text.node_id, wrap_bits))
-                                        .map(|l| l.height())
-                                        .unwrap_or(0.0)
-                                }),
+                                width: known_dims.width.unwrap_or(leaf.width),
+                                height: known_dims.height.unwrap_or(leaf.height),
                             }
                         }
-                        Some(NodeContext::Image { width, height, .. }) => {
-                            let iw = *width as f32;
-                            let ih = *height as f32;
-                            if iw == 0.0 || ih == 0.0 {
-                                // Image still loading — return zero size
-                                return taffy::Size::ZERO;
-                            }
-                            let aspect = iw / ih;
-                            // Use intrinsic dimensions as default, but respect
-                            // CSS width/height if set (via known_dims from Taffy style).
-                            // Maintain aspect ratio when only one dimension is constrained.
-                            let w = match (known_dims.width, known_dims.height) {
-                                (Some(kw), _) => kw,
-                                (None, Some(kh)) => kh * aspect,
-                                (None, None) => iw,
-                            };
-                            let h = match (known_dims.height, known_dims.width) {
-                                (Some(kh), _) => kh,
-                                (None, Some(kw)) => kw / aspect,
-                                (None, None) => ih,
-                            };
-                            taffy::Size {
-                                width: w,
-                                height: h,
-                            }
-                        }
+                        Some(NodeContext::Image {
+                            natural,
+                            aspect,
+                            alt,
+                            ..
+                        }) => crate::replaced::measure_image(
+                            *natural,
+                            *aspect,
+                            alt.as_ref(),
+                            known_dims,
+                            style,
+                            inputs.parent_size,
+                            inputs.sizing_mode == taffy::SizingMode::InherentSize,
+                            inputs.available_space,
+                        ),
                         Some(NodeContext::InlineRoot(root_id)) => {
                             let root_id = *root_id;
 
@@ -745,31 +1040,304 @@ impl RinchDocument {
 
                             // Use wrap_width bits as cache key
                             let wrap_bits = max_width.map(|w| w.to_bits()).unwrap_or(u32::MAX);
+                            // The sign bit: no wrap width has it set.
+                            let fitted_bits = wrap_bits ^ 0x8000_0000;
+
+                            let beside_floats =
+                                floats.is_some() || places_floats || intrinsic.is_some();
+                            // Laid out with no float beside it, the root's paint
+                            // layout has the whole width again: its old bands go
+                            // before the cache below can answer (the bands of a
+                            // root beside floats are recorded after its build).
+                            // (Most documents have no floats: an empty map is
+                            // not hashed into.)
+                            if inputs.run_mode == taffy::RunMode::PerformLayout && !beside_floats {
+                                let mut bands = ifc_float_bands.borrow_mut();
+                                if !bands.is_empty() {
+                                    bands.remove(&root_id);
+                                }
+                            }
 
                             // Check persistent IFC measure cache — skip expensive
                             // Parley rebuild if this root's text hasn't changed.
-                            if !dirty_ifc_text_roots.contains(&root_id) {
-                                if let Some(&(cached_w, cached_h)) =
-                                    ifc_measure_cache.borrow().get(&(root_id, wrap_bits))
-                                {
+                            // Its sizes are of lines with the whole width: a root
+                            // beside a float, or placing its own, is broken afresh,
+                            // and not kept.
+                            if !beside_floats {
+                                // A measure that lined a compressible picture
+                                // up at its shrink-to-fit size is kept apart
+                                // (`AtomicContributions::fitted`), and only a
+                                // measure sizing its box to fit reads it.
+                                // A percentage `text-indent` counts 0 in a
+                                // measure sizing its box, and is of the room
+                                // in one that is not (#2628): neither reads
+                                // the other's lines.
+                                let pct_indent =
+                                    nodes[root_id].computed_style.text_indent.has_percentage();
+                                let cached =
+                                    ifc_measure_cache.borrow().get(&root_id).and_then(|e| {
+                                        if pct_indent {
+                                            e.get(if percent_cyclic {
+                                                fitted_bits
+                                            } else {
+                                                wrap_bits
+                                            })
+                                        } else {
+                                            sizing_to_fit
+                                                .then(|| e.get(fitted_bits))
+                                                .flatten()
+                                                .or_else(|| e.get(wrap_bits))
+                                        }
+                                    });
+                                // A box sized by its content wider than
+                                // the room has the lines of its own width
+                                // (#2425, below), kept beside the room's in
+                                // the entry once a measure has broken them.
+                                let answer = cached.and_then(|m| {
+                                    let own = (sized_by_content
+                                        && max_width.is_some_and(|room| m.width > room))
+                                        || (pct_indent && percent_cyclic);
+                                    match (own, m.at_width) {
+                                        (false, _) => Some((m.width, m.height, m.first_baseline)),
+                                        (true, Some((h, b))) => Some((m.width, h, b)),
+                                        (true, None) => None,
+                                    }
+                                });
+                                if let Some((width, height, baseline)) = answer {
+                                    cache_hits.set(cache_hits.get() + 1);
+                                    first_baseline = baseline;
                                     return taffy::Size {
-                                        width: known_dims.width.unwrap_or(cached_w),
-                                        height: known_dims.height.unwrap_or(cached_h),
+                                        width: known_dims.width.unwrap_or(width),
+                                        height: known_dims.height.unwrap_or(height),
                                     };
                                 }
                             }
 
                             // Full Parley rebuild (text changed or cache miss)
-                            let inline_layout = Self::build_inline_layout(
-                                nodes, root_id, max_width, 1.0, font_cx, layout_cx,
+                            shape_ifc.set(shape_ifc.get() + 1);
+                            let atomic = crate::ifc::AtomicContributions {
+                                wrap_width: max_width,
+                                min_content,
+                                resolved_at,
+                                percent_resolved_at,
+                                requests: min_requests,
+                                fits_compressible: sizing_to_fit,
+                                percent_cyclic,
+                                known_width: known_dims.width,
+                                fitted: std::cell::Cell::new(false),
+                            };
+                            let mut placer = block_ctx.zip(leaf_box).filter(|_| places_floats).map(
+                                |(ctx, leaf)| crate::float_wrap::BlockFloats { ctx, nodes, leaf },
                             );
-                            let w = inline_layout.layout.width();
-                            let h = inline_layout.layout.height();
+                            let (inline_layout, resolved) = Self::build_inline_layout(
+                                nodes,
+                                root_id,
+                                max_width,
+                                None,
+                                1.0,
+                                font_cx,
+                                layout_cx,
+                                Some(&atomic),
+                                floats.as_ref(),
+                                placer
+                                    .as_mut()
+                                    .map(|p| p as &mut dyn crate::ifc::PlaceFloats),
+                            );
+                            font_family_resolves.set(font_family_resolves.get() + resolved);
+                            // The room the lines were finally broken beside, the
+                            // paragraph's own floats included, for the paint layout.
+                            if inputs.run_mode == taffy::RunMode::PerformLayout {
+                                let last = match &placer {
+                                    Some(p) => Some(p.leaf.bands(p.ctx)),
+                                    None => floats.clone(),
+                                }
+                                .filter(|bands| !bands.is_empty());
+                                let mut bands = ifc_float_bands.borrow_mut();
+                                match last {
+                                    Some(last) => {
+                                        bands.insert(root_id, last);
+                                    }
+                                    None if !bands.is_empty() => {
+                                        bands.remove(&root_id);
+                                    }
+                                    None => {}
+                                }
+                            }
+                            let mut h = hang.get();
+                            h.add(inline_layout.hang);
+                            hang.set(h);
+                            // Asked at a definite room with no width known,
+                            // the box is sized fit-content (#2330): a float,
+                            // an absolutely positioned box, a flex or grid item
+                            // aligned to its start. Beside floats the lines
+                            // wrap for the floats too, so the widest line is
+                            // kept there.
+                            let mut w = if beside_floats {
+                                inline_layout.measured_width()
+                            } else {
+                                inline_layout.fit_content_width()
+                            };
+                            if let Some(ctx) = intrinsic {
+                                // Asked at a definite room, the max-content
+                                // lines are broken again: the floats are added
+                                // to unbroken lines, then the room clamps.
+                                let max = max_width.map(|room| {
+                                    let atomic = crate::ifc::AtomicContributions {
+                                        wrap_width: None,
+                                        min_content,
+                                        resolved_at,
+                                        percent_resolved_at,
+                                        requests: min_requests,
+                                        fits_compressible: false,
+                                        percent_cyclic: false,
+                                        known_width: None,
+                                        fitted: std::cell::Cell::new(false),
+                                    };
+                                    let (max, resolved) = Self::build_inline_layout(
+                                        nodes,
+                                        root_id,
+                                        None,
+                                        None,
+                                        1.0,
+                                        font_cx,
+                                        layout_cx,
+                                        Some(&atomic),
+                                        None,
+                                        None,
+                                    );
+                                    font_family_resolves.set(font_family_resolves.get() + resolved);
+                                    (max, room)
+                                });
+                                w = match &max {
+                                    Some((max, room)) => {
+                                        crate::float_wrap::intrinsic_width_beside_floats(
+                                            ctx,
+                                            nodes,
+                                            &max.layout,
+                                            max.measured_width(),
+                                            Some((*room, w)),
+                                        )
+                                    }
+                                    None => crate::float_wrap::intrinsic_width_beside_floats(
+                                        ctx,
+                                        nodes,
+                                        &inline_layout.layout,
+                                        w,
+                                        None,
+                                    ),
+                                };
+                            }
+                            // With less room than its min-content width, a
+                            // box sized fit-content takes that width (#2425):
+                            // the widest piece that cannot break, wider than
+                            // the room. Its lines are those of that width, not
+                            // the room's — Taffy lays a float or an absolutely
+                            // positioned box out at the size this returns, so
+                            // a height of lines broken at the room (`a-5`
+                            // split at a 0 room, one line at its 28.52) was
+                            // a box taller than the lines it painted. Chrome
+                            // 156: `x -5 (-5) a-5` in a float in a `width: 0`
+                            // block is 28.52 x 80 (four lines), not 100.
+                            let wider = sized_by_content
+                                && !beside_floats
+                                && intrinsic.is_none()
+                                && max_width.is_some_and(|room| w > room);
+                            // Lines the room did not soft-wrap, with no
+                            // atomic inline in them, are already those lines
+                            // (#2540): a one-line label in a flex row is not
+                            // broken twice on every change of its text.
+                            let held =
+                                wider && crate::ifc::lines_hold_when_wider(&inline_layout.layout);
+                            // A percentage `text-indent` counted 0 in the
+                            // width (#2628); the box's lines are broken at
+                            // that width with it resolved against it
+                            // (Chrome 157: a `13%` float holding `alpha beta`
+                            // is 79.03 wide and two lines tall).
+                            let pct_rebreak = percent_cyclic
+                                && !beside_floats
+                                && intrinsic.is_none()
+                                && nodes[root_id].computed_style.text_indent.has_percentage();
+                            let rebroken = ((wider && !held) || pct_rebreak).then(|| {
+                                rebreaks.set(rebreaks.get() + 1);
+                                // Laid out at a known width, no picture in
+                                // it is fitted (#2445).
+                                let atomic = crate::ifc::AtomicContributions {
+                                    wrap_width: Some(w),
+                                    min_content,
+                                    resolved_at,
+                                    percent_resolved_at,
+                                    requests: min_requests,
+                                    fits_compressible: false,
+                                    percent_cyclic: false,
+                                    known_width: Some(w),
+                                    fitted: std::cell::Cell::new(false),
+                                };
+                                let (at_width, resolved) = Self::build_inline_layout(
+                                    nodes,
+                                    root_id,
+                                    Some(w),
+                                    None,
+                                    1.0,
+                                    font_cx,
+                                    layout_cx,
+                                    Some(&atomic),
+                                    None,
+                                    None,
+                                );
+                                font_family_resolves.set(font_family_resolves.get() + resolved);
+                                at_width
+                            });
+                            let room_height = inline_layout.content_height();
+                            let room_baseline =
+                                crate::ifc::first_line_baseline(&inline_layout.layout);
+                            let at_width = rebroken
+                                .as_ref()
+                                .map(|lines| {
+                                    (
+                                        lines.content_height(),
+                                        crate::ifc::first_line_baseline(&lines.layout),
+                                    )
+                                })
+                                .or(held.then_some((room_height, room_baseline)));
+                            let (h, baseline) = at_width.unwrap_or((room_height, room_baseline));
+                            first_baseline = baseline;
 
-                            // Store in persistent cache
-                            ifc_measure_cache
-                                .borrow_mut()
-                                .insert((root_id, wrap_bits), (w, h));
+                            if beside_floats {
+                                return taffy::Size {
+                                    width: known_dims.width.unwrap_or(w),
+                                    height: known_dims.height.unwrap_or(h),
+                                };
+                            }
+
+                            // Store in persistent cache: the room's lines,
+                            // and those of its own width when they were
+                            // broken (by this measure or an earlier one).
+                            // A fitted measure's entry is kept apart (#2445)
+                            // and carries them too: they are the lines the
+                            // box is laid out with once its width is known,
+                            // where no picture is fitted.
+                            let key = if atomic.fitted.get() {
+                                fitted_bits
+                            } else {
+                                wrap_bits
+                            };
+                            let mut cache = ifc_measure_cache.borrow_mut();
+                            let entry = cache.entry(root_id).or_default();
+                            let at_width = at_width.or_else(|| {
+                                entry
+                                    .get(key)
+                                    .filter(|m| m.width == w)
+                                    .and_then(|m| m.at_width)
+                            });
+                            entry.insert(
+                                key,
+                                crate::node::IfcMeasure {
+                                    width: w,
+                                    height: room_height,
+                                    first_baseline: room_baseline,
+                                    at_width,
+                                },
+                            );
 
                             // Measure callback for IFC root
                             taffy::Size {
@@ -777,21 +1345,67 @@ impl RinchDocument {
                                 height: known_dims.height.unwrap_or(h),
                             }
                         }
+                        Some(NodeContext::FormControl {
+                            content_width,
+                            content_height,
+                        }) => crate::form_control::measure(
+                            *content_width,
+                            *content_height,
+                            known_dims,
+                        ),
+                        Some(NodeContext::Replaced {
+                            width,
+                            height,
+                            ratio,
+                            aspect,
+                        }) => crate::replaced::contribution(
+                            crate::replaced::measure(
+                                (*width, *height),
+                                aspect.used_ratio(*ratio),
+                                known_dims,
+                                style,
+                                inputs.parent_size,
+                                inputs.sizing_mode == taffy::SizingMode::InherentSize,
+                            ),
+                            style,
+                            known_dims,
+                            inputs.available_space,
+                            inputs.parent_size,
+                            inputs.sizing_mode == taffy::SizingMode::InherentSize,
+                        ),
                         _ => taffy::Size::ZERO,
                     }
                 },
-            )
+            );
+            crate::ifc::with_first_baseline(out, &inputs, style, first_baseline)
+        });
+        // A measure leaf (an IFC root's, beside its out-of-flow
+        // children) places the floats before it: they are the floats
+        // in its root's content, placed at their lines (`float_wrap`).
+        let places_floats = |leaf: taffy::NodeId, context: Option<&NodeContext>| {
+            crate::float_wrap::is_measure_leaf(nodes, leaf, context)
+        };
+        self.tree
+            .taffy
+            .compute_layout_with_block_measure(root_taffy, available_space, measure, places_floats)
             .unwrap();
 
         // Restore the persistent IFC measure cache (dirty_ifc_text_roots cleared after build_ifc)
         self.tree.ifc_measure_cache = ifc_measure_cache.into_inner();
+        self.tree.ifc_float_bands = ifc_float_bands.into_inner();
 
-        if perf {
-            eprintln!(
-                "  [PERF] taffy_compute: {:.2}ms",
-                t.elapsed().as_secs_f64() * 1000.0
-            );
-        }
+        let perf = &self.tree.perf;
+        perf.add(Counter::TaffyMeasureCalls, measure_calls.get());
+        perf.add(Counter::ShapeMeasureIfc, shape_ifc.get());
+        perf.add(Counter::IfcRebreakAtWidth, rebreaks.get());
+        hang.get().record(perf);
+        perf.add(Counter::ShapeMeasureText, shape_text.get());
+        perf.add(Counter::IfcMeasureCacheHits, cache_hits.get());
+        perf.add(
+            Counter::InlineFontFamilyResolves,
+            font_family_resolves.get(),
+        );
+        perf.add_elapsed(Counter::TimeTaffyComputeNs, t);
 
         text_layout_cache.into_inner()
     }
@@ -805,7 +1419,7 @@ impl RinchDocument {
     /// parent's `font-size` changed was measured out of a context built from the
     /// old one. See `NodeTree::dirty_text_contexts`.
     pub(crate) fn sync_dirty_text_contexts(&mut self) {
-        let mut updates: Vec<(taffy::NodeId, usize, TextContextFields)> = Vec::new();
+        let mut updates: Vec<(taffy::NodeId, RawNodeId, TextContextFields)> = Vec::new();
 
         for id in self
             .tree
@@ -823,7 +1437,7 @@ impl RinchDocument {
             let Some(taffy_id) = node.taffy_id else {
                 continue;
             };
-            let parent = node.parent.and_then(|p| self.tree.nodes.get(p));
+            let parent = node.parent.and_then(|p| self.tree.nodes.get_live(p));
             updates.push((taffy_id, id, TextContextFields::from_parent(parent)));
         }
         self.tree.dirty_text_contexts.clear();
@@ -837,16 +1451,45 @@ impl RinchDocument {
         }
     }
 
-    /// Refresh every text node's [`TextMeasure`] from its parent's computed
+    /// Refresh every text node's `TextMeasure` from its parent's computed
     /// style — the full pass, run when the IFC structure changed.
     ///
     /// [`TextContextFields`] is the property list, shared with
     /// [`Self::sync_dirty_text_contexts`] so the full and incremental passes
     /// cannot disagree about what a text node is measured with.
+    /// [`Self::sync_text_contexts`] over a scoped pass's regions (the text
+    /// nodes whose parent — and so whose inherited text style — can have
+    /// changed with the structure), plus whatever a restyle queued in
+    /// `dirty_text_contexts`.
+    pub(crate) fn sync_scoped_text_contexts(&mut self, scope: &crate::ifc_scope::IfcScope) {
+        let mut updates: Vec<(taffy::NodeId, RawNodeId, TextContextFields)> = Vec::new();
+        for &(id, _, _) in &scope.region {
+            let Some(node) = self.tree.nodes.get_live(id) else {
+                continue;
+            };
+            if !matches!(&node.kind, NodeKind::Text(_)) {
+                continue;
+            }
+            let Some(taffy_id) = node.taffy_id else {
+                continue;
+            };
+            let parent = node.parent.and_then(|p| self.tree.nodes.get_live(p));
+            updates.push((taffy_id, id, TextContextFields::from_parent(parent)));
+        }
+        for (taffy_id, node_id, fields) in updates {
+            if let Some(ctx) = self.tree.taffy.get_node_context_mut(taffy_id)
+                && let NodeContext::Text(tm) = ctx
+            {
+                fields.apply_to(tm, node_id);
+            }
+        }
+        self.sync_dirty_text_contexts();
+    }
+
     pub(crate) fn sync_text_contexts(&mut self) {
         // Every text node is refreshed below, so nothing stays owed.
         self.tree.dirty_text_contexts.clear();
-        let mut updates: Vec<(taffy::NodeId, usize, TextContextFields)> = Vec::new();
+        let mut updates: Vec<(taffy::NodeId, RawNodeId, TextContextFields)> = Vec::new();
 
         for (id, node) in &self.tree.nodes {
             if let NodeKind::Text(_) = &node.kind {
@@ -854,7 +1497,7 @@ impl RinchDocument {
                     continue;
                 };
                 // Read from the parent's parsed computed_style, not from CSS strings.
-                let parent = node.parent.and_then(|p| self.tree.nodes.get(p));
+                let parent = node.parent.and_then(|p| self.tree.nodes.get_live(p));
                 updates.push((taffy_id, id, TextContextFields::from_parent(parent)));
             }
         }
@@ -868,60 +1511,259 @@ impl RinchDocument {
         }
     }
 
+    /// The `<textarea>`s whose value changed since the last resolve
+    /// (`NodeTree::textarea_extent_dirty`), on a resolve that runs no layout:
+    /// shape each one's text for its scroll range, so `scroll_height`, the
+    /// wheel and the bars read the new value's height right after the write,
+    /// and hold its scroll offset inside that range — a value that shrank to
+    /// fit scrolls back to 0, as Chrome's does — with its `onscroll` queued
+    /// like layout's clamp (review of #2023). A value that grew moves
+    /// nothing: Chrome keeps the offset.
+    fn refresh_value_changed_textareas(&mut self) {
+        let ids = std::mem::take(&mut self.tree.textarea_extent_dirty);
+        for id in ids {
+            if !self
+                .tree
+                .nodes
+                .get(id)
+                .is_some_and(|n| n.tag() == Some("textarea"))
+            {
+                continue;
+            }
+            crate::form_control::refresh_textarea_extent(
+                &self.tree,
+                &mut self.font_cx,
+                &mut self.layout_cx,
+                id,
+            );
+            let offset = self.tree.nodes[id].scroll_offset.1;
+            if offset == 0.0 {
+                continue;
+            }
+            // The range `clamp_scroll_offsets` holds every scroll container
+            // in: one extent walk, against the content box the bars use.
+            let content = crate::paint::scrollbar::content_extents(&self.tree, id).1;
+            let visible = crate::paint::scrollbar::visible_extents(&self.tree, id).1;
+            let max = self.tree.snap_scroll_offset((content - visible).max(0.0));
+            if offset > max {
+                self.tree.nodes[id].scroll_offset.1 = max;
+                // Repaints the field and re-places any absolute box that
+                // summed the old offset, as the wheel's scroll does.
+                self.tree.mark_scrolled(id);
+                self.tree.queue_scroll_clamp(id, max);
+            }
+        }
+    }
+
     /// Clamp scroll offsets for all scroll containers to their valid range.
     /// After layout changes (e.g., viewport resize), a container's content or
     /// visible area may have changed, making the old scroll offset too large.
     fn clamp_scroll_offsets(&mut self) {
-        use crate::computed_style::OverflowValue;
+        // A `<textarea>`'s extent is its text (#827), shaped at its new width
+        // before it is read — below, and by the wheel, the bars and
+        // `scroll_height` until the next layout. Shaped only when its text,
+        // caret, width or font changed (`form_control::displayed_metrics`).
+        // A document that never made a textarea scans nothing.
+        if self.tree.textarea_elements > 0 {
+            for (id, node) in self.tree.nodes.iter() {
+                if node.tag() == Some("textarea") {
+                    crate::form_control::refresh_textarea_extent(
+                        &self.tree,
+                        &mut self.font_cx,
+                        &mut self.layout_cx,
+                        id,
+                    );
+                }
+            }
+        }
         // Collect (node_id, max_scroll) for nodes that need clamping
-        let mut clamps: Vec<(usize, f64)> = Vec::new();
+        let mut clamps: Vec<(RawNodeId, f64)> = Vec::new();
         for (node_id, _) in self.tree.nodes.iter() {
             let node = &self.tree.nodes[node_id];
-            if !matches!(
-                node.computed_style.overflow_y,
-                OverflowValue::Auto | OverflowValue::Scroll
-            ) {
+            if !node.scrolls_y() {
                 continue;
             }
             if node.scroll_offset == (0.0, 0.0) {
                 continue;
             }
-            let cs = &node.computed_style;
-            let content_top = (cs.padding_top.to_px() + cs.border_top_width.to_px()) as f64;
-            let mut content_height: f64 = 0.0;
-            for &child_id in &node.children {
-                if let Some(child) = self.tree.nodes.get(child_id) {
-                    let bottom = (child.layout.y + child.layout.height) as f64 - content_top;
-                    if bottom > content_height {
-                        content_height = bottom;
-                    }
-                }
+            // The one extent walk (#995): the range the wheel, the bars and
+            // `scroll_height` answer. A walk of its own here — it was the
+            // direct `children` only — took back on every layout pass the
+            // range that one grants: an anonymous box's lines, a `display:
+            // contents` wrapper's children, an IFC root's inline content.
+            //
+            // The content box `scrollbars`, `client_height` and the wheel's
+            // finders measure against (#769) — one computation, not a copy.
+            let visible_h = crate::paint::scrollbar::visible_extents(&self.tree, node_id).1;
+            // First without the absolute boxes listed for this container
+            // from below its children (#770): they only add to the range, so
+            // an offset inside the rest needs no clamp and the walk measures
+            // none of them — the common case, a long list scrolled anywhere
+            // but its end, whose layout would otherwise measure every row's
+            // badge.
+            //
+            // And first from the rounded rects alone (#2116): an offset more
+            // than their slack inside that range is inside the whole-pixel
+            // one, so a layout measures no container unrounded for this.
+            let rounded_flow =
+                crate::paint::scrollbar::content_extents_in_flow_rounded(&self.tree, node_id).1;
+            let slack = crate::paint::scrollbar::ROUNDED_RANGE_SLACK;
+            if node.scroll_offset.1 <= (rounded_flow - visible_h - slack).max(0.0) {
+                continue;
             }
-            let pad_v = (cs.padding_top.to_px() + cs.padding_bottom.to_px()) as f64;
-            let border_v = (cs.border_top_width.to_px() + cs.border_bottom_width.to_px()) as f64;
-            let visible_h = (node.layout.height as f64 - pad_v - border_v).max(0.0);
+            let flow_height =
+                crate::paint::scrollbar::content_extents_in_flow(&self.tree, node_id).1;
+            if node.scroll_offset.1 <= (flow_height - visible_h).max(0.0) {
+                continue;
+            }
+            let content_height = crate::paint::scrollbar::content_extents(&self.tree, node_id).1;
             let max_scroll = (content_height - visible_h).max(0.0);
             if node.scroll_offset.1 > max_scroll {
-                clamps.push((node_id, max_scroll));
+                // On the device pixel grid, at or below the range (#1543),
+                // so the clamped offset is not clamped again next pass.
+                clamps.push((node_id, self.tree.snap_scroll_offset(max_scroll)));
             }
         }
         for (node_id, max_scroll) in clamps {
             self.tree.nodes[node_id].scroll_offset.1 = max_scroll;
+            self.tree.nodes[node_id].scroll_remainder = (0.0, 0.0);
+            // An absolute box placed past this scroller summed the old
+            // offset (`out_of_flow::replace_all`).
+            self.tree.abs_late_moves = true;
             // Queue a deferred scroll notification so the clamp isn't a silent
-            // mutation (#144). Coalesce per node (last value wins): layout can
-            // resolve more than once per frame, and a consumer must see one
-            // event per drain.
-            if let Some(pending) = self
-                .tree
-                .pending_scroll_clamps
-                .iter_mut()
-                .find(|(id, _)| *id == node_id)
-            {
-                pending.1 = max_scroll;
-            } else {
-                self.tree.pending_scroll_clamps.push((node_id, max_scroll));
-            }
+            // mutation (#144).
+            self.tree.queue_scroll_clamp(node_id, max_scroll);
         }
+    }
+
+    /// How far HTML's `align` on `node_id`'s parent moves it from where
+    /// Taffy put it ([`ComputedStyle::html_align`]): a block box in flow, with
+    /// a width of its own (a `width`, a `max-width`, or a table's), and no
+    /// `auto` margin. As Chrome places it (`-webkit-center`, `-webkit-right`),
+    /// its margin box: centred, `left = ml + max(0, free / 2)`; at the end,
+    /// `left = max(ml, avail - width - mr)`; `free` is what the parent's
+    /// content box leaves beside the margin box. Taffy laid it out with its
+    /// own margins, so its relative offset, transform and size stand.
+    ///
+    /// [`ComputedStyle::html_align`]: crate::computed_style::ComputedStyle::html_align
+    fn html_align_dx(&self, node_id: RawNodeId) -> f32 {
+        use crate::computed_style::{
+            DimensionValue, DisplayValue, LengthPercentageAutoValue as M, PositionValue, TablePart,
+            TextAlignValue,
+        };
+        let node = &self.tree.nodes[node_id];
+        let Some(parent) = node.parent.and_then(|p| self.tree.nodes.get(p)) else {
+            return 0.0;
+        };
+        let Some(align) = parent.computed_style.html_align else {
+            return 0.0;
+        };
+        if align == TextAlignValue::Start {
+            return 0.0;
+        }
+        let cs = &node.computed_style;
+        let in_flow_block = matches!(
+            parent.computed_style.display,
+            DisplayValue::Block | DisplayValue::ListItem
+        ) && matches!(
+            cs.display,
+            DisplayValue::Block | DisplayValue::ListItem | DisplayValue::Flex | DisplayValue::Grid
+        ) && !matches!(
+            cs.position,
+            PositionValue::Absolute | PositionValue::Fixed
+        ) && cs.float == taffy::Float::None
+            && !cs.table_part.is_internal()
+            && node.run_box.is_none();
+        let own_width = cs.table_part == TablePart::Table
+            || !matches!(cs.width, DimensionValue::Auto)
+            || !matches!(cs.max_width, DimensionValue::Auto);
+        if !in_flow_block
+            || !own_width
+            || matches!(cs.margin_left, M::Auto)
+            || matches!(cs.margin_right, M::Auto)
+        {
+            return 0.0;
+        }
+        let (Some(t), Some(pt)) = (node.taffy_id, parent.taffy_id) else {
+            return 0.0;
+        };
+        let (Ok(own), Ok(outer)) = (self.tree.taffy.layout(t), self.tree.taffy.layout(pt)) else {
+            return 0.0;
+        };
+        let avail = outer.size.width
+            - outer.padding.left
+            - outer.padding.right
+            - outer.border.left
+            - outer.border.right;
+        let (ml, mr, w) = (own.margin.left, own.margin.right, own.size.width);
+        let left = match align {
+            TextAlignValue::Center => ml + ((avail - w - ml - mr) / 2.0).max(0.0),
+            TextAlignValue::End => ml.max(avail - w - mr),
+            _ => ml,
+        };
+        left - ml
+    }
+
+    /// The offset the relatively positioned split inlines (#513) around
+    /// in-flow box `node_id` move it by (#2408), summed, or `None` when its
+    /// parent is no split inline (nearly every box: one parent check). Each
+    /// is resolved against the block container the split flattens into,
+    /// whose height is definite as the anonymous boxes of its runs were
+    /// given it (`ifc::note_containing_block_height`) — the offset their
+    /// text is drawn at (`resolve_relative_spans`).
+    fn split_inline_relative_offset(&self, node_id: RawNodeId) -> Option<(f32, f32)> {
+        use crate::computed_style::{DisplayValue, PositionValue};
+        let nodes = &self.tree.nodes;
+        let node = nodes.get_live(node_id)?;
+        if matches!(
+            node.computed_style.position,
+            PositionValue::Absolute | PositionValue::Fixed
+        ) {
+            return None;
+        }
+        let parent = nodes.get_live(node.parent?)?;
+        if !parent.is_split_inline() {
+            return None;
+        }
+        let mut relative = Vec::new();
+        let mut cur = Some(parent);
+        let container = loop {
+            let n = cur?;
+            if n.is_split_inline() {
+                if n.computed_style.position == PositionValue::Relative {
+                    relative.push(n);
+                }
+            } else if n.computed_style.display != DisplayValue::Contents {
+                break n;
+            }
+            cur = n.parent.and_then(|p| nodes.get_live(p));
+        };
+        if relative.is_empty() {
+            return None;
+        }
+        let cs = &container.computed_style;
+        let width = container.layout.width
+            - cs.padding_left.to_px()
+            - cs.padding_right.to_px()
+            - cs.border_left_width.to_px()
+            - cs.border_right_width.to_px();
+        let definite = container.run_boxes.iter().any(|&b| {
+            nodes
+                .get_live(b)
+                .is_some_and(|b| b.containing_block_height_definite.get())
+        });
+        let height = definite.then(|| {
+            container.layout.height
+                - cs.padding_top.to_px()
+                - cs.padding_bottom.to_px()
+                - cs.border_top_width.to_px()
+                - cs.border_bottom_width.to_px()
+        });
+        let ltr = crate::ifc::element_is_ltr(container);
+        Some(relative.iter().fold((0.0, 0.0), |(x, y), n| {
+            let (dx, dy) = crate::ifc::relative_inset_offset(&n.computed_style, width, height, ltr);
+            (x + dx, y + dy)
+        }))
     }
 
     /// Read one anonymous block box's Taffy layout back into its `layout`.
@@ -931,8 +1773,8 @@ impl RinchDocument {
     /// a `taffy_id` and a real box, and paint draws its line at that rect.
     /// Its run's members are reached by the ordinary walk, through their real
     /// parent, so this deliberately does **not** recurse.
-    fn read_layout_results_for_box(&mut self, anon_id: usize) {
-        let Some(taffy_id) = self.tree.nodes.get(anon_id).and_then(|n| n.taffy_id) else {
+    fn read_layout_results_for_box(&mut self, anon_id: RawNodeId) {
+        let Some(taffy_id) = self.tree.nodes.get_live(anon_id).and_then(|n| n.taffy_id) else {
             return;
         };
         let Ok(taffy_layout) = self.tree.taffy.layout(taffy_id) else {
@@ -945,10 +1787,26 @@ impl RinchDocument {
             height: taffy_layout.size.height,
         };
         let node = &mut self.tree.nodes[anon_id];
-        node.prev_layout = node.layout;
         if node.layout != new_layout {
+            let resized =
+                node.layout.width != new_layout.width || node.layout.height != new_layout.height;
             node.layout = new_layout;
             self.tree.paint_dirty_nodes.push(anon_id);
+            self.tree.note_marker_move(anon_id, resized);
+            // Read back after the element walk placed the absolute boxes
+            // (`out_of_flow::replace_all`).
+            self.tree.abs_late_moves = true;
+            // The out-of-flow boxes whose static position is in this box's
+            // lines (#632) were read with it where it was. One of them is in
+            // no list `replace_all` walks: an absolute box whose layout
+            // parent is its containing block.
+            let held: Vec<RawNodeId> = match &self.tree.nodes[anon_id].text_layout {
+                Some(inline) => inline.out_of_flow.iter().map(|m| m.id).collect(),
+                None => Vec::new(),
+            };
+            for id in held {
+                crate::out_of_flow::place_static_after_lines(&mut self.tree, id);
+            }
         }
     }
 
@@ -956,22 +1814,28 @@ impl RinchDocument {
     ///
     /// For a subtree that generates no boxes at all — a `display: none` element
     /// and its descendants (#543). Keeps [`Self::read_layout_results`]'s
-    /// bookkeeping: `prev_layout` is carried and a node whose box actually
-    /// changed is pushed to `paint_dirty_nodes`, so the frame that hides
-    /// something repaints where it used to be.
+    /// bookkeeping: a node whose box actually changed is pushed to
+    /// `paint_dirty_nodes` (its `prev_layout` still names the painted box), so
+    /// the frame that hides something repaints where it used to be.
     ///
     /// Iterative: a hidden subtree is arbitrary author markup and may be deep.
-    fn zero_subtree_layout(&mut self, node_id: usize) {
+    fn zero_subtree_layout(&mut self, node_id: RawNodeId) {
         let zero = LayoutResult::default();
         let mut stack = vec![node_id];
         while let Some(id) = stack.pop() {
-            let Some(node) = self.tree.nodes.get_mut(id) else {
+            let Some(node) = self.tree.nodes.get_live_mut(id) else {
                 continue;
             };
             if node.layout != zero {
-                node.prev_layout = node.layout;
                 node.layout = zero;
                 self.tree.paint_dirty_nodes.push(id);
+            }
+            // A hidden cell's children carry no `vertical-align` offset now.
+            if let Some(cell) = node.table_cell.as_mut() {
+                cell.kids_shift = 0.0;
+            }
+            if let Some(cell) = node.anon_cell.as_mut() {
+                cell.kids_shift = 0.0;
             }
             let children = &self.tree.nodes[id].children;
             stack.extend_from_slice(children);
@@ -979,8 +1843,14 @@ impl RinchDocument {
     }
 
     /// Recursively read Taffy layout results into node LayoutResult fields.
-    pub(crate) fn read_layout_results(&mut self, node_id: usize) {
-        let children: Vec<usize> = self.tree.nodes[node_id].children.clone();
+    pub(crate) fn read_layout_results(&mut self, node_id: RawNodeId) {
+        let node = &self.tree.nodes[node_id];
+        let children: Vec<RawNodeId> = node.children.clone();
+        // Read here, where the node is in hand: most nodes are not table
+        // cells, and this runs for every node.
+        let is_table_cell = node.table_cell.is_some()
+            || node.anon_cell.is_some()
+            || node.computed_style.anonymous_inline_table.is_some();
 
         // A `display: contents` element generates no box. Force its layout to the
         // origin so every parent-chain accumulation (paint tree-walk, hit-testing,
@@ -996,7 +1866,6 @@ impl RinchDocument {
             let node = &mut self.tree.nodes[node_id];
             let zero = LayoutResult::default();
             if node.layout != zero {
-                node.prev_layout = node.layout;
                 node.layout = zero;
                 self.tree.paint_dirty_nodes.push(node_id);
             }
@@ -1035,7 +1904,6 @@ impl RinchDocument {
             let node = &mut self.tree.nodes[node_id];
             let zero = LayoutResult::default();
             if node.layout != zero {
-                node.prev_layout = node.layout;
                 node.layout = zero;
                 self.tree.paint_dirty_nodes.push(node_id);
             }
@@ -1069,7 +1937,6 @@ impl RinchDocument {
             let node = &mut self.tree.nodes[node_id];
             let zero = LayoutResult::default();
             if node.layout != zero {
-                node.prev_layout = node.layout;
                 node.layout = zero;
                 self.tree.paint_dirty_nodes.push(node_id);
             }
@@ -1107,7 +1974,7 @@ impl RinchDocument {
         // is nothing further down for the normal path to compute. A
         // `display: contents` node inside the hidden subtree is zeroed by the
         // helper exactly as that branch would zero it. The helper carries this
-        // function's bookkeeping (`prev_layout`, `paint_dirty_nodes`) so the
+        // function's bookkeeping (`paint_dirty_nodes`) so the
         // frame that hides something still repaints where it used to be.
         if self.tree.nodes[node_id].computed_style.display
             == crate::computed_style::DisplayValue::None
@@ -1128,145 +1995,210 @@ impl RinchDocument {
 
             // position: fixed elements use the viewport as their containing block.
             // Taffy treats them as absolute (relative to parent), so we override
-            // their layout to be viewport-relative with proper sizing from insets.
+            // their position to be viewport-relative (`out_of_flow::place_fixed`).
             // Skip when:
             //   - display is none (element itself is hidden)
             //   - Taffy computed 0x0 size (ancestor has display:none — the node's
             //     own display may be Block but it's inside a hidden subtree)
+            //
+            // An axis with both insets `auto` keeps the box's **static
+            // position** — where it would have been in the flow (issue #633;
+            // it used to go to the viewport's origin). `layout` holds a
+            // viewport position for a fixed box, so that is the sum of the
+            // boxes above it with nothing scrolled
+            // (`out_of_flow::place_fixed_static`); such a box is recorded
+            // like a placed absolute one, since the late position writes
+            // move it the same way.
             {
-                let node = &self.tree.nodes[node_id];
-                if node.computed_style.position == crate::computed_style::PositionValue::Fixed
-                    && !matches!(
-                        node.computed_style.display,
-                        crate::computed_style::DisplayValue::None
+                let is_fixed = {
+                    let node = &self.tree.nodes[node_id];
+                    // `box_position`: one whose containing block is a
+                    // transformed ancestor is placed as an absolute box below
+                    // (#1372).
+                    node.box_position() == crate::computed_style::PositionValue::Fixed
+                        && !matches!(
+                            node.computed_style.display,
+                            crate::computed_style::DisplayValue::None
+                        )
+                        && (new_layout.width > 0.0 || new_layout.height > 0.0)
+                };
+                let (static_x, static_y) = if is_fixed {
+                    crate::out_of_flow::place_fixed_static(
+                        &mut self.tree,
+                        node_id,
+                        (new_layout.x, new_layout.y),
                     )
-                    && (new_layout.width > 0.0 || new_layout.height > 0.0)
-                {
-                    let vw = self.tree.viewport.width;
-                    let vh = self.tree.viewport.height;
-                    let style = &node.computed_style;
-
-                    // Resolve insets (top/right/bottom/left)
-                    let top = style.top.resolve(vh);
-                    let right = style.right.resolve(vw);
-                    let bottom = style.bottom.resolve(vh);
-                    let left = style.left.resolve(vw);
-                    let width_auto = style.width.lays_out_as_auto();
-                    let height_auto = style.height.lays_out_as_auto();
-
-                    // Horizontal positioning
-                    if let (Some(l), Some(r)) = (left, right) {
-                        new_layout.x = l;
-                        if width_auto {
-                            new_layout.width = (vw - l - r).max(0.0);
-                        }
-                    } else if let Some(l) = left {
-                        new_layout.x = l;
-                    } else if let Some(r) = right {
-                        new_layout.x = (vw - new_layout.width - r).max(0.0);
-                    } else {
-                        new_layout.x = 0.0;
+                } else {
+                    (None, None)
+                };
+                if static_x.is_some() || static_y.is_some() {
+                    self.tree
+                        .placed_absolutes
+                        .push((node_id, crate::out_of_flow::OutOfFlowKind::Fixed));
+                    self.tree.perf.bump(crate::perf::Counter::AbsBoxesVisited);
+                    // Shrunk to fit in the room its static position leaves
+                    // in the viewport, looked at again once the lines say
+                    // where that is (#893, as #1404 does for absolute).
+                    if crate::out_of_flow::fits_from_static_position(
+                        &self.tree.nodes[node_id].computed_style,
+                    ) {
+                        self.tree
+                            .abs_static_fits
+                            .push((node_id, Some(crate::out_of_flow::OutOfFlowKind::Fixed)));
                     }
+                }
+                if is_fixed {
+                    // Against the viewport as an ICB box is placed: margins
+                    // added, `auto` margins sharing what two insets leave
+                    // (#1980, #2002). The size is Taffy's: the pre-layout
+                    // bake (`out_of_flow::apply_out_of_flow_size_overrides`)
+                    // gave an `auto` or `stretch` size the room between two
+                    // insets less the margins, and shrank one with fewer to
+                    // fit in the viewport (#893); Taffy applied `min-`/`max-`
+                    // sizes to it. (The read-back used to stretch it to the
+                    // whole room afterwards, `max-width` and margins lost.)
+                    let (x, y) = crate::out_of_flow::place_fixed(
+                        &self.tree,
+                        &self.tree.nodes[node_id],
+                        (new_layout.width, new_layout.height),
+                        (static_x, static_y),
+                    );
+                    new_layout.x = x;
+                    new_layout.y = y;
+                }
+            }
 
-                    // Vertical positioning
-                    if let (Some(t), Some(b)) = (top, bottom) {
-                        new_layout.y = t;
-                        if height_auto {
-                            new_layout.height = (vh - t - b).max(0.0);
-                        }
-                    } else if let Some(t) = top {
-                        new_layout.y = t;
-                        // Taffy may compute wrong height for fixed elements
-                        // (their Taffy parent differs from the CSS containing
-                        // block which should be the viewport).  Re-derive
-                        // content height from children.
-                        if height_auto {
-                            let _ = node;
-                            new_layout.height = self.compute_content_height(node_id, &new_layout);
-                        }
-                    } else if let Some(b) = bottom {
-                        if height_auto {
-                            let _ = node;
-                            new_layout.height = self.compute_content_height(node_id, &new_layout);
-                        }
-                        new_layout.y = (vh - new_layout.height - b).max(0.0);
-                    } else {
-                        new_layout.y = 0.0;
+            // An absolutely positioned box resolves against its containing
+            // block, which is not always the direct parent Taffy resolves it
+            // against: the initial containing block when it has no positioned
+            // ancestor (issue #204), or a positioned ancestor further up
+            // (issue #386). Its *size* was already baked from that box before
+            // the compute (`out_of_flow`); this places it.
+            //
+            // The correction is written as a **parent-relative** value, not as
+            // a viewport-absolute coordinate the way `fixed` above is: with
+            //     abs(node) = layout.x + abs(parent) - parent.scroll_offset.x
+            // `LayoutResult` stays parent-relative, so every coordinate walk
+            // in the codebase — paint, stacking, hit testing, ClickContext,
+            // the MCP `absolute` contract — keeps working untouched.
+            // `out_of_flow::place_absolute` has the sum.
+            //
+            // A box in a `display: none` subtree is left alone
+            // (`out_of_flow::is_laid_out`): Taffy gives it 0x0, and correcting
+            // it would drag a hidden node onto its containing block.
+            //
+            // This is also where the passes that run later learn which boxes
+            // are theirs: the box is recorded as placed (for the re-placement
+            // after the late position writes, and for a scroll), the boxes
+            // between it and its containing block are flagged, and its kind
+            // is checked against what the style sites recorded.
+            // A fixed box whose containing block is a transformed ancestor
+            // is one of these (`box_position`, #1372).
+            if self.tree.nodes[node_id].box_position()
+                == crate::computed_style::PositionValue::Absolute
+            {
+                // (`out_of_flow_kind` answers `None` for a `display: contents`
+                // element, which generates no box to place.)
+                let kind = crate::out_of_flow::out_of_flow_kind(&self.tree, node_id);
+                crate::out_of_flow::note_kind_at_read(&mut self.tree, node_id, kind);
+                // Listed for the scroll range it belongs to (#770): which
+                // container that is, and where the box is in it, is worked out
+                // from the final layout when a range is first asked for
+                // (`paint::scrollbar::OverflowAbsolutes`), which also passes
+                // over a box with no area, as a box in a `display: none`
+                // subtree is — so nothing is asked here.
+                self.tree.overflow_absolutes.listed.push((node_id, kind));
+                if crate::out_of_flow::has_inline_containing_block(&self.tree, kind) {
+                    self.tree.abs_inline_cb_seen = true;
+                }
+                if let Some(kind) = kind
+                    && crate::out_of_flow::is_laid_out(
+                        &self.tree,
+                        node_id,
+                        (new_layout.width, new_layout.height),
+                    )
+                {
+                    self.tree.placed_absolutes.push((node_id, kind));
+                    self.tree.perf.bump(crate::perf::Counter::AbsBoxesVisited);
+                    // One shrunk to fit from its static position is looked
+                    // at again once the lines say where that is (#1404).
+                    if crate::out_of_flow::fits_from_static_position(
+                        &self.tree.nodes[node_id].computed_style,
+                    ) {
+                        self.tree.abs_static_fits.push((node_id, Some(kind)));
+                    }
+                    // Its static position: Taffy's, or its place in a line
+                    // (#632).
+                    let location = crate::out_of_flow::static_location(
+                        &self.tree,
+                        node_id,
+                        Some(kind),
+                        (new_layout.x, new_layout.y),
+                    );
+                    if let Some((x, y)) = crate::out_of_flow::place_absolute(
+                        &mut self.tree,
+                        node_id,
+                        kind,
+                        location,
+                        (new_layout.width, new_layout.height),
+                        true,
+                    ) {
+                        new_layout.x = x;
+                        new_layout.y = y;
+                    }
+                } else if kind.is_none()
+                    && crate::out_of_flow::fits_in_layout_parent_later(&self.tree, node_id)
+                    && crate::out_of_flow::is_laid_out(
+                        &self.tree,
+                        node_id,
+                        (new_layout.width, new_layout.height),
+                    )
+                {
+                    // Shrunk to fit in its parent from its static position,
+                    // or in a grid: sized from the parent's last layout,
+                    // which is checked once the lines are built (#1404).
+                    self.tree.abs_static_fits.push((node_id, None));
+                }
+                if kind.is_none() && self.tree.nodes[node_id].static_ifc_root.is_some() {
+                    // Taffy's own answer — the layout parent is the
+                    // containing block — except on an axis with no inset,
+                    // when the box sits among inline content: its static
+                    // position is its place in the lines (#632), which Taffy
+                    // does not see.
+                    let (x, y) = crate::out_of_flow::static_location(
+                        &self.tree,
+                        node_id,
+                        None,
+                        (new_layout.x, new_layout.y),
+                    );
+                    let (horizontal, vertical) =
+                        crate::out_of_flow::static_axes(&self.tree.nodes[node_id].computed_style);
+                    if horizontal {
+                        new_layout.x = x;
+                    }
+                    if vertical {
+                        new_layout.y = y;
                     }
                 }
             }
 
-            // An absolutely positioned box with no positioned ancestor resolves
-            // against the initial containing block — the viewport at the origin
-            // — not against its direct parent, which is the only containing
-            // block Taffy knows (issue #204). Its *size* was already baked from
-            // the viewport before layout (`out_of_flow`); this places it.
-            //
-            // The correction is written as a **parent-relative delta**, not as
-            // a viewport-absolute coordinate the way `fixed` above is: with
-            //     abs(node) = layout.x + abs(parent) - parent.scroll_offset.x
-            // writing `target - abs(parent) + parent.scroll_offset.x` leaves
-            // `LayoutResult` parent-relative, so every coordinate walk in the
-            // codebase — paint, stacking, hit testing, ClickContext, the MCP
-            // `absolute` contract — keeps working untouched, and layout agrees
-            // with paint by construction because it reuses paint's own sum.
-            {
-                let node = &self.tree.nodes[node_id];
-                if node.computed_style.position == crate::computed_style::PositionValue::Absolute
-                    && (new_layout.width > 0.0 || new_layout.height > 0.0)
-                    && crate::out_of_flow::out_of_flow_kind(&self.tree, node_id)
-                        == Some(crate::out_of_flow::OutOfFlowKind::IcbAbsolute)
-                {
-                    let vw = self.tree.viewport.width;
-                    let vh = self.tree.viewport.height;
-                    // The **box-tree** parent (#591): a hoisted out-of-flow box's
-                    // `layout` is relative to its host, not its DOM parent.
-                    let (parent_abs, parent_scroll) =
-                        match Self::box_tree_parent(&self.tree.nodes, node_id) {
-                            Some(parent_id) => {
-                                let (px, py) = crate::paint::compute_absolute_position(
-                                    &self.tree, parent_id, 1.0,
-                                );
-                                let scroll = self.tree.nodes[parent_id].scroll_offset;
-                                ((px as f32, py as f32), (scroll.0 as f32, scroll.1 as f32))
-                            }
-                            None => ((0.0, 0.0), (0.0, 0.0)),
-                        };
+            // HTML's `align` on the parent places a block box with a width of
+            // its own (`html_align_dx`). From Taffy's own answer, so it is the
+            // same on every read.
+            // Gated on the document having met the attribute at all: the
+            // parent lookup per box per layout is otherwise measurable.
+            if self.tree.html_align_seen {
+                new_layout.x += self.html_align_dx(node_id);
+            }
 
-                    let style = &node.computed_style;
-                    let left = style.left.resolve(vw);
-                    let right = style.right.resolve(vw);
-                    let top = style.top.resolve(vh);
-                    let bottom = style.bottom.resolve(vh);
-                    // Percentage margins resolve against the containing block's
-                    // *width* on both axes, per CSS.
-                    let margin_left = style.margin_left.resolve(vw).unwrap_or(0.0);
-                    let margin_right = style.margin_right.resolve(vw).unwrap_or(0.0);
-                    let margin_top = style.margin_top.resolve(vw).unwrap_or(0.0);
-                    let margin_bottom = style.margin_bottom.resolve(vw).unwrap_or(0.0);
-
-                    // Only correct an axis that has a real inset. With both
-                    // insets `auto` the target is `None` and the box keeps
-                    // Taffy's static position — which CSS *does* take from the
-                    // flow position in the DOM parent, so Taffy's answer is the
-                    // right one there.
-                    let target_x = match (left, right) {
-                        (Some(l), _) => Some(l + margin_left),
-                        (None, Some(r)) => Some(vw - r - margin_right - new_layout.width),
-                        (None, None) => None,
-                    };
-                    if let Some(x) = target_x {
-                        new_layout.x = x - parent_abs.0 + parent_scroll.0;
-                    }
-                    let target_y = match (top, bottom) {
-                        (Some(t), _) => Some(t + margin_top),
-                        (None, Some(b)) => Some(vh - b - margin_bottom - new_layout.height),
-                        (None, None) => None,
-                    };
-                    if let Some(y) = target_y {
-                        new_layout.y = y - parent_abs.1 + parent_scroll.1;
-                    }
-                }
+            // A box inside a relative **split** inline (#513) is moved by the
+            // inline's offset, as the inline's text on either side of it is
+            // (#2408, CSS 2.1 §9.4.3): Taffy lays it out as a child of the
+            // container, which knows nothing of the inline, so the offset is
+            // added on every read.
+            if let Some((dx, dy)) = self.split_inline_relative_offset(node_id) {
+                new_layout.x += dx;
+                new_layout.y += dy;
             }
 
             // An atomic inline child of an IFC has its *position* assigned by the IFC
@@ -1282,88 +2214,57 @@ impl RinchDocument {
                     new_layout.x = node.layout.x;
                     new_layout.y = node.layout.y;
                 }
+                // An outside list marker keeps the place `crate::list_marker`
+                // wrote (#1356): Taffy's is its static position, which it does
+                // not use, and writing it would repaint the marker on every
+                // layout.
+                if node.outside_marker.is_some() {
+                    new_layout.x = node.layout.x;
+                    new_layout.y = node.layout.y;
+                }
+                // A text child of its IFC root has the box the root's lines
+                // give it (`write_inline_positions`: the root's width, the
+                // lines' height), not Taffy's: it is a measure leaf and Taffy
+                // answers `0x0`. Read as the lines would write it, so a pass
+                // that keeps the lines does not flip it to `0x0` and push
+                // every paragraph's text paint-dirty on a restyle anywhere
+                // else (#2734).
+                if node.is_text()
+                    && let Some(root_id) = node.ifc_root
+                    && node.parent == Some(root_id)
+                    && let Some(root) = self.tree.nodes.get_live(root_id)
+                    && let Some(inline) = &root.text_layout
+                {
+                    new_layout = LayoutResult {
+                        x: 0.0,
+                        y: 0.0,
+                        width: root.layout.width,
+                        height: inline.layout.height(),
+                    };
+                }
             }
 
-            // Save previous layout for dirty region computation
+            // `prev_layout` is deliberately not written: it is the box this
+            // node was last *painted* in, and only the paint that consumes
+            // `paint_dirty_nodes` may move it (`NodeTree::consume_paint_dirty`).
+            // A second resolve before that paint must not overwrite it, or the
+            // old rect is lost and the move ghosts.
             let node = &mut self.tree.nodes[node_id];
-            node.prev_layout = node.layout;
             if node.layout != new_layout {
+                let resized = node.layout.width != new_layout.width
+                    || node.layout.height != new_layout.height;
                 node.layout = new_layout;
                 self.tree.paint_dirty_nodes.push(node_id);
+                self.tree.note_marker_move(node_id, resized);
             }
         }
 
         for child_id in children {
             self.read_layout_results(child_id);
         }
-    }
-
-    /// Compute the intrinsic content height of a node from its children's
-    /// Taffy-computed sizes. Used for position:fixed elements where Taffy's
-    /// parent-relative sizing gives the wrong result.
-    fn compute_content_height(&self, node_id: usize, _parent_layout: &LayoutResult) -> f32 {
-        let node = &self.tree.nodes[node_id];
-        let pad_top = node.computed_style.padding_top.to_px();
-        let pad_bottom = node.computed_style.padding_bottom.to_px();
-        let border_top = node.computed_style.border_top_width.to_px();
-        let border_bottom = node.computed_style.border_bottom_width.to_px();
-        let gap = node.computed_style.gap_row.to_px();
-        // Children stack vertically (heights sum) when the container is a block
-        // box or a flex column; a flex row lays them side by side (take the max).
-        // Without the `Block` case a `position: fixed` block with auto height —
-        // e.g. a popup/menu appended to <body> — collapses to one child's height.
-        let is_column = matches!(
-            node.computed_style.display,
-            crate::computed_style::DisplayValue::Block
-        ) || matches!(
-            node.computed_style.flex_direction,
-            crate::computed_style::FlexDirectionValue::Column
-                | crate::computed_style::FlexDirectionValue::ColumnReverse
-        );
-
-        let mut content_h: f32 = 0.0;
-        let child_count = node.children.len();
-
-        for (i, &child_id) in node.children.iter().enumerate() {
-            if let Some(child_taffy) = self.tree.nodes.get(child_id).and_then(|c| c.taffy_id) {
-                if let Ok(child_layout) = self.tree.taffy.layout(child_taffy) {
-                    let ch = child_layout.size.height;
-                    if is_column {
-                        content_h += ch;
-                        if i > 0 && i < child_count {
-                            content_h += gap;
-                        }
-                    } else {
-                        content_h = content_h.max(ch);
-                    }
-                }
-            }
+        if is_table_cell {
+            self.note_table_cell_read(node_id);
         }
-
-        let mut h = content_h + pad_top + pad_bottom + border_top + border_bottom;
-
-        // Respect the element's own min/max-height (border-box, like the rest of
-        // the box model here) so a fixed scroll container clamps and scrolls its
-        // overflow instead of growing past its cap.
-        use crate::computed_style::DimensionValue;
-        let vh = self.tree.viewport.height;
-        let resolve = |d: &DimensionValue| -> Option<f32> {
-            match d {
-                DimensionValue::Length(v) => Some(*v),
-                DimensionValue::Percent(p) => Some(p * vh),
-                DimensionValue::Calc { px, pct } => Some(px + pct * vh),
-                // An intrinsic keyword lays out as `auto` (#626), so it
-                // constrains nothing here either.
-                DimensionValue::Auto | DimensionValue::Intrinsic(_) => None,
-            }
-        };
-        if let Some(max_h) = resolve(&node.computed_style.max_height) {
-            h = h.min(max_h);
-        }
-        if let Some(min_h) = resolve(&node.computed_style.min_height) {
-            h = h.max(min_h);
-        }
-        h
     }
 
     /// Handle display:contents nodes by reparenting their taffy children
@@ -1380,7 +2281,17 @@ impl RinchDocument {
     /// `Node::contents_spliced`). A departed wrapper additionally gets its own
     /// Taffy child list rebuilt, because the splice moved its children's Taffy
     /// ids into the ancestor's list and nothing else gives them back.
-    pub(crate) fn sync_display_contents(&mut self) {
+    ///
+    /// With a `scope` (`crate::ifc_scope`), only the wrappers in the scope's
+    /// regions are looked at. A `display: contents` wrapper is never a
+    /// formatting container, so every wrapper whose splice could have moved —
+    /// its children changed, it moved, it crossed into or out of `contents` —
+    /// is in the region of a container of the scope, and so is the ancestor
+    /// that holds its splice. Everything else keeps its splice, and the rows
+    /// that hold one are not dirtied (they used to be: every wrapper in the
+    /// document was re-spliced, with a `set_children` and a `mark_dirty` per
+    /// child, on every structural change).
+    pub(crate) fn sync_display_contents(&mut self, scope: Option<&crate::ifc_scope::IfcScope>) {
         use crate::computed_style::values::DisplayValue;
 
         // Find all display:contents nodes and their nearest non-contents ancestors.
@@ -1392,14 +2303,35 @@ impl RinchDocument {
         // inline form. Without this, class-based contents elements stay in the
         // Taffy tree as ordinary boxes and trap their children inside a 0×0 (or
         // 2×2 text-sized) parent — see issue #25.
-        let mut affected_parents: Vec<usize> = Vec::new();
-        let mut all_contents_nodes: Vec<usize> = Vec::new();
+        let mut affected_parents: Vec<RawNodeId> = Vec::new();
+        let mut all_contents_nodes: Vec<RawNodeId> = Vec::new();
         // Nodes a previous pass spliced as `display: contents` that no longer
         // compute `Contents` (#520): the wrapper's box must come back and its
         // children must stop contributing to the flattening ancestor.
-        let mut departed_nodes: Vec<usize> = Vec::new();
+        let mut departed_nodes: Vec<RawNodeId> = Vec::new();
 
-        for (id, node) in &self.tree.nodes {
+        let candidates: Vec<RawNodeId> = match scope {
+            None => self.tree.nodes.iter().map(|(id, _)| id).collect(),
+            // Ascending, as the slab walk visits them. Order matters here and
+            // should not: a wrapper's splice reads `contributes_in_flow_block`
+            // from the *previous* pass (this runs before it is recomputed), so
+            // an element that just stopped being a flex container can read as a
+            // split inline and have its children flattened into the ancestor
+            // — and it is the order in which the affected parents are rebuilt
+            // that decides whether its own list gets them back. The scope's
+            // set iterates in hash order; the whole-document pass in id order.
+            // (Found by the random differential, which tripped over exactly
+            // that and orphaned a text node.)
+            Some(scope) => {
+                let mut v: Vec<RawNodeId> = scope.nodes.iter().copied().collect();
+                v.sort_unstable();
+                v
+            }
+        };
+        for id in candidates {
+            let Some(node) = self.tree.nodes.get(id) else {
+                continue;
+            };
             // This pass maintains the DOM flattening of **author** wrappers,
             // and asking an anonymous block box which wrapper holds it is not
             // an unanswerable question — it is the wrong one (#566). Its Taffy
@@ -1484,6 +2416,7 @@ impl RinchDocument {
 
         // For each affected parent, rebuild its taffy children by flattening
         // display:contents nodes recursively.
+        let mut any_rebuilt = false;
         for parent_id in &affected_parents {
             let parent_taffy = match self.tree.nodes[*parent_id].taffy_id {
                 Some(t) => t,
@@ -1491,12 +2424,41 @@ impl RinchDocument {
             };
 
             let new_children = Self::collect_effective_taffy_children(&self.tree.nodes, *parent_id);
+            // A child list the splice leaves as it was is not touched (#2136).
+            // A scoped structural pass reaches every wrapper in its
+            // containers' regions — a grid built by a keyed `for` holds one
+            // `display: contents` wrapper per item — and rebuilding the list
+            // and dirtying every item for each of them cleared the Taffy cache
+            // of all 430 cards of a grid whenever anything moved in it, so the
+            // next compute measured every card's text again (10,892 shapes
+            // for one re-appended wrapper).
+            let old_children: Vec<taffy::NodeId> =
+                self.tree.taffy.children(parent_taffy).unwrap_or_default();
+            if old_children == new_children {
+                // The parent itself is still dirtied (review of #2142): a
+                // container whose only content is inline content inside a
+                // wrapper is an IFC root, whose Taffy child list is empty
+                // before and after that content goes, and `set_children` was
+                // the only thing that marked it — a `div` > wrapper > `span`
+                // kept the span's line after the span left. Its children's
+                // caches are what this keeps.
+                let _ = self.tree.taffy.mark_dirty(parent_taffy);
+                continue;
+            }
+            any_rebuilt = true;
             let _ = self.tree.taffy.set_children(parent_taffy, &new_children);
 
-            // Also mark each reparented child dirty so their own caches are
-            // cleared (they may have stale entries from their old position).
+            // Mark a child that was not in this list dirty, so its own cache
+            // is cleared (it may have entries from its old position under
+            // another parent). One that stays — reordered or not — keeps its
+            // cache: Taffy keys an entry on the inputs its parent passes, not
+            // on where it sits, and the parent itself is dirtied by
+            // `set_children`.
+            let old: std::collections::HashSet<taffy::NodeId> = old_children.into_iter().collect();
             for &child_taffy in &new_children {
-                let _ = self.tree.taffy.mark_dirty(child_taffy);
+                if !old.contains(&child_taffy) {
+                    let _ = self.tree.taffy.mark_dirty(child_taffy);
+                }
             }
         }
 
@@ -1504,7 +2466,7 @@ impl RinchDocument {
         // Taffy's mark_dirty propagation stops at already-empty ancestors,
         // which can leave stale cached layouts when available space hasn't
         // changed but children have been swapped.
-        if !affected_parents.is_empty() || !departed_nodes.is_empty() {
+        if any_rebuilt || !departed_nodes.is_empty() {
             if let Some(root_taffy) = self.tree.nodes[self.tree.root_id].taffy_id {
                 let _ = self.tree.taffy.mark_dirty(root_taffy);
             }
@@ -1517,13 +2479,10 @@ impl RinchDocument {
         for node_id in all_contents_nodes {
             self.tree.nodes[node_id].contents_spliced = true;
             if let Some(node_taffy) = self.tree.nodes[node_id].taffy_id {
-                let _ = self.tree.taffy.set_style(
-                    node_taffy,
-                    taffy::Style {
-                        display: taffy::Display::None,
-                        ..Default::default()
-                    },
-                );
+                let _ = self
+                    .tree
+                    .taffy
+                    .set_style(node_taffy, crate::node::display_contents_taffy_style());
             }
         }
     }
@@ -1544,8 +2503,11 @@ impl RinchDocument {
     /// run's. That is invisible for a document's first run, whose box is at
     /// `y = 0`, and wrong for every one after it: it was found by a focus test
     /// clicking a toolbar `<input>` and hitting the node above it.
-    pub fn box_tree_parent(nodes: &slab::Slab<crate::node::Node>, node_id: usize) -> Option<usize> {
-        let node = nodes.get(node_id)?;
+    pub fn box_tree_parent(
+        nodes: &crate::node_slab::NodeSlab,
+        node_id: RawNodeId,
+    ) -> Option<RawNodeId> {
+        let node = nodes.get_live(node_id)?;
         // A hoisted out-of-flow box is held by its host's lists, not its DOM
         // parent's (#591): its `layout` is relative to the host, so every
         // coordinate sum steps there. `Node::hoisted_out_of_flow_to`.
@@ -1584,7 +2546,7 @@ impl RinchDocument {
     /// # Everything that walks boxes must come through here
     ///
     /// Paint's descent, hit testing, the stacking sequence, `layer_bounds`, the
-    /// viewport-hole walk and [`Self::collect_effective_taffy_children`] all
+    /// viewport-hole walk and `Self::collect_effective_taffy_children` all
     /// used to walk `node.children` directly and get the box for free. They no
     /// longer can. Routing them through one function rather than open-coding
     /// the interleave six times is deliberate: four sites disagreeing about
@@ -1604,11 +2566,11 @@ impl RinchDocument {
     /// **Borrows** for the overwhelmingly common case of a node with no run
     /// among its children, so the per-frame walks that call it pay nothing.
     pub fn box_tree_children(
-        nodes: &slab::Slab<crate::node::Node>,
-        node_id: usize,
-    ) -> std::borrow::Cow<'_, [usize]> {
+        nodes: &crate::node_slab::NodeSlab,
+        node_id: RawNodeId,
+    ) -> std::borrow::Cow<'_, [RawNodeId]> {
         use std::borrow::Cow;
-        let Some(node) = nodes.get(node_id) else {
+        let Some(node) = nodes.get_live(node_id) else {
             return Cow::Borrowed(&[]);
         };
         // An anonymous box's box-tree children **are** its run, verbatim — no
@@ -1649,7 +2611,7 @@ impl RinchDocument {
         // and the box is its host's. Both are one bit per child.
         if node.run_boxes.is_empty()
             && !node.children.iter().any(|&c| {
-                nodes.get(c).is_some_and(|child| {
+                nodes.get_live(c).is_some_and(|child| {
                     child.is_split_inline()
                         || child.hosts_hoisted_out_of_flow
                         || child.hoisted_out_of_flow_to.is_some()
@@ -1680,18 +2642,18 @@ impl RinchDocument {
         // replaced by its box like any other; a wrapper that was broken up
         // vanishes here exactly as it does from the Taffy child list, since it
         // generates no box (CSS 2.1 §9.2.1.1) — its units stand in its place.
-        let mut units: Vec<usize> = Vec::new();
+        let mut units: Vec<RawNodeId> = Vec::new();
         Self::collect_run_units(nodes, node_id, &mut units);
 
-        let mut out: Vec<usize> = Vec::with_capacity(units.len());
+        let mut out: Vec<RawNodeId> = Vec::with_capacity(units.len());
         // A run is **not** contiguous in this list either: a comment or a
         // `display: none` child sits between two members of one run, so the box
         // must be emitted once for the whole run rather than once per
         // maximal stretch. Resetting on a non-member emits it twice and Taffy
         // panics on the duplicate in `set_children`.
-        let mut last_box: Option<usize> = None;
+        let mut last_box: Option<RawNodeId> = None;
         for unit in units {
-            match nodes.get(unit).and_then(|c| c.run_box) {
+            match nodes.get_live(unit).and_then(|c| c.run_box) {
                 Some(b) => {
                     if last_box != Some(b) {
                         out.push(b);
@@ -1769,8 +2731,8 @@ impl RinchDocument {
     /// wrapper's own detached id instead. Read the two together before changing
     /// either gate.
     pub(crate) fn collect_effective_taffy_children(
-        nodes: &slab::Slab<crate::node::Node>,
-        node_id: usize,
+        nodes: &crate::node_slab::NodeSlab,
+        node_id: RawNodeId,
     ) -> Vec<taffy::NodeId> {
         use crate::computed_style::values::DisplayValue;
 
@@ -1791,12 +2753,12 @@ impl RinchDocument {
         // blocks and once as an IFC line.
         //
         // `get`, not indexing, on both hops. The anonymous-box rebuilds this
-        // replaced skipped an id missing from the slab (`nodes.get(child_id)`),
+        // replaced skipped an id missing from the slab (`nodes.get_live(child_id)`),
         // and routing them here must not turn that into a panic — a DOM
         // `children` list holding a freed id is a bug, but a wrong picture beats
         // a crash and this function is not where it should be discovered.
         for &child_id in Self::box_tree_children(nodes, node_id).iter() {
-            let Some(child) = nodes.get(child_id) else {
+            let Some(child) = nodes.get_live(child_id) else {
                 continue;
             };
             if child.computed_style.display == DisplayValue::Contents {
@@ -1852,14 +2814,14 @@ impl RinchDocument {
     /// caller reaches it today: a caller that asks about a box inside a split
     /// inline and is handed the element would rebuild a list nothing lays out.
     pub(crate) fn effective_taffy_owner(
-        nodes: &slab::Slab<crate::node::Node>,
-        node_id: usize,
-    ) -> Option<usize> {
+        nodes: &crate::node_slab::NodeSlab,
+        node_id: RawNodeId,
+    ) -> Option<RawNodeId> {
         use crate::computed_style::values::DisplayValue;
 
         let mut ancestor = Self::box_tree_parent(nodes, node_id)?;
         loop {
-            let node = nodes.get(ancestor)?;
+            let node = nodes.get_live(ancestor)?;
             // Two kinds of ancestor hold none of their children's boxes, so
             // neither can be the answer: a `display: contents` element, which
             // generates no box (#476), and a **split inline** (#513), whose
@@ -1919,13 +2881,13 @@ impl RinchDocument {
     /// never pick a wrong slot — while erring narrow silently loses the sibling
     /// and sends the search one step further back than it should go.
     pub(crate) fn collect_taffy_contribution(
-        nodes: &slab::Slab<crate::node::Node>,
-        node_id: usize,
+        nodes: &crate::node_slab::NodeSlab,
+        node_id: RawNodeId,
         out: &mut Vec<taffy::NodeId>,
     ) {
         use crate::computed_style::values::DisplayValue;
 
-        let Some(node) = nodes.get(node_id) else {
+        let Some(node) = nodes.get_live(node_id) else {
             return;
         };
         if let Some(taffy_id) = node.taffy_id {
@@ -1942,9 +2904,9 @@ impl RinchDocument {
         // where it would be. Erring wide is free here (see above), so every
         // hoisted descendant is offered, whatever its host.
         if node.hosts_hoisted_out_of_flow {
-            let mut stack: Vec<usize> = node.children.clone();
+            let mut stack: Vec<RawNodeId> = node.children.clone();
             while let Some(id) = stack.pop() {
-                let Some(n) = nodes.get(id) else {
+                let Some(n) = nodes.get_live(id) else {
                     continue;
                 };
                 if n.hoisted_out_of_flow_to.is_some()
@@ -2024,9 +2986,9 @@ impl RinchDocument {
     /// inline must rebuild that element's container itself, as that function's one
     /// such caller does.
     pub(crate) fn taffy_child_list_owners(
-        nodes: &slab::Slab<crate::node::Node>,
-        node_id: usize,
-    ) -> Vec<usize> {
+        nodes: &crate::node_slab::NodeSlab,
+        node_id: RawNodeId,
+    ) -> Vec<RawNodeId> {
         use crate::computed_style::values::DisplayValue;
 
         let mut owners = vec![node_id];
@@ -2052,7 +3014,10 @@ impl RinchDocument {
     /// call sites that drift:
     ///
     /// 1. the Parley layout of the IFC that holds the text —
-    ///    [`Self::invalidate_ifc_for_node`];
+    ///    [`Self::invalidate_ifc_for_node`], plus the IFC of each text child,
+    ///    which is an **anonymous box** outside the element tree when the
+    ///    run sits beside a block-level sibling or inside a split inline
+    ///    (#513) and so is reached by no ancestor walk;
     /// 2. the box of any atomic inline above it, which no Taffy compute reaches
     ///    — [`Self::mark_atomic_inline_dirty`];
     /// 3. the `NodeContext::Text` a text child is measured through when it is a
@@ -2073,24 +3038,93 @@ impl RinchDocument {
     /// nothing unless a compute follows, and steps 1 and 3 are invalidations
     /// rather than work; so a property listed one predicate too wide costs a
     /// spare re-shape, and one listed too narrow leaves a box frozen.
-    pub(crate) fn invalidate_text_measure_for_node(&mut self, node_id: usize) {
+    pub(crate) fn invalidate_text_measure_for_node(&mut self, node_id: RawNodeId) {
+        self.invalidate_text_layout_for_node(node_id, true);
+    }
+
+    /// [`Self::invalidate_text_measure_for_node`], saying whether the change
+    /// can move a size (`ComputedStyle::same_measured_text_inputs` failed) or
+    /// only re-shapes glyphs in place (a colour): see
+    /// [`Self::mark_atomic_inline_dirty_for`].
+    pub(crate) fn invalidate_text_layout_for_node(&mut self, node_id: RawNodeId, sizes: bool) {
         if !self.tree.nodes.contains(node_id) {
             return;
         }
         self.invalidate_ifc_for_node(node_id);
-        self.mark_atomic_inline_dirty(node_id);
+        self.mark_atomic_inline_dirty_for(node_id, sizes);
         for child in self.tree.nodes[node_id].children.clone() {
-            let Some(child_node) = self.tree.nodes.get(child) else {
+            let Some(child_node) = self.tree.nodes.get_live(child) else {
                 continue;
             };
             if !matches!(child_node.kind, NodeKind::Text(_)) {
                 continue;
             }
             let taffy_id = child_node.taffy_id;
+            // A text run beside a block-level sibling is laid out by an
+            // anonymous block box, and one inside a split inline (#513) by the
+            // box around its fragment — neither in the element tree, so the
+            // walk above, which asks this node and its ancestors, never finds
+            // it. The text node's own `ifc_root` names that box. A text node is
+            // never cascaded on its own, so this is the only call that can
+            // reach it.
+            if let Some(root) = child_node.ifc_root
+                && root != node_id
+            {
+                self.invalidate_ifc_root(root);
+            }
             self.tree.dirty_text_contexts.insert(child);
             if let Some(t) = taffy_id {
                 let _ = self.tree.taffy.mark_dirty(t);
             }
+        }
+        // The anonymous boxes this node is the container of take their
+        // `text-overflow: ellipsis` from it (`ellipsis_style_owner`, #1071),
+        // and hold none of what that reads: neither `text-overflow` nor
+        // `overflow` is inherited. The loop above reaches a box only through a
+        // text child of this node, which a run inside a split `<span>` (#513)
+        // is not — the span holds the text, and does not re-cascade when this
+        // node's non-inherited properties change.
+        // And they inherit from it: a box keeps the style it was minted with
+        // until the next structural pass, and since parley 0.12 its line
+        // boxes start from that style's strut (font size, line height), so a
+        // `font-size` change of the container laid its text out against the
+        // old strut (#663: 22px lines where a fresh layout made 20).
+        for b in self.tree.nodes[node_id].run_boxes.clone() {
+            if self.tree.nodes.contains(b) {
+                let style = crate::computed_style::ComputedStyle::for_anonymous_box(
+                    &self.tree.nodes[node_id].computed_style,
+                );
+                self.tree.nodes[b].computed_style = style;
+            }
+            self.invalidate_ifc_root(b);
+        }
+    }
+
+    /// Drop the inline layouts `node_id`'s `color` is baked into as a brush:
+    /// the IFC the node is in or is the root of, and the anonymous boxes that
+    /// lay out its own text runs. Those are roots
+    /// [`Self::invalidate_text_measure_for_node`] reaches; the rest of what
+    /// that does is not owed. A colour moves no box and is no input of a text
+    /// leaf's layout (paint colours a leaf from the live style, #904), so no
+    /// atomic inline and no flex item's measure is marked, and a node in no
+    /// IFC — a flex container whose text is a leaf — drops nothing.
+    pub(crate) fn invalidate_text_brushes_for_node(&mut self, node_id: RawNodeId) {
+        let node = &self.tree.nodes[node_id];
+        let mut roots = node.run_boxes.clone();
+        roots.extend(node.ifc_root);
+        roots.extend(node.children.iter().filter_map(|&child| {
+            let child = self.tree.nodes.get_live(child)?;
+            matches!(child.kind, NodeKind::Text(_))
+                .then_some(child.ifc_root)
+                .flatten()
+        }));
+        if self.holds_ifc_layout(node_id) {
+            roots.push(node_id);
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        for root in roots {
+            self.invalidate_ifc_root(root);
         }
     }
 
@@ -2099,58 +3133,105 @@ impl RinchDocument {
     /// Clears the IFC root's cached text_layout so it rebuilds on next layout pass.
     /// Also checks the parent's text_layout as a fallback when ifc_root hasn't been
     /// set yet (before the first layout pass).
-    pub(crate) fn invalidate_ifc_for_node(&mut self, node_id: usize) {
+    pub(crate) fn invalidate_ifc_for_node(&mut self, node_id: RawNodeId) {
         if let Some(ifc_root_id) = self.tree.nodes.get(node_id).and_then(|n| n.ifc_root) {
-            if let Some(root) = self.tree.nodes.get_mut(ifc_root_id) {
-                root.text_layout = None;
+            self.invalidate_ifc_root(ifc_root_id);
+            // An atomic inline (`inline-block`/`-flex`/`-grid`) is a member of
+            // the IFC it sits in *and* the root of its own text, so its restyle
+            // owes both: the outer layout (its box moved) and its own (its
+            // glyphs changed). Reaching only the outer one left a `<button>`'s
+            // label in its old colour and size after a class change.
+            if self.holds_ifc_layout(node_id) {
+                self.invalidate_ifc_root(node_id);
             }
-            // Invalidate IFC measure cache so style changes (e.g., font-size) trigger re-measurement
-            self.tree.dirty_ifc_text_roots.insert(ifc_root_id);
-            self.tree
-                .ifc_measure_cache
-                .retain(|&(root_id, _), _| root_id != ifc_root_id);
-        } else if self
-            .tree
+        } else if self.holds_ifc_layout(node_id) {
+            // The node itself IS the IFC root (block element containing inline text)
+            self.invalidate_ifc_root(node_id);
+        } else {
+            self.invalidate_nearest_ifc_ancestor(node_id);
+        }
+    }
+
+    /// Fallback for a node with no `ifc_root` yet (before the first layout
+    /// pass): walk ancestors to the nearest one holding an IFC layout.
+    fn invalidate_nearest_ifc_ancestor(&mut self, node_id: RawNodeId) {
+        let mut cur = self.tree.nodes.get(node_id).and_then(|n| n.parent);
+        while let Some(pid) = cur {
+            if self.holds_ifc_layout(pid) {
+                self.invalidate_ifc_root(pid);
+                break;
+            }
+            cur = self.tree.nodes.get_live(pid).and_then(|n| n.parent);
+        }
+    }
+
+    /// What a node being **moved** (or inserted) leaves behind: the IFC it
+    /// was a *member* of, which lost it — never the node's **own** IFC, if it
+    /// is a root (issue #914).
+    ///
+    /// A move does not change what a root is built from: its members, their
+    /// text and their order all travel with it. What its new position *can*
+    /// change reaches it by the two routes every other change takes. Its
+    /// typography, inherited from a new parent or matched by a positional
+    /// selector (`:nth-child`), arrives through the cascade, which compares the
+    /// old and new text inputs and drops the layout itself when they differ
+    /// (`ComputedStyle::same_text_layout_inputs`); its available width is a
+    /// key of the measure cache and of `build_ifc_layouts`' rebuild test. And
+    /// the structural pass re-signs it (the verb seeds its subtree), so a
+    /// content change it somehow missed still drops it
+    /// (`refresh_ifc_signatures`).
+    ///
+    /// [`Self::invalidate_ifc_for_node`] drops both for an atomic inline and
+    /// the node's own for a block root; that is right for a restyle of the
+    /// node, and for a move it re-shaped the moved row of every keyed `for`
+    /// reorder — twice per row on a reversed list — with nothing changed.
+    pub(crate) fn invalidate_ifc_left_by(&mut self, node_id: RawNodeId) {
+        if let Some(ifc_root_id) = self.tree.nodes.get(node_id).and_then(|n| n.ifc_root) {
+            self.invalidate_ifc_root(ifc_root_id);
+        } else if !self.holds_ifc_layout(node_id) {
+            self.invalidate_nearest_ifc_ancestor(node_id);
+        }
+    }
+
+    /// Whether `node_id` holds a layout derived from an inline formatting
+    /// context of its own: a paint layout, or sizes the measure function
+    /// cached for it.
+    fn holds_ifc_layout(&self, node_id: RawNodeId) -> bool {
+        self.tree
             .nodes
             .get(node_id)
-            .map(|n| n.text_layout.is_some())
-            .unwrap_or(false)
-        {
-            // The node itself IS the IFC root (block element containing inline text)
-            self.tree.nodes[node_id].text_layout = None;
-            self.tree.dirty_ifc_text_roots.insert(node_id);
-            self.tree
+            .is_some_and(|n| n.text_layout.is_some())
+            || self
+                .tree
                 .ifc_measure_cache
-                .retain(|&(root_id, _), _| root_id != node_id);
-            // Mark Taffy dirty so it re-measures this node (triggering IFC rebuild)
-            if let Some(taffy_id) = self.tree.nodes.get(node_id).and_then(|n| n.taffy_id) {
-                let _ = self.tree.taffy.mark_dirty(taffy_id);
-            }
-            // The measure may live on this root's measure leaf, which a mark
-            // on the root does not reach — dirty propagates up, not down (#466).
-            self.mark_ifc_measure_dirty(node_id);
-        } else {
-            // Fallback: walk ancestors to find one with text_layout (the IFC root)
-            let mut cur = self.tree.nodes.get(node_id).and_then(|n| n.parent);
-            while let Some(pid) = cur {
-                if self
-                    .tree
-                    .nodes
-                    .get(pid)
-                    .map(|p| p.text_layout.is_some())
-                    .unwrap_or(false)
-                {
-                    self.tree.nodes[pid].text_layout = None;
-                    // Invalidate IFC measure cache for this root
-                    self.tree.dirty_ifc_text_roots.insert(pid);
-                    self.tree
-                        .ifc_measure_cache
-                        .retain(|&(root_id, _), _| root_id != pid);
-                    break;
-                }
-                cur = self.tree.nodes.get(pid).and_then(|n| n.parent);
-            }
+                .get(&node_id)
+                .is_some_and(|e| !e.sizes.is_empty())
+    }
+
+    /// Drop everything derived from IFC root `root_id`'s content: the paint
+    /// layout (`text_layout`), the measure function's cached sizes, and
+    /// Taffy's own cached size for it — on the root and on its #466 measure
+    /// leaf, since `mark_dirty` propagates up, not down.
+    ///
+    /// The Taffy marks are what make the cache drop reachable. A restyle that
+    /// changes only an inline *member's* typography (a `span` inside the
+    /// paragraph) marks no Taffy node on its way — the member is detached from
+    /// Taffy — so without the mark on the root the compute serves the root's
+    /// cached size and never calls the measure function at all. The member
+    /// branch of [`Self::invalidate_ifc_for_node`] used to drop the paint
+    /// layout and the cache and mark nothing, which was harmless only while an
+    /// eager subtree drop on every attribute write marked the root by another
+    /// route.
+    pub(crate) fn invalidate_ifc_root(&mut self, root_id: RawNodeId) {
+        if let Some(root) = self.tree.nodes.get_mut(root_id) {
+            root.text_layout = None;
         }
+        self.tree.dirty_ifc_text_roots.insert(root_id);
+        self.tree.forget_ifc_measures(root_id);
+        if let Some(taffy_id) = self.tree.nodes.get(root_id).and_then(|n| n.taffy_id) {
+            let _ = self.tree.taffy.mark_dirty(taffy_id);
+        }
+        self.mark_ifc_measure_dirty(root_id);
     }
 
     /// Append `child_taffy` under `parent_taffy`, asserting in debug builds that
@@ -2247,7 +3328,7 @@ impl RinchDocument {
     pub(crate) fn taffy_detach_contribution(
         &mut self,
         parent_taffy: taffy::NodeId,
-        node_id: usize,
+        node_id: RawNodeId,
     ) {
         use crate::computed_style::values::DisplayValue;
 
@@ -2289,7 +3370,7 @@ impl RinchDocument {
         // removing it as the only child left the box silently reachable. Walk
         // the subtree, and cut every edge whose Taffy parent is not a subtree
         // member. O(subtree), like the `ifc_root` clear the same DOM ops run.
-        let mut subtree: Vec<usize> = vec![node_id];
+        let mut subtree: Vec<RawNodeId> = vec![node_id];
         let mut i = 0;
         while i < subtree.len() {
             if let Some(n) = self.tree.nodes.get(subtree[i]) {
@@ -2302,7 +3383,7 @@ impl RinchDocument {
             .filter_map(|&id| self.tree.nodes.get(id).and_then(|n| n.taffy_id))
             .collect();
         for &id in &subtree[1..] {
-            let Some(t) = self.tree.nodes.get(id).and_then(|n| n.taffy_id) else {
+            let Some(t) = self.tree.nodes.get_live(id).and_then(|n| n.taffy_id) else {
                 continue;
             };
             if let Some(p) = self.tree.taffy.parent(t)
@@ -2325,14 +3406,14 @@ impl RinchDocument {
     /// nested wrapper's grandchildren stranded when both wrappers were toggled
     /// away from `contents` in the same flush.
     fn collect_taffy_detach_candidates(
-        nodes: &slab::Slab<crate::node::Node>,
-        node_id: usize,
+        nodes: &crate::node_slab::NodeSlab,
+        node_id: RawNodeId,
         out: &mut Vec<taffy::NodeId>,
     ) {
         use crate::computed_style::values::DisplayValue;
 
         for &child_id in &nodes[node_id].children {
-            let Some(child) = nodes.get(child_id) else {
+            let Some(child) = nodes.get_live(child_id) else {
                 continue;
             };
             if let Some(child_taffy) = child.taffy_id {
@@ -2364,7 +3445,7 @@ impl RinchDocument {
     /// subtree from one that never left.
     ///
     /// Three things are reset and a fourth deliberately is not. The three are
-    /// exactly what [`NodeTree::remove_subtree`] drops when it *frees* a
+    /// exactly what `NodeTree::remove_subtree` drops when it *frees* a
     /// subtree, minus the freeing — which is the point: a detached node is not
     /// a dead one, and rinch has to keep it readable.
     ///
@@ -2426,9 +3507,9 @@ impl RinchDocument {
     /// | route | who reaches it |
     /// |---|---|
     /// | `remove_node` | every reactive removal — `show_dom`, `match_dom`, `for_each_dom_typed`'s `Remove`, its re-render swap and `reclaim_displaced`, `virtual_list`, the component re-render effect, the editor's `ViewDesc` diff. They reach it by **two** verbs since #719: `NodeHandle::remove` where the same subtree may be shown again (`show_dom`, `match_dom`) and `NodeHandle::discard` where it may not (all the rest). On this backend `discard_node` **is** `remove_node` — the trait default — so both land here; only `rinch-web` tells them apart, by pruning its node maps on the second |
-    /// | `remove_child` | `NodeHandle::remove_child` and `RenderScope`'s batched `DomUpdate::RemoveChild` |
+    /// | `remove_child` | `NodeHandle::remove_child` |
     /// | `replace_node` | the displaced `old` subtree |
-    /// | `set_text_content` | `NodeHandle::set_text_content` and `RenderScope`'s batched `DomUpdate::SetTextContent`, **when the target is an element with children** — it orphans every one of them. Reactive text in `rsx!` targets a text node and takes the other branch, so this is app code writing over an element's children |
+    /// | `set_text_content` | `NodeHandle::set_text` and a batched `DomUpdate::SetText` (`UpdateBatch::apply`), **when the target is an element with children** — it orphans every one of them. Reactive text in `rsx!` targets a text node and takes the other branch, so this is app code writing over an element's children |
     ///
     /// The fifth is `set_inner_html`, and it is safe by **destruction** rather
     /// than by reset: it calls `NodeTree::remove_subtree`, which frees the slab
@@ -2451,18 +3532,23 @@ impl RinchDocument {
     /// either, and has its own: [`Self::detach_subtree_styles_if_moved_out`]
     /// (#702). It is not a `parent = None` detach, but it is disconnected,
     /// which #696 established is the question that matters.
-    pub(crate) fn detach_subtree_styles(&mut self, node_id: usize) {
+    pub(crate) fn detach_subtree_styles(&mut self, node_id: RawNodeId) {
         // Iterative, like `clear_ifc_root_recursive` — a deep subtree must not
         // overflow the stack on its way out of the document.
         let mut stack = vec![node_id];
         while let Some(id) = stack.pop() {
-            let Some(node) = self.tree.nodes.get_mut(id) else {
+            let Some(node) = self.tree.nodes.get_live_mut(id) else {
                 continue;
             };
             node.has_been_styled = false;
             stack.extend(node.children.iter().copied());
             self.tree.active_transitions.remove(&id);
             self.tree.active_animations.remove(&id);
+            // Guarded: `remove` hashes the key even on an empty map, and this
+            // walk visits every node of a hidden branch (#783's Perf report).
+            if !self.tree.finished_animations.is_empty() {
+                self.tree.finished_animations.remove(&id);
+            }
         }
     }
 
@@ -2555,23 +3641,82 @@ impl RinchDocument {
     /// nothing", true of every destination but a detached one.
     pub(crate) fn detach_subtree_styles_if_moved_out(
         &mut self,
-        child: usize,
-        old_parent: usize,
-        new_parent: usize,
+        child: RawNodeId,
+        old_parent: RawNodeId,
+        new_parent: RawNodeId,
     ) {
         if old_parent != new_parent && self.depth_if_connected(new_parent).is_none() {
             self.detach_subtree_styles(child);
         }
     }
 
-    /// Clear ifc_root on a node and all its descendants.
-    pub(crate) fn clear_ifc_root_recursive(&mut self, node_id: usize) {
+    /// Whether moving `child` to `new_parent` may keep the style it has, and
+    /// skip the re-cascade an insertion gives a subtree (issue #914).
+    ///
+    /// Yes when the move stays **within one parent** and the child already
+    /// carries a style. Its ancestor chain is then the one it was cascaded
+    /// against, so every descendant, child and ancestor-attribute selector
+    /// answers as before, and so does everything it inherits. What its
+    /// position can change — `:nth-child`, `:first-/:last-child`, `+`, `~`,
+    /// an `<ol>`'s numbering — is exactly what the selector flags on the
+    /// parent say, and the verb's two `note_child_list_changed` calls (at the
+    /// old index and the new) restyle the moved node itself whenever they do:
+    /// `HAS_SLOW_SELECTOR*` and an `<ol>` mark every child from the insertion
+    /// index on, which includes it, and `HAS_EDGE_CHILD_SELECTOR` marks the
+    /// child at that index, which is it.
+    ///
+    /// This is **not** what a browser does for `insertBefore`: Chrome removes
+    /// and re-inserts the node and discards its computed style. It is what
+    /// `moveBefore()` does — a move that keeps the node's state — and rinch
+    /// already treats a connected move that way on purpose (a move is not a
+    /// detach: a running transition survives a keyed reorder).
+    ///
+    /// A move to **another** parent re-cascades, as an insertion always did:
+    /// both the inherited values and the ancestor chain may differ, and
+    /// comparing them to prove otherwise costs about what the cascade does.
+    /// Neither the keyed `for` reorder nor the editor's view diff moves a node
+    /// between parents.
+    ///
+    /// A child with no style yet — never styled, or its data dropped by an
+    /// earlier insertion this frame — is cascaded as before.
+    pub(crate) fn keeps_style_across_move(&self, child: RawNodeId, new_parent: RawNodeId) -> bool {
+        let Some(node) = self.tree.nodes.get_live(child) else {
+            return false;
+        };
+        node.parent == Some(new_parent)
+            && node.is_element()
+            && node
+                .stylo_element_data
+                .borrow()
+                .as_ref()
+                .is_some_and(|d| d.styles.primary.is_some())
+    }
+
+    /// Clear ifc_root on a node and all its descendants — and take each out
+    /// of the anonymous block box whose run it was in.
+    ///
+    /// Every verb that moves or removes a subtree calls this. The run is its
+    /// old container's: a scoped structural pass sets the *new* container up
+    /// but reaches the old one only while it is still in the document, and a
+    /// member that kept its `run_box` reads as "claimed by a box" to the new
+    /// container's root detection, which then withheld roothood from a grid
+    /// holding nothing but that text (found by the scoped pass's random
+    /// differential: a text moved out of a mixed container that was removed
+    /// in the same frame). The whole-document pass cleaned every box every
+    /// time, which hid it.
+    pub(crate) fn clear_ifc_root_recursive(&mut self, node_id: RawNodeId) {
         // Use iterative approach to avoid stack overflow
         let mut stack = vec![node_id];
         while let Some(id) = stack.pop() {
-            if let Some(node) = self.tree.nodes.get_mut(id) {
-                node.ifc_root = None;
-                stack.extend(node.children.iter().copied());
+            let Some(node) = self.tree.nodes.get_live_mut(id) else {
+                continue;
+            };
+            node.ifc_root = None;
+            stack.extend(node.children.iter().copied());
+            if let Some(b) = node.run_box.take()
+                && let Some(boxx) = self.tree.nodes.get_mut(b)
+            {
+                boxx.run_members.retain(|&m| m != id);
             }
         }
     }
@@ -2579,23 +3724,11 @@ impl RinchDocument {
     /// Invalidate IFC state for a parent element.
     /// Clears text_layout on the parent and ifc_root on all its inline children.
     /// Also marks the Taffy node dirty so the measure callback re-fires.
-    pub(crate) fn invalidate_parent_ifc(&mut self, parent_id: usize) {
-        if let Some(parent) = self.tree.nodes.get_mut(parent_id) {
-            parent.text_layout = None;
-        }
-        // Invalidate IFC measure cache so style changes trigger re-measurement
-        self.tree.dirty_ifc_text_roots.insert(parent_id);
-        self.tree
-            .ifc_measure_cache
-            .retain(|&(root_id, _), _| root_id != parent_id);
-        if let Some(taffy_id) = self.tree.nodes.get(parent_id).and_then(|n| n.taffy_id) {
-            let _ = self.tree.taffy.mark_dirty(taffy_id);
-        }
-        // The measure may live on this root's measure leaf, which the mark
-        // above does not reach — dirty propagates up, not down (#466). Without
-        // this, a text edit in a `text + absolute` container serves the leaf's
-        // cached measure and the container's height never changes.
-        self.mark_ifc_measure_dirty(parent_id);
+    pub(crate) fn invalidate_parent_ifc(&mut self, parent_id: RawNodeId) {
+        // The mark on the #466 measure leaf inside matters here: without it a
+        // text edit in a `text + absolute` container serves the leaf's cached
+        // measure and the container's height never changes.
+        self.invalidate_ifc_root(parent_id);
         // NOTE: Do NOT clear ifc_root on children here. This function handles
         // text/style invalidation where the IFC structure is unchanged. Clearing
         // ifc_root would prevent build_ifc_layouts() from finding this IFC root
@@ -2603,4 +3736,23 @@ impl RinchDocument {
         // and setup_inline_formatting_contexts() won't re-assign them because
         // ifc_dirty is not set for text-only changes.
     }
+}
+
+/// The text layouts a compute's measures built, by node and wrap width.
+type MeasuredTextLayouts = HashMap<(RawNodeId, u32), parley::layout::Layout<Brush>>;
+
+/// Pins a measure closure to the signature Taffy's compute takes, so it can
+/// be built as a `let` (the higher-ranked lifetimes are not inferred for a
+/// closure bound to one).
+fn measure_fn<F>(f: F) -> F
+where
+    F: FnMut(
+        taffy::LayoutInput,
+        taffy::NodeId,
+        Option<&mut NodeContext>,
+        &taffy::Style,
+        Option<&mut taffy::BlockContext<'_>>,
+    ) -> taffy::LayoutOutput,
+{
+    f
 }

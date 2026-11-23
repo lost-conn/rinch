@@ -84,9 +84,81 @@ pub enum DisplayValue {
     /// box was therefore classified block-level and ended the inline run it
     /// should have joined.
     InlineGrid,
+    /// `display: list-item` (#725) — **block-outside, flow-inside** only: a
+    /// block box with a marker. Stylo carries "is a list item" as an
+    /// orthogonal bit on `Display` (`Display::is_list_item`), so
+    /// `display_from_stylo` returns this for `list-item` / `block list-item`
+    /// and lets `inline list-item` take its plain `(outside, inside)` value —
+    /// it stays inline-level, as in Chrome 153. (Stylo's servo build rejects
+    /// `flex list-item`, `grid list-item` and the `flow-root` forms.)
+    ///
+    /// It lays out as [`Self::Block`] does, and every layout site that asks
+    /// for `Block` must ask for this too (`to_taffy` → `taffy::Display::Block`,
+    /// `DisplayMode::Block`). The marker
+    /// itself does not read this value: `resolve_list_marker` reads Stylo's
+    /// `is_list_item()`.
+    ListItem,
+}
+
+/// Which part of a CSS table a box is, from its computed `display`.
+///
+/// `display_from_stylo` maps a table to [`DisplayValue::Grid`], a row or row
+/// group to [`DisplayValue::Contents`] and a cell or caption to
+/// [`DisplayValue::Block`], so `display` alone cannot say. See `table_layout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub enum TablePart {
+    /// Not a table part.
+    #[default]
+    None,
+    /// `table` / `inline-table`.
+    Table,
+    /// `table-row-group`.
+    RowGroup,
+    /// `table-header-group`: its rows come first, wherever it stands.
+    HeaderGroup,
+    /// `table-footer-group`: its rows come last, wherever it stands.
+    FooterGroup,
+    /// `table-row`.
+    Row,
+    /// `table-cell`.
+    Cell,
+    /// A column or a column group.
+    Other,
+    /// `table-caption`: a table part, but not an internal table box.
+    Caption,
+}
+
+impl TablePart {
+    /// Whether a box of this part, as a child of a table, is a row of its
+    /// own or a group of them.
+    pub fn is_row_like(self) -> bool {
+        matches!(
+            self,
+            Self::RowGroup | Self::HeaderGroup | Self::FooterGroup | Self::Row
+        )
+    }
+
+    /// Whether this is an internal table box (css-tables-3: a row, a row
+    /// group, a cell, a column or a column group — not the table and not a
+    /// caption). `aspect-ratio` does not apply to one (css-sizing-4 §5.1,
+    /// #1286; Chrome 155).
+    pub fn is_internal(self) -> bool {
+        self.is_row_like() || matches!(self, Self::Cell | Self::Other)
+    }
 }
 
 impl DisplayValue {
+    /// Whether this box is a flex or grid container (either outside): its
+    /// own text runs are anonymous flex / grid items. Such an item does not
+    /// clip, so its text never takes the container's `text-overflow`
+    /// ellipsis (#904, measured in Chrome 153).
+    pub fn is_flex_or_grid_container(self) -> bool {
+        matches!(
+            self,
+            Self::Flex | Self::InlineFlex | Self::Grid | Self::InlineGrid
+        )
+    }
+
     /// Convert to Taffy Display — the **inside** of the display value, i.e.
     /// which formatting context this box's children get.
     ///
@@ -102,7 +174,7 @@ impl DisplayValue {
     pub fn to_taffy(&self) -> taffy::Display {
         match self {
             Self::Flex | Self::InlineFlex => taffy::Display::Flex,
-            Self::Block => taffy::Display::Block,
+            Self::Block | Self::ListItem => taffy::Display::Block,
             Self::Grid | Self::InlineGrid => taffy::Display::Grid,
             Self::None => taffy::Display::None,
             Self::Contents => taffy::Display::Flex, // transparent container
@@ -174,11 +246,11 @@ impl PositionValue {
 
 /// A CSS **intrinsic sizing keyword** (css-sizing-3 §5, css-sizing-4 §4).
 ///
-/// None of these lays out yet — see [`DimensionValue::Intrinsic`] for what
-/// happens to one and why. The keyword is carried this far rather than folded
-/// into `Auto` at style conversion so that a consumer can tell a declared
-/// `max-content` from an undeclared size (#626): `Auto` now means the author
-/// wrote `auto` (or nothing), which is what every reader of it already assumed.
+/// They lay out on `width`, `height` and `flex-basis` (#691) and not on
+/// `min-*`/`max-*` (#1275) — see [`DimensionValue::Intrinsic`]. The keyword is
+/// carried this far rather than folded into `Auto` at style conversion so that
+/// a consumer can tell a declared `max-content` from an undeclared size
+/// (#626): `Auto` means the author wrote `auto` (or nothing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum IntrinsicSize {
     /// `max-content` — the box's preferred size, laid out with no wrapping.
@@ -195,6 +267,16 @@ pub enum IntrinsicSize {
 }
 
 impl IntrinsicSize {
+    /// The Taffy keyword for `width`/`height`/`flex-basis` (#691).
+    pub fn to_taffy(self) -> taffy::Dimension {
+        match self {
+            Self::MaxContent => taffy::Dimension::max_content(),
+            Self::MinContent => taffy::Dimension::min_content(),
+            Self::FitContent => taffy::Dimension::fit_content(),
+            Self::Stretch => taffy::Dimension::stretch(),
+        }
+    }
+
     /// The keyword as an author would write it, for diagnostics.
     pub fn css_name(self) -> &'static str {
         match self {
@@ -221,84 +303,104 @@ pub enum DimensionValue {
         px: f32,
         pct: f32,
     },
-    /// An intrinsic sizing keyword, which **does not lay out yet** (#626): it
-    /// reaches Taffy as `auto`, so the used size is whatever `auto` would give.
+    /// An intrinsic sizing keyword.
     ///
-    /// Taffy 0.12 cannot be handed one. `taffy::Dimension` is a newtype over
-    /// `CompactLength`, and while that type does carry `MIN_CONTENT_TAG` /
-    /// `MAX_CONTENT_TAG` / `FIT_CONTENT_*_TAG`, only the **grid track sizing**
-    /// functions ever read them: `Dimension`'s own resolver
-    /// (`MaybeResolve for Dimension`, taffy-0.12.2 `src/util/resolve.rs:57`)
-    /// matches `AUTO`/`LENGTH`/`PERCENT`/calc and ends `_ => unreachable!()`,
-    /// and `Dimension` exposes no safe constructor for the intrinsic tags at
-    /// all. So a `size`/`min_size`/`max_size` carrying one **panics** in
-    /// layout rather than shrink-wrapping — pinned by
-    /// `tests/intrinsic_sizing_tests.rs`, which is what fails if a future
-    /// Taffy bump makes this representable.
+    /// **On `width`, `height` and `flex-basis` it lays out** (#691):
+    /// [`DimensionValue::to_taffy`] hands Taffy 0.14 the keyword itself, which
+    /// lays it out on any box it computes as a child. Two kinds of box are not
+    /// that, and rinch resolves the keyword itself for them:
     ///
-    /// Implementing them therefore needs a rinch-side measurement pass, not a
-    /// mapping. In the meantime the declaration is at least *inspectable* —
-    /// the MCP's `GetComputedStyles` serializes this enum, so it now reports
-    /// `{"Intrinsic": "MaxContent"}` where it used to say `"Auto"` — and
-    /// `from_stylo` prints one line per property and keyword per process, so
-    /// the substitution is no longer silent.
+    /// - an **atomic inline** is computed as a Taffy *root*, and a root
+    ///   ignores its own size keyword — `ifc.rs::resolve_root_width_keyword`
+    ///   measures the width keywords there, and
+    ///   `ifc.rs::pin_containing_block_sizes` resolves `height: stretch`
+    ///   against a definite containing-block height (#1277);
+    /// - an out-of-flow box whose containing block is the **viewport** would
+    ///   take `stretch` from its Taffy parent — `out_of_flow.rs` bakes it from
+    ///   the viewport.
+    ///
+    /// **On `min-*`/`max-*` it still lays out as `auto`** (#1275): Taffy 0.14
+    /// stores those as `LengthPercentageAuto`, which has no keyword, so
+    /// [`DimensionValue::to_taffy_lpa`] answers `auto`. The declaration is at
+    /// least inspectable — the MCP's `GetComputedStyles` serializes this enum
+    /// (`{"Intrinsic": "MaxContent"}`) — and `from_stylo` prints one line per
+    /// such property and keyword per process.
     ///
     /// All four keywords reach this variant, `-webkit-fill-available` folding
     /// into `Stretch`. `fit-content(<length-percentage>)` does not — it is
     /// `clamp(min-content, <lp>, max-content)`, a different value from the bare
     /// keyword, so it stays `Auto` and is reported separately.
     ///
-    /// None of them is gated, which is less obvious than it looks: Stylo guards
-    /// `stretch`, `-webkit-fill-available` and `fit-content()` on
-    /// `static_prefs::pref!(…)`, which is **not** the runtime preference store
-    /// `RinchDocument::new` pokes (`stylo_config`, which answers `false` for
-    /// every unset key). It is a compile-time macro in `stylo_static_prefs`
-    /// that hard-codes those keys to `true`.
+    /// None of them is gated: Stylo guards `stretch`, `-webkit-fill-available`
+    /// and `fit-content()` on `layout.css.stretch-size-keyword.enabled`,
+    /// `layout.css.webkit-fill-available.enabled` and
+    /// `layout.css.fit-content-function.enabled`, which `stylo_static_prefs`
+    /// defaults to `true` and `set_stylo_prefs` leaves alone.
     Intrinsic(IntrinsicSize),
 }
 
 impl DimensionValue {
     /// Convert to Taffy Dimension.
     ///
-    /// A `Calc` cannot be represented in a Taffy value — Taffy 0.12's calc
-    /// pointer (`CompactLength::calc`) only works for callers implementing the
+    /// A `Calc` cannot be represented in a Taffy value — Taffy's calc pointer
+    /// (`CompactLength::calc`) only works for callers implementing the
     /// layout-tree traits themselves; `TaffyTree`'s `resolve_calc_value` is
-    /// hardcoded to `0.0` (taffy-0.12.2, `src/tree/taffy_tree.rs:391`). So the
+    /// hardcoded to `0.0` (taffy-0.14.0, `src/tree/taffy_tree.rs:387`). So the
     /// length part goes in as a *seed* and `resolve_layout_calcs`
     /// (`calc_layout.rs`) overwrites it with the resolved length before a
     /// layout result is read — on the converged path; a run that hits the
     /// fixpoint's iteration cap reads the last iterate (see `calc_layout.rs`).
-    /// An [`Intrinsic`](Self::Intrinsic) keyword has no Taffy representation
-    /// either, and unlike a `Calc` no later pass repairs it: it goes in as
-    /// `auto` and stays `auto` (#626). See that variant for why Taffy 0.12
-    /// cannot be handed one.
+    /// An [`Intrinsic`](Self::Intrinsic) keyword goes in as Taffy's own
+    /// keyword (#691; [`IntrinsicSize::to_taffy`]).
     pub fn to_taffy(&self) -> taffy::Dimension {
         match self {
             Self::Auto => taffy::Dimension::auto(),
             Self::Length(v) => taffy::Dimension::length(*v),
             Self::Percent(v) => taffy::Dimension::percent(*v),
             Self::Calc { px, .. } => taffy::Dimension::length(px.max(0.0)),
-            Self::Intrinsic(_) => taffy::Dimension::auto(),
+            Self::Intrinsic(k) => k.to_taffy(),
+        }
+    }
+
+    /// Convert to the `LengthPercentageAuto` Taffy 0.14 stores `min_size` and
+    /// `max_size` as. Same mapping as [`Self::to_taffy`]; an
+    /// [`Intrinsic`](Self::Intrinsic) keyword goes in as `auto`, since Taffy's
+    /// min/max sizes have no keyword representation at all (#1275).
+    pub fn to_taffy_lpa(&self) -> taffy::LengthPercentageAuto {
+        match self {
+            Self::Auto => taffy::LengthPercentageAuto::auto(),
+            Self::Length(v) => taffy::LengthPercentageAuto::length(*v),
+            Self::Percent(v) => taffy::LengthPercentageAuto::percent(*v),
+            Self::Calc { px, .. } => taffy::LengthPercentageAuto::length(px.max(0.0)),
+            Self::Intrinsic(_) => taffy::LengthPercentageAuto::auto(),
         }
     }
 
     /// Whether the author wrote `auto` (or nothing).
     ///
-    /// This is the **specified** value. It answers `false` for an intrinsic
-    /// keyword even though one currently lays out as `auto` — ask
-    /// [`Self::lays_out_as_auto`] when the question is about the used size.
+    /// This is the **specified** value: it answers `false` for an intrinsic
+    /// keyword, which lays out as itself (#691) — ask
+    /// [`Self::is_auto_or_keyword`] for "no declared length".
     pub fn is_auto(&self) -> bool {
         matches!(self, Self::Auto)
     }
 
-    /// Whether this value reaches Taffy as `auto`.
+    /// Whether the author declared no size here: `auto`, or a sizing keyword.
     ///
-    /// True for `auto` itself and for every intrinsic keyword, because none of
-    /// them lays out yet (#626). Every call site is a place that will need
-    /// revisiting when they do, which is why it is spelled separately from
-    /// [`Self::is_auto`] rather than folded into it.
-    pub fn lays_out_as_auto(&self) -> bool {
+    /// Either way the used size is derived — from the content or from the
+    /// containing block — rather than read off the declaration, which is the
+    /// question the IFC wrap tolerance asks.
+    /// It is **not** "lays out like `auto`": since #691 the keywords lay out as
+    /// themselves on `width`/`height`/`flex-basis`.
+    pub fn is_auto_or_keyword(&self) -> bool {
         matches!(self, Self::Auto | Self::Intrinsic(_))
+    }
+
+    /// Whether a box with this size fills the space between two paired insets
+    /// of a positioned box: `auto` and `stretch` do, a content keyword
+    /// (`max-content`, `min-content`, `fit-content`) keeps its measured size.
+    pub fn fills_between_insets(&self) -> bool {
+        matches!(self, Self::Auto | Self::Intrinsic(IntrinsicSize::Stretch))
     }
 
     /// The intrinsic sizing keyword the author wrote, if any.
@@ -321,7 +423,7 @@ impl DimensionValue {
 }
 
 /// CSS length-percentage value (padding, border-width, gap).
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub enum LengthPercentageValue {
     #[default]
     Zero,
@@ -480,73 +582,178 @@ impl FlexWrapValue {
     }
 }
 
-/// CSS align-items property values.
+/// An `align-items` / `align-self` position: the keyword and whether it is
+/// `safe` (an item that overflows its area is then put at the start, #1987).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
-pub enum AlignItemsValue {
+pub struct AlignValue {
+    pub keyword: AlignKeyword,
+    pub safe: bool,
+}
+
+/// The keyword of an `align-items` / `align-self` value. `start` / `end`
+/// and `flex-start` / `flex-end` are kept apart: they differ in a
+/// `wrap-reverse` flex container's cross axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum AlignKeyword {
+    Start,
+    End,
     FlexStart,
     FlexEnd,
+    SelfStart,
+    SelfEnd,
     Center,
     Baseline,
     Stretch,
 }
 
-impl AlignItemsValue {
-    /// Convert to Taffy AlignItems.
+impl AlignValue {
+    /// Convert to Taffy's `AlignItems` / `AlignSelf` (one type).
     pub fn to_taffy(&self) -> taffy::AlignItems {
-        match self {
-            Self::FlexStart => taffy::AlignItems::FLEX_START,
-            Self::FlexEnd => taffy::AlignItems::FLEX_END,
-            Self::Center => taffy::AlignItems::CENTER,
-            Self::Baseline => taffy::AlignItems::BASELINE,
-            Self::Stretch => taffy::AlignItems::STRETCH,
+        use taffy::{AlignItemsKeyword as K, AlignmentSafety as S};
+        let keyword = match self.keyword {
+            AlignKeyword::Start => K::Start,
+            AlignKeyword::End => K::End,
+            AlignKeyword::FlexStart => K::FlexStart,
+            AlignKeyword::FlexEnd => K::FlexEnd,
+            AlignKeyword::SelfStart => K::SelfStart,
+            AlignKeyword::SelfEnd => K::SelfEnd,
+            AlignKeyword::Center => K::Center,
+            AlignKeyword::Baseline => K::Baseline,
+            AlignKeyword::Stretch => K::Stretch,
+        };
+        // `safe stretch` / `safe baseline` are not valid CSS.
+        let safe =
+            self.safe && !matches!(self.keyword, AlignKeyword::Stretch | AlignKeyword::Baseline);
+        taffy::AlignItems {
+            keyword,
+            safety: if safe { S::Safe } else { S::Unsafe },
         }
     }
 }
 
-/// CSS align-self property values.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
-pub enum AlignSelfValue {
+/// Where `justify-items` / `justify-self` puts a grid item, a block-level
+/// box in a block container (#1985), or an absolute box's static position,
+/// on the inline axis (#1511). `left` and `right` are physical: which of
+/// `start` and `end` they are depends on the alignment container's
+/// `direction` (#1995), so they are resolved when the Taffy style is built
+/// ([`JustifyValue::to_taffy`]). `baseline` has no inline-axis meaning for a
+/// horizontal item: in a grid it falls back to `safe start` (`last baseline`
+/// to `safe end`), as css-align-3 §9.3 says; a block container (Chrome 157)
+/// starts both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum JustifyKeyword {
+    Start,
+    End,
     FlexStart,
     FlexEnd,
+    SelfStart,
+    SelfEnd,
+    Left,
+    Right,
     Center,
-    Baseline,
     Stretch,
+    Baseline,
+    LastBaseline,
 }
 
-impl AlignSelfValue {
-    /// Convert to Taffy AlignSelf.
-    pub fn to_taffy(&self) -> taffy::AlignSelf {
-        match self {
-            Self::FlexStart => taffy::AlignSelf::FLEX_START,
-            Self::FlexEnd => taffy::AlignSelf::FLEX_END,
-            Self::Center => taffy::AlignSelf::CENTER,
-            Self::Baseline => taffy::AlignSelf::BASELINE,
-            Self::Stretch => taffy::AlignSelf::STRETCH,
+/// A `justify-items` or `justify-self` value: a [`JustifyKeyword`] and the
+/// `safe` overflow modifier (an item that overflows its area is then placed
+/// at the start, not centred or end-aligned past the area's start edge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct JustifyValue {
+    pub keyword: JustifyKeyword,
+    pub safe: bool,
+}
+
+impl JustifyValue {
+    /// Convert to Taffy's `JustifyItems` / `JustifySelf` (one type).
+    /// `container_rtl` is the alignment container's `direction` (`left` is
+    /// its `end` when it is right to left); `in_block` says the alignment
+    /// container is a block container, where a baseline value starts the
+    /// box.
+    pub fn to_taffy(&self, container_rtl: bool, in_block: bool) -> taffy::JustifyItems {
+        use JustifyKeyword as K;
+        use taffy::JustifyItems as J;
+        let (start, end) = if container_rtl {
+            (K::End, K::Start)
+        } else {
+            (K::Start, K::End)
+        };
+        let (keyword, safe) = match self.keyword {
+            K::Left => (start, self.safe),
+            K::Right => (end, self.safe),
+            K::Baseline | K::LastBaseline if in_block => (K::Start, false),
+            K::Baseline => (K::Start, true),
+            K::LastBaseline => (K::End, true),
+            k => (k, self.safe),
+        };
+        let unsafe_ = match keyword {
+            K::End => J::END,
+            K::FlexStart => J::FLEX_START,
+            K::FlexEnd => J::FLEX_END,
+            K::SelfStart => J::SELF_START,
+            K::SelfEnd => J::SELF_END,
+            K::Center => J::CENTER,
+            // `safe stretch` is not valid CSS; stretch never overflows.
+            K::Stretch => return J::STRETCH,
+            _ => J::START,
+        };
+        if safe {
+            taffy::JustifyItems {
+                safety: taffy::AlignmentSafety::Safe,
+                ..unsafe_
+            }
+        } else {
+            unsafe_
         }
     }
 }
 
-/// CSS justify-content property values.
+/// CSS `justify-content` values. `start` / `end` and `flex-start` /
+/// `flex-end` are kept apart (they differ in a reversed flex container),
+/// and `left` / `right` are physical, resolved against the container's
+/// `direction` and main axis when the Taffy style is built (#1995).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub enum JustifyContentValue {
+    Start,
+    End,
     FlexStart,
     FlexEnd,
+    Left,
+    Right,
     Center,
+    Stretch,
     SpaceBetween,
     SpaceAround,
     SpaceEvenly,
 }
 
 impl JustifyContentValue {
-    /// Convert to Taffy JustifyContent.
-    pub fn to_taffy(&self) -> taffy::JustifyContent {
+    /// Convert to Taffy `JustifyContent`. `rtl` is the container's
+    /// `direction`; `horizontal` says its justify axis is the inline axis (a
+    /// grid, a row flex container). `left` / `right` on a vertical axis are
+    /// `start` (css-align-3 §4.2).
+    pub fn to_taffy(&self, rtl: bool, horizontal: bool) -> taffy::JustifyContent {
+        use taffy::JustifyContent as J;
+        let physical = |left: bool| {
+            if horizontal && (left == rtl) {
+                J::END
+            } else {
+                J::START
+            }
+        };
         match self {
-            Self::FlexStart => taffy::JustifyContent::FLEX_START,
-            Self::FlexEnd => taffy::JustifyContent::FLEX_END,
-            Self::Center => taffy::JustifyContent::CENTER,
-            Self::SpaceBetween => taffy::JustifyContent::SPACE_BETWEEN,
-            Self::SpaceAround => taffy::JustifyContent::SPACE_AROUND,
-            Self::SpaceEvenly => taffy::JustifyContent::SPACE_EVENLY,
+            Self::Start => J::START,
+            Self::End => J::END,
+            Self::FlexStart => J::FLEX_START,
+            Self::FlexEnd => J::FLEX_END,
+            Self::Left => physical(true),
+            Self::Right => physical(false),
+            Self::Center => J::CENTER,
+            Self::Stretch => J::STRETCH,
+            Self::SpaceBetween => J::SPACE_BETWEEN,
+            Self::SpaceAround => J::SPACE_AROUND,
+            Self::SpaceEvenly => J::SPACE_EVENLY,
         }
     }
 }
@@ -607,13 +814,12 @@ impl ScrollbarWidthValue {
 ///
 /// # Why this is not `scrollbar-color`
 ///
-/// The real property is **gecko-only in Stylo** (`engines="gecko"` on the
-/// longhand in `properties/longhands/inherited_ui.mako.rs`), and that is a
-/// codegen-time filter, not a `#[cfg]`: the servo build rinch uses emits no
-/// `LonghandId` for it, no parser entry and no field on any style struct, so
-/// `scrollbar-color: red blue` in a stylesheet is an unknown declaration and
-/// Stylo drops it. Grepping this repo's own generated `properties.rs` for
-/// `scrollbar_color` finds nothing.
+/// With stylo 0.11 the real property was **gecko-only** (`engines="gecko"`,
+/// a codegen-time filter): the servo build emitted no `LonghandId`, parser
+/// entry or style-struct field for it, so `scrollbar-color: red blue` was an
+/// unknown declaration and was dropped. Since stylo 0.21 the servo build
+/// parses it (behind `layout.unimplemented`, which rinch turns on), but
+/// nothing in rinch reads it.
 ///
 /// So the value arrives through a **custom property**, `--rinch-scrollbar-color`,
 /// which the servo build does support fully: it cascades, it inherits, and it
@@ -685,6 +891,29 @@ pub enum TextOverflowValue {
     Ellipsis,
 }
 
+/// `tab-size` (css-text-3 §4.2, #1584). Inherited; the initial value is
+/// `8`. Stylo 0.11 parsed it for Gecko only; since stylo 0.21 the servo build
+/// parses and cascades it too.
+///
+/// What Chrome 155 does with it (`tests/tab_stop_1122_tests.rs`): each tab
+/// takes the `tab-size` of the element its text is in, while a number counts
+/// spaces of the **block container's** font, its `letter-spacing` and
+/// `word-spacing` included; a length is the interval itself, spacing not
+/// added. `0` lays a tab out zero wide.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub enum TabSizeValue {
+    /// A `<number>`: that many spaces.
+    Spaces(f32),
+    /// A `<length>`, in CSS px.
+    Length(f32),
+}
+
+impl Default for TabSizeValue {
+    fn default() -> Self {
+        Self::Spaces(8.0)
+    }
+}
+
 /// CSS font-style property values.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub enum FontStyleValue {
@@ -728,12 +957,18 @@ impl LineHeightValue {
 }
 
 /// CSS text-align property values.
+///
+/// `left` and `right` are their own values, not `start` and `end`: they are
+/// the same only in a left-to-right paragraph, and rinch hands parley a
+/// `direction: rtl` block's direction (parley 0.12's base direction).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub enum TextAlignValue {
     #[default]
     Start,
     Center,
     End,
+    Left,
+    Right,
     Justify,
 }
 
@@ -744,9 +979,40 @@ impl TextAlignValue {
             Self::Start => parley::layout::Alignment::Start,
             Self::Center => parley::layout::Alignment::Center,
             Self::End => parley::layout::Alignment::End,
+            Self::Left => parley::layout::Alignment::Left,
+            Self::Right => parley::layout::Alignment::Right,
             Self::Justify => parley::layout::Alignment::Justify,
         }
     }
+}
+
+/// CSS `vertical-align` property (#724). Non-inherited; the initial value is
+/// `baseline`.
+///
+/// Only [`Baseline`](Self::Baseline), [`Sub`](Self::Sub), [`Super`](Self::Super)
+/// and [`LengthPercentage`](Self::LengthPercentage) have a layout consumer
+/// today — see `ifc::vertical_align_shift_px` and its module doc.
+/// `Top`/`TextTop`/`Middle`/`Bottom`/`TextBottom` parse and round-trip through
+/// `get_computed_styles` so an author's declaration is reported faithfully,
+/// but lay out on a text span identically to `Baseline` (no shift) — #1357.
+/// An atomic inline honours all of them (`ifc::atomic_vertical_align`), and
+/// a table cell's is its own alignment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub enum VerticalAlignValue {
+    #[default]
+    Baseline,
+    Sub,
+    Super,
+    Top,
+    TextTop,
+    Middle,
+    Bottom,
+    TextBottom,
+    /// `<length>` or `<percentage>`. A percentage resolves against the
+    /// element's own `line-height` (CSS 2.1 §10.8.1, measured in Chrome 153);
+    /// a length is absolute. Positive raises the box, matching
+    /// [`LengthPercentageValue::resolve`]'s sign.
+    LengthPercentage(LengthPercentageValue),
 }
 
 /// CSS `text-decoration-style` — how the decoration line is drawn.
@@ -841,6 +1107,55 @@ pub enum WhiteSpaceValue {
     Pre,
     PreWrap,
     PreLine,
+    /// `break-spaces`: preserved like `pre-wrap`, but its spaces and tabs
+    /// never hang — one that does not fit starts the next line — and there is
+    /// a break opportunity after each of them (#1043).
+    BreakSpaces,
+}
+
+/// CSS `text-indent` (#2628): the indent of a block container's first
+/// formatted line, inherited. With `each_line` every line after a forced
+/// break is indented too; with `hanging` the lines that would not be are
+/// indented instead. The length is the unclamped affine `px + pct * basis`
+/// ([`LengthPercentageValue`]), its basis the block's own content width.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct TextIndentValue {
+    pub length: LengthPercentageValue,
+    pub hanging: bool,
+    pub each_line: bool,
+}
+
+impl TextIndentValue {
+    /// The indent in px, a percentage of `basis`.
+    pub fn resolve(&self, basis: f32) -> f32 {
+        self.length.resolve(basis)
+    }
+
+    /// Whether it indents nothing, whatever the basis.
+    pub fn is_zero(&self) -> bool {
+        match self.length {
+            LengthPercentageValue::Zero => true,
+            LengthPercentageValue::Length(v) | LengthPercentageValue::Percent(v) => v == 0.0,
+            LengthPercentageValue::Calc { px, pct } => px == 0.0 && pct == 0.0,
+        }
+    }
+
+    /// Whether a percentage is in it.
+    pub fn has_percentage(&self) -> bool {
+        match self.length {
+            LengthPercentageValue::Percent(v) => v != 0.0,
+            LengthPercentageValue::Calc { pct, .. } => pct != 0.0,
+            _ => false,
+        }
+    }
+
+    /// parley's options for it.
+    pub fn options(&self) -> parley::IndentOptions {
+        parley::IndentOptions {
+            each_line: self.each_line,
+            hanging: self.hanging,
+        }
+    }
 }
 
 /// CSS overflow-wrap (word-wrap) property values.
@@ -850,6 +1165,53 @@ pub enum OverflowWrapValue {
     Normal,
     BreakWord,
     Anywhere,
+}
+
+/// CSS `word-break` (#2388). Stylo's servo build has no `break-word`
+/// (Gecko-only compat value).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
+pub enum WordBreakValue {
+    #[default]
+    Normal,
+    BreakAll,
+    KeepAll,
+}
+
+impl WordBreakValue {
+    /// Convert to parley's `WordBreak`.
+    pub fn to_parley(self) -> parley::style::WordBreak {
+        match self {
+            Self::Normal => parley::style::WordBreak::Normal,
+            Self::BreakAll => parley::style::WordBreak::BreakAll,
+            Self::KeepAll => parley::style::WordBreak::KeepAll,
+        }
+    }
+}
+
+/// CSS `line-break` (#2388).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
+pub enum LineBreakValue {
+    #[default]
+    Auto,
+    Loose,
+    Normal,
+    Strict,
+    Anywhere,
+}
+
+impl LineBreakValue {
+    /// Convert to parley's `LineBreak`. `auto` is parley's default,
+    /// `strict`: the strictness rinch laid every text out with before it
+    /// read the property. For ASCII, Chrome's pair table decides under every
+    /// value but `anywhere` (`ifc::CHROME_LINE_BREAKS`).
+    pub fn to_parley(self) -> parley::style::LineBreak {
+        match self {
+            Self::Auto | Self::Strict => parley::style::LineBreak::Strict,
+            Self::Loose => parley::style::LineBreak::Loose,
+            Self::Normal => parley::style::LineBreak::Normal,
+            Self::Anywhere => parley::style::LineBreak::Anywhere,
+        }
+    }
 }
 
 impl OverflowWrapValue {
@@ -873,6 +1235,18 @@ pub enum BorderStyleValue {
     Dotted,
     Double,
     Hidden,
+    /// Top/left darkened, bottom/right lightened — a "pressed in" bevel.
+    Inset,
+    /// The reverse of `Inset` — top/left lightened, bottom/right darkened —
+    /// a "pushed out" bevel.
+    Outset,
+    /// Each edge split into two halves along its thickness: the half nearer
+    /// the box's outer edge takes `Inset`'s shading, the half nearer the
+    /// content takes `Outset`'s — a bevel that looks carved into the page.
+    Groove,
+    /// The reverse split of `Groove` — a bevel that looks raised off the
+    /// page.
+    Ridge,
 }
 
 /// CSS visibility property values.
@@ -925,14 +1299,136 @@ pub enum PointerEventsValue {
     None,
 }
 
+/// One function of a `filter` or `backdrop-filter` list (#2719), in CSS px
+/// and plain numbers, as Stylo computed it. The list is applied in order,
+/// each function to the output of the one before.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub enum FilterOp {
+    /// `blur(<length>)`: a Gaussian of this standard deviation.
+    Blur(f32),
+    /// `brightness(<number>)`.
+    Brightness(f32),
+    /// `contrast(<number>)`.
+    Contrast(f32),
+    /// `grayscale(<number>)`, clamped to 0..=1 by Stylo.
+    Grayscale(f32),
+    /// `hue-rotate(<angle>)`, in degrees.
+    HueRotate(f32),
+    /// `invert(<number>)`, 0..=1.
+    Invert(f32),
+    /// `opacity(<number>)`, 0..=1.
+    Opacity(f32),
+    /// `saturate(<number>)`.
+    Saturate(f32),
+    /// `sepia(<number>)`, 0..=1.
+    Sepia(f32),
+    /// `drop-shadow(<color> <dx> <dy> <std-deviation>)`. The third length is
+    /// the blur's **standard deviation** (Chrome 157 measures it so; a
+    /// `text-shadow`'s blur radius is twice its deviation).
+    DropShadow {
+        offset_x: f32,
+        offset_y: f32,
+        std_dev: f32,
+        #[serde(serialize_with = "color_serde::serialize")]
+        color: Option<peniko::Color>,
+    },
+}
+
+impl FilterOp {
+    /// Whether this function changes no pixel: `blur(0)`, `brightness(1)`,
+    /// `contrast(1)`, `saturate(1)`, `opacity(1)`, a zero `grayscale`,
+    /// `sepia`, `invert` or `hue-rotate`. A `drop-shadow()` always draws.
+    pub fn is_identity(&self) -> bool {
+        match *self {
+            FilterOp::Blur(s) => s <= 0.0,
+            FilterOp::Brightness(v)
+            | FilterOp::Contrast(v)
+            | FilterOp::Opacity(v)
+            | FilterOp::Saturate(v) => v == 1.0,
+            FilterOp::Grayscale(v) | FilterOp::Sepia(v) | FilterOp::Invert(v) => v == 0.0,
+            FilterOp::HueRotate(d) => d.rem_euclid(360.0) == 0.0,
+            FilterOp::DropShadow { .. } => false,
+        }
+    }
+
+    /// Whether this function spreads ink past the pixels it is given, so
+    /// the list has to be drawn into an offscreen raster
+    /// (`paint::filter`): a `blur()` with a deviation or any
+    /// `drop-shadow()`.
+    pub fn moves_pixels(&self) -> bool {
+        match *self {
+            FilterOp::Blur(s) => s > 0.0,
+            FilterOp::DropShadow { .. } => true,
+            _ => false,
+        }
+    }
+}
+
 /// A single text-shadow value.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TextShadowValue {
     pub offset_x: f32,
     pub offset_y: f32,
     pub blur_radius: f32,
     #[serde(serialize_with = "color_serde::serialize")]
     pub color: Option<peniko::Color>,
+}
+
+/// How an element's text is filled and outlined beyond its `color` (#2719):
+/// `-webkit-text-fill-color`, `-webkit-text-stroke-width`,
+/// `-webkit-text-stroke-color` and `paint-order`, all inherited. Stylo's
+/// servo build parses none of them; they reach the cascade as custom
+/// properties (`crate::webkit_box::rewrite`) and are read back by
+/// `ComputedStyle::from_stylo`. [`TextPaintValue::PLAIN`] (the default) is
+/// text painted in its `color` alone.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct TextPaintValue {
+    /// `-webkit-text-fill-color` where it is not `currentcolor`: what the
+    /// glyphs are filled with instead of `color` (decorations keep `color`).
+    #[serde(serialize_with = "color_serde::serialize")]
+    pub fill: Option<peniko::Color>,
+    /// `-webkit-text-stroke-width` in CSS px; `0` draws no stroke.
+    pub stroke_width: f32,
+    /// `-webkit-text-stroke-color`, `currentcolor` resolved against this
+    /// element's `color`.
+    #[serde(serialize_with = "color_serde::serialize")]
+    pub stroke_color: Option<peniko::Color>,
+    /// `-webkit-text-stroke-color` is `currentcolor` (#2870): a child that
+    /// inherits it through a declaration invalid at computed-value time
+    /// resolves it against its own `color`, not this element's.
+    pub stroke_currentcolor: bool,
+    /// `paint-order` puts `stroke` before `fill` (`stroke`, `stroke fill`,
+    /// `markers stroke`, …): the outline is drawn under the glyphs.
+    pub stroke_first: bool,
+}
+
+impl TextPaintValue {
+    /// Text drawn in its `color` alone.
+    pub const PLAIN: Self = Self {
+        fill: None,
+        stroke_width: 0.0,
+        stroke_color: None,
+        stroke_currentcolor: false,
+        stroke_first: false,
+    };
+
+    /// Whether the glyphs are drawn just as `color` draws them.
+    #[inline]
+    pub fn is_plain(&self) -> bool {
+        self.fill.is_none() && !self.strokes()
+    }
+
+    /// Whether an outline is drawn.
+    #[inline]
+    pub fn strokes(&self) -> bool {
+        self.stroke_width > 0.0 && self.stroke_color.is_some_and(|c| c.components[3] > 0.0)
+    }
+}
+
+impl Default for TextPaintValue {
+    fn default() -> Self {
+        Self::PLAIN
+    }
 }
 
 /// A single box-shadow value.
@@ -968,13 +1464,37 @@ pub struct TransformValue {
     /// Pre-computed 2D affine matrix [a, b, c, d, e, f], with the percentage
     /// part of every `translate` excluded (see the type doc).
     pub matrix: [f64; 6],
-    /// Whether this is the identity transform (no-op).
+    /// Whether this is the identity transform (no-op): what paint and hit
+    /// testing ask, through [`crate::Node::has_applied_transform`], to skip a
+    /// transform that moves nothing. `true` for `none`, and also for a list
+    /// that composes to the identity (`translateX(0)`, `rotate(0deg)`).
     pub is_identity: bool,
+    /// Whether the computed value is `none` — an empty function list. This,
+    /// not [`Self::is_identity`], decides a transform's side effects
+    /// (#415): CSS makes any transform other than `none` a stacking context
+    /// and the containing block of its absolute descendants, whatever matrix
+    /// it composes to ([`crate::Node::has_transform`]). `!is_identity`
+    /// implies `!is_none`.
+    pub is_none: bool,
     /// The `(e, f)` contribution per unit of the element's **width**, summed
     /// over every percentage `translateX` in the list, each in its own frame.
     pub pct_translate_w: [f64; 2],
     /// The same per unit of the element's **height**, for `translateY`.
     pub pct_translate_h: [f64; 2],
+    /// The function list the fields above were composed from, which is what a
+    /// transition or animation interpolates (#414). Empty for `none`.
+    ///
+    /// Everything else — paint, hit testing, layout — reads the composed form
+    /// and must go on doing so; this is kept only because CSS interpolates
+    /// `rotate(0deg)` → `rotate(90deg)` as `rotate(45deg)`, which the composed
+    /// matrices cannot express.
+    #[serde(skip)]
+    pub functions: Vec<crate::transition::TransformOp>,
+    /// Whether the transform — about the element's `transform-origin`, z
+    /// included — turns the element's back to the viewer
+    /// ([`compose_about_origin_z`](crate::transition::compose_about_origin_z)).
+    /// Only `backface-visibility: hidden` reads it (#997).
+    pub back_facing: bool,
 }
 
 impl Default for TransformValue {
@@ -982,8 +1502,11 @@ impl Default for TransformValue {
         Self {
             matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             is_identity: true,
+            is_none: true,
             pct_translate_w: [0.0, 0.0],
             pct_translate_h: [0.0, 0.0],
+            functions: Vec::new(),
+            back_facing: false,
         }
     }
 }
@@ -1009,6 +1532,167 @@ impl ObjectFitValue {
             Self::ScaleDown => "scale-down",
         }
     }
+}
+
+/// CSS `image-rendering` (css-images-3 §5.3, #2098): how an image drawn at
+/// another size than its own is sampled. Inherited. Stylo's servo build
+/// parses `auto`, `crisp-edges` (and `-moz-crisp-edges`) and `pixelated`;
+/// `smooth` and the legacy `optimizeSpeed`/`optimizeQuality` are gecko-only
+/// there, so such a declaration is dropped and the inherited value stays.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub enum ImageRenderingValue {
+    /// The backend's own filter (bilinear on the GPU; see
+    /// [`ImageSampling::Auto`](crate::paint::painter::ImageSampling::Auto)).
+    #[default]
+    Auto,
+    /// Nearest-neighbour, up and down: Chrome 156 draws both keywords so.
+    CrispEdges,
+    /// Nearest-neighbour, up and down (Chrome 156; the spec lets a
+    /// downscale stay smooth, Chrome does not).
+    Pixelated,
+}
+
+impl ImageRenderingValue {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::CrispEdges => "crisp-edges",
+            Self::Pixelated => "pixelated",
+        }
+    }
+
+    /// Whether the value asks for nearest-neighbour sampling.
+    pub fn is_nearest(self) -> bool {
+        !matches!(self, Self::Auto)
+    }
+}
+
+/// A `<blend-mode>` (compositing-1 §9.2): one entry of
+/// `background-blend-mode` (#2221). `Normal` is source-over; every other
+/// keyword is a [`MixMode`](crate::paint::painter::MixMode) the painters
+/// blend with ([`Self::mix`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub enum BlendModeValue {
+    #[default]
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    HardLight,
+    SoftLight,
+    Difference,
+    Exclusion,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
+}
+
+impl BlendModeValue {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Multiply => "multiply",
+            Self::Screen => "screen",
+            Self::Overlay => "overlay",
+            Self::Darken => "darken",
+            Self::Lighten => "lighten",
+            Self::ColorDodge => "color-dodge",
+            Self::ColorBurn => "color-burn",
+            Self::HardLight => "hard-light",
+            Self::SoftLight => "soft-light",
+            Self::Difference => "difference",
+            Self::Exclusion => "exclusion",
+            Self::Hue => "hue",
+            Self::Saturation => "saturation",
+            Self::Color => "color",
+            Self::Luminosity => "luminosity",
+        }
+    }
+
+    /// The mode the painters blend with, `None` for `normal`.
+    pub fn mix(self) -> Option<crate::paint::painter::MixMode> {
+        use crate::paint::painter::MixMode as X;
+        Some(match self {
+            Self::Normal => return None,
+            Self::Multiply => X::Multiply,
+            Self::Screen => X::Screen,
+            Self::Overlay => X::Overlay,
+            Self::Darken => X::Darken,
+            Self::Lighten => X::Lighten,
+            Self::ColorDodge => X::ColorDodge,
+            Self::ColorBurn => X::ColorBurn,
+            Self::HardLight => X::HardLight,
+            Self::SoftLight => X::SoftLight,
+            Self::Difference => X::Difference,
+            Self::Exclusion => X::Exclusion,
+            Self::Hue => X::Hue,
+            Self::Saturation => X::Saturation,
+            Self::Color => X::Color,
+            Self::Luminosity => X::Luminosity,
+        })
+    }
+}
+
+/// CSS `aspect-ratio` (css-sizing-4 §2, #1286): `auto`, `<ratio>`, or
+/// `auto <ratio>`. `ratio` is width / height, `None` for `auto` alone and for
+/// a degenerate ratio (`0 / 1`, `1 / 0`), which behaves as `auto`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct AspectRatioValue {
+    /// The `auto` keyword: a box with a natural aspect ratio uses that one.
+    pub auto: bool,
+    /// The preferred ratio, width / height.
+    pub ratio: Option<f32>,
+}
+
+impl Default for AspectRatioValue {
+    fn default() -> Self {
+        Self {
+            auto: true,
+            ratio: None,
+        }
+    }
+}
+
+impl AspectRatioValue {
+    /// The ratio a box with natural ratio `natural` (a replaced element's;
+    /// `None` for everything else) is laid out with: a `<ratio>` without
+    /// `auto` replaces the natural one, `auto <ratio>` is used only when there
+    /// is no natural one.
+    pub fn used(&self, natural: Option<f32>) -> Option<f32> {
+        self.used_ratio(natural).map(|r| r.value)
+    }
+
+    /// [`Self::used`], saying which box it relates: a `<ratio>` without
+    /// `auto` the `box-sizing` box, a natural ratio and `auto <ratio>`'s the
+    /// content box (css-sizing-4 §2; Chrome 155).
+    pub fn used_ratio(&self, natural: Option<f32>) -> Option<UsedRatio> {
+        match (self.auto, self.ratio, natural) {
+            (false, Some(value), _) => Some(UsedRatio {
+                value,
+                box_sizing_box: true,
+            }),
+            (_, r, n) => n.or(r).map(|value| UsedRatio {
+                value,
+                box_sizing_box: false,
+            }),
+        }
+    }
+}
+
+/// The aspect ratio a replaced element is laid out with
+/// ([`AspectRatioValue::used_ratio`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UsedRatio {
+    /// Width / height.
+    pub value: f32,
+    /// A `<ratio>` declared without `auto`, which relates the sizes of the
+    /// `box-sizing` box; otherwise the content box's.
+    pub box_sizing_box: bool,
 }
 
 /// CSS `user-select` property values.
@@ -1047,12 +1731,42 @@ pub enum BackgroundValue {
     #[default]
     None,
     Color(#[serde(serialize_with = "color_serde::serialize_direct")] peniko::Color),
+    /// `#[non_exhaustive]` (#1798): a gradient feature not read yet
+    /// (interpolation hints, a colour space) can add a field without
+    /// breaking a match.
+    #[non_exhaustive]
     LinearGradient {
         angle_degrees: f32,
         stops: Vec<GradientStop>,
+        /// `repeating-linear-gradient()` (#1798).
+        repeating: bool,
     },
+    #[non_exhaustive]
     RadialGradient {
         stops: Vec<GradientStop>,
+        /// The ending shape and its size (#1798).
+        shape: RadialShape,
+        /// The centre, against the box's width and height (#1798).
+        position_x: LengthPercentageValue,
+        position_y: LengthPercentageValue,
+        /// `repeating-radial-gradient()` (#1798).
+        repeating: bool,
+    },
+    /// `conic-gradient()` / `repeating-conic-gradient()` (#2719): colours
+    /// swept clockwise about a centre, starting from the `from` angle.
+    #[non_exhaustive]
+    ConicGradient {
+        /// The `from <angle>`, clockwise from straight up, in degrees.
+        from_degrees: f32,
+        /// The stops. A stop's angle is carried as a share of a full turn
+        /// (`LengthPercentageValue::Percent`, so `90deg` and `25%` are both
+        /// `Percent(0.25)`); a conic stop never has a length.
+        stops: Vec<GradientStop>,
+        /// The centre (`at <position>`), against the box's width and height.
+        position_x: LengthPercentageValue,
+        position_y: LengthPercentageValue,
+        /// `repeating-conic-gradient()`.
+        repeating: bool,
     },
     /// A background image loaded from a URL or file path.
     Image {
@@ -1060,10 +1774,110 @@ pub enum BackgroundValue {
     },
 }
 
-/// A gradient color stop.
+/// `background-size` of the first background layer (#468).
+///
+/// `Explicit` carries `auto` per axis as `LengthPercentageAutoValue::Auto`,
+/// so the initial value `auto auto` is `Explicit { Auto, Auto }`.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub enum BackgroundSizeValue {
+    Explicit {
+        width: LengthPercentageAutoValue,
+        height: LengthPercentageAutoValue,
+    },
+    Cover,
+    Contain,
+}
+
+impl Default for BackgroundSizeValue {
+    fn default() -> Self {
+        Self::Explicit {
+            width: LengthPercentageAutoValue::Auto,
+            height: LengthPercentageAutoValue::Auto,
+        }
+    }
+}
+
+/// One axis of `background-repeat` (#468). `space` and `round` are carried
+/// but painted as `repeat` — see `paint::background`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub enum BackgroundRepeatValue {
+    #[default]
+    Repeat,
+    Space,
+    Round,
+    NoRepeat,
+}
+
+/// `background-origin`: the box the image is positioned and sized in (#468).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub enum BackgroundOriginValue {
+    BorderBox,
+    #[default]
+    PaddingBox,
+    ContentBox,
+}
+
+/// How one background layer is sized, positioned and tiled: the per-layer
+/// entries of `background-size`, `-position`, `-repeat` and `-origin` (#468,
+/// #1142).
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct BackgroundLayerGeometry {
+    pub size: BackgroundSizeValue,
+    pub position_x: LengthPercentageValue,
+    pub position_y: LengthPercentageValue,
+    pub repeat_x: BackgroundRepeatValue,
+    pub repeat_y: BackgroundRepeatValue,
+    pub origin: BackgroundOriginValue,
+}
+
+/// A `background-image` layer below the first (#1142): its image and the
+/// entries of the other background lists at its index, each list repeated
+/// to the number of images (css-backgrounds-3 §2.2).
 #[derive(Debug, Clone, Serialize)]
+pub struct BackgroundLayer {
+    /// `LinearGradient`, `RadialGradient`, `ConicGradient` or `Image`, never `None` or
+    /// `Color`: a layer with nothing rinch can paint is not kept.
+    pub image: BackgroundValue,
+    pub geometry: BackgroundLayerGeometry,
+    /// Its `background-blend-mode` entry (#2221): how it blends with the
+    /// layers and the colour under it. Always `Normal` for a `mask-image`
+    /// layer.
+    pub blend: BlendModeValue,
+}
+
+/// A gradient color stop. `#[non_exhaustive]`, as the gradient variants
+/// are (#1798).
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct GradientStop {
-    pub offset: f32,
+    /// Where the stop is along the gradient line (a percentage of its
+    /// length, a length, or both). `None` for a stop written without a
+    /// position, which paint places between its neighbours
+    /// (css-images-3 §3.5.3). Resolved against the line's length at paint
+    /// (#1798: a length used to be read as a hundredth of the line, so
+    /// `31px` was `31%`).
+    pub position: Option<LengthPercentageValue>,
     #[serde(serialize_with = "color_serde::serialize")]
     pub color: Option<peniko::Color>,
+}
+
+/// A radial gradient's ending shape (#1798).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub enum RadialShape {
+    /// `circle <length>`.
+    Circle(f32),
+    /// An ellipse with explicit radii, each against the box's width and
+    /// height.
+    Ellipse(LengthPercentageValue, LengthPercentageValue),
+    /// A circle or ellipse sized to an extent keyword.
+    Extent { circle: bool, extent: RadialExtent },
+}
+
+/// A radial gradient's size keyword (#1798).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum RadialExtent {
+    ClosestSide,
+    FarthestSide,
+    ClosestCorner,
+    FarthestCorner,
 }

@@ -29,6 +29,7 @@ pub mod decoration;
 pub mod error;
 pub mod input_rules;
 pub mod keymap;
+pub mod links;
 pub mod model;
 pub mod motion;
 pub mod plugin;
@@ -48,21 +49,23 @@ pub use decoration::{Decoration, DecorationSet, Widget};
 pub use error::EditorError;
 pub use input_rules::{InputRule, apply_input_rules};
 pub use keymap::{Key, KeyBinding, Keymap, Modifiers};
+pub use links::{LinkSpan, link_at};
 pub use model::{AttrValue, Attrs, Fragment, Mark, MarkType, Node, NodeType, Slice};
 pub use motion::{CursorMotion, block_range_at, resolve_cursor_motion, word_range_at};
-pub use plugin::{Plugin, PluginKey};
+pub use plugin::{PasteContent, Plugin, PluginKey};
 pub use plugins::{HistoryPlugin, MarkdownInputRulesPlugin, PlaceholderPlugin};
 pub use pos::{Pos, ResolvedPos};
 pub use schema::{
-    AttrSpec, MarkSet, MarkSpec, MarkSpecBuilder, NodeSpec, NodeSpecBuilder, Schema, SchemaBuilder,
+    AttrSpec, IMAGE_MAX_WIDTH, MarkSet, MarkSpec, MarkSpecBuilder, NodeSpec, NodeSpecBuilder,
+    Schema, SchemaBuilder, app_data_attrs, is_app_data_attr,
 };
 pub use selection::{CellSelection, NodeSelection, Selection, TextSelection};
 pub use state::{EditorState, Transaction};
 pub use tables::{Axis, Rect, TableMap};
 pub use transform::{
-    AddMarkStep, MapResult, Mapping, NodeRange, RemoveMarkStep, ReplaceAroundStep, ReplaceStep,
-    SetDocAttrStep, SetNodeAttrStep, Step, StepError, StepMap, Transform, block_range,
-    block_range_simple,
+    AddMarkStep, BatchEdit, BatchStep, MapResult, Mapping, NodeRange, RemoveMarkStep,
+    ReplaceAroundStep, ReplaceStep, SetDocAttrStep, SetNodeAttrStep, Step, StepError, StepMap,
+    Transform, block_range, block_range_simple,
 };
 pub use view::{EditorView, ViewRequest};
 

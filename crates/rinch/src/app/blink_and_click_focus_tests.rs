@@ -17,7 +17,7 @@ use super::*;
 
 // ── item 2: the blink gate ──────────────────────────────────────────────────
 
-#[cfg(feature = "desktop")]
+#[cfg(feature = "windowing")]
 mod blink {
     use super::*;
 
@@ -98,9 +98,8 @@ mod blink {
 
 /// A focusable outer node with a focusable *inner* node inside it, plus a
 /// plain child of the outer. Returns (app, outer, inner, plain_child).
-fn nested_fixture() -> (RinchApp, usize, usize, usize) {
-    let ids: Rc<std::cell::Cell<Option<(usize, usize, usize)>>> =
-        Rc::new(std::cell::Cell::new(None));
+fn nested_fixture() -> (RinchApp, u64, u64, u64) {
+    let ids: Rc<std::cell::Cell<Option<(u64, u64, u64)>>> = Rc::new(std::cell::Cell::new(None));
     let ids_in = ids.clone();
     let mut app = RinchApp::new(move |scope: &mut RenderScope| {
         let root = scope.create_element("div");
@@ -128,13 +127,13 @@ fn nested_fixture() -> (RinchApp, usize, usize, usize) {
     (app, outer, inner, plain)
 }
 
-fn abs_center(app: &RinchApp, id: usize) -> (f32, f32) {
+fn abs_center(app: &RinchApp, id: u64) -> (f32, f32) {
     let d = app.doc.as_ref().unwrap().borrow();
     let (ax, ay, w, h) = painted_element_box(&d.tree, id);
     (ax + w / 2.0, ay + h / 2.0)
 }
 
-fn press(app: &mut RinchApp, id: usize, button: MouseButton) {
+fn press(app: &mut RinchApp, id: u64, button: MouseButton) {
     let (x, y) = abs_center(app, id);
     app.handle_event(PlatformEvent::MouseDown { x, y, button }, (800, 600), 1.0);
     app.handle_event(PlatformEvent::MouseUp { x, y, button }, (800, 600), 1.0);
@@ -188,14 +187,13 @@ fn a_left_press_on_a_nested_focusable_moves_the_claim() {
     assert_eq!(app.focus_target, FocusTarget::Node(inner));
 }
 
-/// The divergence, and the only behaviour this half of the PR changes. A
-/// right/middle press never runs the mousedown claim, so the release check is
-/// live there — and under the old any-ancestor rule the *inner* press counted
-/// as "inside the outer node", leaving the outer node holding the keyboard.
-/// It now resolves to the inner node, which is not the claim holder, so the
-/// claim is released.
+/// A right/middle press used to run no mousedown claim, so the release check
+/// was the only thing it did: the inner press resolved to the inner node, which
+/// was not the claim holder, and the outer node lost the keyboard to nobody
+/// (issue #452). It now runs the same claim a left press does — as a browser's
+/// mousedown focuses whatever the button — so the inner node takes it.
 #[test]
-fn a_right_press_on_a_nested_focusable_releases_the_outer_claim() {
+fn a_right_press_on_a_nested_focusable_moves_the_claim() {
     let (mut app, outer, inner, _plain) = nested_fixture();
 
     press(&mut app, outer, MouseButton::Left);
@@ -205,8 +203,8 @@ fn a_right_press_on_a_nested_focusable_releases_the_outer_claim() {
 
     assert_eq!(
         app.focus_target,
-        FocusTarget::None,
-        "the press did not resolve to the claim holder, so it lost the keyboard"
+        FocusTarget::Node(inner),
+        "the press resolved to the inner node, and the inner node took the keyboard"
     );
 }
 

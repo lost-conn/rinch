@@ -26,6 +26,22 @@ pub(super) fn display_from_stylo(display: &style::values::computed::Display) -> 
     if display.is_contents() {
         return DisplayValue::Contents;
     }
+    // `list-item` is an orthogonal bit on `Display` (#725), not a
+    // `DisplayInside` variant, and Stylo parses it combined with any
+    // outside/inside. Only the block-outside, flow-inside forms are
+    // `ListItem`; `inline list-item` falls through to `Inline` (Chrome 153
+    // lays two of them on one line). Stylo's servo build rejects
+    // `flex list-item`, `grid list-item` and the `flow-root` forms, so they
+    // never reach this match.
+    if display.is_list_item()
+        && display.outside() == DisplayOutside::Block
+        && matches!(
+            display.inside(),
+            DisplayInside::Flow | DisplayInside::FlowRoot
+        )
+    {
+        return DisplayValue::ListItem;
+    }
 
     let outside = display.outside();
     let inside = display.inside();
@@ -39,7 +55,53 @@ pub(super) fn display_from_stylo(display: &style::values::computed::Display) -> 
         (DisplayOutside::Block, DisplayInside::Flex) => DisplayValue::Flex,
         (DisplayOutside::Block, DisplayInside::Grid) => DisplayValue::Grid,
         (DisplayOutside::Inline, DisplayInside::Grid) => DisplayValue::InlineGrid,
-        _ => DisplayValue::Flex, // Default to flex for unknown
+        // A cell and a caption hold flow content, so they are block containers
+        // (their children stack, their text is an IFC and takes
+        // `text-overflow`). See `table_layout` for the rest: a table is a grid,
+        // row groups and rows generate no box, and columns no box at all.
+        (DisplayOutside::InternalTable, DisplayInside::TableCell) => DisplayValue::Block,
+        (DisplayOutside::TableCaption, DisplayInside::Flow) => DisplayValue::Block,
+        (DisplayOutside::Inline, DisplayInside::Table) => DisplayValue::InlineGrid,
+        (_, DisplayInside::Table) => DisplayValue::Grid,
+        (
+            DisplayOutside::InternalTable,
+            DisplayInside::TableRowGroup
+            | DisplayInside::TableHeaderGroup
+            | DisplayInside::TableFooterGroup
+            | DisplayInside::TableRow,
+        ) => DisplayValue::Contents,
+        (DisplayOutside::InternalTable, _) => DisplayValue::None,
+        _ => DisplayValue::Flex,
+    }
+}
+
+/// Whether a computed `display` is block-level `flow-root` (#2351), which
+/// [`display_from_stylo`] maps to [`DisplayValue::Block`]: the flag that
+/// makes it a formatting-context root (`ComputedStyle::flow_root`).
+pub(super) fn flow_root_from_stylo(display: &style::values::computed::Display) -> bool {
+    use style::values::specified::box_::{DisplayInside, DisplayOutside};
+    !display.is_none()
+        && !display.is_contents()
+        && display.outside() == DisplayOutside::Block
+        && display.inside() == DisplayInside::FlowRoot
+}
+
+/// The [`TablePart`] a computed `display` names.
+pub(super) fn table_part_from_stylo(display: &style::values::computed::Display) -> TablePart {
+    use style::values::specified::box_::{DisplayInside, DisplayOutside};
+    if display.is_none() || display.is_contents() {
+        return TablePart::None;
+    }
+    match (display.outside(), display.inside()) {
+        (_, DisplayInside::Table) => TablePart::Table,
+        (DisplayOutside::InternalTable, DisplayInside::TableRowGroup) => TablePart::RowGroup,
+        (DisplayOutside::InternalTable, DisplayInside::TableHeaderGroup) => TablePart::HeaderGroup,
+        (DisplayOutside::InternalTable, DisplayInside::TableFooterGroup) => TablePart::FooterGroup,
+        (DisplayOutside::InternalTable, DisplayInside::TableRow) => TablePart::Row,
+        (DisplayOutside::InternalTable, DisplayInside::TableCell) => TablePart::Cell,
+        (DisplayOutside::InternalTable, _) => TablePart::Other,
+        (DisplayOutside::TableCaption, _) => TablePart::Caption,
+        _ => TablePart::None,
     }
 }
 
@@ -90,7 +152,7 @@ pub(crate) fn note_unsupported_size(prop: &'static str, value: &str) -> bool {
     eprintln!(
         "[rinch] `{prop}: {value}` is not implemented; it lays out as `auto`, which \
          matches a browser only where `auto` already gives the same used size \
-         (issue #626). Reported once per property and value per process."
+         (issues #626, #1275). Reported once per property and value per process."
     );
     true
 }
@@ -99,17 +161,22 @@ pub(crate) fn note_unsupported_size(prop: &'static str, value: &str) -> bool {
 /// [`flex_basis_from_stylo`].
 ///
 /// The four intrinsic keywords survive as [`DimensionValue::Intrinsic`] rather
-/// than collapsing into `Auto`. That does **not** make them lay out — they
-/// still reach Taffy as `auto` (see that variant) — it makes the declaration
-/// visible to a reader of the computed style, and it is what lets the
-/// diagnostic above fire exactly once instead of on every style resolution.
+/// than collapsing into `Auto`. On `width`/`height`/`flex-basis` they lay out
+/// (#691); on `min-width`/`min-height` they still reach Taffy as `auto` (see
+/// that variant, #1275), and the diagnostic above fires for those once
+/// instead of on every style resolution.
 pub(super) fn size_from_stylo(
     prop: &'static str,
     size: &style::values::computed::Size,
 ) -> DimensionValue {
     use style::values::computed::Size;
+    // `width`/`height`/`flex-basis` lay the keywords out (#691); `min-*`
+    // cannot — Taffy's `min_size` has no keyword (#1275) — so only that
+    // property is reported.
     let keyword = |k: IntrinsicSize| {
-        note_unsupported_size(prop, k.css_name());
+        if prop.starts_with("min-") {
+            note_unsupported_size(prop, k.css_name());
+        }
         DimensionValue::Intrinsic(k)
     };
     match size {
@@ -184,11 +251,17 @@ pub(super) fn flex_direction_from_stylo(
 pub(super) fn flex_wrap_from_stylo(
     wrap: &style::properties::longhands::flex_wrap::computed_value::T,
 ) -> FlexWrapValue {
+    // A bitflag set since stylo 0.21 (`nowrap | [wrap | wrap-reverse] ||
+    // balance`). `balance` (which `wrap balance` computes to) parses only
+    // under the `layout.flexbox.balance` pref, which rinch leaves off; it
+    // wraps, so it reads as `wrap` if ever turned on.
     use style::properties::longhands::flex_wrap::computed_value::T as FlexWr;
-    match *wrap {
-        FlexWr::Nowrap => FlexWrapValue::NoWrap,
-        FlexWr::Wrap => FlexWrapValue::Wrap,
-        FlexWr::WrapReverse => FlexWrapValue::WrapReverse,
+    if wrap.contains(FlexWr::WRAP_REVERSE) {
+        FlexWrapValue::WrapReverse
+    } else if wrap.intersects(FlexWr::WRAP | FlexWr::BALANCE) {
+        FlexWrapValue::Wrap
+    } else {
+        FlexWrapValue::NoWrap
     }
 }
 
@@ -200,81 +273,203 @@ pub(super) fn flex_basis_from_stylo(basis: &style::values::computed::FlexBasis) 
     }
 }
 
-pub(super) fn align_items_from_stylo(
-    align: &style::values::computed::ItemPlacement,
-) -> Option<AlignItemsValue> {
-    use style::values::specified::align::AlignFlags;
-    let flags = align.0.value();
-    if flags == AlignFlags::FLEX_START
-        || flags == AlignFlags::START
-        || flags == AlignFlags::SELF_START
-    {
-        Some(AlignItemsValue::FlexStart)
-    } else if flags == AlignFlags::FLEX_END
-        || flags == AlignFlags::END
-        || flags == AlignFlags::SELF_END
-    {
-        Some(AlignItemsValue::FlexEnd)
-    } else if flags == AlignFlags::CENTER {
-        Some(AlignItemsValue::Center)
-    } else if flags == AlignFlags::BASELINE {
-        Some(AlignItemsValue::Baseline)
-    } else if flags == AlignFlags::STRETCH || flags == AlignFlags::NORMAL {
-        Some(AlignItemsValue::Stretch) // Normal defaults to stretch for flex items
+/// The position keyword of an `align-items` / `align-self` value, its `safe`
+/// modifier kept (#1987). `normal` answers `normal`; `auto` (and anything
+/// rinch does not place, `last baseline` among them) answers `None`.
+fn align_from_flags(
+    flags: style::values::specified::align::AlignFlags,
+    normal: Option<AlignValue>,
+) -> Option<AlignValue> {
+    use style::values::specified::align::AlignFlags as F;
+    let safe = flags.contains(F::SAFE);
+    let at = |keyword| Some(AlignValue { keyword, safe });
+    let v = flags.value();
+    if v == F::START {
+        at(AlignKeyword::Start)
+    } else if v == F::END {
+        at(AlignKeyword::End)
+    } else if v == F::FLEX_START {
+        at(AlignKeyword::FlexStart)
+    } else if v == F::FLEX_END {
+        at(AlignKeyword::FlexEnd)
+    } else if v == F::SELF_START {
+        at(AlignKeyword::SelfStart)
+    } else if v == F::SELF_END {
+        at(AlignKeyword::SelfEnd)
+    } else if v == F::CENTER || v == F::ANCHOR_CENTER {
+        at(AlignKeyword::Center)
+    } else if v == F::BASELINE {
+        at(AlignKeyword::Baseline)
+    } else if v == F::STRETCH {
+        at(AlignKeyword::Stretch)
+    } else if v == F::NORMAL {
+        normal
     } else {
         None
     }
 }
 
+pub(super) fn align_items_from_stylo(
+    align: &style::values::computed::ItemPlacement,
+) -> Option<AlignValue> {
+    // `normal` is `None`, which Taffy lays out as `stretch` for a flex item
+    // and for a grid item, except a replaced grid item, which it lays out as
+    // `start` (`taffy::Style::normal_aligns_as_start`, #1280, #2700). It used
+    // to be `stretch` itself, which left Taffy no way to tell the two apart.
+    align_from_flags(align.0, None)
+}
+
 pub(super) fn align_self_from_stylo(
     align: &style::values::computed::SelfAlignment,
-) -> Option<AlignSelfValue> {
+) -> Option<AlignValue> {
+    // `auto` (and `normal`, which rinch has always read as `auto` here) is
+    // `None`: the parent's `align-items`.
+    align_from_flags(align.0, None)
+}
+
+/// `justify-items` (#1511). `legacy center` places items as `center` does:
+/// the `legacy` bit only matters for inheritance. A bare `legacy` (the
+/// initial value) computes to `normal` here — it should take the parent's
+/// `legacy <kw>`, but Stylo does that in a gecko-only style adjuster
+/// (#1987). `normal` is `None`, which Taffy's grid treats as `normal`.
+pub(super) fn justify_items_from_stylo(
+    justify: &style::values::computed::JustifyItems,
+) -> Option<JustifyValue> {
+    justify_from_flags(justify.computed.0.0, None)
+}
+
+/// `justify-self` (#1511): `auto` is `None` (the parent's `justify-items`);
+/// `normal` is `stretch`, which Taffy's grid places at the start for an item
+/// with a width of its own — not `None`, which would take the parent's
+/// `justify-items` (Chrome 156: `justify-self: normal` under
+/// `justify-items: center` starts a 40px item).
+pub(super) fn justify_self_from_stylo(
+    justify: &style::values::computed::SelfAlignment,
+) -> Option<JustifyValue> {
     use style::values::specified::align::AlignFlags;
-    let flags = align.0.value();
-    if flags == AlignFlags::AUTO {
-        None // Auto means inherit from align-items
-    } else if flags == AlignFlags::FLEX_START
-        || flags == AlignFlags::START
-        || flags == AlignFlags::SELF_START
-    {
-        Some(AlignSelfValue::FlexStart)
-    } else if flags == AlignFlags::FLEX_END
-        || flags == AlignFlags::END
-        || flags == AlignFlags::SELF_END
-    {
-        Some(AlignSelfValue::FlexEnd)
-    } else if flags == AlignFlags::CENTER {
-        Some(AlignSelfValue::Center)
-    } else if flags == AlignFlags::BASELINE {
-        Some(AlignSelfValue::Baseline)
-    } else if flags == AlignFlags::STRETCH {
-        Some(AlignSelfValue::Stretch)
+    if justify.0.value() == AlignFlags::AUTO {
+        return None;
+    }
+    justify_from_flags(
+        justify.0,
+        Some(JustifyValue {
+            keyword: JustifyKeyword::Stretch,
+            safe: false,
+        }),
+    )
+}
+
+/// The position keyword of a `justify-items` / `justify-self` value, its
+/// `safe` modifier kept (`unsafe` is the default). `normal` answers `normal`.
+fn justify_from_flags(
+    flags: style::values::specified::align::AlignFlags,
+    normal: Option<JustifyValue>,
+) -> Option<JustifyValue> {
+    use style::values::specified::align::AlignFlags as F;
+    let safe = flags.contains(F::SAFE);
+    let at = |keyword| Some(JustifyValue { keyword, safe });
+    let v = flags.value();
+    if v == F::START {
+        at(JustifyKeyword::Start)
+    } else if v == F::END {
+        at(JustifyKeyword::End)
+    } else if v == F::FLEX_START {
+        at(JustifyKeyword::FlexStart)
+    } else if v == F::FLEX_END {
+        at(JustifyKeyword::FlexEnd)
+    } else if v == F::SELF_START {
+        at(JustifyKeyword::SelfStart)
+    } else if v == F::SELF_END {
+        at(JustifyKeyword::SelfEnd)
+    } else if v == F::LEFT {
+        at(JustifyKeyword::Left)
+    } else if v == F::RIGHT {
+        at(JustifyKeyword::Right)
+    } else if v == F::CENTER || v == F::ANCHOR_CENTER {
+        // `anchor-center` with no anchor is `center` (css-anchor-position-1).
+        at(JustifyKeyword::Center)
+    } else if v == F::STRETCH {
+        at(JustifyKeyword::Stretch)
+    } else if v == F::BASELINE {
+        at(JustifyKeyword::Baseline)
+    } else if v == F::LAST_BASELINE {
+        at(JustifyKeyword::LastBaseline)
     } else {
-        None
+        // `normal`, and `auto` / bare `legacy`, which a computed
+        // `justify-items` does not hold.
+        normal
     }
 }
 
 pub(super) fn justify_content_from_stylo(
     justify: &style::values::computed::ContentDistribution,
 ) -> Option<JustifyContentValue> {
-    use style::values::specified::align::AlignFlags;
-    let flags = justify.primary();
-    let value = flags.value();
-    if value == AlignFlags::SPACE_BETWEEN {
+    use style::values::specified::align::AlignFlags as F;
+    let value = justify.primary().value();
+    if value == F::SPACE_BETWEEN {
         Some(JustifyContentValue::SpaceBetween)
-    } else if value == AlignFlags::SPACE_AROUND {
+    } else if value == F::SPACE_AROUND {
         Some(JustifyContentValue::SpaceAround)
-    } else if value == AlignFlags::SPACE_EVENLY {
+    } else if value == F::SPACE_EVENLY {
         Some(JustifyContentValue::SpaceEvenly)
-    } else if value == AlignFlags::FLEX_START || value == AlignFlags::START {
+    } else if value == F::START {
+        Some(JustifyContentValue::Start)
+    } else if value == F::END {
+        Some(JustifyContentValue::End)
+    } else if value == F::FLEX_START {
         Some(JustifyContentValue::FlexStart)
-    } else if value == AlignFlags::FLEX_END || value == AlignFlags::END {
+    } else if value == F::FLEX_END {
         Some(JustifyContentValue::FlexEnd)
-    } else if value == AlignFlags::CENTER {
+    } else if value == F::LEFT {
+        Some(JustifyContentValue::Left)
+    } else if value == F::RIGHT {
+        Some(JustifyContentValue::Right)
+    } else if value == F::CENTER {
         Some(JustifyContentValue::Center)
+    } else if value == F::STRETCH {
+        Some(JustifyContentValue::Stretch)
     } else {
         None
     }
+}
+
+/// Whether a property other than `transform` makes the element the containing
+/// block of its `position: fixed` descendants (`ComputedStyle::contains_fixed`,
+/// #1372).
+pub(super) fn contains_fixed_from_stylo(
+    box_style: &style::properties::style_structs::Box,
+    effects: &style::properties::style_structs::Effects,
+) -> bool {
+    use style::values::computed::Contain;
+    use style::values::specified::box_::WillChangeBits;
+    box_style
+        .clone_contain()
+        .intersects(Contain::PAINT | Contain::LAYOUT)
+        || contains_fixed_inline_from_stylo(box_style, effects)
+        || !matches!(
+            box_style.perspective,
+            style::values::generics::box_::Perspective::None
+        )
+        || box_style.will_change.bits.intersects(
+            WillChangeBits::TRANSFORM
+                | WillChangeBits::PERSPECTIVE
+                | WillChangeBits::FIXPOS_CB_NON_SVG,
+        )
+}
+
+/// The part of [`contains_fixed_from_stylo`] that applies to a non-atomic
+/// inline element too (`ComputedStyle::contains_fixed_inline`): the filters.
+pub(super) fn contains_fixed_inline_from_stylo(
+    box_style: &style::properties::style_structs::Box,
+    effects: &style::properties::style_structs::Effects,
+) -> bool {
+    use style::values::specified::box_::WillChangeBits;
+    !effects.filter.0.is_empty()
+        || !effects.backdrop_filter.0.is_empty()
+        || box_style
+            .will_change
+            .bits
+            .intersects(WillChangeBits::FIXPOS_CB_NON_SVG)
 }
 
 #[cfg(test)]

@@ -74,7 +74,42 @@ var(--rinch-color-text)        /* Primary text */
 var(--rinch-color-dimmed)      /* Secondary text */
 var(--rinch-color-border)      /* Borders */
 var(--rinch-color-placeholder) /* Input placeholders */
+var(--rinch-color-option-hover)    /* A hovered list item: neutral gray (gray-2 light, dark-5 dark) */
+var(--rinch-color-option-selected) /* The selected list item: primary tint (primary-0 light, primary at 15% dark) */
+var(--rinch-color-option-selected-hover) /* The selected item under the pointer (primary-1 light, primary at 25% dark) */
 ```
+
+`option-hover` and `option-selected` are what `Select` paints its hovered and
+selected options with, and `Tree` its hovered and selected rows (a hovered
+selected row is `option-selected-hover`); use them for any list with both states (a taskbar, a
+sidebar) and the two stay distinguishable in both schemes.
+
+```css
+var(--rinch-color-focus-ring) /* Keyboard focus ring of Checkbox, Radio, Switch (primary-2 light, primary at 50% dark) */
+var(--rinch-color-mark)       /* Mark and Highlight background (yellow-2 light, yellow-6 at 35% dark) */
+```
+
+### Variant Colors
+
+Mantine's `light` variant family, for every palette color (`--rinch-color-{name}-…`)
+and for the primary (`--rinch-primary-color-…`). The light scheme gets the palette's
+light shades; the dark scheme gets the color as a translucent tint over whatever
+surface it sits on, and lighter text on it (a `-0` shade there would be a near-white
+slab under light text).
+
+```css
+var(--rinch-color-blue-light)              /* Fill: blue-0 light, blue-6 at 15% dark */
+var(--rinch-color-blue-light-hover)        /* Hovered fill: blue-1 light, 20% dark */
+var(--rinch-color-blue-light-active)       /* Pressed fill: blue-2 light, 25% dark */
+var(--rinch-color-blue-light-color)        /* Accent text on the fill: blue-6 light, blue-4 dark */
+var(--rinch-color-blue-light-color-strong) /* Stronger accent (titles, code): blue-7 light, blue-3 dark */
+var(--rinch-color-blue-light-text)         /* Body text on the fill: blue-9 light, --rinch-color-text dark */
+var(--rinch-primary-color-light)           /* The same six for the primary; its dark tint is --rinch-primary-color */
+```
+
+The components' `light` variants paint these: Button and ActionIcon (`light` fills
+and the hover/active fills of `outline` and `subtle`), Badge, Alert, inline Code and
+the `light` Avatar. Use them for your own tinted surfaces and they follow the scheme.
 
 ### Spacing
 
@@ -150,6 +185,9 @@ own declaration beats:
 | `code`, `kbd`, `samp`, `pre` | `font-family: monospace` |
 | `small`, `sub`, `sup` | `font-size: smaller` |
 | `hr` | `color: gray`, a 1px `inset` border, `margin-block: 0.5em`, `margin-inline: auto`, `height: 0`, `overflow: hidden` |
+| `[dir=rtl]`, `[dir=ltr]` | that `direction`, and `unicode-bidi: isolate` (so do `bdi`, `output` and any `[dir]`) |
+| `[dir=auto]`, `bdi` without `dir` | `unicode-bidi: plaintext` — the content isolated in the direction of its first strong letter, as Chrome lays it out (whose computed value is `isolate` with a direction from the content) |
+| `bdo` | `unicode-bidi: isolate-override` — its letters in its `direction`'s order |
 
 Before this an `<hr>` rendered **nothing at all** — the UA sheet's own
 `* { border-width: 0 }` reset, which is there to undo Stylo's `medium` initial,
@@ -169,20 +207,147 @@ Four things about that set are worth knowing before they surprise you.
 - **Whitespace in `<pre>` is preserved now**, which means a `<pre>` whose source
   was indented in your `rsx!` will show that indentation. That is the element
   doing its job; `white-space: normal` on it opts out.
+- **A tab in `<pre>` advances to the next tab stop**, as in a browser: the
+  stops fall every `tab-size` (8 by default) spaces of the block's font (its
+  `letter-spacing` and `word-spacing` included), or every `tab-size` length,
+  measured from the line's start (#1122, #1584). Each tab takes the
+  `tab-size` of the element its text is in. The same
+  holds under `pre-wrap` and `break-spaces`; `normal`, `nowrap` and `pre-line`
+  collapse a tab to a space. A flex or grid item's own text and the
+  text of a form control do not set tabs to stops yet (#1585). In a long
+  soft-wrapped `pre-wrap` paragraph some tabs from about the fifth line on can
+  stay a few pixels off their stops (#1593).
+- **The line-clamp pattern works**: `display: -webkit-box;
+  -webkit-box-orient: vertical; -webkit-line-clamp: N` makes the box N lines
+  tall and ends the Nth line in "…", as in Chrome (add `overflow: hidden` to
+  hide the lines after it). The lines are counted through the box's block
+  children, as Chrome counts them: `<p>` after `<p>`, nested blocks and the
+  inline text beside them; the box, and every block on the way to the Nth
+  line, ends after that line, and the "…" is drawn on it when anything
+  follows (#2581). A box that starts a formatting context of its own
+  (`display: flow-root`, a scroller, a flex box) is not counted into.
+  Any other `display: -webkit-box` is laid out as Chrome lays it out: a
+  flex row (a column under `-webkit-box-orient: vertical`) whose block
+  children are items that grow and shrink only by `-webkit-box-flex`, each
+  run of inline content one item, and no `text-overflow` "…" (#1703,
+  #2581). It places them by `-webkit-box-pack` (`start`, `end`, `center`,
+  `justify`), `-webkit-box-align` (`stretch`, `start`, `end`, `center`,
+  `baseline`) and `-webkit-box-direction: reverse`; as in Chrome,
+  `justify-content`, `align-items`, `align-self` and `flex-direction` do
+  nothing there. A `min-height` or `max-height` on a block between a
+  clamp and its Nth line holds that block, and the clamp ends after it.
+  A `var()` in `-webkit-line-clamp`, `-webkit-box-orient`,
+  `-webkit-box-flex` or the three placing properties is read (#2820), and
+  so is one in `display` naming `-webkit-box` or `-webkit-inline-box`
+  (#2870).
 - **rinch does not copy Chrome's monospace font-*size* quirk.** Chrome renders a
   `medium`-sized monospace element at 13px rather than 16px; rinch has no
   per-family default size, so `<code>` keeps the size it inherits. Only the
   family comes from the UA sheet.
 
-`vertical-align: sub`/`super` on `<sub>`/`<sup>` (issue #724) and list markers on
-`<li>` (issue #725) are **not** part of this: neither is a stylesheet line —
-`ComputedStyle` carries no `vertical_align` field and `DisplayValue` no
-`ListItem` — so both need property and layout work first. Until then a `<sub>`
-is smaller but not lowered, and a bulleted list is indented but **unbulleted**:
-desktop draws no list marker at all, for a bare `<ul>`, for the `List`
-component (whose `list-style-type` is parsed and ignored) and for the
-rich-text editor alike. The editor's only marker is the task-list checkbox,
-which it draws itself as a `::before`.
+#### Text controls
+
+A raw `<input>` or `<textarea>` carries the browser's own box and font (issue
+#1194, every value measured in Chrome 153). The input components (`TextInput`,
+`Textarea`, `NumberInput`, `PasswordInput`, `ColorInput`) declare their own
+border, padding and font size, so this is about controls you write by hand:
+
+| control | box | font and text |
+|---------|-----|---------------|
+| text-state `<input>` (no `type`, `text`, `search`, `email`, `password`, `number`, …) | `padding: 1px 2px`, `border: 2px inset` grey | `13.3333px` Arial, weight and style `normal`, `line-height: normal` |
+| date/time `<input>` | `padding: 0 0 0 1px` (inline start only), the same border | the same, in monospace |
+| `checkbox`, `radio`, `range`, `file`, `image`, `hidden` | none | the same 13.3333px font |
+| the button types, `color` | none in rinch — Chrome gives `submit`/`reset`/`button` `1px 6px` and a `2px outset` border, `color` `1px 2px` and a `1px solid` one (not modelled yet) | the same 13.3333px font |
+| `<textarea>` | `padding: 2px`, `border: 1px solid` grey | `13.3333px` monospace, `white-space: pre-wrap`, `overflow-wrap: break-word` |
+
+Both controls also reset `letter-spacing`, `word-spacing`, `text-transform`,
+`text-indent` and `text-align` rather than inheriting them. The font is not
+cosmetic: a control is `size` (or `cols`) average characters of its **own**
+font wide.
+
+Overflow follows Chrome too. An `<input>` other than a checkbox, radio or range
+is `overflow: clip`, and stays `clip` whatever you declare (the UA rule is
+`!important`). A `<textarea>`'s computed overflow is `auto`, and a `visible` you
+declare on either axis computes `auto` (a `hidden` or `clip` is kept), so a raw
+textarea shrinks as a flex item instead of holding its full width. rinch does
+not yet lay out or scroll a textarea's text, so it shows no scrollbar and takes
+no wheel even when its value overflows.
+
+Everything else is an ordinary UA rule your own declaration beats. The theme's
+`button, input, select, textarea { font-family: inherit }` is one such
+declaration, so under the theme a raw control takes the page's family and keeps
+the 13.3333px size — as it does in a browser under the same sheet. The colours
+(`FieldText` on `Field`) are **not** copied: the theme gives form controls
+`color: inherit` on purpose, so they stay readable in dark mode.
+
+`vertical-align: sub`/`super` on `<sub>`/`<sup>` is now part of this (issue
+#724): `ComputedStyle::vertical_align` gives the span an `ifc::vertical_align_shift_px`
+shift, calibrated against Chrome 153 and the bundled Inter at a 16px parent
+font-size (exact only there — see that doc for the numbers). Since #1357 the
+shift is parley's: the line box grows to hold the raised or lowered span, as
+Chrome's does, nested shifts add up, and the shift lands on whole pixels. The element's background and border move with its text (#1817),
+and an `overflow: hidden` box clips shifted text that reaches past it. A wavy
+underline is drawn on the line whoever declares it. That matches Chrome for a
+wave propagated from an ancestor, but a wave declared on the shifted element
+itself moves with its text in Chrome and stays on the line in rinch (older
+than #1817; the clip check and damage measure it where rinch draws it). `top`/`text-top`/`middle`/`bottom`/`text-bottom` lay out on a text span as
+on an atomic inline (parley's own keywords; the caret and glyph bounds read
+where parley put the run's baseline). Inside an inline split by a block
+(#513) the split element's keyword is still `baseline`.
+
+List markers on `<li>` (issue #725) are partly part of this. `li` computes
+`display: list-item`, and the UA sheet gives lists Chrome's own defaults: `ul`,
+`menu` and `dir` are `disc`, `ol` is `decimal`, a list inside one other list is
+`circle` and inside two is `square` — an `ol` counts as a level, so `ol > li >
+ul` is `circle`, measured in Chrome 153. A block-level `list-item` box lays out
+as a `block` one does (its children stack, its height is theirs); `display: inline list-item` stays inline.
+
+What desktop draws is a text marker: `•`, `◦` or `▪` for `disc`, `circle` or
+`square`, `N. ` for `decimal` (`<ol start>` and `<li value>` included), and
+the old bullet or number for any other keyword. It is generated as a
+`<rinch-marker>` element at the start of an `<li>` whose parent is a `<ul>` or `<ol>`, whose computed
+`display` is `list-item`, whose `list-style-type` is not `none` and which has
+no `::before` or `::after` of its own (Chrome draws the marker beside either; a
+`menu`/`dir` item gets none yet — #1370). So an item restyled to `display:
+flex` — a `List` item with an icon — draws no marker.
+
+`list-style-position` is read (#1356). An **`outside`** marker (the default)
+is a box of its own, out of the item's flow, hung in the list's padding
+beside the item's first line box, as Chrome hangs it: an item whose first
+child is a block (`<li><div>`, `<li><p>`, `<li><table>`) is as tall as the
+block, not a line taller, and a wrapped item's later lines start under its
+first line's text. The first line is found through the item's block children
+(a padded or bordered `<div>`'s first line, past an empty block or a picture);
+beside a table the marker sits at its first row's content bottom; an item with
+no line at all (`<li></li>`, `<li><img style="display: block">`) is at least
+one marker line high. A disc ends `ascent * 2 / 3 + 8` px before the item's
+border box (Blink's rule; Chrome draws it as a shape, rinch as a glyph centred
+where the shape is), a number ends at that edge, and under `direction: rtl`
+both hang on the right. An **`inside`** marker is inline content at the start
+of the item, so it does take a line of its own above a block child, as in
+Chrome. The marker paints in its item's flow: whatever clips the item
+(`overflow: hidden` on it or an ancestor, a scroller) clips the marker, and a
+later positioned box covers it. It is a `<rinch-marker>` element, so a rule
+naming an element (`li span:first-child`, `li > div`) never matches it. A
+universal rule (`li *`, `#t > *`) or one naming `rinch-marker` does match it,
+but the UA sheet resets with `!important` everything such a rule could change
+about how it looks: its box (margin, padding, border, size, position, float,
+transform), its font, colour and visibility (taken from the item), and its
+opacity, background, outline, shadows and filter. So `#t > * { opacity: 0 }`
+or `li * { color: blue }` leaves it as Chrome leaves a `::marker`. A property
+not in that list, such as `text-decoration` or `cursor`, does still reach it.
+There is no `::marker` selector to style it with. On desktop the marker is a
+node in the tree, so `text_content` of an `<li>` includes its glyph or number,
+as it includes any generated box (#1629); `query_selector`, structural selectors
+(`:first-child`, `:nth-child`) and copying a selection skip it. Still not Chrome's: a number is drawn without Chrome's
+tabular digits (its far edge is up to 3px in); an `inside` disc's glyph sits
+about 0.12em right of Chrome's shape; a marker whose own line is taller
+than the first line it sits on does not push the item's content down; and a
+later block's background pulled up over the item (a negative margin) hides the
+marker, as it hides any earlier text in rinch, where Chrome paints inline
+content above in-flow backgrounds (#2276). The
+rich-text editor's task-list checkbox is a `::before` hung against the item's
+left edge the same way (#1246).
 
 **Components are unaffected**, and that is pinned rather than assumed —
 `Divider`, `List`, `Breadcrumbs`, `Tree`, `Image`, `Blockquote` and `Code` all
@@ -219,21 +384,25 @@ rsx! {
 }
 ```
 
-**A percentage is dropped, and that is a divergence.** rinch keeps only the
-length part of `letter-spacing` / `word-spacing`, so `50%` spaces by nothing and
-`calc(5px + 50%)` spaces by 5px. Chrome 150 resolves the percentage against the
-element's own font-size — measured, `letter-spacing: 50%` at `font-size: 20px`
-adds 10px per character — so a percentage that works in a browser does nothing
-here. Use `px`, `em` or `rem`, all of which are exact. Tracked as issue #743.
+**A percentage resolves against the element's own font-size** (issue #743),
+on both properties: `letter-spacing: 50%` / `word-spacing: 50%` add 10px per
+affected character at `font-size: 20px`, and `calc(5px + 50%)` adds 15px —
+measured in Chrome 153 and matched here, including `word-spacing`, whose
+percentage css-text-4 describes as relative to the space glyph's own advance
+rather than the font-size; Chrome's actual behaviour (and rinch's, now) is
+the font-size basis, not that reading.
 
 `normal` is zero, as in CSS, and it is a genuine reset: an inline element
 declaring it inside a spaced ancestor gets no spacing on its own characters,
 which is what the `span` above relies on.
 
-**Form controls are the exception.** An `<input>`, `<textarea>` or `<select>`
-shapes its own value through a separate text path that does not read either
-property yet, so a spacing declared on one has no effect on the text inside it.
-Tracked as issue #320, which unifies that path with the rest.
+**Form controls take them too** (issue #320): an `<input>`'s or a
+`<textarea>`'s value and a closed `<select>`'s label are set in the control's
+`letter-spacing`, `word-spacing` and `font-style` as in Chrome, and a
+`<textarea>`'s lines are its `line-height` apart. The caret and a click in a
+field follow the spaced text. The UA stylesheet resets both spacings on the
+controls, so a spacing inherited from a parent does not reach them; declare it
+on the control.
 
 #### Scaling the whole UI with `rem`
 
@@ -348,6 +517,27 @@ rsx! {
 }
 ```
 
+### In SVG paint
+
+An SVG shape's `fill` and `stroke` take a variable too, as a presentation
+attribute or in its `style` (#1800):
+
+```rust
+rsx! {
+    svg { viewBox: "0 0 16 16", style: "width: 16px; height: 16px",
+        path { d: "M2 8h12", stroke: "var(--rinch-primary-color)" }
+        path { d: "M8 2v12", style: "stroke: var(--rinch-color-dimmed)" }
+    }
+}
+```
+
+A fallback works (`var(--brand, #228be6)`), a variable holding
+`currentColor` paints in the shape's own `color`, and a missing variable with
+no fallback leaves the shape the `<svg>`'s paint, as in a browser. On desktop
+a `fill`/`stroke` written in a **stylesheet** rule (`.logo path { stroke: … }`)
+is not read: rinch's style engine has no such property, so the shape's own
+attribute or `style` is the place for it.
+
 ## CSS Selector Support (desktop)
 
 Desktop styling runs through Stylo, the same cascade engine Servo uses, so
@@ -356,29 +546,109 @@ The **selector** surface is narrower than a browser's, and the gaps are silent:
 an unsupported selector parses fine and then matches nothing, with no warning.
 On `rinch-web` the browser does its own matching, so everything below works
 there — which is exactly what makes a gap easy to miss.
+`NodeHandle::query_selector` / `query_selector_all` use the same matcher on
+desktop (#1796), so this table is also what a query can find there.
 
 Measured on the desktop engine:
 
 | Selector | Desktop | Note |
 |---|---|---|
 | `tag`, `.class`, `#id`, `*` | works | `#id` was silently dropped before #675 |
+| an UPPERCASE HTML *tag* name, in the markup (`<DIV>`, `<Button>`) | works | as of #739 — a tag is stored ASCII-lowercased in HTML content, matching Stylo's own lowercased type-selector comparison for an HTML element. A tag that is one of SVG's own camelCase spellings, however it was cased, is restored to that spelling rather than lowercased (`attr_name::fold_tag_name`), mirroring #688's attribute-name fold one row down |
 | descendant / `>` / `+` / `~` | works | |
 | `[attr]`, `[attr=v]`, `~=`, `\|=`, `^=`, `$=`, `*=` | works | |
 | an UPPERCASE attribute *name*, in the selector or the markup (`[DATA-X]`, `<div ID="up">`) | works | as of #688 — attribute names are stored ASCII-lowercased in HTML content, and Stylo lowercases the selector's name itself. `viewBox` and the other camelCase SVG attributes are kept verbatim |
-| `[attr=v i]` (case-insensitive flag) | **ignored** | the `i` is discarded, so the match stays case-sensitive. This is the *value*; the name above is a different question |
+| `[attr=v i]` / `[attr=v s]` (case flags) | works | since the style-invalidation work: attribute matching goes through the selectors crate's own evaluator, the same one Stylo's invalidation snapshots use. This is the *value*; the name above is a different question |
 | `:hover`, `:active`, `:focus`, `:focus-visible` | works | |
 | `:enabled`, `:disabled`, `:checked` | works | form controls only, by design |
 | `:link`, `:any-link` | works | `<a>`/`<area>` with an `href` |
 | `:visited` | never matches | rinch tracks no history |
 | `:first-child`, `:nth-child()`, `:not()`, `:is()`, `:where()`, `:root`, `:empty` | works | handled by the selector engine itself |
-| `:has()` | **never matches** | parses, then matches nothing even when the subject is present |
-| `:required`, `:optional`, `:read-only`, `:read-write`, `:placeholder-shown`, `:indeterminate`, `:valid`, `:invalid`, `:default`, `:defined`, `:target`, `:focus-within`, `:fullscreen`, `:lang()` | **never match** | they parse, then fall through to a catch-all `false` |
+| `:has()` | **never matches** | `stylo`'s servo-feature `SelectorParser` answers `parse_has() -> false` (#680), so `div:has(em) { … }` never parses into a relative selector in the first place — an upstream-dependency limitation, not a `rinch-dom` matching bug, and fixing it needs a patched/forked `stylo` (the same shape as the vendored `wgpu` fork) |
+| `:required`, `:optional`, `:read-only`, `:read-write`, `:placeholder-shown`, `:defined`, `:lang()` | works (#681) | narrower than the full CSS definition — see `Node::tag_supports_required` / `Node::tag_is_readonly_capable`'s docs for the exact scope each leaves out (no `<fieldset disabled>` inheritance, no non-form-control `:read-only`; `:lang()`'s invalidation is a forced self+subtree+later-siblings restyle on a `lang` write, not Stylo's state maps) |
+| `:focus-within` | **never matches** | attempted for #681 and reverted: an eager ancestor-propagated bit went stale under `style_invalidation_twin_tests.rs`'s random-mutation oracle (`.a:focus-within`) whenever a subtree was `Move`d while focus lived elsewhere — see `stylo_impl.rs`'s comment at the pseudo-class match's catch-all |
+| `:indeterminate`, `:valid`, `:invalid`, `:in-range`, `:out-of-range`, `:default`, `:target`, `:fullscreen`, `:modal`, `:popover-open`, `:autofill`, `:user-valid`, `:user-invalid` | **never match** | they parse, then fall through to a catch-all `false` — rinch has no constraint validation, no document/fragment concept, and no "default" tracking distinct from current state |
 | `::before`, `::after` | works | |
-| camelCase SVG type selectors (`linearGradient`, `clipPath`) | **never match** | type selectors are lowercased as if every element were HTML |
-| Presentational attributes (`<img width=100>`, `<td bgcolor>`) | **no effect** | legacy-attribute hints are not synthesized |
+| camelCase SVG type selectors (`linearGradient`, `clipPath`) | works (#683) | `is_html_element_in_html_document` answers `false` for SVG content tags (`attr_name::is_svg_content_tag`), so the selector keeps the author's exact spelling instead of being lowercased as if every element were HTML |
+| `width` / `height` attributes on an `<svg>` | works | presentation attributes: mapped to `width` / `height` as CSS lengths (a bare number is pixels), below every author rule; with CSS `auto` the attributes and the `viewBox` give the natural size and ratio, else 300x150 (#1797) |
+| `width` / `height` attributes on `<img>`, `<video>`, `<iframe>` | works | mapped to `width` / `height` below every author rule and above the UA sheet's normal rules, plus the pair's aspect ratio on an image or video (#684), as `aspect-ratio: auto w / h`, so an author `aspect-ratio` replaces it (#1286) |
+| Other presentational attributes (`<td bgcolor>`, `<img hspace>`, `<table width>`, `cellspacing`, `cellpadding`, `<font color>`) | works | mapped below every author rule, their values read as Chrome reads them (`cellspacing="10px"` is 10px); an inline image's `hspace` does not move it in its line (#1405) |
 
 Reach for a class where the table says a selector does not match — that is the
 one spelling with no gap on either backend.
+
+### Stylesheets added after the first frame (desktop)
+
+CSS loaded with `load_css`, a theme replaced with `set_theme_css`, or a
+`<style>` element inserted, removed or edited after the document is on screen
+restyles the elements its rules reach, as in a browser (#884). A `<style>`
+applies only while it is in the document. Because those elements keep their
+previous style, **a late sheet starts CSS transitions** on what it changes,
+also as in a browser: a late `.leaf { width: 300px }` animates a `.leaf` that
+has `transition: width 10s`.
+
+## Text decoration (desktop)
+
+`text-decoration-line`, `-color` and `-style` all reach the desktop painter.
+`text-decoration-style: wavy` draws a zigzag under the text — the spellcheck
+squiggle — in the decoration colour, or the text colour when none is given.
+The other styles (`double`, `dotted`, `dashed`) parse and paint as a solid
+line. A decoration propagates to descendants as in CSS: a wavy word inside an
+underlined link keeps the link's line and gains the wave. The wave follows the
+text on screen, right-to-left and mixed-direction runs included.
+
+## Selecting text (desktop)
+
+An app's own text is not selectable unless it says so: rinch reads an
+unset `user-select` (`auto`) as `none`, so labels, buttons and menus do not
+start a selection when pressed. `user-select: text` on an element makes it
+and everything inside it selectable, as `auto` takes its parent's value in
+CSS; an element inside that declares `user-select: none` is passed over.
+It cascades like any property: from a style sheet rule, an inline `style`,
+with specificity and `!important`, and `-webkit-user-select` is the same
+property:
+
+```rust
+rsx! { div { class: "article", {article_body} } }
+// .article { user-select: text; }
+```
+
+The built-in components that are pressed rather than read (checkbox,
+radio, switch, slider, select, tree, the menu bar, …) say
+`user-select: none` in their own styles, so they stay unselectable inside
+selectable text; a rule of yours that is more specific, or as specific and
+later, overrides that.
+
+A press in selectable text starts a selection and a drag extends it into
+any selectable paragraph it reaches, every paragraph between included;
+dragging into the space beside, between or below text extends it to the
+nearest selectable text anywhere in the window, as a browser does. A double
+click selects a word, a triple click the paragraph, Shift+click extends the
+selection, and Ctrl+A (Cmd+A) with no field focused selects all the text the
+selection is in. A `user-select: all` element is selected whole. Text inside
+that is `user-select: none` or `visibility: hidden` is neither highlighted
+nor copied. A press on a link in selectable text follows it on release, and
+a drag across it selects it instead.
+
+Ctrl+C (Cmd+C) copies what Chrome's `getSelection().toString()` gives for
+the same markup:
+- a tab before each cell but a row's first, even an empty one;
+- a line break between blocks and rows, and a blank line after a `<p>`;
+- a line of its own for a `<br>`, or for an `<img>` or `<iframe>` between
+  blocks;
+- the text of an `inline-block`, `inline-flex`, float, inline table or
+  positioned box where it stands in its line (`before mid after`), and only
+  when the selection reaches it; a space before and after an inline table;
+- the text of a flex or grid container, even text placed directly in one
+  (an `inline-flex` button's label);
+- no list bullets or other generated content.
+
+The white space between a document's tables and columns is neither
+highlighted nor copied, but a space drawn between two `inline-block`
+columns is copied, as Chrome copies it. Text placed directly in a flex or
+grid container is selected like any other text: highlighted, copied, and a
+selection can start or end inside it. `<code>`, `<pre>`, `<kbd>` and `<samp>` are selectable wherever
+they are. On the web the browser selects text itself, from the same CSS.
 
 ## Extending the Theme
 
@@ -438,7 +708,10 @@ For dynamic dark mode toggling (e.g., a switch in your app), use `dark_mode_fn` 
 ## Scrollbars
 
 A desktop scroll container paints an overlay thumb on each axis that is
-scrollable and overflowing. Two custom properties style it, and both **inherit**
+scrollable and overflowing. Pressing the thumb grabs it where it is, and
+dragging moves it with the pointer; pressing the empty track beside it jumps
+there, a position along the track mapping linearly onto the scroll range.
+Two custom properties style it, and both **inherit**
 — one declaration on a root node restyles every scroll region in the app.
 
 ```css
@@ -464,33 +737,58 @@ For the cases in this paragraph, rinch counts the same content a browser does.
 A `position: fixed` child is anchored to the viewport, so it never makes an
 ancestor scroll — a `Modal`, `Drawer` or `Notification` inside an
 `overflow: auto` region adds nothing to that region's scroll range, open or
-closed. A `position: absolute` child counts only where the container is its
-containing block, i.e. the container is itself positioned (or transformed); an
+closed. A `position: absolute` child counts only where its containing block is
+the container or something inside it — the container is itself positioned (or
+transformed), or an inline element between them is, such as a
+`position: relative` `<span>` holding the absolute; an
 absolute that resolves against something further up escapes that container,
 exactly as it does on the web. `visibility: hidden` content still counts,
 because it still occupies its box; `display: none` content does not, because it
-has none.
+has none. The children of a `display: contents` element count as the
+container's own, since the wrapper has no box — so a region whose rows come
+from a `for`, an `if` branch or an embedded `Vec<NodeHandle>`, each of which
+`rsx!` may put in such a wrapper, scrolls as it would on the web, and so does
+one holding text — a reactive `{|| text}` included — whether it is the
+container's only content or sits beside block children, as a log panel's
+footer line sits after its rows.
+
+A child counts as a browser counts it (#776, #775): an in-flow child by its
+**margin box**, so a last child's `margin-bottom` (and a flex item's
+end margins) is room to scroll to — except a plain `display: inline` element
+such as a `<span>`, whose vertical margins a browser ignores too; a `transform`ed child also where it is
+drawn; an `absolute` child by its border box alone, so a `position: absolute;
+inset: 0` overlay such as `LoadingOverlay` in a padded panel adds no scrollbar;
+and a `position: relative` child with an offset both where it is drawn and
+where it would have been.
+
+An `absolute` box counts wherever it sits, in the nearest scroll container at
+or above its containing block, as a browser counts it (#770): under a
+`position: relative` wrapper inside a scroll region it scrolls that region; a
+scroll region between the box and its containing block does not scroll to it
+(the box does not move with it); one with no positioned ancestor scrolls the
+page, which on desktop is the `<body>`. A `fixed` box scrolls nothing, and a
+box with no width or no height counts nothing.
+
+So an absolute overlay that hangs past the window's edge with no positioned
+scroll region above it — a tooltip or hover card on a control at the bottom or
+right of the window — gives the page a scroll range, and scrollbars, for as long
+as it is shown, as it does in a browser. (`Select`, `Popover` and `DropdownMenu`
+flip or shift to stay inside the window; `Tooltip` and `HoverCard` do not.) An
+app that does not want that sets `body { overflow: hidden }` (`ui-zoo-desktop`
+does), or keeps its overlays inside the window.
 
 Where desktop still differs from a browser:
 
-- **An `absolute` child of a padded scroll container** can add up to the
-  container's right and bottom padding to its scroll range, which a browser
-  does not. A `position: absolute; inset: 0` overlay — a `LoadingOverlay`, say —
-  inside a `padding: 20px; overflow: auto; position: relative` panel gives the
-  panel 20px of scroll travel on each axis and two scrollbars, where a browser
-  shows none.
-- **A `position: relative` child with an offset** counts only where the offset
-  puts it, while a browser also counts where it would have been. Shifted toward
-  the end of a padded container, it can add up to the container's right or
-  bottom padding; shifted toward the start, it can take away up to the offset,
-  padded container or not — a 240px-wide child at `left: -40px` in a 200px-wide
-  `overflow: auto` box gets no scrollbar, where a browser gives 40px of travel.
-  A `relative` child with no offset is measured like any other.
-- **An absolute whose containing block is further up than its parent** is
-  counted by no scroll container at all; a browser counts it in that ancestor.
-- **A child's `transform` and its end margins** do not extend the scroll range,
-  and neither do the children of a `display: contents` wrapper; a browser's
-  scroll range includes all three.
+- **A grid item's margins** count nothing here: a browser counts the grid's
+  tracks, so a last row whose `auto` track a margin grows is room to scroll
+  to in a browser and not here.
+
+- **A margin that collapses through a child's end** — the last child of a
+  `height: auto` child carrying `margin-bottom` — is not counted; a browser
+  counts it.
+- **An in-flow box that overflows its own parent** — a 300px child of a
+  `height: 50px` child — is not counted: a browser scrolls 200 to it, desktop
+  0 (#2054). An absolute box in the same place is.
 
 ### Why not `scrollbar-color` / `scrollbar-width`?
 
@@ -504,6 +802,14 @@ real properties for servo, they will be honoured alongside these.
 Neither affects layout: rinch's bar is an overlay drawn on top of content and
 takes no space, so `thin` and `none` change what you see, not where anything
 sits.
+
+"On top of content" includes the scroller's positioned descendants: a
+`position: relative` row, one with a `z-index`, an absolute whose containing
+block is inside the scroller. Those are painted in the enclosing stacking
+context's order, so the bar is drawn there, right after the last of them, as
+Chrome draws it (#1717). A box that is *not* the scroller's content — a later
+positioned sibling, a box at a higher `z-index` than any of its rows, an
+absolute that escapes it — can still cover the bar, in Chrome as in rinch.
 
 ### The default follows your palette
 
@@ -542,71 +848,92 @@ properties work there.
 
 > **Gotcha:** `--rinch-color-gray-0` is `#f8f9fa`, which matches the default body background. If you use it as a card background, it'll be invisible. Use `gray-1` or higher for visible backgrounds.
 
+## `box-sizing`
+
+rinch reads `box-sizing` as a browser does. Its initial value is `content-box`: a box's `width` and `height` size its content, and its padding and border go outside them, so `width: 200px; padding: 10px` is a box 220px wide. With `box-sizing: border-box` the padding and border are inside it, and the same box is 200px wide.
+
+The theme sets `*, *::before, *::after { box-sizing: border-box }`, so in a themed app every box is a border box unless you say otherwise, and the components are designed that way. Without the theme (an app that does not install it, or HTML you render as content, such as an email), boxes are `content-box`, as in a browser. The built-in stylesheet makes border boxes of the elements a browser does: tables, `select`, `button`, `meter`, `progress`, and button-like, checkbox, radio, colour and search inputs. The editor's root and the Popover's arrow declare `border-box` themselves, so they are the same size themed or not.
+
+Until joeleaver/rinch#1278, `box-sizing` was ignored and every box was sized as a border box. An unthemed app that gave a box a `width` or `height` together with padding or a border sees that box grow by them; add `box-sizing: border-box` to it, or the theme's global rule to your stylesheet, to keep the old size.
+
 ## CSS sizing keywords
 
 For `width`, `height`, `min-width`/`min-height`, `max-width`/`max-height` and
 `flex-basis`, rinch supports lengths, percentages, `calc()` mixing the two,
-`auto` and `none`. It supports **no intrinsic sizing keyword** on any of them
-(issue #626): every one parses and is then laid out as `auto`.
+`auto` and `none`. The intrinsic sizing keywords are supported on **`width`,
+`height` and `flex-basis`** (#691), and parse but lay out as `auto` on
+**`min-*`/`max-*`** (#1275).
 
-| Value | What rinch does |
-|---|---|
-| `<length>` (`px`, `em`, `rem`, …) | Supported |
-| `<percentage>` | Supported |
-| `calc()` mixing a length and a percentage | Supported |
-| `auto`, `none` | Supported |
-| `max-content` | Laid out as `auto` |
-| `min-content` | Laid out as `auto` |
-| `fit-content` | Laid out as `auto` |
-| `fit-content(<length-percentage>)` | Laid out as `auto` |
-| `stretch`, `-webkit-fill-available` | Laid out as `auto` |
-| `anchor-size(…)` | Laid out as `auto` |
+| Value | `width` / `height` / `flex-basis` | `min-*` / `max-*` |
+|---|---|---|
+| `<length>`, `<percentage>`, `calc()` of the two | Supported | Supported |
+| `auto`, `none` | Supported | Supported |
+| `max-content` | Supported | Laid out as `auto` |
+| `min-content` | Supported | Laid out as `auto` |
+| `fit-content` | Supported | Laid out as `auto` |
+| `stretch`, `-webkit-fill-available` | Supported | Laid out as `auto` |
+| `fit-content(<length-percentage>)` | `auto` — Chrome 153 does not accept it on these properties either | Laid out as `auto` |
+| `anchor-size(…)` | Laid out as `auto` | Laid out as `auto` |
 
-rinch prints one line on stderr per property and keyword per process, so the
-substitution is visible rather than silent:
+They are checked against Chrome 153 in block, flex (both axes, and
+`flex-basis`), grid, `inline-block`/`inline-flex`, `absolute` and `fixed`
+contexts (`crates/rinch-dom/tests/intrinsic_sizing_twin_tests.rs`). What still
+differs, each with its issue:
+
+- **`width: stretch` on a flex item** whose content is wider than the
+  container is not capped by it (#1277).
+- An `inline-block` (or `inline-flex`, `inline-grid`) whose width is
+  **`auto`** is shrink-to-fit since #658, as in a browser: capped at its
+  containing block, so wider content wraps there. That holds where the
+  block's own width comes from the box too (#1476): inside a **flex item**,
+  a **grid item in an `auto` track**, a **`fit-content` or `min-content`
+  block**, a **shrink-to-fit absolute box** or **another `auto` atomic
+  inline**, the container is sized from the box's min-content and
+  max-content widths (its longest word, its one-line width), and the box
+  wraps in what that gives. Two things in this corner are not a browser's
+  yet. A box whose own `min-width` or `max-width` is a **percentage**, or
+  whose `width` is `fit-content` or a percentage, still contributes the
+  size it currently has to such a container, as before, so it is not a
+  browser's there: a `width: fit-content` box keeps its full width, and a
+  `max-width: 80%` box comes out narrower than a browser's and narrower
+  again on each relayout (older than #1476). A box whose **`width`** is a
+  percentage, in a flex item or an `auto` grid track, is the same cycle:
+  its container is sized from the box and the box from its container, so
+  the first layout is not where it settles — it drifts over the next few
+  layouts, and since #1476 an `auto` box in a neighbouring item or track
+  moves with it (up to seven layouts, measured).
+  A box that fits within a pixel of its containing block is left unwrapped
+  (a 380.9px line in a 380px block overflows by that pixel).
+
+For `min-*`/`max-*` rinch prints one line on stderr per property and keyword
+per process, so the substitution is visible rather than silent:
 
 ```text
-[rinch] `width: max-content` is not implemented; it lays out as `auto`, which
-matches a browser only where `auto` already gives the same used size (issue
-#626). Reported once per property and value per process.
+[rinch] `min-width: max-content` is not implemented; it lays out as `auto`,
+which matches a browser only where `auto` already gives the same used size
+(issues #626, #1275). Reported once per property and value per process.
 ```
 
-**Grid tracks are a different story and they do work.**
-`grid-template-columns: max-content` and `min-content` size a column the way a
-browser does — measured, an item whose content is 300px wide gets 300px in such
-a track and 800px in an `auto` one — because Taffy implements intrinsic sizing
-for track sizing functions. (`fit-content(<length-percentage>)` is converted for
-tracks too.) It is only a *box's own* `width`/`height`/`min-*`/`max-*` that
-cannot carry one, so this is not a missing line in a conversion table —
-implementing it needs a measurement pass of rinch's own.
+**Grid tracks** take the keywords too: `grid-template-columns: max-content`
+and `min-content` size a column the way a browser does, and
+`fit-content(<length-percentage>)` is converted for tracks.
 
-### When `auto` happens to be the right answer
+### When `auto` is the right answer for `min-*`/`max-*`
 
-Whether the substitution changes anything depends on the box, and the two
-halves are mirror images. Measured against Chrome 150, for a box whose content
-is 300px wide inside an 800px containing block:
+On `min-*`/`max-*`, where every keyword is still laid out as `auto`, whether
+that changes anything depends on the box. Measured against
+Chrome 150, for a box whose content is 300px wide inside an 800px containing
+block:
 
 | The box | `auto` gives | `max-content`/`min-content`/`fit-content` | `stretch` |
 |---|---|---|---|
-| block-level `width` | fills (800) | **wrong** — should shrink-wrap (300) | correct (800) |
 | `min-width` / `max-width` | no constraint | **wrong** — should constrain to 300 | correct |
-| `inline-block` `width` | shrink-wraps (300) | correct (300) | **wrong** — should fill (800) |
-| flex-row item `width` (main axis) | content (300) | correct (300) | **wrong** — should fill (800) |
-| flex-column or grid item `width` (cross axis) | stretches (800) | **wrong** — should be 300 | correct (800) |
-| block `height` | content height | correct | **wrong** — should fill the containing block |
 | `min-height` | none | correct | **wrong** — should fill the containing block |
+| `max-height` | none | correct | correct |
 
-So the three intrinsic keywords are already right wherever `auto` is
-content-sized, and `stretch` is already right wherever `auto` fills.
+A float shrink-wraps too, as in a browser: `float: left` on the same box gives
+300.
 
-A browser would put floats in the shrink-wrapping row. rinch does not, because
-**rinch implements no CSS float at all** — measured, `float: left` on the same
-box gives 800, the full containing block, where a browser gives 300. So a float
-is not a way to reach the shrink-to-fit behaviour here; `display: inline-block`
-is.
-
-**The workaround in both directions is a declared length or percentage.** Where
-you reached for `width: fit-content` on a block, `display: inline-block` gives
-the same shrink-to-fit today; where you reached for `height: stretch`, `height:
-100%` gives the same used size as long as the box has no margin, border or
-padding on that axis.
+Where a `min-*`/`max-*` keyword is wrong, a declared length or percentage is
+the workaround: `min-height: 100%` gives `min-height: stretch`'s used size as
+long as the box has no margin, border or padding on that axis.

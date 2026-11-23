@@ -13,6 +13,10 @@ pub type ReactiveString = Rc<dyn Fn() -> String>;
 pub struct Textarea {
     /// Label displayed above the textarea.
     pub label: String,
+    /// The field's `id` (Mantine's `id`): its label's `for` names it, and the
+    /// description and error are `{id}-description` / `{id}-error`. Empty
+    /// generates a unique one per render (issue #2034).
+    pub id: String,
     /// Description displayed below the textarea.
     pub description: String,
     /// Error message to display.
@@ -25,29 +29,44 @@ pub struct Textarea {
     pub disabled: bool,
     /// Whether the textarea is required.
     pub required: bool,
-    /// Whether the textarea should auto-resize.
+    /// Whether the textarea should grow with its content, up to `max_rows`.
+    ///
+    /// Chrome's own `<textarea>` never does this — its height is always
+    /// exactly `rows` lines, content or no content (autosize is a component
+    /// convention, not an HTML one; see [`Self::max_rows`]). With this on, the
+    /// control's `rows` attribute is recomputed on every value change from the
+    /// number of `\n`-separated lines in the (controlled) value, clamped to
+    /// `min_rows` (default 2) and `max_rows` (default unbounded) — a `rows`
+    /// change re-measures the control exactly as a user-written one would
+    /// (#297). This counts *explicit* lines, not wrapped ones: a long
+    /// unbroken line that wraps visually does not grow the control, which is
+    /// the one way this is not a faithful stand-in for a browser's own
+    /// autosize library (those measure `scrollHeight` in pixels; rinch has no
+    /// such signal for an attribute-valued control to read). Reactive only
+    /// through [`Self::value_fn`] — an uncontrolled `value` sets the initial
+    /// `rows` once, at mount, same as it always has.
     pub autosize: bool,
     /// Minimum number of visible text rows.
     ///
     /// Renders as the `rows` attribute, which sizes the control to that many
     /// lines (plus padding and border). Defaults to 2 rows when unset, matching
-    /// HTML. A larger CSS `min-height` still wins.
+    /// HTML. A larger CSS `min-height` still wins. With [`Self::autosize`] on,
+    /// this is the floor `rows` never shrinks below rather than the fixed
+    /// value.
     pub min_rows: Option<u32>,
     /// Maximum number of visible text rows.
     ///
-    /// **Declared and inert on desktop** (issue #715). It is not that nothing
-    /// reads it — a `max-height` cannot *bind* on a rinch `<textarea>` at all.
-    /// The control has no content height (it holds its value in an attribute,
-    /// not as a text child), so `style_resolution` gives it a `min-height` from
-    /// its `rows`, and the stylesheet declares a 60–120px floor besides. Its
-    /// used height is therefore exactly its `min-height`, and `min-height` beats
-    /// `max-height` in CSS. Measured: `min_rows: 20` with `max_rows: 2` lays out
-    /// at 446px either way, and a textarea holding 40 lines is the same 80px as
-    /// an empty one.
-    ///
-    /// This is the reason `tests/no_dead_props.rs` still allowlists it. Wiring
-    /// it is #715's job, not a component's: the control's height has to be able
-    /// to follow its content first.
+    /// Sets `max-height` to `rows` lines (at the control's own `normal` —
+    /// 1.2× font-size — line height, plus its padding and border), which binds
+    /// because the control's content height is now a Taffy *measure*
+    /// (#297/#1152) rather than a `min-height` rinch wrote — before that fix,
+    /// one `min-height` always beat the other in CSS, so nothing here could
+    /// ever cap anything (issue #715). The stylesheet's own 60–120px
+    /// `min-height` floor still wins when it is taller than this cap, exactly
+    /// as an author's `min-height` beats `max-height` on any element — so a
+    /// `max_rows` under about 3 lines is unreachable at every size step,
+    /// which is a CSS fact about the two declarations, not a bug in this
+    /// prop.
     pub max_rows: Option<u32>,
     /// Current value.
     pub value: String,
@@ -59,12 +78,18 @@ pub struct Textarea {
     /// after a modification) — HTML `change` semantics, receives the final
     /// value. Fires only if the value changed since focus (issue #226).
     pub onchange: Option<InputCallback>,
+    /// Spellchecking for this field (#2862): `Some(false)` turns it off,
+    /// `Some(true)` turns it on inside a subtree that turned it off, `None`
+    /// (the default) inherits the nearest ancestor's `spellcheck`, which is
+    /// on unless something above says otherwise.
+    pub spellcheck: Option<bool>,
 }
 
 impl std::fmt::Debug for Textarea {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Textarea")
             .field("label", &self.label)
+            .field("id", &self.id)
             .field("description", &self.description)
             .field("error", &self.error)
             .field("placeholder", &self.placeholder)
@@ -78,6 +103,7 @@ impl std::fmt::Debug for Textarea {
             .field("value_fn", &self.value_fn.as_ref().map(|_| "<reactive>"))
             .field("oninput", &self.oninput.as_ref().map(|_| "<callback>"))
             .field("onchange", &self.onchange.as_ref().map(|_| "<callback>"))
+            .field("spellcheck", &self.spellcheck)
             .finish()
     }
 }
@@ -119,6 +145,8 @@ impl Component for Textarea {
         container.set_attribute("class", &self.class_string());
 
         // Label
+        let ids = crate::field_ids::FieldIds::new(&self.id);
+        let mut label_node = None;
         if !self.label.is_empty() {
             let label_text = &self.label;
             let label =
@@ -131,10 +159,14 @@ impl Component for Textarea {
             }
 
             container.append_child(&label);
+            label_node = Some(label);
         }
 
         // Textarea element
         let textarea = rinch_macros::rsx! { textarea { class: "rinch-textarea__input" } };
+        if let Some(on) = self.spellcheck {
+            textarea.set_attribute("spellcheck", if on { "true" } else { "false" });
+        }
 
         if !self.placeholder.is_empty() {
             textarea.set_attribute("placeholder", &self.placeholder);
@@ -145,21 +177,48 @@ impl Component for Textarea {
         if self.required {
             textarea.set_attribute("required", "");
         }
-        if let Some(rows) = self.min_rows {
+
+        // `max_rows` caps the control's height at that many lines of its own
+        // `normal` (1.2× font-size) line height, plus its padding and border
+        // — the same terms the stylesheet's own box uses, so this tracks the
+        // control's actual font-size and size step rather than a baked-in
+        // pixel value (issue #715).
+        if let Some(rows) = self.max_rows {
+            textarea.set_style(
+                "max-height",
+                &format!("calc(1.2em * {rows} + 2 * var(--rinch-spacing-sm) + 2px)"),
+            );
+        }
+
+        let min_rows = self.min_rows.unwrap_or(2).max(1);
+        if self.autosize {
+            let max_rows = self.max_rows;
+            let rows_for = move |value: &str| -> u32 {
+                let lines = (value.lines().count().max(1) as u32).max(min_rows);
+                match max_rows {
+                    Some(max) => lines.min(max.max(min_rows)),
+                    None => lines,
+                }
+            };
+            if let Some(ref value_fn) = self.value_fn {
+                let value_fn = value_fn.clone();
+                textarea.set_attribute("rows", &rows_for(&value_fn()).to_string());
+                let field = textarea.clone();
+                __scope.create_effect(move || {
+                    field.set_attribute("rows", &rows_for(&value_fn()).to_string());
+                });
+            } else {
+                textarea.set_attribute("rows", &rows_for(&self.value).to_string());
+            }
+        } else if let Some(rows) = self.min_rows {
             textarea.set_attribute("rows", &rows.to_string());
         }
 
         // Reactive value binding
         if let Some(ref value_fn) = self.value_fn {
-            let initial_value = value_fn();
-            textarea.set_attribute("value", &initial_value);
-
-            let value_fn = value_fn.clone();
-            let textarea_clone = textarea.clone();
-            __scope.create_effect(move || {
-                let current_value = value_fn();
-                textarea_clone.set_attribute("value", &current_value);
-            });
+            // Written now and on every change — minus the echo of the user's
+            // own keystroke, which the field already shows (#238).
+            crate::value_binding::bind_value_fn(__scope, &textarea, value_fn);
         } else if !self.value.is_empty() {
             textarea.set_attribute("value", &self.value);
         }
@@ -188,19 +247,32 @@ impl Component for Textarea {
         container.append_child(&textarea);
 
         // Description
+        let mut desc_node = None;
         if !self.description.is_empty() {
             let desc = &self.description;
             let desc_div =
                 rinch_macros::rsx! { div { class: "rinch-textarea__description", {desc} } };
             container.append_child(&desc_div);
+            desc_node = Some(desc_div);
         }
 
         // Error
+        let mut err_node = None;
         if !self.error.is_empty() {
             let err = &self.error;
             let err_div = rinch_macros::rsx! { div { class: "rinch-textarea__error", {err} } };
             container.append_child(&err_div);
+            err_node = Some(err_div);
         }
+
+        // The label names the field (#2034).
+        ids.wire(
+            &textarea,
+            true,
+            label_node.as_ref(),
+            desc_node.as_ref(),
+            err_node.as_ref(),
+        );
 
         container
     }

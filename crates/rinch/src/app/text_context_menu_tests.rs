@@ -38,6 +38,17 @@ fn left_press(app: &mut RinchApp, x: f32, y: f32) -> Vec<AppAction> {
     press_with(app, x, y, MouseButton::Left)
 }
 
+/// A press as the desktop shell delivers one: the pointer's move first, then
+/// the press and release at the position the app recorded for that move
+/// (`cursor_pos`), which is all the shell passes on (`rinch_runtime.rs`).
+fn shell_press(app: &mut RinchApp, x: f32, y: f32, button: MouseButton) -> Vec<AppAction> {
+    let mut actions = ev(app, PlatformEvent::MouseMove { x, y });
+    let (x, y) = app.cursor_pos.expect("a move records where the pointer is");
+    actions.extend(ev(app, PlatformEvent::MouseDown { x, y, button }));
+    actions.extend(ev(app, PlatformEvent::MouseUp { x, y, button }));
+    actions
+}
+
 fn key_with(app: &mut RinchApp, key: KeyCode, text: Option<&str>, modifiers: Modifiers) {
     ev(
         app,
@@ -79,24 +90,24 @@ fn shift() -> Modifiers {
     }
 }
 
-fn abs_box(app: &RinchApp, id: usize) -> (f32, f32, f32, f32) {
+fn abs_box(app: &RinchApp, id: u64) -> (f32, f32, f32, f32) {
     let d = app.doc.as_ref().unwrap().borrow();
     painted_element_box(&d.tree, id)
 }
 
-fn abs_center(app: &RinchApp, id: usize) -> (f32, f32) {
+fn abs_center(app: &RinchApp, id: u64) -> (f32, f32) {
     let (x, y, w, h) = abs_box(app, id);
     (x + w / 2.0, y + h / 2.0)
 }
 
-fn attr(app: &RinchApp, id: usize, name: &str) -> Option<String> {
+fn attr(app: &RinchApp, id: u64, name: &str) -> Option<String> {
     let d = app.doc.as_ref().unwrap().borrow();
     d.tree.get(id).and_then(|n| n.attributes.get(name).cloned())
 }
 
 /// The field's `(value, selection start, cursor)` as the DOM carries them —
 /// what paint reads, so what the user sees.
-fn field_state(app: &RinchApp, id: usize) -> (String, String, String) {
+fn field_state(app: &RinchApp, id: u64) -> (String, String, String) {
     (
         attr(app, id, "value").unwrap_or_default(),
         attr(app, id, "data-selection-start").unwrap_or_default(),
@@ -130,7 +141,7 @@ fn highlighted(app: &RinchApp) -> Option<TextEditAction> {
 /// The smallest window x at which a press in `input` places the caret at
 /// byte `offset` — found with the runtime's own click-to-offset map, so the
 /// fixture presses exactly where the user would have to.
-fn x_for_offset(app: &mut RinchApp, input: usize, offset: usize) -> f32 {
+fn x_for_offset(app: &mut RinchApp, input: u64, offset: usize) -> f32 {
     let (bx, by, bw, bh) = abs_box(app, input);
     let y = by + bh / 2.0;
     let doc = app.doc.clone().unwrap();
@@ -169,14 +180,14 @@ const FIELD_STYLE: &str = "width: 300px; height: 30px; padding: 0; margin: 0; \
 
 #[derive(Clone, Copy)]
 struct Ids {
-    input: usize,
-    textarea: usize,
-    checkbox: usize,
-    plain: usize,
+    input: u64,
+    textarea: u64,
+    checkbox: u64,
+    plain: u64,
     /// An input under a `div` carrying a live `data-oncontextmenu`.
-    guarded_input: usize,
+    guarded_input: u64,
     /// A `<div tabindex>` beside the fields, for a press that lands elsewhere.
-    other: usize,
+    other: u64,
 }
 
 type Log = Rc<RefCell<Vec<String>>>;
@@ -269,7 +280,7 @@ fn page(
 }
 
 /// Focus `input` with a left press at its left edge and select `2..5`.
-fn focus_and_select(app: &mut RinchApp, input: usize) {
+fn focus_and_select(app: &mut RinchApp, input: u64) {
     let (bx, by, _, bh) = abs_box(app, input);
     left_press(app, bx + 1.0, by + bh / 2.0);
     assert_eq!(app.focus_target, FocusTarget::Input(input));
@@ -380,7 +391,7 @@ fn a_disabled_field_takes_no_focus_and_opens_nothing() {
 
 // ── Enabled states ───────────────────────────────────────────────────────────
 
-fn state_after_right_press(app: &mut RinchApp, input: usize) -> TextEditState {
+fn state_after_right_press(app: &mut RinchApp, input: u64) -> TextEditState {
     let (x, y) = abs_center(app, input);
     right_press(app, x, y);
     app.text_edit_state()
@@ -487,6 +498,117 @@ fn a_right_press_inside_the_selection_keeps_it_and_outside_moves_the_caret() {
 }
 
 // ── Pointer and keyboard on the open menu ────────────────────────────────────
+
+/// The shell's shape of a press (a move, then a press at `cursor_pos`) while
+/// the menu is open: the menu takes every move, and the position must still
+/// be recorded, or the press is judged where the menu was opened, which is
+/// inside its panel. Before the fix a real press outside never closed the
+/// menu, and a real press on an item never ran it (only focus loss closed it).
+#[test]
+fn a_real_press_outside_closes_the_menu() {
+    let (mut app, ids, _log) = page("hello world", &[]);
+    focus_and_select(&mut app, ids.input);
+    let x = x_for_offset(&mut app, ids.input, 4);
+    let (_, by, _, bh) = abs_box(&app, ids.input);
+    shell_press(&mut app, x, by + bh / 2.0, MouseButton::Right);
+    assert!(app.is_text_context_menu_open(), "precondition: open");
+
+    let (px, py, _, ph) = abs_box(&app, ids.plain);
+    shell_press(&mut app, px + 10.0, py + ph / 2.0, MouseButton::Left);
+    assert!(
+        !app.is_text_context_menu_open(),
+        "a press outside closes it"
+    );
+}
+
+#[test]
+fn a_real_press_on_an_item_runs_it_and_closes_the_menu() {
+    let (mut app, ids, _log) = page("hello world", &[]);
+    focus_and_select(&mut app, ids.input);
+    let x = x_for_offset(&mut app, ids.input, 4);
+    let (_, by, _, bh) = abs_box(&app, ids.input);
+    shell_press(&mut app, x, by + bh / 2.0, MouseButton::Right);
+
+    // Off the row's centre and off the x = y diagonal (the centre sits near
+    // it), so a press judged at a swapped or duplicated coordinate misses the
+    // row instead of landing on it by accident.
+    let row = app
+        .open_text_menu
+        .as_ref()
+        .and_then(|m| {
+            m.items
+                .iter()
+                .find(|r| r.action == TextEditAction::SelectAll)
+        })
+        .map(|r| r.node_id)
+        .expect("the menu is open and has Select all");
+    let (rx, ry, rw, rh) = abs_box(&app, row);
+    let (sx, sy) = (rx + rw - 6.0, ry + rh / 2.0);
+    let inside = |(x, y): (f32, f32)| x >= rx && x < rx + rw && y >= ry && y < ry + rh;
+    assert!(inside((sx, sy)), "precondition: the press is on the row");
+    assert!(
+        !inside((sy, sx)) && !inside((sx, sx)),
+        "precondition: ({sx}, {sy}) is off the diagonal of the row {:?}",
+        (rx, ry, rw, rh)
+    );
+    shell_press(&mut app, sx, sy, MouseButton::Left);
+    assert!(
+        !app.is_text_context_menu_open(),
+        "running an item closes the menu"
+    );
+    let (_, start, end) = field_state(&app, ids.input);
+    assert_eq!(
+        (start.as_str(), end.as_str()),
+        ("0", "11"),
+        "Select all ran"
+    );
+}
+
+/// A pointer-capture drag whose release was missed (issue #381), then a real
+/// left press that closes the open menu. The menu swallows the press, so the
+/// heal has to run before the menu takes it: otherwise the press's release
+/// reached the `MouseUp` arm with the menu gone and `finish_drag` committed the
+/// stranded drag through `on_end` at the click's position — the wrong commit
+/// #381's heal exists to prevent.
+#[test]
+fn a_stranded_drag_is_cancelled_not_committed_by_the_press_that_closes_the_menu() {
+    let (mut app, ids, _log) = page("hello world", &[]);
+    focus_and_select(&mut app, ids.input);
+    let ends = Rc::new(RefCell::new(Vec::<(f32, f32)>::new()));
+    let cancels = Rc::new(Cell::new(0u32));
+    {
+        let (e, c) = (ends.clone(), cancels.clone());
+        rinch_core::Drag::absolute()
+            .on_move(|_, _| {})
+            .on_end(move |x, y| e.borrow_mut().push((x, y)))
+            .on_cancel(move |_, _| c.set(c.get() + 1))
+            .start();
+    }
+    assert!(
+        rinch_core::Drag::is_active(),
+        "precondition: a stranded drag"
+    );
+    let x = x_for_offset(&mut app, ids.input, 4);
+    let (_, by, _, bh) = abs_box(&app, ids.input);
+    shell_press(&mut app, x, by + bh / 2.0, MouseButton::Right);
+    assert!(app.is_text_context_menu_open(), "precondition: open");
+
+    let (px, py, _, ph) = abs_box(&app, ids.plain);
+    shell_press(&mut app, px + 10.0, py + ph / 2.0, MouseButton::Left);
+    let (ended, cancelled, active) = (
+        ends.borrow().clone(),
+        cancels.get(),
+        rinch_core::Drag::is_active(),
+    );
+    rinch_core::Drag::cancel();
+    assert!(
+        !app.is_text_context_menu_open(),
+        "the press closes the menu"
+    );
+    assert_eq!(ended, Vec::new(), "a stranded drag is never committed");
+    assert_eq!(cancelled, 1, "it ends through on_cancel, once");
+    assert!(!active, "and it is over");
+}
 
 #[test]
 fn an_outside_press_closes_the_menu_without_acting_and_is_swallowed() {
@@ -767,6 +889,48 @@ fn under_shell_presentation_the_gesture_prepares_and_emits_instead_of_opening() 
     assert!(!actions.contains(&AppAction::ShowTextContextMenu));
 }
 
+// ── No clipboard: Cut does nothing (issue #823) ──────────────────────────────
+
+/// Without the `clipboard` feature there is nowhere to cut *to*, so Cut on a
+/// plain `<input>`/`<textarea>` must leave the field alone — the chord, the
+/// shell seam (`perform_text_edit`, which the context menu's item also runs)
+/// alike. It used to delete the selection and copy it nowhere. Selection
+/// `2..5`, off the `0..n` fixed point; a Delete afterwards is the positive
+/// control that the keys reach the field at all.
+#[cfg(not(feature = "clipboard"))]
+#[test]
+fn without_a_clipboard_cut_leaves_the_field_alone_issue_823() {
+    for field in [|ids: &Ids| ids.input, |ids: &Ids| ids.textarea] {
+        let (mut app, ids, log) = page("hello world", &[]);
+        let id = field(&ids);
+        focus_and_select(&mut app, id);
+        let selected = ("hello world".into(), "2".into(), "5".into());
+        assert_eq!(field_state(&app, id), selected);
+
+        key_with(&mut app, KeyCode::KeyX, None, primary());
+        assert_eq!(field_state(&app, id), selected, "the chord cut nothing");
+        app.perform_text_edit(TextEditAction::Cut);
+        assert_eq!(field_state(&app, id), selected, "the seam cut nothing");
+        assert!(
+            log.borrow().is_empty(),
+            "no oninput fired: {:?}",
+            log.borrow()
+        );
+        // Nothing went on the undo stack either: Ctrl+Z has nothing of Cut's
+        // to undo, so the field is still as it was.
+        key_with(&mut app, KeyCode::KeyZ, None, primary());
+        assert_eq!(field_state(&app, id), selected, "no Cut step to undo");
+
+        // Positive control: an ordinary delete of the same selection lands.
+        key(&mut app, KeyCode::Delete);
+        assert_eq!(
+            field_state(&app, id),
+            ("he world".into(), "2".into(), "2".into()),
+            "a Delete still deletes the selection"
+        );
+    }
+}
+
 // ── Item versus chord: one code path ─────────────────────────────────────────
 
 /// The clipboard is one per process and the test binary is many threads:
@@ -815,6 +979,11 @@ fn by_chord_and_by_item(
             key_with(&mut app, chord, None, primary());
         }
         assert_eq!(app.focus_target, FocusTarget::Input(ids.input));
+        if action == TextEditAction::Paste {
+            // The paste reads the clipboard off the UI thread and lands on a
+            // later turn (issue #328), by the chord and the item alike.
+            assert_eq!(super::input_paste_async_tests::settle(&mut app), 1);
+        }
         let clip = rinch_clipboard::paste_text().unwrap_or_default();
         (field_state(&app, ids.input), clip)
     };
@@ -1102,7 +1271,7 @@ fn two_hundred_cycles_add_no_nodes_and_the_panel_is_as_tall_as_its_rows() {
 }
 
 /// The panel's node ids and every node under it.
-fn panel_subtree(app: &RinchApp) -> Vec<usize> {
+fn panel_subtree(app: &RinchApp) -> Vec<u64> {
     let Some(panel) = app.text_menu_panel.as_ref().map(|p| p.panel_id) else {
         return Vec::new();
     };
@@ -1273,9 +1442,9 @@ mod anchor {
     const OFFSET_FIELD: &str = "width: 300px; height: 80px; padding: 0; margin: 0; \
          font-size: 16px; line-height: 20px; font-family: sans-serif";
 
-    fn field_app(tag: &'static str, value: &'static str, style: &'static str) -> (RinchApp, usize) {
+    fn field_app(tag: &'static str, value: &'static str, style: &'static str) -> (RinchApp, u64) {
         let h = register_input_handler(InputCallback::new(|_| {}));
-        let id: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+        let id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
         let id_in = id.clone();
         let mut app = RinchApp::new(move |scope: &mut RenderScope| {
             let root = scope.create_element("div");
@@ -1302,7 +1471,7 @@ mod anchor {
     /// The x at which the caret for `offset` is drawn, bracketed by the press
     /// map: pressing just left of it still lands on `offset`, pressing at the
     /// first x that maps to `offset + 1` does not.
-    fn assert_caret_x(app: &mut RinchApp, input: usize, x: f32, offset: usize) {
+    fn assert_caret_x(app: &mut RinchApp, input: u64, x: f32, offset: usize) {
         let lo = x_for_offset(app, input, offset);
         let hi = x_for_offset(app, input, offset + 1);
         assert!(
@@ -1401,7 +1570,10 @@ mod anchor {
         let (bx, by, _, bh) = abs_box(&app, input);
         left_press(&mut app, bx + 1.0, by + bh / 2.0);
         let s = app.text_edit_state().unwrap();
-        assert_eq!(s.anchor, (bx, by, 1.0, bh));
+        // The text origin is the content box: the UA `<input>`'s 2px border
+        // in from the border box (#1721; it was the left padding, over the
+        // border).
+        assert_eq!(s.anchor, (bx + 2.0, by, 1.0, bh));
     }
 }
 
@@ -1485,9 +1657,11 @@ mod unadopted_write {
         );
     }
 
-    /// A focused field inside a `data-rid` container whose click handler writes
-    /// the field's `value` — during the press itself.
-    fn rid_writing_page(new_value: &'static str) -> (RinchApp, usize, Rc<Cell<u32>>) {
+    /// A focused field inside a container whose `data-onmousedown` handler
+    /// writes the field's `value` — during the press itself. (It was a
+    /// `data-rid` until #1093: a right press no longer clicks, and a press's
+    /// own `data-onmousedown` is what still runs user code on every button.)
+    fn mousedown_writing_page(new_value: &'static str) -> (RinchApp, u64, Rc<Cell<u32>>) {
         let node: Rc<RefCell<Option<NodeHandle>>> = Rc::new(RefCell::new(None));
         let fired = Rc::new(Cell::new(0u32));
         let h = register_input_handler(InputCallback::new(|_| {}));
@@ -1502,7 +1676,7 @@ mod unadopted_write {
         let mut app = RinchApp::new(move |scope: &mut RenderScope| {
             let root = scope.create_element("div");
             let wrap = scope.create_element("div");
-            wrap.set_attribute("data-rid", &rid.0.to_string());
+            wrap.set_attribute("data-onmousedown", &rid.0.to_string());
             wrap.set_attribute("style", "padding: 10px");
             let f = scope.create_element("input");
             f.set_attribute("style", FIELD_STYLE);
@@ -1519,16 +1693,16 @@ mod unadopted_write {
         (app, id, fired)
     }
 
-    /// A right press inside the selection keeps a write its `data-rid`
-    /// ancestor made during the press, as a left press and a right press
+    /// A right press inside the selection keeps a write its
+    /// `data-onmousedown` ancestor made during the press, as a left press and a right press
     /// outside the selection do. The caret rule used to put the saved
     /// selection back and sync the state's old text over the write. (The
     /// review's round-3 fixture.)
     #[test]
-    fn rid_write_survives_a_right_press_inside_the_selection() {
+    fn a_mousedown_write_survives_a_right_press_inside_the_selection() {
         for v in ["HELLO WORLD", "\u{20ac}\u{20ac}\u{20ac}\u{20ac}"] {
             let press = |button: MouseButton| {
-                let (mut app, id, fired) = rid_writing_page(v);
+                let (mut app, id, fired) = mousedown_writing_page(v);
                 let (bx, by, _, bh) = abs_box(&app, id);
                 left_press(&mut app, bx + 1.0, by + bh / 2.0);
                 // Undo the focusing press's own write.
@@ -1546,7 +1720,7 @@ mod unadopted_write {
                 let f0 = fired.get();
                 let x = x_for_offset(&mut app, id, 3);
                 press_with(&mut app, x, by + bh / 2.0, button);
-                assert_eq!(fired.get(), f0 + 1, "positive control: the rid ran");
+                assert_eq!(fired.get(), f0 + 1, "positive control: the handler ran");
                 let menu = app.is_text_context_menu_open();
                 let _ = app.text_edit_state();
                 app.resolve_and_repaint(800.0, 600.0);
@@ -1555,11 +1729,24 @@ mod unadopted_write {
             let (right, menu) = press(MouseButton::Right);
             assert!(menu, "the right press opened the menu");
             assert_eq!(right.0, v, "the app's write survives the gesture");
-            // The write replaced the text the saved selection indexed, so the
-            // caret is where the write left it — as after a left press — and
-            // not the old 2..5, which on `€€€€` is inside a character.
-            let (left, _) = press(MouseButton::Left);
-            assert_eq!(right, left, "a right press ends as a left press does");
+            // The write landed before the gesture saved the selection, and the
+            // gesture adopts it first, so what it saves indexes the written
+            // text. A same-length write keeps 2..5, and the press inside it
+            // keeps the selection; `€€€€` resizes the value and the caret
+            // ends collapsed at 6, a character boundary. Without the pre-save
+            // adoption the first ends at (2,2). (Until #1093 the write came from a
+            // `data-rid` the right press clicked *after* the save, and this
+            // compared the right press with a left one.)
+            let expected = if v == "HELLO WORLD" {
+                ("2", "5")
+            } else {
+                ("6", "6")
+            };
+            assert_eq!(
+                (right.1.as_str(), right.2.as_str()),
+                expected,
+                "{v:?}: the selection the right press leaves"
+            );
         }
     }
 
@@ -1642,7 +1829,7 @@ mod anchor_against_paint {
         app.sync_input_cursor_to_dom();
     }
 
-    pub(super) fn caret_visible(app: &RinchApp, id: usize, visible: bool) {
+    pub(super) fn caret_visible(app: &RinchApp, id: u64, visible: bool) {
         app.doc
             .as_ref()
             .unwrap()
@@ -1655,7 +1842,7 @@ mod anchor_against_paint {
     }
 
     /// The box paint draws the collapsed caret at `offset` in.
-    fn painted_caret(app: &mut RinchApp, id: usize, offset: usize) -> (f32, f32, f32, f32) {
+    fn painted_caret(app: &mut RinchApp, id: u64, offset: usize) -> (f32, f32, f32, f32) {
         set_selection(app, offset, offset);
         caret_visible(app, id, true);
         let (on, w, h) = frame(app);
@@ -1669,9 +1856,9 @@ mod anchor_against_paint {
         tag: &'static str,
         value: &'static str,
         style: &'static str,
-    ) -> (RinchApp, usize) {
+    ) -> (RinchApp, u64) {
         let h = register_input_handler(InputCallback::new(|_| {}));
-        let id: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+        let id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
         let id_in = id.clone();
         let mut app = RinchApp::new(move |scope: &mut RenderScope| {
             let root = scope.create_element("div");
@@ -1807,20 +1994,20 @@ mod closed_panel_against_paint {
 
 // ── The rich-text editor ─────────────────────────────────────────────────────
 
-#[cfg(feature = "desktop")]
+#[cfg(feature = "windowing")]
 mod editor {
     use super::*;
     use rinch_editor_core::{Pos, Selection};
 
     struct EditorPage {
         app: RinchApp,
-        container: usize,
+        container: u64,
         handle: crate::editor::EditorHandle,
-        other: usize,
+        other: u64,
     }
 
     fn editor_page(html: &'static str) -> EditorPage {
-        let slot: Rc<RefCell<Option<(usize, crate::editor::EditorHandle, usize)>>> =
+        let slot: Rc<RefCell<Option<(u64, crate::editor::EditorHandle, u64)>>> =
             Rc::new(RefCell::new(None));
         let slot_in = slot.clone();
         let mut app = RinchApp::new(move |scope: &mut RenderScope| {
@@ -1996,10 +2183,10 @@ mod in_a_modal {
 
     /// A `Modal` with `lock_scroll` (its default) holding one text field, under
     /// the real theme and component sheets, opened from the start.
-    fn modal_page() -> (RinchApp, usize) {
+    fn modal_page() -> (RinchApp, u64) {
         let opened = Signal::new(true);
         let input_h = register_input_handler(InputCallback::new(|_| {}));
-        let ids: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+        let ids: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
         let ids_in = ids.clone();
         let mut app = RinchApp::new(move |scope: &mut RenderScope| {
             let input = scope.create_element("input");
@@ -2024,6 +2211,9 @@ mod in_a_modal {
             d.recompute_all_styles_full();
         }
         app.resolve_and_repaint(800.0, 600.0);
+        // The open modal's parked focus move is dropped: since #2731 the
+        // first key would apply it (`trap_focus_tests::settle`).
+        let _ = rinch_core::take_pending_focus_steps(app.doc_key(), true);
         (app, ids.get().expect("captured at mount"))
     }
 
@@ -2079,7 +2269,7 @@ mod in_a_modal {
 
 /// Not a pin — a measurement, `#[ignore]`d. Run with
 /// `cargo test -p rinch --lib text_context_menu_tests::bench -- --ignored --nocapture`.
-#[cfg(feature = "desktop")]
+#[cfg(feature = "windowing")]
 mod bench {
     use super::*;
     use rinch_editor_core::{Pos, Selection};
@@ -2095,7 +2285,7 @@ mod bench {
                 .collect::<String>()
                 .into_boxed_str(),
         );
-        let slot: Rc<RefCell<Option<(usize, crate::editor::EditorHandle)>>> =
+        let slot: Rc<RefCell<Option<(u64, crate::editor::EditorHandle)>>> =
             Rc::new(RefCell::new(None));
         let slot_in = slot.clone();
         let mut app = RinchApp::new(move |scope: &mut RenderScope| {
@@ -2193,4 +2383,39 @@ mod bench {
             "BENCH layout pass: before the first open {before:.4}ms, after a close {after:.4}ms"
         );
     }
+}
+
+/// Review of PR #1518: `data-tcm-item` is read by an ancestor walk from the
+/// hit node, so any element carrying it — an editor `<img>` that kept a pasted
+/// `data-tcm-item` (the PR keeps every unreserved `data-*`) — is a menu row
+/// while the menu is open. A press on it must act as an outside press.
+#[test]
+fn review_1518_a_foreign_data_tcm_item_outside_the_panel_is_no_row() {
+    let (mut app, ids, _log) = page("hello world", &[]);
+    focus_and_select(&mut app, ids.input);
+    let x = x_for_offset(&mut app, ids.input, 4);
+    let (_, by, _, bh) = abs_box(&app, ids.input);
+    right_press(&mut app, x, by + bh / 2.0);
+    let idx = app
+        .open_text_menu
+        .as_ref()
+        .unwrap()
+        .items
+        .iter()
+        .position(|r| r.action == TextEditAction::SelectAll)
+        .unwrap();
+    app.doc.as_ref().unwrap().borrow_mut().set_attribute(
+        NodeId(ids.plain),
+        "data-tcm-item",
+        &idx.to_string(),
+    );
+    let state_before = field_state(&app, ids.input);
+    let (px, py, _, ph) = abs_box(&app, ids.plain);
+    left_press(&mut app, px + 10.0, py + ph / 2.0);
+    assert!(!app.is_text_context_menu_open(), "closed");
+    assert_eq!(
+        field_state(&app, ids.input),
+        state_before,
+        "a press outside the panel ran an item"
+    );
 }

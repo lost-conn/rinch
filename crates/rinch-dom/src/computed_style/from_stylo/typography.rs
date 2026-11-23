@@ -2,34 +2,63 @@
 
 use crate::computed_style::values::*;
 
-pub(super) fn font_family_from_stylo(family: &style::values::computed::font::FontFamily) -> String {
-    use style::values::computed::font::{GenericFontFamily, SingleFontFamily};
+/// The computed `font-family` as a CSS list parley's `parse_css_list` reads
+/// back as the same families (#1223).
+///
+/// Every family *name* is written quoted, so a name with spaces or a comma
+/// stays one name, a name spelled like a generic (`"serif"`) stays a name,
+/// and a name that starts with a quote is not an unterminated string. Bare
+/// are stylo's generics and an unquoted name parley parses as a generic
+/// stylo lacks (`ui-monospace`, `emoji`, `math`, `fangsong`, ...). An empty
+/// name matches no font and would be a parse error that loses every family
+/// after it, so it is left out; so is a name holding both `"` and `'`, which
+/// parley's parser (no escapes) cannot read.
+pub(crate) fn font_family_from_stylo(family: &style::values::computed::font::FontFamily) -> String {
+    use style::values::computed::font::{
+        FontFamilyNameSyntax, GenericFontFamily, SingleFontFamily,
+    };
     let mut result = String::new();
-    for (i, f) in family.families.iter().enumerate() {
-        if i > 0 {
+    for f in family.families.iter() {
+        let item = match f {
+            SingleFontFamily::FamilyName(family_name) => {
+                let name: &str = family_name.name.as_ref();
+                if name.is_empty() {
+                    continue;
+                }
+                // A CSS Fonts 4 generic the servo build of stylo does not know
+                // (`ui-monospace`, `emoji`, `math`, `fangsong`, ...) arrives as
+                // an unquoted name; it stays bare so parley reads it as the
+                // generic. Quoted, it is a family name, as CSS says.
+                if family_name.syntax == FontFamilyNameSyntax::Identifiers
+                    && parley::fontique::GenericFamily::parse(name).is_some()
+                {
+                    std::borrow::Cow::Borrowed(name)
+                } else {
+                    match crate::fonts::quote_family(name) {
+                        Some(quoted) => std::borrow::Cow::Owned(quoted),
+                        None => continue,
+                    }
+                }
+            }
+            SingleFontFamily::Generic(generic) => std::borrow::Cow::Borrowed(match *generic {
+                GenericFontFamily::None => "sans-serif",
+                GenericFontFamily::Serif => "serif",
+                GenericFontFamily::SansSerif => "sans-serif",
+                GenericFontFamily::Monospace => "monospace",
+                GenericFontFamily::Cursive => "cursive",
+                GenericFontFamily::Fantasy => "fantasy",
+                GenericFontFamily::SystemUi => "system-ui",
+            }),
+        };
+        if !result.is_empty() {
             result.push_str(", ");
         }
-        match f {
-            SingleFontFamily::FamilyName(name) => {
-                result.push_str(name.name.as_ref());
-            }
-            SingleFontFamily::Generic(generic) => {
-                result.push_str(match *generic {
-                    GenericFontFamily::None => "sans-serif",
-                    GenericFontFamily::Serif => "serif",
-                    GenericFontFamily::SansSerif => "sans-serif",
-                    GenericFontFamily::Monospace => "monospace",
-                    GenericFontFamily::Cursive => "cursive",
-                    GenericFontFamily::Fantasy => "fantasy",
-                    GenericFontFamily::SystemUi => "system-ui",
-                });
-            }
-        }
+        result.push_str(&item);
     }
     result
 }
 
-pub(super) fn font_style_from_stylo(
+pub(crate) fn font_style_from_stylo(
     font_style: &style::values::computed::font::FontStyle,
 ) -> FontStyleValue {
     use style::values::computed::font::FontStyle as StyloFontStyle;
@@ -55,21 +84,57 @@ pub(super) fn line_height_from_stylo(lh: &style::values::computed::LineHeight) -
     }
 }
 
-pub(super) fn letter_spacing_from_stylo(ls: &style::values::computed::text::LetterSpacing) -> f32 {
-    // LetterSpacing wraps a LengthPercentage. A percentage here is
-    // font-relative (resolved per glyph at used-value time — Chrome keeps
-    // `calc(50% - 10px)` unresolved in the computed value), which the px-only
-    // spacing rinch hands Parley cannot express. Keep the length part of a
-    // mixed calc rather than dropping the whole value.
-    let (px, _pct) = super::calc::split_length_percentage(&ls.0);
-    px
+/// `letter-spacing`'s percentage resolves against the element's own
+/// `font-size` (#743) — measured in Chrome 153: `letter-spacing: 50%` at
+/// `font-size: 20px` adds exactly 10px per affected cluster, and at
+/// `font-size: 40px` exactly 20px, so the basis scales with `font-size` and
+/// not with any glyph's measured advance (the font's own glyphs, including
+/// the space, average well under 1em wide in that same probe, which is what
+/// rules out "the space glyph's advance" as the basis for either property —
+/// see `word_spacing_from_stylo` below). `font_size_px` is the caller's
+/// already-computed `font.font_size.computed_size().px()`, the same value
+/// that lands in `ComputedStyle::font_size`, so the two can never disagree
+/// about which font-size the percentage was resolved against — and a later
+/// `font-size` change re-shapes this text because `same_text_layout_inputs`/
+/// `same_measured_text_inputs` compare `font_size` directly, not just the
+/// resolved spacing.
+pub(super) fn letter_spacing_from_stylo(
+    ls: &style::values::computed::text::LetterSpacing,
+    font_size_px: f32,
+) -> f32 {
+    let (px, pct) = super::calc::split_length_percentage(&ls.0);
+    px + pct * font_size_px
 }
 
-pub(super) fn word_spacing_from_stylo(ws: &style::values::computed::text::WordSpacing) -> f32 {
-    // Same shape as letter_spacing_from_stylo: the percentage part is
-    // font-relative and not representable in px-only spacing.
-    let (px, _pct) = super::calc::split_length_percentage(ws);
-    px
+/// `word-spacing`'s percentage resolves against the element's own
+/// `font-size` too — **not** against the space glyph's advance width, which
+/// is what css-text-4 §10 describes and what the comment this replaces
+/// assumed. Measured in Chrome 153, `20px/40px monospace`, `white-space:
+/// pre`, `a a a` (one character per 12.04375px, i.e. about 0.6 of the
+/// 20px font-size): `word-spacing: 50%` widens the box by 20px over the
+/// unspaced line — 10px per space, exactly 50% of the 20px font-size and
+/// not 50% of the ~12px glyph advance a space-relative basis would give.
+/// Doubling `font-size` to 40px doubles the added width to 40px (20px per
+/// space), confirming the basis scales with `font-size` and not with a
+/// fixed glyph metric. See `letter_spacing_from_stylo` for the shared shape.
+pub(super) fn word_spacing_from_stylo(
+    ws: &style::values::computed::text::WordSpacing,
+    font_size_px: f32,
+) -> f32 {
+    let (px, pct) = super::calc::split_length_percentage(ws);
+    px + pct * font_size_px
+}
+
+/// `tab-size` (#1584): a number of spaces, or a length already in px (an
+/// `em` resolved by the cascade). Negative values do not parse.
+pub(super) fn tab_size_from_stylo(
+    ts: &style::values::computed::NonNegativeLengthOrNumber,
+) -> TabSizeValue {
+    use style::values::generics::length::LengthOrNumber;
+    match ts {
+        LengthOrNumber::Number(n) => TabSizeValue::Spaces(n.0),
+        LengthOrNumber::Length(l) => TabSizeValue::Length(l.0.px()),
+    }
 }
 
 pub(super) fn text_align_from_stylo(align: &style::values::computed::TextAlign) -> TextAlignValue {
@@ -77,11 +142,25 @@ pub(super) fn text_align_from_stylo(align: &style::values::computed::TextAlign) 
     match *align {
         TextAlign::Start => TextAlignValue::Start,
         TextAlign::End => TextAlignValue::End,
-        TextAlign::Left => TextAlignValue::Start,
-        TextAlign::Right => TextAlignValue::End,
+        TextAlign::Left => TextAlignValue::Left,
+        TextAlign::Right => TextAlignValue::Right,
         TextAlign::Center => TextAlignValue::Center,
         TextAlign::Justify => TextAlignValue::Justify,
-        _ => TextAlignValue::Start,
+        _ => html_align_from_stylo(align).unwrap_or_default(),
+    }
+}
+
+/// The alignment HTML's `align` attribute gives (`-moz-center` and its
+/// kin, which `legacy_hints` writes), if that is what `align` is.
+pub(super) fn html_align_from_stylo(
+    align: &style::values::computed::TextAlign,
+) -> Option<TextAlignValue> {
+    use style::values::computed::TextAlign;
+    match *align {
+        TextAlign::MozCenter => Some(TextAlignValue::Center),
+        TextAlign::MozLeft => Some(TextAlignValue::Start),
+        TextAlign::MozRight => Some(TextAlignValue::End),
+        _ => None,
     }
 }
 
@@ -97,6 +176,11 @@ pub(super) fn white_space_from_stylo(
         (WSCollapse::Preserve, TWMode::Nowrap) => WhiteSpaceValue::Pre,
         (WSCollapse::Preserve, TWMode::Wrap) => WhiteSpaceValue::PreWrap,
         (WSCollapse::PreserveBreaks, TWMode::Wrap) => WhiteSpaceValue::PreLine,
+        // `break-spaces` preserves spaces and newlines, as `pre-wrap` /
+        // `pre` do, and its spaces never hang (#1043). Without wrapping no
+        // space can hang anyway: that is `pre`.
+        (WSCollapse::BreakSpaces, TWMode::Wrap) => WhiteSpaceValue::BreakSpaces,
+        (WSCollapse::BreakSpaces, TWMode::Nowrap) => WhiteSpaceValue::Pre,
         _ => WhiteSpaceValue::Normal,
     }
 }
@@ -161,6 +245,43 @@ pub(super) fn overflow_wrap_from_stylo(
         StyloOW::Normal => OverflowWrapValue::Normal,
         StyloOW::BreakWord => OverflowWrapValue::BreakWord,
         StyloOW::Anywhere => OverflowWrapValue::Anywhere,
+    }
+}
+
+/// `word-break` (#2388).
+pub(super) fn word_break_from_stylo(
+    wb: &style::properties::longhands::word_break::computed_value::T,
+) -> WordBreakValue {
+    use style::values::specified::text::WordBreak as StyloWB;
+    match *wb {
+        StyloWB::Normal => WordBreakValue::Normal,
+        StyloWB::BreakAll => WordBreakValue::BreakAll,
+        StyloWB::KeepAll => WordBreakValue::KeepAll,
+    }
+}
+
+/// `text-indent` (#2628).
+pub(super) fn text_indent_from_stylo(
+    ti: &style::properties::longhands::text_indent::computed_value::T,
+) -> TextIndentValue {
+    TextIndentValue {
+        length: super::box_model::lp_value_from_stylo(&ti.length),
+        hanging: ti.hanging,
+        each_line: ti.each_line,
+    }
+}
+
+/// `line-break` (#2388).
+pub(super) fn line_break_from_stylo(
+    lb: &style::properties::longhands::line_break::computed_value::T,
+) -> LineBreakValue {
+    use style::values::specified::text::LineBreak as StyloLB;
+    match *lb {
+        StyloLB::Auto => LineBreakValue::Auto,
+        StyloLB::Loose => LineBreakValue::Loose,
+        StyloLB::Normal => LineBreakValue::Normal,
+        StyloLB::Strict => LineBreakValue::Strict,
+        StyloLB::Anywhere => LineBreakValue::Anywhere,
     }
 }
 

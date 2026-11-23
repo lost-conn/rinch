@@ -50,8 +50,10 @@ Configuring them on the builder leaves no ordering to get wrong.
 Calling `.fonts()` more than once registers all of them, in call order — unlike
 `.title()` or `.menu()`, a second call adds rather than replaces.
 
-`AppFont::data` is `&'static [u8]`, which is what `include_bytes!` gives you.
 The file is a TrueType (`.ttf`), OpenType (`.otf`) or collection (`.ttc`).
+The constructors above take `&'static [u8]`, which is what `include_bytes!`
+gives you; a face whose bytes arrive while the app runs is owned instead (see
+[Where the bytes come from](#where-the-bytes-come-from)).
 
 ## What a face is reachable *as*
 
@@ -82,14 +84,14 @@ The constructors say which slot a face is claiming:
 | `AppFont::sans_serif` | `sans-serif`, `system-ui`, `ui-sans-serif` |
 | `AppFont::monospace` | `monospace`, `ui-monospace` |
 
-Anything else is a struct literal, over the full set of CSS generics:
+Anything else names its generics, over the full set of CSS generics:
 
 ```rust,ignore
-AppFont {
-    generics: &[GenericFamily::Cursive, GenericFamily::Fantasy],
-    ..AppFont::new(bytes)
-}
+AppFont::new(bytes).with_generics(&[GenericFamily::Cursive, GenericFamily::Fantasy])
 ```
+
+(`AppFont::SERIF`, `AppFont::SANS_SERIF` and `AppFont::MONOSPACE` are the lists
+the three constructors claim.)
 
 A bundled face goes **ahead of** the platform's own entry for a slot —
 including the face rinch's Android repair filled an empty slot with (below).
@@ -126,12 +128,196 @@ The repair runs at context construction, before any app font can register, so
 an appended claim would sit behind the repair's platform face and silently
 lose — on Android only, which is the platform nobody would test it on.
 
+## A stack that names nothing installed
+
+rinch resolves a `font-family` list the way Chrome does:
+
+- **A missing family is replaced by its alternate** where that is installed:
+  Helvetica by Arial, Times by Times New Roman, Courier by Courier New, and
+  each the other way (Courier New by Courier except on Windows). This is
+  Blink's table, so `Helvetica, Tahoma, sans-serif` on a Linux machine with
+  Arial and Tahoma but no Helvetica draws Arial, as Chrome does, not Tahoma
+  (nor fontconfig's Helvetica, Nimbus Sans). On Linux a missing family can
+  also be drawn in fontconfig's substitute, [below](#fontconfigs-substitutes-linux-and-the-bsds).
+- **A list whose every family is missing ends in the default font**: Times
+  New Roman, Chrome's "standard font", or the first face of `sans-serif`
+  where the machine has no Times (Chrome then takes fontconfig's sans face,
+  not its serif setting). So `font-family: Oswald` without Oswald draws its
+  letters *and digits* in Times New Roman, as in Chrome, and in DejaVu Sans
+  on a machine whose only fonts are DejaVu.
+- **`serif` means Times New Roman and `sans-serif` Arial** where the machine
+  has them or their substitutes (Times and Helvetica on macOS), ahead of the
+  platform's own choice for the slot: these are Chrome's font settings, and on Linux they
+  differ from fontconfig's `serif` and `sans-serif` (Noto Serif, DejaVu Sans).
+
+A stack that finds any family, or names a generic that has one, gets no
+default font. The theme's stack ends in `sans-serif`, so it never does, and an
+element under a theme is unaffected; end your own stacks in a generic to
+choose the fallback yourself.
+
+All three are settings, Chrome's by default. An app that wants its own face
+as the default font, or the platform's `serif`, says so:
+
+```rust,ignore
+App::new(app)
+    .fonts(&[AppFont::sans_serif(include_bytes!("../assets/Inter.ttf"))])
+    .font_defaults(
+        FontDefaults::default()
+            .with_standard("Inter, sans-serif") // the default font
+            .with_serif(None),                  // keep the platform's `serif`
+    )                                           // `sans-serif`: still Arial
+    .run();
+```
+
+`standard` is a `font-family` list: its first family the machine has (or a
+generic's first face) is the default font; when it has none, the first face of
+`sans-serif` is. A face claimed for a generic with `AppFont` still heads that
+slot, ahead of `serif` and `sans_serif` here. An embedder that builds its
+context itself calls `rinch::font::set_font_defaults` before creating it. On
+the web the browser's own settings apply. `FontDefaults` is
+`#[non_exhaustive]` (a later setting is not a breaking change), so it is built
+from `FontDefaults::default()` with its `with_*` methods, or by assigning its
+fields.
+
+### fontconfig's substitutes (Linux and the BSDs)
+
+Where fontconfig is the font source, a missing family is also drawn in the
+face fontconfig substitutes for it, **when Chrome would draw it there**.
+fontconfig always matches *some* font, so, like Chrome, rinch takes its match
+only when the match is
+
+- a **metric-compatible replacement** in Chrome's table: Liberation Sans or
+  Arimo for Arial, Liberation Serif or Tinos for Times New Roman, Liberation
+  Mono or Cousine for Courier New, Carlito for Calibri, Caladea for Cambria,
+  and the CJK pairs (Noto Sans CJK JP for MS PGothic, and so on);
+- or the family the configuration puts **first** for the name (a rule that
+  prepends or prefers it, such as your own `~/.config/fontconfig` alias).
+
+So on a machine with Liberation and no Microsoft fonts (most Linux desktops)
+`Arial` is Liberation Sans, `Helvetica` is Liberation Sans too (by way of its
+alternate, Arial), and `serif` and the default font, both Times New Roman, are
+Liberation Serif, as in Chrome. fontconfig's other guesses are not used:
+`Calibri` without Carlito, `Georgia`, or a family a rule only appends (what
+`fc-match` prints) leave the list to move on to its next family. An installed
+family is always itself. The substitute is tried before the alternate, as in
+Chrome: with Helvetica and Liberation Sans but no Arial, `Arial` is Liberation
+Sans.
+
+This is `FontDefaults::system_substitutes`, on by default. An app that wants
+the same face on every machine that has its families turns it off:
+
+```rust,ignore
+App::new(app)
+    .font_defaults(FontDefaults::default().with_system_substitutes(false))
+    .run();
+```
+
+### Faux bold
+
+A family with no face as heavy as the text asks for is drawn faux bold, by
+Chrome's two rules. A face you registered (`AppFont`, `register_font_data`, an
+embed's fonts), like an `@font-face` face, is emboldened when the text asks
+for 600 or more and the face is under 600: a regular-only family at
+`font-weight: 600` is faux bold, a semibold (600) face never is. A system face
+is emboldened when the text asks for more than 200 over the face's weight:
+Liberation Sans Regular from 601. A variable face takes its weight from its
+`wght` axis instead.
+
+## Emoji
+
+An emoji-presentation character — 😀, ⬜, a flag, or an emoji character
+followed by U+FE0F (❤️, ©️) — is drawn from the `emoji` generic unless a family
+in your stack covers it first, where each generic in the stack counts as its
+**first face** only; the generics' other faces come after the `emoji` generic,
+so a character the emoji face lacks still finds them. U+FE0F after a character
+that is not an emoji (𝄞, Thai ก) changes nothing.
+So under `font-family: sans-serif` (or the theme's default stack) an emoji is in
+colour even on a machine whose `sans-serif` list goes on to text faces that
+also have it (DejaVu Sans, FreeSans), as in Chrome; a family you *name* that
+covers the emoji still draws it, as in Chrome, and an emoji face you name after
+a generic (`…, sans-serif, 'Segoe UI Emoji'`) wins it. A character that is text
+by default — ❤ without U+FE0F, ©, the digits — follows the stack as written.
+
+## Fonts installed while the app runs
+
+rinch lists the installed fonts once, when the first window (or embedded
+context) starts, and every document shares that list. A font the user installs
+afterwards is picked up by a **refresh**: the fonts are listed again on a
+background thread, and on its next frame every window rebuilds its fonts over
+the new list (your [`App::fonts`](#shipping-a-face) included), then restyles,
+re-measures and repaints.
+
+- **Linux**: `App::run` asks the kernel (inotify) to say when anything the
+  font list was read from changes: fontconfig's configuration files and
+  `conf.d` directories, and its font directories (including one that is
+  configured but does not exist yet, such as `~/.local/share/fonts` on a new
+  account). After a change rinch waits 5 seconds for more (installing a family
+  is many files), then lists the fonts again, once; the wait counts from the
+  first change, so a steady stream of changes is one listing per 5 seconds.
+  Between changes the
+  watch's thread sleeps in the kernel: an idle app has no wake-ups for it.
+  The watch never lists the fonts at start: it waits for the list the first
+  window's document makes, so it costs the first frame nothing.
+  Change the wait, or turn the watch off, before or after `App::run`:
+
+  ```rust,ignore
+  rinch::font::watch_system_fonts(Some(std::time::Duration::from_secs(1)));
+  rinch::font::watch_system_fonts(None); // never watch
+  ```
+
+  On Linux the duration is that wait after a change, not how often rinch
+  looks: it never looks on a timer. An embedded `RinchContext` has no watch
+  until its host calls this.
+- **Everywhere else** (macOS, Windows, Android) nothing watches, and
+  `watch_system_fonts` is accepted and does nothing. There, and whenever the
+  app knows better, call `rinch::font::refresh_system_fonts()`. It returns at
+  once.
+
+A refresh lists every font again, which costs what start-up did (about 250 M
+instructions for 1,300 fonts), so it is not something to call every frame. The
+web backend uses the browser's fonts and needs none of this.
+
 ## Platforms with no fonts at all
 
 Wasm has no system font source: an unregistered app renders **zero glyphs**, not
 a fallback. That case wants a face in the last-resort fallback chain as well as
 in a generic slot, which is what [`RinchApp::register_font_data`] and
 [`RinchContextConfig::fonts`] do, and what `AppFont::script_fallback` turns on.
+
+Font data registered that way declares nothing about what it is for. It fills
+a generic only where the **plain** slot (`sans-serif`, `serif`, `monospace`)
+is empty, and only the slots of its own class, read from the font's own
+tables:
+
+| The face | Fills, when the plain slot is empty |
+| --- | --- |
+| sans serif, or no declared class | `sans-serif`, `system-ui`, `ui-sans-serif` |
+| serif | `serif`, `ui-serif` |
+| fixed pitch | `monospace`, `ui-monospace` |
+| script, decorative or symbol class; color emoji (`COLR`, `CBDT`, `sbix` or `SVG ` tables); no `A` or `a` in its cmap (icon fonts) | nothing |
+
+The `ui-*` and `system-ui` slots are filled only together with their plain
+slot, never on their own, and a slot already holding a face is never
+changed. So on wasm the first sans-serif text face you register is what
+`sans-serif` means, whatever you register before or after it. On a desktop
+the platform maps the plain generics (fontconfig maps no `ui-*` slot, but
+those are left empty as well), so **registering font data changes no generic
+slot**: `sans-serif` is the platform's sans-serif face, and the theme's
+monospace stack, which starts with `ui-monospace`, still reaches the
+platform's `monospace`. To make a face *the* `sans-serif` there, claim it
+(`AppFont::sans_serif`, or `register_app_font` in an embed; see
+[Game engine integration](./game-engine.md)).
+
+### Migrating from before #2102
+
+Until issue #2102 every such face was put at the head of `sans-serif` and
+`system-ui`, so the face registered **last** — a script face as easily as a
+text face — was what every `sans-serif` element drew in. An app that relied
+on that, on a platform with fonts, now gets the platform's face instead. To
+keep a registered face as a generic, either claim it —
+`ctx.register_app_font(AppFont::sans_serif(BYTES))` in an embed, or
+`App::fonts(&[AppFont::sans_serif(BYTES)])` — or name its family in the stack
+(`font-family: "Liberation Sans", sans-serif`).
 
 Do **not** turn it on where the platform does have fonts. The text stack
 resolves a script's fallback from the app's own list first and the platform's
@@ -148,15 +334,187 @@ stack already covers the character, fallback is never consulted. That makes it
 worse, not better — the breakage shows up only for the scripts and stacks
 nobody tested.
 
+## Text rendering
+
+How glyphs are rasterised is an app option with OS defaults, as in Chrome
+(issue #2286). `App::text_rasterization` takes a `TextRasterization`, every field of
+which defaults to `Auto`:
+
+```rust
+use rinch::prelude::*;
+
+App::new(app)
+    .text_rasterization(
+        TextRasterization::default()
+            .stem_darkening(StemDarkening::Off) // no thickening of light text
+            .hinting(TextHinting::None),        // exact outlines, whatever the OS says
+    )
+    .run();
+```
+
+| Field | `Auto` means | Other values |
+|---|---|---|
+| `hinting` | The OS's hint style; `Slight` where it says nothing, `None` on macOS | `None`, `Slight`, `Medium`, `Full` (the last three all hint today) |
+| `stem_darkening` | Light text is grown by up to 0.10 px a side | `Off`, `Px(amount)` (up to 0.5) |
+| `antialias` | The OS's: subpixel where it names a subpixel order, else grayscale (macOS: always grayscale) | `Grayscale`, `Subpixel`, `None` (drawn grayscale) |
+| `subpixel_order` | `None`: the OS's (fontconfig `rgba`, ClearType's orientation) | `Some(Rgb)`, `Bgr`, `VRgb`, `VBgr`; `Some(SubpixelOrder::None)` turns subpixel text off |
+| `lcd_filter` | `None`: the OS's (fontconfig `lcdfilter`), FreeType's default filter where it says nothing | `Some(Default)`, `Light`, `Legacy`, `None` |
+| `gpu_glyph_outlines` | `false`: the GPU draws glyphs from the glyph-mask atlas | `true`: from outlines (below) |
+
+**Stem darkening.** Both renderers blend a glyph's coverage in sRGB-encoded
+space, as FreeType's usual callers do, and that makes light text on a dark
+background look about a quarter thinner than the same text dark on light. So
+light text is thickened a little: by up to 0.10 device pixels on every side for
+text whose colour is light (its sRGB luma, over black, from 0.5 to 0.85 ramps
+from none to all of it), at sizes up to 24 device pixels, tapering to none at 64.
+Only the text colour decides, as in Skia: paint does not know what lies under
+the text, so light-grey text on a light background (the light theme's
+placeholder grey, `#adb5bd` on white) is thickened too. Dark text is untouched.
+The amount and the size taper are in device pixels, under CSS transforms too
+(13px text under `scale(2)` is treated as 26px), and both renderers apply the
+same amount, so the GPU and software renderers still draw the same glyphs.
+Blurred `text-shadow`s follow their own colour: a dark shadow is not thickened.
+
+**The OS's settings** are read once, when the first text is painted, and
+`rinch::text_rasterization::system_text_settings()` returns them. The first
+frame already draws with them; no frame is drawn with defaults first:
+
+- **Linux**: fontconfig's match for `sans-serif` — `antialias`, `hinting`,
+  `hintstyle`, `rgba`, `lcdfilter`. KDE's font settings write these into the
+  user's `fonts.conf`. GNOME's own font settings reach only GTK apps (through
+  XSETTINGS) and are not read; fontconfig's defaults are GNOME's defaults.
+  The match is made on the configuration rinch's font list was read with, so
+  it costs one match; a system without libfontconfig reads nothing.
+- **Windows**: font smoothing and ClearType, with ClearType's subpixel order
+  (`SystemParametersInfo`).
+- **macOS**: grayscale and unhinted.
+
+**How glyphs are drawn.** Both renderers draw text from one cache of glyph
+masks (the glyph-mask atlas, #2286): each glyph is rasterised once per font,
+device size and quarter-pixel horizontal position, and drawn at a whole device
+pixel, so letters keep their fractional spacing and the GPU and software
+renderers draw the same pixels. Text under a rotation, a skew or an uneven
+scale, emoji and other colour glyphs, text larger than 64 device pixels and
+synthetic italics (below) are drawn from outlines on the GPU instead; a uniform scale
+(a HiDPI display, CSS `scale()`) is rasterised at the scaled size. Text whose
+size is animating (a `font-size` or `scale()` transition or animation) is
+drawn from outlines while it changes, since each size would be a new set of
+masks, and goes back to the atlas once it settles. The two rasterisers differ
+slightly, so on the frame the text starts or stops animating its glyph edges
+shift by up to about half a pixel and its weight by about 1%; the animation
+itself hides the first, and the second is one frame. An app can keep outlines
+for everything with `TextRasterization::default().gpu_glyph_outlines(true)`.
+
+**Synthetic bold and italic.** A family with no bold face, set in
+`font-weight: bold` (any weight more than 200 over the face's), is drawn from
+its regular face emboldened, as Chrome draws it: each side of a glyph's outline
+moves out by `size / 48` up to 9px, `size / 64` from 36px and in between
+proportionally, the size being in device pixels (an `l` at 16px is 0.62 px
+wider at 1x, 0.52 CSS px at 2x), the same on both renderers, and on top of any
+stem darkening. A family with no italic face (and no italic or slant axis),
+set in `font-style: italic`, is slanted by 14 degrees. Shadows of such text are
+emboldened and slanted with it. `font-synthesis-weight: none` on an element
+(inherited) draws its bold from the regular face as it is, as in Chrome.
+Synthesised italics cannot be turned off yet: `font-synthesis-style` and the
+`font-synthesis` shorthand are not parsed (#2345). Ship the real face
+(`App::font`) where the weight or style matters: a synthesised bold is heavier
+than the regular but is not the designer's bold, and its advances are the
+regular face's.
+
+**Subpixel (LCD) text.** Where the OS draws subpixel text — fontconfig's `rgba`
+on Linux (KDE's "Sub-pixel rendering: RGB" writes `rgba=rgb`), ClearType on
+Windows — rinch does too, on both renderers: each glyph is rasterised at three
+times the resolution across the panel's subpixels, filtered with the OS's LCD
+filter (FreeType's `lcddefault` or `lcdlight`, in FreeType's arithmetic;
+`lcdlegacy` is `lcddefault`: FreeType 2.14 no longer has the legacy filter) and drawn per channel, so its edges use the red, green and blue
+subpixels of a pixel separately, as KDE's and Chrome's text does. macOS has
+drawn no subpixel text since 10.14, and rinch never does there. Subpixel text
+needs to know the pixel under it, so, as Chrome and Skia do, rinch draws grey
+text instead:
+
+- inside an opacity group (any `opacity` below 1), a `mask-image`, a `filter`,
+  or anything else drawn into a layer of its own;
+- over a pixel that is not opaque: in a transparent window where nothing opaque
+  is under the text, or over a translucent background (decided per pixel, so
+  text on an opaque panel in a transparent window is still subpixel);
+- under a rotation, a skew or an uneven scale, and while its size animates
+  (the outlines those draw are grey); a uniform scale (HiDPI, `scale()`) is
+  rasterised at the device size and stays subpixel;
+- for emoji and other colour glyphs, and text larger than 64 device pixels on
+  the GPU.
+
+While a window shows a `RenderSurface`, a `GameViewport` or a video layer, the
+GPU renders the UI over a transparent base (the layers show through it), so
+text with no opaque background of its own under it turns grey for as long as
+the layer is on screen, and back when it goes; give such text an opaque
+background (most pages have one on `body`) to keep it subpixel. **Embedding
+hosts** (`RinchContext`): subpixel text is right only when the UI texture
+reaches the screen pixel for pixel. A host that scales the texture, draws it
+at a fractional offset or maps it onto a surface in 3D should ask for
+`TextAntialias::Grayscale` through `set_text_rasterization`.
+
+Clips (`overflow: hidden`, rounded or not) do not stop it. Text that fades in
+with an `opacity` animation is grey while it fades and turns subpixel when the
+animation ends at `opacity: 1`, as in Chrome. At a fractional scale factor
+(125%, 150%) the masks are still rasterised for the device pixels the window is
+drawn at, so the subpixel grid lines up with the panel as long as the
+compositor shows the window's pixels unscaled (Wayland's fractional-scale
+protocol, Windows' per-monitor DPI). An app can set the order for a panel the
+OS reports wrongly, or not at all (a BGR monitor, one rotated to portrait,
+`VRgb`), or turn subpixel text off:
+
+```rust
+App::new(app)
+    .text_rasterization(
+        TextRasterization::default()
+            .subpixel_order(Some(SubpixelOrder::Bgr)) // or Some(SubpixelOrder::None): grey
+            .lcd_filter(Some(LcdFilter::Light)),
+    )
+    .run();
+```
+
+The colour fringes are visible when a screenshot is scaled or shown on another
+display; an app that takes screenshots for others to see can ask for
+`TextAntialias::Grayscale`. Subpixel coverage is blended in sRGB-encoded space
+like grey coverage (and like FreeType's usual callers, KDE's included), and
+takes the same stem darkening. `antialias: None` (fontconfig `antialias=false`)
+is drawn grayscale: rinch has no aliased text.
+
+An
+embedding host that wants the OS's settings calls
+`rinch::text_rasterization::set_text_rasterization(TextRasterization::default())` before its
+first frame; without it an embedded document renders as if the OS said nothing
+(grayscale, slight hinting, stem darkening on).
+
 ## Where the bytes come from
 
 `include_bytes!` puts the file in the binary — in the `.so`, for an Android
-build — and needs no packaging. On Android the more idiomatic alternative is to
-put the files in the APK's `assets/` and read them through `AndroidApp`'s asset
-manager, which keeps the shared object smaller; it is also more machinery, it
-is Android-only, and the bytes it produces are owned rather than `'static`. The
-API here takes `&'static [u8]`, so `include_bytes!` is the supported route
-today.
+build — and needs no packaging. Bytes that arrive while the app runs — a font
+the user imports, a game's own fonts, a file read from the APK's `assets/`
+through `AndroidApp`'s asset manager — are owned, and every registration takes
+them as [`FontData`]: a `Vec<u8>`, a `Box<[u8]>`, an `Arc<[u8]>` or a parley
+`Blob<u8>`, each with `.into()`, as well as `&'static [u8]`:
+
+```rust,ignore
+let bytes: Vec<u8> = std::fs::read("UserFont.ttf")?;
+let face = AppFont::from_data(bytes).with_generics(AppFont::SANS_SERIF);
+App::new(app).fonts(&[face]).run();
+```
+
+Owned bytes are **not leaked**: rinch keeps a reference for as long as an app
+(or an embed's `RinchContext`) that registered them lives, and drops it with
+that app. The tests pin it by the `Arc`'s count after a mount that laid out and
+painted text in the face (issue #2101). Before that, the API took only
+`&'static [u8]`, and an app with run-time fonts had to leak each one.
+
+A registered face cannot be **unregistered** from a running app. fontique has
+`Collection::unregister_font` (per family, width, style and weight), but the
+face also lives in every layout, shaping and glyph cache that used it, so
+removing it means relaying out and repainting everything; rinch does not do
+that. A face's bytes are freed when the app or context that registered them is
+dropped, so an app whose fonts change for good builds a new context.
+
+[`FontData`]: https://docs.rs/rinch/latest/rinch/font/struct.FontData.html
 
 [`App`]: ./windows.md
 [`RinchApp::register_font_data`]: https://docs.rs/rinch/latest/rinch/app/struct.RinchApp.html#method.register_font_data

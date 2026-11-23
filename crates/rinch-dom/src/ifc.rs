@@ -5,111 +5,13 @@ use std::collections::HashMap;
 use peniko::Brush;
 
 use crate::RinchDocument;
+use crate::computed_style::VerticalAlignValue;
+use crate::float_wrap::FloatBands;
 use crate::layout;
+use crate::node::RawNodeId;
 use crate::node::{
     DisplayMode, InlineFlowRole, InlineLayout, LayoutResult, Node, NodeContext, NodeKind,
 };
-
-/// Write the one-line height floor an empty block container is owed onto its
-/// Taffy style.
-///
-/// A deliberate rinch divergence from CSS, **not** a spec rule: CSS 2.1 §10.6.3
-/// gives a block container with no in-flow children `height: 0` (an empty
-/// `<div></div>` is 0px in every browser). Rinch floors it at one line box
-/// instead because `<input>` and `<textarea>` keep their value in an *attribute*
-/// rather than in a text child — they are childless however much text they hold,
-/// there is no `NodeContext` measure function for them, and this floor is the
-/// only thing that gives a blockified one a height at all. The right fix is an
-/// intrinsic size for form controls (as `<textarea rows>` already gets); until
-/// then the floor must be applied consistently or the control vanishes.
-///
-/// **Called from both passes that write a node's Taffy style, because either
-/// runs without the other.** [`RinchDocument::setup_inline_formatting_contexts`]
-/// only runs on a structural change (`ifc_dirty`), while
-/// `apply_stylo_styles_to_taffy` runs on every style recompute and rebuilds the
-/// style from the computed values. Applied in the IFC pass alone, the floor was
-/// silently discarded by the next restyle of that node — a `:focus` write when
-/// a text field is clicked was enough — collapsing the element to zero height,
-/// which `paint_node` skips outright: no background, no value, no caret, and
-/// nothing to restore it short of a new structural change.
-///
-/// No-ops unless the node is a childless element that would establish an IFC
-/// and left its height `auto`; an explicit height (a `height: 1px` separator)
-/// is never inflated.
-///
-/// # The `is_block_container()` test survives mutation, and the reason is not
-/// reachability
-///
-/// Removing `Inline` from it — letting a childless `display: inline` element
-/// take the one-line floor — keeps `-p rinch-dom -p rinch` green (#593).
-/// Re-measured after #513 landed and still green. The arm is **reached**, and
-/// often: instrumented, a childless inline element reaches it in 29 of the
-/// suite's 52 test binaries and in 38 of 67 constructed shapes, so this is not
-/// a dead branch.
-///
-/// What is unobserved is the *consequence*, and the mechanism is the detach: an
-/// inline element that is IFC content is removed from its parent's Taffy node by
-/// `mark_inline_descendants`, so Taffy computes nothing from its style and a
-/// `min-height` written there reaches no number anybody reads. That is the reason
-/// the green is unsurprising, **not** a proof of it — it does not cover a
-/// childless inline element whose parent is not an IFC root, which keeps its Taffy
-/// node. The measurement is the measurement; this is why it came out that way.
-///
-/// Keep the test regardless: a `min-height` on an inline-level box is wrong
-/// whether or not anything can see it, and the four sites asking this question
-/// are one authority (#614) — with the one qualification #592 added below, that
-/// this site alone excludes an **atomic inline**, because the floor is a rinch
-/// divergence for form controls and not a CSS rule the other three share.
-pub(crate) fn apply_empty_block_line_floor(node: &Node, style: &mut taffy::Style) {
-    use crate::computed_style::values::DisplayValue;
-
-    if !node.is_element() || !node.children.is_empty() {
-        return;
-    }
-    // Only block containers establish an IFC; a `display: contents` node
-    // generates no box at all.
-    //
-    // **And not an atomic inline**, which is the one place the four sites
-    // deliberately diverge (#592). `is_block_container` admits `inline-block`
-    // since #592 — its *inside* is a block container, which is what the other
-    // three sites ask about — but this floor is a rinch divergence invented for
-    // blockified form controls, and CSS is unambiguous that an **empty**
-    // `inline-block` is 0 tall: measured in Chrome 150, `<span
-    // style="display:inline-block"></span>` in a `line-height: 20px` container
-    // is `0x0`, not `0x20`. Applying the floor here made every childless
-    // atomic inline one line tall, `<img>` included (it is `inline-block` in the
-    // UA sheet), so an image with no `src` got a 19px box and a 3x2 data URI
-    // got a 3x19 one — `pending_image_tests`' two failures, which is how this
-    // was found rather than argued.
-    if !node.display_mode.is_block_container()
-        || node.display_mode.is_atomic_inline()
-        || node.computed_style.display == DisplayValue::Contents
-    {
-        return;
-    }
-    if !style.size.height.is_auto() {
-        return;
-    }
-
-    let line_h = node.computed_style.line_height_px();
-
-    // The floor must not stomp an author `min-height` — it is a *floor*, not an
-    // override. A childless block (a `<textarea>`, an empty spacer div)
-    // otherwise collapses to one line no matter what the author asked for.
-    if let Some(author_min) = style.min_size.height.into_option() {
-        // An explicit length: the floor is the larger of the two.
-        style.min_size.height = taffy::Dimension::length(line_h.max(author_min));
-    } else if style.min_size.height.is_auto() {
-        style.min_size.height = taffy::Dimension::length(line_h);
-    }
-    // A percentage/calc min-height is left untouched so Taffy can resolve it
-    // against the containing block (it could not before the 0.12 upgrade, which
-    // is why this used to flatten it to `line_h`). Note the consequence: if the
-    // containing block's height is indefinite the percentage resolves to zero
-    // per CSS, so such a block collapses rather than keeping the one-line floor.
-    // That matches browsers, and an empty block with no min-height at all still
-    // gets the floor.
-}
 
 /// What the post-layout tree-check sweep may fail on, and what it may not.
 ///
@@ -124,15 +26,756 @@ pub struct TreeCheckVerdict {
     pub fatal: Vec<String>,
 }
 
+/// The IFC root's own text style, which the `text-overflow: ellipsis` "…"
+/// is shaped in (#1100).
+pub(crate) struct EllipsisStyle {
+    font_size: f32,
+    font_family: std::borrow::Cow<'static, str>,
+    font_weight: parley::style::FontWeight,
+    font_style: parley::style::FontStyle,
+    color: peniko::Color,
+    line_height: Option<parley::style::LineHeight>,
+    letter_spacing: f32,
+    word_spacing: f32,
+    underline: bool,
+    strikethrough: bool,
+    decoration_color: Option<peniko::Color>,
+}
+
+/// The colour an IFC root's own style gives its text: the default brush of
+/// its layout, and of the flat `text-overflow: ellipsis` rebuild.
+pub(crate) fn root_text_color(cs: &crate::computed_style::ComputedStyle) -> peniko::Color {
+    cs.color.unwrap_or(peniko::Color::BLACK)
+}
+
+/// The colour a text node's glyphs are drawn in: its element's `color`.
+///
+/// A text node has no style of its own. `walk_inline_children` pushes each
+/// inline element's colour as a span around its text, a styled `display:
+/// contents` wrapper's (#574) and the DOM parent's for a member of an
+/// anonymous box, so in every case the brush a run gets is its text node's DOM
+/// parent's colour — which is what this answers, at the build (recorded as
+/// [`crate::node::IfcTextRange::color`]) and again at every paint (#679).
+pub(crate) fn text_color(
+    nodes: &crate::node_slab::NodeSlab,
+    text_node: RawNodeId,
+) -> peniko::Color {
+    let mut cur = nodes.get(text_node).and_then(|t| t.parent);
+    while let Some(node) = cur.and_then(|id| nodes.get(id)) {
+        if let Some(color) = node.computed_style.color {
+            return color;
+        }
+        cur = node.parent;
+    }
+    peniko::Color::BLACK
+}
+
+/// The colour of an element's wavy underline: its `text-decoration-color`,
+/// or its `color` for `currentcolor`.
+pub(crate) fn wavy_underline_color(cs: &crate::computed_style::ComputedStyle) -> peniko::Color {
+    cs.text_decoration
+        .color
+        .or(cs.color)
+        .unwrap_or(peniko::Color::BLACK)
+}
+
+/// Whether a `position: static` inline element is a stacking context (#2869):
+/// a `filter`, an `opacity` below 1 or a `mask-image` (a `transform` does not
+/// apply to it, #1080, and a `z-index` does nothing). Its IFC records its
+/// byte range with the relative ones (`InlineLayout::relative_spans_resting`,
+/// at a zero offset), and its own entry of the stacking sequence paints it
+/// (`paint::paints_in_own_entry`).
+pub(crate) fn is_static_inline_layer(cs: &crate::computed_style::ComputedStyle) -> bool {
+    cs.position == crate::computed_style::PositionValue::Static
+        && (cs.opacity < 1.0 || cs.has_filter() || !cs.mask_image.is_empty())
+}
+
+/// Whether an inline element has a background to draw: a colour that is not
+/// fully transparent, or an image layer (a gradient, a `url()`, #2884). The
+/// one test [`inline_background_span`] makes, asked on its own by the
+/// transition and animation ticks (#679).
+pub(crate) fn has_inline_background(cs: &crate::computed_style::ComputedStyle) -> bool {
+    cs.background_color().is_some_and(|c| c.components[3] > 0.0) || has_inline_image(cs)
+}
+
+/// Whether an inline element's background has an image layer (#2884): paint
+/// draws its fragments through the block background painter then, the layer
+/// laid out over the fragments side by side (`box-decoration-break: slice`).
+pub(crate) fn has_inline_image(cs: &crate::computed_style::ComputedStyle) -> bool {
+    use crate::computed_style::BackgroundValue as B;
+    !matches!(cs.background, B::None | B::Color(_))
+}
+
+/// The bit an **edge box**'s parley id carries (#1426).
+///
+/// parley 0.11.1 has no per-span padding, so the room a `display: inline`
+/// element's inline-start margin, border and padding take on its first line,
+/// and its inline-end ones on its last, is an `InlineBox` of that width and
+/// no height pushed before and after its content
+/// ([`IfcText::push_edge_box`]). Such a box holds no node: its id is this bit,
+/// [`EDGE_BOX_END`] for the end box, and the owner's node id (a
+/// [`RawNodeId`]: its generation in the high 32 bits, its slot below these two
+/// bits), so that the id cannot name a real node. Every walker of a layout's
+/// inline boxes that maps a box to a node asks [`is_edge_box`] first.
+pub const EDGE_BOX: u64 = 1 << 31;
+/// Set with [`EDGE_BOX`] on an element's inline-end box.
+pub const EDGE_BOX_END: u64 = 1 << 30;
+
+/// A line's typographic extent above its baseline: the tallest ascent of its
+/// glyphs and the part of its inline boxes over the baseline. parley 0.12
+/// dropped `LineMetrics::ascent` (linebender/parley#697); its
+/// `content_block_min_coord` is the top of that extent.
+pub(crate) fn line_ascent(m: &parley::LineMetrics) -> f32 {
+    m.baseline - m.content_block_min_coord
+}
+
+/// The top of what a line covers: its line box's (`block_min_coord`), or its
+/// glyphs' when they reach higher — under a negative half-leading, where they
+/// stand out of a line box shorter than they are (Chrome highlights and
+/// hit-tests that content area). The glyphs are the line's text runs, each
+/// its font's ascent above the baseline: what parley 0.11.1 folded into
+/// `block_min_coord`. Not 0.12's `content_block_min_coord`, which also holds
+/// the strut — the block's own font — so a 16px run in a 32px block reached
+/// 8px above its line (`review_1587_tests`, `span32`).
+pub(crate) fn line_top(line: &parley::layout::Line<'_, Brush>) -> f32 {
+    let m = line.metrics();
+    // Rounded as parley 0.11.1 rounded them in a quantized layout (every
+    // IFC's), so a highlight stays on whole pixels.
+    line.runs()
+        .map(|run| m.baseline - run.font_metrics().ascent.round())
+        .fold(m.block_min_coord, f32::min)
+}
+
+/// The content area of the text at layout byte `byte` on `line`, as `(top,
+/// bottom)`: its font's rounded ascent and descent around the baseline parley
+/// placed its span on, which `vertical-align` moved (#1357). `None` when no
+/// glyph run on the line holds the byte's span.
+///
+/// What a shifted element's background box and a shifted glyph's bounds are
+/// measured from: the line's own extent already holds the shifted span, so
+/// the line moved by the shift counts it twice.
+pub(crate) fn span_content_box(
+    layout: &parley::Layout<Brush>,
+    line: &parley::layout::Line<'_, Brush>,
+    byte: usize,
+) -> Option<(f32, f32)> {
+    let cluster = parley::layout::Cluster::from_byte_index(layout, byte)?;
+    let style = cluster.style_index();
+    let run = cluster.run();
+    let metrics = run.font_metrics();
+    let (ascent, descent) = (metrics.ascent.round(), metrics.descent.round());
+    line.items().find_map(|item| match item {
+        parley::layout::PositionedLayoutItem::GlyphRun(run) if run.style_index() == style => {
+            Some((run.baseline() - ascent, run.baseline() + descent))
+        }
+        _ => None,
+    })
+}
+
+/// [`line_top`]'s counterpart at the bottom: the line box's, or its runs'
+/// descent below the baseline.
+pub(crate) fn line_bottom(line: &parley::layout::Line<'_, Brush>) -> f32 {
+    let m = line.metrics();
+    line.runs()
+        .map(|run| m.baseline + run.font_metrics().descent.round())
+        .fold(m.block_max_coord, f32::max)
+}
+
+/// [`line_ascent`]'s counterpart below the baseline (`LineMetrics::descent`
+/// before parley 0.12).
+pub(crate) fn line_descent(m: &parley::LineMetrics) -> f32 {
+    m.content_block_max_coord - m.baseline
+}
+
+/// What one line holds, for the boxes of the inline elements on it: their
+/// edge boxes, the atomic inlines, and the glyph clusters but for the white
+/// space the line hangs at its end (#2607). Read by paint
+/// (`paint::text::inline_background_rects`) and by hit testing
+/// ([`crate::text_query::glyph_cluster_in_inline`]), so the box an element
+/// draws and the text a point over it finds agree.
+#[derive(Default)]
+pub(crate) struct LineContent {
+    /// The edge boxes (#1426), `(owner, is end, x, width)`, those past the
+    /// hung white space moved back over it.
+    pub(crate) edges: Vec<(RawNodeId, bool, f64, f64)>,
+    /// The atomic inlines, `(node, left, right)`.
+    pub(crate) atomics: Vec<(RawNodeId, f64, f64)>,
+    /// The glyph clusters, `(first byte, left, right)`, in byte order, less
+    /// the hung white space.
+    pub(crate) clusters: Vec<(usize, f64, f64)>,
+    /// The hung white space's extent, `(left, right)`.
+    pub(crate) hung: Option<(f64, f64)>,
+}
+
+impl LineContent {
+    /// `line`'s content, in `inline`'s lines. The collapsible spaces (and
+    /// tabs) at a line's logical end are removed from it in CSS (CSS Text 3
+    /// §4.1.3) and hang past its visual end in parley: no part of an inline
+    /// element's fragment in Chrome 157 (its box closes against the content
+    /// before them, and an end edge box after them is moved back over them),
+    /// no text a point finds, and no part of a fragment in `getClientRects`
+    /// (`out_of_flow::measure_span_fragments`, #1779). Their visual end is
+    /// the right of a left-to-right line and the left of a right-to-left one
+    /// (or of a left-to-right word set in one); with an atomic inline past
+    /// them they are not at the end. An NBSP is no collapsible space, and
+    /// Chrome keeps a preserved space (`pre-wrap`, `break-spaces`) in the
+    /// fragment, so in lines that preserve spaces anywhere
+    /// ([`crate::node::InlineLayout::preserves_spaces`]) nothing is taken out.
+    pub(crate) fn of(
+        line: &parley::layout::Line<'_, Brush>,
+        inline: &crate::node::InlineLayout,
+    ) -> Self {
+        use parley::layout::PositionedLayoutItem;
+        let mut content = Self::default();
+        // `(first byte, left, right, white space, right-to-left)`.
+        let mut clusters: Vec<(usize, f64, f64, bool, bool)> = Vec::new();
+        // A run is handed out once per style it holds; its clusters are
+        // walked once, from where its first piece starts.
+        let mut last_run = None;
+        for item in line.items() {
+            match item {
+                PositionedLayoutItem::GlyphRun(piece) => {
+                    let run = piece.run();
+                    if last_run == Some(run.index()) {
+                        continue;
+                    }
+                    last_run = Some(run.index());
+                    let mut x = piece.offset() as f64;
+                    for cluster in run.visual_clusters() {
+                        let advance = cluster.advance() as f64;
+                        let start = cluster.text_range().start;
+                        clusters.push((
+                            start,
+                            x,
+                            x + advance,
+                            collapsible_space_at(inline, start),
+                            cluster.is_rtl(),
+                        ));
+                        x += advance;
+                    }
+                }
+                PositionedLayoutItem::InlineBox(b) => {
+                    last_run = None;
+                    let (x, w) = (b.x as f64, b.width as f64);
+                    if let Some((owner, end)) = edge_box_owner(b.id) {
+                        content.edges.push((owner, end, x, w));
+                    } else if !is_edge_box(b.id) {
+                        content.atomics.push((b.id as RawNodeId, x, x + w));
+                    }
+                }
+            }
+        }
+        clusters.sort_by_key(|c| c.0);
+        // The spaces that end the line in byte order; an atomic inline has
+        // no byte, so one may stand among them: only those visually past
+        // all the other content are at the line's end (review of #2623:
+        // `<i></i> </span>` hangs the space after the box, not the one
+        // before it).
+        let trailing = clusters.iter().rev().take_while(|c| c.3).count();
+        let first = clusters.len() - trailing;
+        if trailing > 0 {
+            const EPS: f64 = 0.01;
+            let span = |it: &mut dyn Iterator<Item = (f64, f64)>| {
+                it.fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), (x0, x1)| {
+                    (a.min(x0), b.max(x1))
+                })
+            };
+            let (lo, hi) = span(
+                &mut clusters[..first]
+                    .iter()
+                    .map(|c| (c.1, c.2))
+                    .chain(content.atomics.iter().map(|a| (a.1, a.2))),
+            );
+            let alone = lo > hi;
+            let right = |c: &(usize, f64, f64, bool, bool)| c.1 >= hi - EPS;
+            let left = |c: &(usize, f64, f64, bool, bool)| c.2 <= lo + EPS;
+            let on_right = if alone {
+                !clusters[first].4
+            } else {
+                clusters[first..].iter().any(right)
+            };
+            let hung: Vec<bool> = clusters
+                .iter()
+                .enumerate()
+                .map(|(i, c)| i >= first && (alone || if on_right { right(c) } else { left(c) }))
+                .collect();
+            let gone: Vec<(f64, f64)> = clusters
+                .iter()
+                .zip(&hung)
+                .filter(|(_, h)| **h)
+                .map(|(c, _)| (c.1, c.2))
+                .collect();
+            if !gone.is_empty() {
+                let (h0, h1) = span(&mut gone.iter().copied());
+                for e in &mut content.edges {
+                    let past: f64 = gone
+                        .iter()
+                        .filter(|c| {
+                            if on_right {
+                                c.1 <= e.2 + EPS
+                            } else {
+                                c.0 >= e.2 + e.3 - EPS
+                            }
+                        })
+                        .map(|c| c.1 - c.0)
+                        .sum();
+                    e.2 += if on_right { -past } else { past };
+                }
+                let mut keep = hung.iter().map(|h| !h);
+                clusters.retain(|_| keep.next().unwrap_or(true));
+                content.hung = Some((h0, h1));
+            }
+        }
+        content.clusters = clusters.into_iter().map(|c| (c.0, c.1, c.2)).collect();
+        content
+    }
+
+    /// The visual extent of the clusters of bytes `start..end` on this line.
+    pub(crate) fn extent(&self, start: usize, end: usize) -> Option<(f64, f64)> {
+        let from = self.clusters.partition_point(|c| c.0 < start);
+        let to = self.clusters.partition_point(|c| c.0 < end);
+        self.clusters
+            .get(from..to)?
+            .iter()
+            .fold(None, |acc, &(_, x0, x1)| {
+                Some(acc.map_or((x0, x1), |(a, b): (f64, f64)| (a.min(x0), b.max(x1))))
+            })
+    }
+}
+
+/// Whether the cluster at byte `start` of `inline`'s text is a collapsible
+/// space or tab: one CSS removes at the end of a line ([`LineContent::of`]).
+pub(crate) fn collapsible_space_at(inline: &crate::node::InlineLayout, start: usize) -> bool {
+    !inline.preserves_spaces
+        && matches!(
+            inline.text_content.as_bytes().get(start),
+            Some(b' ' | b'\t')
+        )
+}
+
+/// The id of the zero-size out-of-flow box an IFC with no content at all
+/// (no text, no inline box) is handed: parley 0.12 gives a layout with no
+/// items one line holding the root's strut, kept for a caret, where CSS 2.1
+/// §9.4.2 makes such a line box zero-height (Chrome 153: a block holding only
+/// collapsible spaces, a comment, an empty `<span>` or an out-of-flow box is
+/// 0 tall). With one item that is no content parley makes the line invisible.
+/// It reads as an edge box ([`is_edge_box`]) of an owner no node has, so
+/// every walker skips it.
+pub const EMPTY_IFC_BOX: u64 = EDGE_BOX | EDGE_BOX_END | (EDGE_BOX_END - 1);
+
+/// The id of the zero-size box an inline element that holds no text and no
+/// inline box is handed ([`IfcText::push_empty_inline_box`], #1463): parley
+/// adds a span box to a line only from what the span holds, and CSS 2.1
+/// §10.8.1 gives every inline box on the line its strut, glyphs or not
+/// (Chrome 157: `x <span style="font-size: 32px"></span>y` lowers its line's
+/// baseline). A `Strut` box, or an `OutOfFlow` one where the element cuts
+/// shaping (#2470), so it makes no line content (a line of only empty spans
+/// stays 0 tall, §9.4.2). Like [`EMPTY_IFC_BOX`], an edge box of an owner no
+/// node has.
+pub const EMPTY_INLINE_BOX: u64 = EDGE_BOX | EDGE_BOX_END | (EDGE_BOX_END - 2);
+
+/// Whether an inline box id is an edge box ([`EDGE_BOX`]) rather than an
+/// atomic inline's node id.
+pub fn is_edge_box(id: u64) -> bool {
+    id & EDGE_BOX != 0
+}
+
+/// Set with [`EDGE_BOX`] on a float's box: where a float stands in the
+/// content, which the line breaker places when it reaches it (`float_wrap`).
+/// An edge box to every walker that skips edge boxes, and no element's edge
+/// ([`edge_box_owner`] answers `None`): it takes no room on a line, and the
+/// float's own box is laid out by Taffy.
+pub const FLOAT_BOX: u64 = 1 << 29;
+
+/// The owner of an edge box and whether it is the inline-end one. `None`
+/// for a float's box ([`FLOAT_BOX`]).
+pub(crate) fn edge_box_owner(id: u64) -> Option<(RawNodeId, bool)> {
+    (is_edge_box(id) && id & FLOAT_BOX == 0)
+        .then_some((id & !(EDGE_BOX | EDGE_BOX_END), id & EDGE_BOX_END != 0))
+}
+
+/// The id of the box marking where float `float` stands ([`FLOAT_BOX`]).
+pub(crate) fn float_box_id(float: RawNodeId) -> u64 {
+    debug_assert!(crate::node_slab::slot_of(float) < FLOAT_BOX as usize);
+    EDGE_BOX | FLOAT_BOX | float
+}
+
+/// The float a [`FLOAT_BOX`] box stands for.
+pub(crate) fn float_box_node(id: u64) -> Option<RawNodeId> {
+    (id & (EDGE_BOX | FLOAT_BOX) == EDGE_BOX | FLOAT_BOX).then_some(id & !(EDGE_BOX | FLOAT_BOX))
+}
+
+/// Push `b` into `builder`. parley's `TreeBuilder` (0.11.1, and 0.12 still) commits the text
+/// pushed so far only before an `InFlow` box, and gives any box the length of
+/// the committed text as its position: a float's box (`CustomOutOfFlow`)
+/// would stand before all of the text since the last span. An empty span
+/// commits it first (the builder is in `Preserve` mode, so the white space is
+/// untouched).
+fn push_inline_box(builder: &mut parley::TreeBuilder<'_, Brush>, b: &parley::InlineBox) {
+    if b.kind != parley::InlineBoxKind::InFlow {
+        builder.push_style_modification_span(std::iter::empty());
+        builder.pop_style_span();
+    }
+    builder.push_inline_box(b.clone());
+}
+
+/// Whether `layout` holds a float's box: its line breaking must consume
+/// them (`skip_float_boxes`), or parley yields the same box for ever.
+pub(crate) fn has_float_boxes(layout: &parley::Layout<Brush>) -> bool {
+    layout
+        .inline_boxes()
+        .any(|b| b.kind == parley::InlineBoxKind::CustomOutOfFlow)
+}
+
+/// The breaker's next line, past every float box it stops at
+/// (`CustomOutOfFlow`, [`FLOAT_BOX`]), each taking no room. parley hands such
+/// a box to the caller and does not move past it until the caller appends
+/// it: a loop that only asked for the next line would get the same box back
+/// for ever. [`hang_pass`] places floats where it meets them; every other
+/// loop over a breaker comes through here.
+fn skip_float_boxes(
+    breaker: &mut parley::layout::BreakLines<'_, Brush>,
+) -> Option<parley::layout::YieldData> {
+    loop {
+        match breaker.break_next() {
+            Some(parley::layout::YieldData::InlineBoxBreak(b)) => {
+                breaker
+                    .state_mut()
+                    .append_inline_box_to_line(b.advance, 0.0, 0.0);
+            }
+            other => return other,
+        }
+    }
+}
+
+/// An edge box's id ([`EDGE_BOX`]).
+pub(crate) fn edge_box_id(owner: RawNodeId, end: bool) -> u64 {
+    debug_assert!(crate::node_slab::slot_of(owner) < EDGE_BOX_END as usize);
+    EDGE_BOX | if end { EDGE_BOX_END } else { 0 } | owner
+}
+
+/// The room a `display: inline` element takes before its content on its
+/// first line and after it on its last (#1426): its inline-start and
+/// inline-end margin + border + padding, in CSS px, `(start, end)`. With
+/// `ltr` false the start is the right side. A percentage margin or padding is
+/// taken as 0 (its basis is the containing block's width, which the IFC does
+/// not know when it is built).
+///
+/// A side is `None` when its margin, border and padding are all 0, and
+/// `Some` otherwise, whatever they add up to: a negative margin takes room
+/// back, pulling what follows over the element's edge, and a side with any
+/// of the three non-zero makes an empty element's line non-empty — Blink's
+/// `IsInlineBoxStartEmpty` / `IsInlineBoxEndEmpty` (Chrome 156: an empty
+/// `<span style="margin-left:-5px">` gives a line, and so does
+/// `margin-left:-5px; padding-left:5px`, which sums to 0; #2406).
+pub(crate) fn inline_edge_widths(
+    cs: &crate::computed_style::ComputedStyle,
+    ltr: bool,
+) -> (Option<f32>, Option<f32>) {
+    use crate::computed_style::BorderStyleValue as S;
+    use crate::computed_style::LengthPercentageAutoValue as M;
+    let margin = |m: M| match m {
+        M::Length(px) => px,
+        _ => 0.0,
+    };
+    let border = |w: f32, s: S| {
+        if matches!(s, S::None | S::Hidden) {
+            0.0
+        } else {
+            w
+        }
+    };
+    let side = |parts: [f32; 3]| parts.iter().any(|&p| p != 0.0).then(|| parts.iter().sum());
+    let left = side([
+        margin(cs.margin_left),
+        border(cs.border_left_width.to_px(), cs.border_left_style),
+        cs.padding_left.to_px(),
+    ]);
+    let right = side([
+        margin(cs.margin_right),
+        border(cs.border_right_width.to_px(), cs.border_right_style),
+        cs.padding_right.to_px(),
+    ]);
+    if ltr { (left, right) } else { (right, left) }
+}
+
+/// Whether a leaf's height is **definite** for a percentage of it (CSS 2.1
+/// §10.5, CSS Sizing 3 §2.1), as Taffy lays the leaf out with `inputs`
+/// (#2427): whether its parent handed it a height and called that height
+/// definite (`known_dimensions_are_definite`). That is the test Taffy's
+/// block and flex algorithms make before resolving a child's percentage
+/// height against a box, so the answer is layout's, not a mirror of its
+/// rules. Every parent hands a leaf the height its style resolves to — a
+/// length, a percentage of a definite parent, an `aspect-ratio` of the
+/// width it is given — and a flex, grid or absolute parent hands it the
+/// height it lays it out at, definite for a stretched flex or grid item, a column
+/// item's flexed height in a definite column, or an absolute
+/// box's inset-given height, and not for a content-sized item.
+pub(crate) fn leaf_height_is_definite(inputs: &taffy::LayoutInput) -> bool {
+    inputs.known_dimensions.height.is_some() && inputs.known_dimensions_are_definite.height
+}
+
+/// Record, at an IFC root's final layout, whether its containing block's
+/// content height is definite ([`Node::containing_block_height_definite`],
+/// read by [`crate::RinchDocument::resolve_relative_spans`]). An anonymous
+/// block box stands in for its parent, whose percentage basis is the
+/// `parent_size` Taffy hands the box: `Some` exactly when that height is
+/// definite. Any other root is its own containing block — and when what is
+/// measured is the root's #466 measure leaf (a root holding an out-of-flow
+/// box), not the root, the leaf is a block child of the root, and its
+/// `parent_size` is the root's content box, as an anonymous box's is.
+pub(crate) fn note_containing_block_height(
+    nodes: &crate::node_slab::NodeSlab,
+    measured: taffy::NodeId,
+    context: Option<&crate::node::NodeContext>,
+    inputs: &taffy::LayoutInput,
+) {
+    let Some(crate::node::NodeContext::InlineRoot(root_id)) = context else {
+        return;
+    };
+    if inputs.run_mode != taffy::RunMode::PerformLayout {
+        return;
+    }
+    let Some(root) = nodes.get_live(*root_id) else {
+        return;
+    };
+    let definite = if (root.is_anonymous_block_box && root.parent.is_some())
+        || root.taffy_id != Some(measured)
+    {
+        inputs.parent_size.height.is_some()
+    } else {
+        leaf_height_is_definite(inputs)
+    };
+    root.containing_block_height_definite.set(definite);
+}
+
+/// The offset a `position: relative` element's insets `o` move it by
+/// (CSS 2.1 §9.4.3), against a containing block `width` wide and, when that
+/// is definite, `height` tall: a percentage `top`/`bottom` of an indefinite
+/// height computes to `auto` (§9.3.2). `top` wins over `bottom`, and `left`
+/// over `right` when `ltr` (`right` otherwise).
+pub(crate) fn relative_inset_offset(
+    o: &crate::computed_style::ComputedStyle,
+    width: f32,
+    height: Option<f32>,
+    ltr: bool,
+) -> (f32, f32) {
+    use crate::computed_style::LengthPercentageAutoValue as L;
+    let vertical = |v: L| match (v, height) {
+        (L::Percent(_) | L::Calc { .. }, None) => None,
+        (v, h) => v.resolve(h.unwrap_or(0.0)),
+    };
+    let dx = match (o.left.resolve(width), o.right.resolve(width)) {
+        (Some(l), Some(r)) => {
+            if ltr {
+                l
+            } else {
+                -r
+            }
+        }
+        (Some(l), None) => l,
+        (None, Some(r)) => -r,
+        (None, None) => 0.0,
+    };
+    let dy = vertical(o.top)
+        .or_else(|| vertical(o.bottom).map(|b| -b))
+        .unwrap_or(0.0);
+    (dx, dy)
+}
+
+/// Whether an element's own direction is left to right.
+pub(crate) fn element_is_ltr(node: &Node) -> bool {
+    node.stylo_element_data
+        .borrow()
+        .as_ref()
+        .and_then(|d| d.styles.get_primary().map(|p| p.writing_mode.is_bidi_ltr()))
+        .unwrap_or(true)
+}
+
+/// An element's `unicode-bidi` and whether its `direction` is `ltr`, from its
+/// Stylo style; `normal` and `ltr` for a node without one (an anonymous box).
+fn unicode_bidi_of(node: &Node) -> (style::computed_values::unicode_bidi::T, bool) {
+    use style::computed_values::unicode_bidi::T as U;
+    node.stylo_element_data
+        .borrow()
+        .as_ref()
+        .and_then(|d| d.styles.get_primary())
+        .map_or((U::Normal, true), |p| {
+            (p.get_text().unicode_bidi, p.writing_mode.is_bidi_ltr())
+        })
+}
+
+/// The bidi control characters an inline element's `unicode-bidi` puts
+/// around its content (css-writing-modes-3 §2.4.2, "bidi control codes
+/// injection"): `(before, after)`, or `None` for `normal` (#2588). parley's
+/// bidi analysis reads them like any text, and an inline box among them takes
+/// part as the object replacement character it stands for, so the element's
+/// content is embedded, isolated or overridden in its paragraph as in Chrome.
+/// Each is zero-width and owns no DOM text: its flat bytes lie between the
+/// text ranges around it, as a `<wbr>`'s do ([`IfcText::push_bidi_control`]).
+fn inline_bidi_controls(node: &Node) -> Option<(&'static str, &'static str)> {
+    use style::computed_values::unicode_bidi::T as U;
+    let (bidi, ltr) = unicode_bidi_of(node);
+    Some(match (bidi, ltr) {
+        (U::Normal, _) => return None,
+        // LRE / RLE … PDF
+        (U::Embed, true) => ("\u{202a}", "\u{202c}"),
+        (U::Embed, false) => ("\u{202b}", "\u{202c}"),
+        // LRI / RLI … PDI
+        (U::Isolate, true) => ("\u{2066}", "\u{2069}"),
+        (U::Isolate, false) => ("\u{2067}", "\u{2069}"),
+        // LRO / RLO … PDF
+        (U::BidiOverride, true) => ("\u{202d}", "\u{202c}"),
+        (U::BidiOverride, false) => ("\u{202e}", "\u{202c}"),
+        // An isolate outside, an override inside.
+        (U::IsolateOverride, true) => ("\u{2066}\u{202d}", "\u{202c}\u{2069}"),
+        (U::IsolateOverride, false) => ("\u{2067}\u{202e}", "\u{202c}\u{2069}"),
+        // FSI … PDI: the direction is the content's first strong character's.
+        (U::Plaintext, _) => ("\u{2068}", "\u{2069}"),
+    })
+}
+
+/// The base direction of the paragraph a block container lays out, and the
+/// override around all its content (#2594, #2588). CSS gives a paragraph its
+/// block's `direction` (css-writing-modes-3 §2.4), so a `ltr` block's
+/// paragraph is left to right even when it starts with Hebrew or Arabic, not
+/// parley's first-strong default (UAX #9 P2/P3); only `unicode-bidi:
+/// plaintext` takes the direction from the text. `bidi-override` and
+/// `isolate-override` on a block container override "an anonymous inline
+/// element box that surrounds all of its content": LRO / RLO … PDF.
+fn block_bidi(
+    nodes: &crate::node_slab::NodeSlab,
+    root_id: RawNodeId,
+) -> (parley::BaseDirection, Option<(&'static str, &'static str)>) {
+    use style::computed_values::unicode_bidi::T as U;
+    // An anonymous block has no `unicode-bidi` of its own (`normal`), and
+    // the `direction` it inherits.
+    let bidi = nodes
+        .get(root_id)
+        .map_or(U::Normal, |n| unicode_bidi_of(n).0);
+    let ltr = css_direction_is_ltr(nodes, root_id);
+    let base = match (bidi, ltr) {
+        (U::Plaintext, _) => parley::BaseDirection::Auto,
+        (_, true) => parley::BaseDirection::Ltr,
+        (_, false) => parley::BaseDirection::Rtl,
+    };
+    let overrides = match (bidi, ltr) {
+        (U::BidiOverride | U::IsolateOverride, true) => Some(("\u{202d}", "\u{202c}")),
+        (U::BidiOverride | U::IsolateOverride, false) => Some(("\u{202e}", "\u{202c}")),
+        _ => None,
+    };
+    (base, overrides)
+}
+
+/// Whether an inline element draws a border of its own on its fragments.
+pub(crate) fn has_inline_border(cs: &crate::computed_style::ComputedStyle) -> bool {
+    use crate::computed_style::BorderStyleValue as S;
+    let on = |w: f32, s: S| w > 0.0 && !matches!(s, S::None | S::Hidden);
+    on(cs.border_left_width.to_px(), cs.border_left_style)
+        || on(cs.border_right_width.to_px(), cs.border_right_style)
+        || on(cs.border_top_width.to_px(), cs.border_top_style)
+        || on(cs.border_bottom_width.to_px(), cs.border_bottom_style)
+}
+
+/// The background span inline element `owner` draws over `start..end`, from
+/// its style as it is now; `None` when it has neither a background nor a
+/// border to draw (a border alone gives a span of transparent colour, #1426).
+///
+/// Called at the build, which records one span per element that has one, and
+/// by paint for each recorded span, so the rectangle follows a colour,
+/// padding or radius written with no re-shape (#679).
+pub(crate) fn inline_background_span(
+    owner: &Node,
+    start: usize,
+    end: usize,
+) -> Option<crate::node::InlineBackgroundSpan> {
+    let cs = &owner.computed_style;
+    // An image layer's colour is the one under it (`background_underlay`),
+    // which paint draws with the layers; the span's own is transparent.
+    let color = cs
+        .background_color()
+        .filter(|c| c.components[3] > 0.0)
+        .or_else(|| {
+            (has_inline_image(cs) || has_inline_border(cs)).then_some(peniko::Color::TRANSPARENT)
+        })?;
+    Some(crate::node::InlineBackgroundSpan {
+        owner: owner.id,
+        start,
+        end,
+        color,
+        padding_left: cs.padding_left.to_px(),
+        padding_right: cs.padding_right.to_px(),
+        padding_top: cs.padding_top.to_px(),
+        padding_bottom: cs.padding_bottom.to_px(),
+        border_radius: cs.border_radius_top_left.to_px(),
+    })
+}
+
+impl EllipsisStyle {
+    pub(crate) fn of(cs: &crate::computed_style::ComputedStyle, scale: f32) -> Self {
+        Self {
+            font_size: cs.font_size * scale,
+            font_family: if cs.font_family.is_empty() {
+                "sans-serif".into()
+            } else {
+                cs.font_family.clone().into()
+            },
+            font_weight: parley::style::FontWeight::new(cs.font_weight),
+            font_style: cs.font_style.to_parley(),
+            color: root_text_color(cs),
+            line_height: cs.line_height.to_parley(),
+            letter_spacing: cs.letter_spacing,
+            word_spacing: cs.word_spacing,
+            underline: cs.text_decoration.underline && !cs.text_decoration.is_wavy_underline(),
+            strikethrough: cs.text_decoration.strikethrough,
+            decoration_color: cs.text_decoration.color,
+        }
+    }
+
+    /// `text` shaped in this style, not yet broken into lines. `paint` adds
+    /// what only the drawn layout needs (brush, line height, decorations);
+    /// a measurement leaves them out.
+    pub(crate) fn shape(
+        &self,
+        layout_cx: &mut parley::LayoutContext<Brush>,
+        font_cx: &mut parley::FontContext,
+        text: &str,
+        scale: f32,
+        paint: bool,
+    ) -> parley::layout::Layout<Brush> {
+        use parley::style::StyleProperty as P;
+        let font_family = crate::fonts::parley_text_family(font_cx, &self.font_family, text);
+        let mut b = layout_cx.ranged_builder(font_cx, text, scale, true);
+        b.push_default(P::FontSize(self.font_size));
+        b.push_default(P::FontWeight(self.font_weight));
+        b.push_default(P::FontStyle(self.font_style));
+        font_family.push_to(&mut b);
+        push_spacing(&mut b, self.letter_spacing, self.word_spacing);
+        if paint {
+            b.push_default(P::Brush(Brush::Solid(self.color)));
+            if let Some(lh) = self.line_height {
+                b.push_default(P::LineHeight(lh));
+            }
+            b.push_default(P::Underline(self.underline));
+            b.push_default(P::Strikethrough(self.strikethrough));
+            if let Some(c) = self.decoration_color {
+                b.push_default(P::UnderlineBrush(Some(Brush::Solid(c))));
+                b.push_default(P::StrikethroughBrush(Some(Brush::Solid(c))));
+            }
+        }
+        b.build(text)
+    }
+}
+
 /// Push the inherited `letter-spacing` / `word-spacing` onto a ranged builder,
 /// in CSS pixels (#698).
 ///
-/// The `text-overflow: ellipsis` paths build **three** throwaway layouts per
-/// truncation — the ellipsis glyph's width, each binary-search prefix, and the
-/// final truncated line — and all three have to shape the text the way the
-/// untruncated line was shaped, or the prefix that "fits" is measured under one
-/// set of advances and painted under another. One call site each, so they
-/// cannot drift apart.
+/// The `text-overflow: ellipsis` rebuild shapes the ellipsis glyph, each
+/// binary-search prefix of a whole-text cut and the final truncated layout,
+/// and all of them have to shape the text the way the untruncated line was
+/// shaped, or the prefix that "fits" is measured under one set of advances and
+/// painted under another. They all go through [`EllipsisStyle::shape`], so
+/// they cannot drift apart.
 ///
 /// Unconditional, like the sibling pushes in
 /// [`RinchDocument::inline_style_props`]: 0 is parley's own default, so a zero
@@ -142,15 +785,4940 @@ fn push_spacing(b: &mut parley::RangedBuilder<'_, Brush>, letter_spacing: f32, w
     b.push_default(parley::style::StyleProperty::WordSpacing(word_spacing));
 }
 
+/// The width a paragraph that does not wrap is aligned within (#1237): the
+/// root's content width, or, for an auto-width root (`up_to`, the width its
+/// lines are broken at, is the content width plus `ifc_paint_max_width`'s
+/// pixel of slack) whose paragraph is within a pixel of that width, the
+/// paragraph's own width. A root sized from its text (shrink-to-fit:
+/// `inline-block`, an absolute box, `max-content`, `fit-content`) is as wide
+/// as its widest line rounded to a whole pixel, and its lines are aligned
+/// within the widest line itself, as in Chrome 155 (review of #1868). Not
+/// Chrome's: an auto-width block that stretches to a width its text happens
+/// to be within a pixel of is aligned within the text's width too (off by
+/// that fraction). For a declared width `up_to` is `width`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct AlignWidth {
+    /// The content-box width.
+    pub width: f32,
+    /// The width the paint layout is broken at.
+    pub up_to: f32,
+}
+
+/// What `break_lines_hanging_spaces` had to do to one layout, for the
+/// `ifc_hang_*` perf counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HangStats {
+    /// Whole-paragraph re-breaks: 0 when no line needed its spaces hung or
+    /// a hung NBSP undone (#1218), else exactly 1 however many lines did.
+    pub passes: u32,
+    /// Lines broken a second time: at a widened width to keep their spaces,
+    /// or to undo a hung NBSP (`unglue`).
+    pub lines: u32,
+    /// Extra breaks of the whole paragraph to drop parley's empty line after
+    /// an overflowing last inline box (#1050) or a final forced break
+    /// (#1172): 0 or 1.
+    pub phantom_rebreaks: u32,
+    /// Breaks of one line `unglue` made to move a break parley put after
+    /// a hung NBSP (#1218): a few per such line, logarithmic in the length
+    /// of a glued chain.
+    pub unglue_rebreaks: u32,
+    /// Builds of a paragraph after the first, made to put its preserved
+    /// tabs at their stops (#1122): one for a line of tabs that do not wrap,
+    /// at most `MAX_TAB_BUILDS`` - 1`.
+    pub tab_rebuilds: u32,
+    /// Lines `css_line` was asked about (#1426, #1238, #1243): one scan of
+    /// the line's units each, whether or not the line was broken again.
+    pub css_scans: u32,
+}
+
+impl HangStats {
+    /// Sum `other` into these, field by field.
+    pub(crate) fn add(&mut self, other: HangStats) {
+        self.passes += other.passes;
+        self.lines += other.lines;
+        self.phantom_rebreaks += other.phantom_rebreaks;
+        self.unglue_rebreaks += other.unglue_rebreaks;
+        self.tab_rebuilds += other.tab_rebuilds;
+        self.css_scans += other.css_scans;
+    }
+
+    /// Add these to `perf`'s `ifc_hang_*` counters.
+    pub(crate) fn record(&self, perf: &crate::perf::PerfCounters) {
+        perf.add(crate::perf::Counter::IfcHangPasses, u64::from(self.passes));
+        perf.add(crate::perf::Counter::IfcHangLines, u64::from(self.lines));
+        perf.add(
+            crate::perf::Counter::IfcPhantomRebreaks,
+            u64::from(self.phantom_rebreaks),
+        );
+        perf.add(
+            crate::perf::Counter::IfcUnglueRebreaks,
+            u64::from(self.unglue_rebreaks),
+        );
+        perf.add(
+            crate::perf::Counter::IfcTabRebuilds,
+            u64::from(self.tab_rebuilds),
+        );
+        perf.add(
+            crate::perf::Counter::IfcCssLineScans,
+            u64::from(self.css_scans),
+        );
+    }
+}
+
+/// Break `layout` into lines at `max_width`, then commit again the lines
+/// parley ends where CSS does not.
+///
+/// Since parley 0.12 the white space itself is parley's: preserved spaces at
+/// a soft wrap hang, those before a forced break or at the end hang only as
+/// far as they overflow, a `break-spaces` space never hangs
+/// ([`white_space_hanging`]), an NBSP never does, and a justified line's
+/// opportunities are CSS's. rinch's own fix-ups for those in 0.11.1 — a
+/// hang pass for preserved spaces, NBSPs hung at a soft wrap, alignment
+/// widths narrowed by trailing white space that does not hang (#1042) and
+/// justification opportunities recounted (#1056) — are gone.
+///
+/// What is left is a second break of the paragraph ([`hang_pass`]) when a line
+/// may end where CSS does not end it: next to an inline element's edge box
+/// (#1426), at a seam between atomic inlines or `pre` spaces (#1238, #1243),
+/// right after an inline box parley placed by its emergency branch (#1081),
+/// at an overflowing NBSP ([`unglue`], #1218) and in overflowing
+/// `break-spaces` spaces (#1043). It follows each line's end through a table
+/// of the paragraph's clusters and inline boxes in logical order, advanced by
+/// each committed line's advance ([`line_end`]); if that ever disagrees with
+/// the breaker, fixing stops for the rest of the paragraph and it is broken
+/// exactly as parley breaks it. A paragraph needing none of it costs the one
+/// ordinary break and a scan of its lines.
+///
+/// And whatever the white space, a paragraph that ends in the empty line parley
+/// commits after an overflowing inline box or a final forced break
+/// ([`phantom_last_line`], #1050, #1172) is broken once more, the same way,
+/// without it.
+///
+/// And with `align_width`, a paragraph broken unconstrained (`max_width` is
+/// `None`: none of its text may wrap) is aligned within that width ([`AlignWidth`]) rather
+/// than within its own widest line, which is what parley does with no width
+/// (#1237): it is the line box CSS aligns a line in. Its lines are those of
+/// the unconstrained break — nothing wraps, not even after an inline box,
+/// where parley would break a `nowrap` paragraph given a width (#1238) — and
+/// each line's alignment width is set to `align_width` as it is committed
+/// ([`break_unwrapped`]). A line wider than that overflows and parley starts
+/// it at the start edge, as CSS does. The caller passes `align_width` only
+/// for an alignment that moves a line from the left edge: `right`,
+/// `center` and `end` in a left-to-right block, and every alignment in a
+/// right-to-left one, whose overflowing line is start-aligned at the right
+/// edge (#2546).
+///
+/// [`set_prior_line_width`]: parley::layout::BreakLines::set_prior_line_width
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn break_lines_hanging_spaces<'p>(
+    layout: &mut parley::Layout<Brush>,
+    text: &str,
+    max_width: Option<f32>,
+    preserves_spaces: bool,
+    unhung: &UnhungSpaces,
+    align_width: Option<AlignWidth>,
+    floats: Option<&FloatBands>,
+    placer: Option<&mut (dyn PlaceFloats + 'p)>,
+) -> Broken {
+    // A paragraph that does not wrap still starts each line beside the
+    // floats (`break_unwrapped`).
+    let unwrapped_floats = floats.filter(|f| max_width.is_none() && !f.is_empty());
+    // #1237: a paragraph that does not wrap, aligned within the box.
+    if let Some(align) =
+        align_width.filter(|a| max_width.is_none() && a.width.is_finite() && a.width > 0.0)
+    {
+        return Broken::plain(break_unwrapped_aligned(
+            layout,
+            text,
+            align,
+            preserves_spaces,
+            unhung,
+            unwrapped_floats,
+        ));
+    }
+    if let Some(floats) = unwrapped_floats {
+        break_unwrapped(layout, floats.width(), None, Some(floats));
+        return Broken::default();
+    }
+    // A paragraph holding floats' boxes is broken by a loop that consumes
+    // them (parley's own `break_all_lines` would get the first one back for
+    // ever), and then always again by the line-by-line pass, which places
+    // them.
+    let float_boxes = has_float_boxes(layout);
+    if float_boxes {
+        break_lines_up_to(layout, max_width, usize::MAX);
+    } else {
+        layout.break_all_lines(max_width);
+    }
+    let max = max_width.filter(|max| max.is_finite());
+    // Lines beside a float are each given their own room, which only the
+    // line-by-line pass does.
+    let floats = floats.filter(|f| max.is_some() && !f.is_empty());
+    let mut placer = placer.filter(|_| max.is_some() && float_boxes);
+    // #1243: whether the seams are in force for `pre` spaces depends on
+    // where parley broke the paragraph.
+    unhung
+        .pre_seams
+        .set(unhung.pre_candidate && max.is_some() && pre_seams_needed(layout, text, unhung));
+    let fix = max.filter(|_| {
+        floats.is_some()
+            || float_boxes
+            || any_emergency_box_line_before_white_space(layout, text)
+            || any_line_split_at_edge(layout)
+            || unhung.active_seams().is_some()
+    });
+    let mut float_drop = 0.0f32;
+    let mut stats = match fix {
+        Some(max) => hang_pass(
+            layout,
+            text,
+            max,
+            None,
+            unhung,
+            floats,
+            placer.as_deref_mut(),
+            &mut float_drop,
+        ),
+        None => HangStats::default(),
+    };
+    // #1050, #1172: parley's trailing empty line after an overflowing inline
+    // box or a final forced break. Broken again, the same way, up to the line
+    // before it.
+    if let Some(keep) = phantom_last_line(layout) {
+        match fix {
+            Some(max) => {
+                stats = hang_pass(
+                    layout,
+                    text,
+                    max,
+                    Some(keep),
+                    unhung,
+                    floats,
+                    placer,
+                    &mut float_drop,
+                )
+            }
+            None => break_lines_up_to(layout, max_width, keep),
+        }
+        stats.phantom_rebreaks = 1;
+    }
+    Broken {
+        hang: stats,
+        float_drop,
+    }
+}
+
+/// Places the floats a paragraph holds as its line breaker reaches them
+/// (`float_wrap::BlockFloats`, over the block context the paragraph is laid
+/// out in). Coordinates are the paragraph's content box's.
+pub(crate) trait PlaceFloats {
+    /// Float `float`'s margin-box width, while it waits to be placed.
+    fn width(&self, float: RawNodeId) -> Option<f32>;
+    /// Place float `float` as high as it fits at or below `y`, and return
+    /// the room the floats now leave the paragraph's lines, `None` when
+    /// nothing changed.
+    fn place(&mut self, float: RawNodeId, y: f32) -> Option<FloatBands>;
+}
+
+/// What [`break_lines_hanging_spaces`] did to a layout.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Broken {
+    /// The work it took.
+    pub(crate) hang: HangStats,
+    /// How far lines were moved down to clear floats they did not fit beside
+    /// ([`place_line_beside_floats`]), in all: parley's `height` sums the
+    /// lines' heights and does not count it, so a layout's content height is
+    /// its `height` plus this.
+    pub(crate) float_drop: f32,
+}
+
+impl Broken {
+    fn plain(hang: HangStats) -> Self {
+        Self {
+            hang,
+            float_drop: 0.0,
+        }
+    }
+}
+
+/// How many times `resolve_layout` runs `resolve_percentage_inline_blocks`
+/// and the root compute after it, at most (#1476). A pass is followed by
+/// another only when it found a min-content request, so the rounds end when
+/// no measure asks any more; the limit is a guard against a cycle, not a
+/// budget. A layout that stops at it is not a fixpoint: the next one
+/// carries on.
+pub(crate) const MAX_INLINE_ROUNDS: u32 = 64;
+
+/// Whether an atomic inline whose max-content width is `max` fits a line
+/// `stretch` wide — the first half of its shrink-to-fit width
+/// `min(max-content, max(min-content, stretch))` (#658). See
+/// `RinchDocument::resolve_root_width_keyword` for the pixel of tolerance.
+pub(crate) fn atomic_inline_fits(max: f32, stretch: f32) -> bool {
+    max <= stretch + 1.0
+}
+
+/// The second half: the width a box that does not fit `stretch` is capped
+/// at, or `None` when that is within a pixel of its max-content width (it
+/// then keeps that).
+pub(crate) fn atomic_inline_capped_width(min: f32, max: f32, stretch: f32) -> Option<f32> {
+    let fit = stretch.max(min);
+    (fit + 1.0 < max).then_some(fit)
+}
+
+/// What an atomic inline's own percentage inline sizes are resolved against
+/// in a measure. See `RinchDocument::own_percentage_widths`.
+#[derive(Clone, Copy)]
+enum OwnPercentageBasis {
+    /// Resolve against this containing-block width (`None`: not known yet).
+    ContainingBlock(Option<f32>),
+    /// The box is laid out at a width already resolved and pinned.
+    PinnedWidth,
+}
+
+/// An atomic inline's own percentage inline sizes as the Taffy values they
+/// take against its containing block (#2140, #2146); `None` for a field left
+/// as it is. See `RinchDocument::own_percentage_widths`.
+struct OwnPercentageWidths {
+    width: Option<taffy::Dimension>,
+    min: Option<taffy::LengthPercentageAuto>,
+    max: Option<taffy::LengthPercentageAuto>,
+}
+
+/// Whether an atomic inline's width is the plain shrink-to-fit of its
+/// content, which an IFC measure can work out for any line width from the
+/// box's min- and max-content sizes (#1476): an `auto` width, no percentage
+/// `min-`/`max-width` (whose basis is the containing block), and margins that
+/// are lengths. Returns the horizontal margins.
+pub(crate) fn plain_shrink_to_fit_margins(
+    style: &crate::computed_style::ComputedStyle,
+) -> Option<f32> {
+    use crate::computed_style::DimensionValue::{Auto, Calc, Percent};
+    use crate::computed_style::LengthPercentageAutoValue as M;
+    if !matches!(style.width, Auto)
+        || matches!(style.min_width, Percent(_) | Calc { .. })
+        || matches!(style.max_width, Percent(_) | Calc { .. })
+        // Its min- and max-content sizes are measured with no basis for
+        // the padding, which is resolved only against its containing block
+        // (#1480): it is lined up at the size it has.
+        || has_percentage_padding(style)
+    {
+        return None;
+    }
+    let margin = |m: M| match m {
+        M::Auto => Some(0.0),
+        M::Length(px) => Some(px),
+        _ => None,
+    };
+    Some(margin(style.margin_left)? + margin(style.margin_right)?)
+}
+
+/// Whether a padding of this style is a percentage, alone or in a `calc()`:
+/// of the containing block's width on every side.
+pub(crate) fn has_percentage_padding(style: &crate::computed_style::ComputedStyle) -> bool {
+    use crate::computed_style::LengthPercentageValue::{Calc, Percent};
+    [
+        style.padding_top,
+        style.padding_right,
+        style.padding_bottom,
+        style.padding_left,
+    ]
+    .iter()
+    .any(|p| matches!(p, Percent(_) | Calc { .. }))
+}
+
+/// The margins of an atomic inline whose `width` is a percentage, when they
+/// are lengths or `auto`. Such a box's percentage is cyclic in a min-content
+/// measure of the line it sits on, so there it contributes as `auto` does:
+/// its min-content width (css-sizing-3 §5.2.1). An email's "responsive
+/// columns" are exactly this, `display: inline-block; width: 100%` tables in
+/// a cell: lined up at their one-line width instead, they made the cell, and
+/// the table, as wide as their longest paragraph (#2159). A percentage
+/// `min-width` or `max-width` is as cyclic there, and changes nothing: a
+/// cyclic `max-width` is `none` and a cyclic `min-width` 0 in a min-content
+/// contribution. MJML writes `width: 100%; max-width: 100%` on every column.
+pub(crate) fn percent_width_margins(style: &crate::computed_style::ComputedStyle) -> Option<f32> {
+    use crate::computed_style::DimensionValue::Percent;
+    use crate::computed_style::LengthPercentageAutoValue as M;
+    if !matches!(style.width, Percent(_)) {
+        return None;
+    }
+    let margin = |m: M| match m {
+        M::Auto => Some(0.0),
+        M::Length(px) => Some(px),
+        _ => None,
+    };
+    Some(margin(style.margin_left)? + margin(style.margin_right)?)
+}
+
+/// Whether an atomic inline's min-content width is measured and kept
+/// (`NodeTree::atomic_min_content`): a plain shrink-to-fit box, or one with
+/// a percentage width ([`percent_width_margins`]).
+fn keeps_min_content(style: &crate::computed_style::ComputedStyle) -> bool {
+    plain_shrink_to_fit_margins(style).is_some() || percent_width_margins(style).is_some()
+}
+
+/// What an IFC **measure** needs to size the atomic inlines on its lines
+/// (#1476).
+///
+/// The paint layout lines an atomic inline up at the size it has
+/// (`Node::layout`). A measure answers a question about a width the box may
+/// never be laid out at — "how narrow can this be", "how wide would it like
+/// to be", "how tall is it at 400px" — and CSS answers each from what the box
+/// *contributes* at that width: its min-content size, its max-content size,
+/// or its shrink-to-fit size `min(max-content, max(min-content, width))`.
+/// Lined up at its current size instead, a box made every container sized
+/// from that answer (a flex item, a grid `auto` track, a shrink-to-fit
+/// absolute box, another `auto` atomic inline) as wide as itself, so the cap
+/// `resolve_percentage_inline_blocks` puts on it could never bind — and once
+/// one was capped, the container stayed that narrow when there was room
+/// again.
+///
+/// Only for a box whose width is the plain shrink-to-fit of its content
+/// ([`plain_shrink_to_fit_margins`]); any other is lined up at the size it
+/// has, as before.
+pub(crate) struct AtomicContributions<'a> {
+    /// The width the measure breaks lines at: `None` for max-content,
+    /// `Some(0.0)` for min-content.
+    pub wrap_width: Option<f32>,
+    /// `NodeTree::atomic_min_content`.
+    pub min_content: &'a HashMap<RawNodeId, f32>,
+    /// `NodeTree::keyword_inline_cb_width`: the containing-block width each
+    /// resolved box was last resolved against.
+    pub resolved_at: &'a HashMap<RawNodeId, f32>,
+    /// `NodeTree::percent_inline_cb_width`: the same for each box with a
+    /// percentage inline size.
+    pub percent_resolved_at: &'a HashMap<RawNodeId, f32>,
+    /// `NodeTree::atomic_min_requests`.
+    pub requests: &'a std::cell::RefCell<Vec<RawNodeId>>,
+    /// Whether this is the content measure of a box sized to fit its
+    /// content: the box whose lines these are has no width yet (the measure
+    /// is handed no known width), so a percentage of it has no basis. Only
+    /// then is a
+    /// compressible picture lined up at its shrink-to-fit size
+    /// ([`crate::replaced::compressed_inline_fit`]); in a line of a box
+    /// with a width it keeps the size resolved against that width, and
+    /// overflows the line as in Chrome (#2445 review).
+    pub fits_compressible: bool,
+    /// Whether a percentage of the box's own width is cyclic in this
+    /// measure, and counts 0 (#2628: a percentage `text-indent`): it sizes a
+    /// box to fit ([`Self::fits_compressible`]) outside the layout run. In
+    /// the layout run the box is laid out at its available width, which is
+    /// then the basis.
+    pub percent_cyclic: bool,
+    /// The box's width when the measure is handed it: what a percentage of
+    /// it is of, whatever room the lines are broken in.
+    pub known_width: Option<f32>,
+    /// Set when a compressible picture was lined up at its shrink-to-fit
+    /// size: the measure is then not the one a line of the same width with
+    /// a percentage basis gives, and is cached apart from it.
+    pub fitted: std::cell::Cell<bool>,
+}
+
+impl AtomicContributions<'_> {
+    /// The size to line atomic inline `id` up at.
+    fn size(&self, id: RawNodeId, node: &Node) -> (f32, f32) {
+        let layout = (node.layout.width, node.layout.height);
+        // Where the box was last resolved, if it has been since it was last
+        // measured as `auto`. Only then can it have another size than its
+        // natural one, and only then is the recorded one current: a box
+        // that became an atomic inline by a restyle has never been measured
+        // as one, and the size it was laid out at stands.
+        let resolved_at = if self.resolved_at.is_empty() {
+            None
+        } else {
+            self.resolved_at.get(&id).copied()
+        };
+        let natural = match resolved_at {
+            Some(_) => node.natural_inline_size,
+            None => layout,
+        };
+        // A box that has the width asked for is lined up as it is: its
+        // height is then the real one (a box laid out again around a capped
+        // one inside it keeps its width and grows).
+        let at = |width: f32, height: f32| {
+            if (width - layout.0).abs() <= 0.5 {
+                layout
+            } else {
+                (width, height)
+            }
+        };
+        let Some(wrap) = self.wrap_width else {
+            // A percentage inline size is cyclic in a max-content measure
+            // too, so the box contributes as `auto` does: its natural size,
+            // not the width it was last resolved to (regress-017). Lined up
+            // at that width, a table's `width: 100%` pictures gave their
+            // columns the widths they had been resolved to, and a picture
+            // that arrived after the first layout (measured at its natural
+            // width) took a wider share than the ones before it: the columns
+            // depended on the order the pictures loaded in.
+            if !self.percent_resolved_at.is_empty() && self.percent_resolved_at.contains_key(&id) {
+                let (w, h) = node.natural_inline_size;
+                return at(w, h);
+            }
+            // Max-content: the box's own max-content size, whatever it has
+            // been capped at since.
+            return if natural == layout
+                || plain_shrink_to_fit_margins(&node.computed_style).is_none()
+            {
+                layout
+            } else {
+                at(natural.0, natural.1)
+            };
+        };
+        // A compressible replaced element contributes no min-content width
+        // (css-sizing-3 §5.2.2, #2398).
+        if wrap <= 0.0
+            && let Some(width) = crate::replaced::compressed_inline_min_content(node)
+        {
+            return (width, layout.1);
+        }
+        // At a definite width, its shrink-to-fit contribution (#2424).
+        if wrap > 0.0
+            && self.fits_compressible
+            && let Some(size) = crate::replaced::compressed_inline_fit(node, layout, wrap)
+        {
+            self.fitted.set(true);
+            return size;
+        }
+        // A percentage width in a min-content measure is cyclic: the box
+        // contributes its min-content width, as `auto` does (#2159).
+        if wrap <= 0.0
+            && let Some(margins) = percent_width_margins(&node.computed_style)
+        {
+            return match self.min_content.get(&id) {
+                Some(&min_width) => (min_width + margins, layout.1),
+                None => {
+                    self.requests.borrow_mut().push(id);
+                    layout
+                }
+            };
+        }
+        // Resolved against exactly this width: the size it has is the answer
+        // (and the one the paint layout will use).
+        if resolved_at.is_some_and(|w| (w - wrap).abs() < 0.01) {
+            // Capped: its margin box, as below.
+            return match plain_shrink_to_fit_margins(&node.computed_style) {
+                Some(margins) if layout.0 + 0.5 < natural.0 => (layout.0 + margins, layout.1),
+                _ => layout,
+            };
+        }
+        let Some(margins) = plain_shrink_to_fit_margins(&node.computed_style) else {
+            return layout;
+        };
+        let stretch = (wrap - margins).max(0.0);
+        if atomic_inline_fits(natural.0, stretch) {
+            return at(natural.0, natural.1);
+        }
+        let Some(&min_width) = self.min_content.get(&id) else {
+            // Not measured yet, and a measure cannot start a compute: line
+            // it up at its max-content size, as before #1476, and ask.
+            self.requests.borrow_mut().push(id);
+            return at(natural.0, natural.1);
+        };
+        // A capped box is lined up at its **margin box**: the line is then
+        // as wide as what the box takes of it, so a container sized from
+        // this answer leaves the box the width it was capped at here once
+        // its margins come out again. (A box that fits is lined up without
+        // them, as the paint layout lines every box up.)
+        match atomic_inline_capped_width(min_width, natural.0, stretch) {
+            None => at(natural.0, natural.1),
+            // Its height at a width it has not been laid out at is not
+            // known; the one it has stands in until
+            // `resolve_percentage_inline_blocks` lays it out there — and is
+            // the answer when it already has that width. Not the height of
+            // its min-content compute, which breaks its text at every
+            // opportunity: at its min-content *width* the short words share
+            // lines (review of #1488).
+            //
+            // At the width its layout will round that to (a box laid out as
+            // a root is `round(width)` wide), which is what the branch above
+            // answers once it has been: a measure at this width then answers
+            // the same before and after, so a container sized from it does
+            // not move by the rounding between an incremental layout and a
+            // fresh one, and is not a pixel narrower than the box it holds
+            // (reviews of #1510).
+            Some(fit) => (fit.round() + margins, layout.1),
+        }
+    }
+}
+
+/// Where the first line of `layout` sits its baseline, from the top of the
+/// layout — the content-box top of the box it was measured for. `None` when it
+/// laid out no line, or only the empty line of an IFC with no content
+/// ([`EMPTY_IFC_BOX`]), which has no line box (CSS 2.1 §9.4.2), as
+/// [`last_line_baseline`] skips it (#2475): a flex item holding only
+/// collapsible spaces has no baseline, and an `inline-flex` whose first item
+/// it is synthesizes one from that item's border box (#2580).
+pub(crate) fn first_line_baseline(layout: &parley::layout::Layout<Brush>) -> Option<f32> {
+    if layout.inline_boxes().any(|b| b.id == EMPTY_IFC_BOX) {
+        return None;
+    }
+    layout.lines().next().map(|line| line.metrics().baseline)
+}
+
+/// Its last line's baseline, from the layout's top (`None` when it has no
+/// line): an `inline-block`'s baseline is its last line box's (CSS 2.1
+/// §10.8.1, #663).
+///
+/// An IFC with no content ([`EMPTY_IFC_BOX`]: collapsible spaces, a comment,
+/// an out-of-flow box) has no line box in CSS (§9.4.2), so it has no
+/// baseline either, though parley lays out one empty line. Counted, the
+/// anonymous block holding the spaces after an inline-block's last block
+/// child put the inline-block's baseline at its bottom, and the line it sat
+/// in grew by the strut's descent:
+/// `<span style="display: inline-block"><p>a</p><div>b</div> </span>` stood
+/// 5px taller than in Chrome 157, which takes the `<div>`'s line (#2475).
+pub(crate) fn last_line_baseline(layout: &parley::layout::Layout<Brush>) -> Option<f32> {
+    if layout.inline_boxes().any(|b| b.id == EMPTY_IFC_BOX) {
+        return None;
+    }
+    layout.lines().last().map(|line| line.metrics().baseline)
+}
+
+/// Atomic inline `id`'s baseline from its border-box top, read from the
+/// Taffy layout its detached compute just made (#663): what parley 0.12 lines
+/// the box up by (`InlineBox::baseline`) against the line's strut.
+///
+/// - an `inline-flex` / `inline-grid` takes its **first** baseline, the first
+///   in-flow item's (css-flexbox-1 §8.5, css-grid-1 §11.8; approximated: no
+///   baseline alignment groups, no reordering);
+/// - any other atomic inline (an `inline-block`, a `<button>`) its **last**
+///   line box's, found through its last in-flow block child that has one, or
+///   none — lined up by its bottom edge — when it has no line box or its
+///   `overflow` is neither `visible` nor `clip` (CSS 2.1 §10.8.1);
+/// - a replaced element and a form control with no line of its own, none.
+pub(crate) fn atomic_inline_baseline(tree: &crate::node::NodeTree, id: RawNodeId) -> Option<f32> {
+    use crate::computed_style::{DisplayValue, OverflowValue};
+    let node = tree.nodes.get(id)?;
+    let taffy_id = node.taffy_id?;
+    let style = &node.computed_style;
+    let first = matches!(
+        style.display,
+        DisplayValue::InlineFlex | DisplayValue::InlineGrid
+    );
+    let clips = |o: OverflowValue| !matches!(o, OverflowValue::Visible | OverflowValue::Clip);
+    if let Some(NodeContext::FormControl { .. }) = tree.taffy.get_node_context(taffy_id) {
+        let height = tree.taffy.unrounded_layout(taffy_id).size.height;
+        return crate::form_control::input_baseline(node, height);
+    }
+    // An inline alt placeholder (#2309) is an inline-block of its text, on
+    // its last line's baseline, as Chrome's alt container is.
+    if let Some(NodeContext::Image {
+        natural: None,
+        alt: Some(alt),
+        ..
+    }) = tree.taffy.get_node_context(taffy_id)
+        && alt.inline
+    {
+        let layout = tree.taffy.unrounded_layout(taffy_id);
+        let content = layout.size.width
+            - layout.padding.left
+            - layout.padding.right
+            - layout.border.left
+            - layout.border.right;
+        return Some(layout.border.top + layout.padding.top + alt.last_baseline(content));
+    }
+    // A cell standing in an anonymous inline-table
+    // (`table_layout::wrap_cell_in_inline_table`): the table's baseline is
+    // its row's, the cell's first line when the cell is baseline-aligned,
+    // else the bottom of its content box (CSS 2.1 §17.5.3; Chrome 157 sits a
+    // `vertical-align: middle` cell's content bottom on the line's
+    // baseline). A cell with no line has its content bottom too.
+    if let Some(align) = style.anonymous_inline_table {
+        let first_line = (align == VerticalAlignValue::Baseline)
+            .then(|| taffy_baseline(tree, taffy_id, true, 0))
+            .flatten();
+        let layout = tree.taffy.unrounded_layout(taffy_id);
+        return first_line.or(Some(
+            layout.size.height - layout.padding.bottom - layout.border.bottom,
+        ));
+    }
+    if !first && (clips(style.overflow_x) || clips(style.overflow_y)) {
+        return None;
+    }
+    taffy_baseline(tree, taffy_id, first, 0)
+}
+
+/// [`atomic_inline_baseline`]'s walk over the Taffy subtree at `taffy_id`:
+/// its first (`first`) or last line's baseline, from its border-box top.
+fn taffy_baseline(
+    tree: &crate::node::NodeTree,
+    taffy_id: taffy::NodeId,
+    first: bool,
+    depth: usize,
+) -> Option<f32> {
+    // Deep enough for any real tree; a cycle cannot happen, a pathological
+    // nesting just lines the box up by its bottom.
+    if depth > 256 {
+        return None;
+    }
+    let taffy = &tree.taffy;
+    let layout = taffy.unrounded_layout(taffy_id);
+    let top = layout.padding.top + layout.border.top;
+    let leaf = match taffy.get_node_context(taffy_id) {
+        Some(NodeContext::InlineRoot(root)) => Some(*root),
+        Some(NodeContext::Text(text)) => Some(text.node_id),
+        _ => None,
+    };
+    if let Some(leaf) = leaf {
+        let width = layout.size.width
+            - layout.padding.left
+            - layout.padding.right
+            - layout.border.left
+            - layout.border.right;
+        // The measure at the width it has; the closest one when Taffy clamped
+        // the measured width (a box `380` wide whose line measured 380.86),
+        // the newest of equally close ones.
+        let height = layout.size.height
+            - layout.padding.top
+            - layout.padding.bottom
+            - layout.border.top
+            - layout.border.bottom;
+        let off = |e: &crate::node::LineBaselines| (e.0 - width).abs() + (e.1 - height).abs();
+        let nearest = |entries: Option<&Vec<crate::node::LineBaselines>>| {
+            entries?
+                .iter()
+                .rev()
+                .min_by(|a, b| off(a).total_cmp(&off(b)))
+                .copied()
+        };
+        let exact = |e: &crate::node::LineBaselines| off(e) <= 0.5;
+        // The records since the root's content last changed come first; the
+        // ones from before it (`NodeTree::stale_line_baselines`) answer only
+        // for the box's exact size, which a later compute that Taffy answered
+        // from its cache may not have measured again (#896).
+        let current = nearest(tree.atomic_line_baselines.get(&leaf));
+        let stale = nearest(tree.stale_line_baselines.get(&leaf));
+        let entry = match (current, stale) {
+            (Some(c), _) if exact(&c) => c,
+            (_, Some(s)) if exact(&s) => s,
+            (Some(c), _) => c,
+            (None, s) => s?,
+        };
+        let entry = &entry;
+        // Measured at the width the box has, the line is where that measure
+        // put it — a box whose declared height its lines overflow included
+        // (its baseline is its last line's, below its bottom). Measured at
+        // another width (Taffy answered the layout from a cache the records
+        // no longer match exactly), a last line keeps its distance from the
+        // content bottom — when the content is what makes the box as tall as
+        // it is. A box with a declared `height` or `min-height` is not
+        // measured at its own width at all (Taffy needs no measure for a
+        // leaf whose size is known), and its lines stand at the top of its
+        // content box however tall it is: counted up from its bottom, a 40px
+        // box's one line was 20px too low, which only a zero top margin hid
+        // (review of #2308: `margin-top: -10px` put the box 10px above its
+        // line).
+        let same_width = (entry.0 - width).abs() <= 0.5;
+        let content_sized = taffy.style(taffy_id).is_ok_and(|s| {
+            s.size.height == taffy::Dimension::auto()
+                && s.min_size.height == taffy::LengthPercentageAuto::auto()
+        });
+        return if first {
+            entry.2
+        } else if same_width || !content_sized {
+            entry.3
+        } else {
+            entry.3.map(|b| height - (entry.1 - b))
+        }
+        .map(|b| top + b);
+    }
+    let count = taffy::TraversePartialTree::child_count(taffy, taffy_id);
+    let in_flow = |child: taffy::NodeId| {
+        let style = taffy.style(child).ok();
+        style.is_some_and(|s| {
+            s.display != taffy::Display::None && s.position != taffy::Position::Absolute
+        })
+    };
+    // A block container's last baseline skips its table children, at any
+    // depth through block containers: Chrome 157 lines an inline-block up by
+    // the last line box *outside* a table (`<p>` then `<table>`: the `<p>`'s
+    // line), or by its bottom when there is none, a caption or `display:
+    // table` alike (#2475). A flex or grid container's items are not
+    // skipped.
+    let skips_tables = !first
+        && taffy
+            .style(taffy_id)
+            .is_ok_and(|s| s.display == taffy::Display::Block);
+    let is_table = |child: taffy::NodeId| {
+        tree.taffy_map
+            .get(&child)
+            .and_then(|&id| tree.nodes.get(id))
+            .is_some_and(|n| n.computed_style.table_part == crate::computed_style::TablePart::Table)
+    };
+    let at = |i: usize| -> Option<f32> {
+        let child = taffy.child_at_index(taffy_id, i).ok()?;
+        if !in_flow(child) || (skips_tables && is_table(child)) {
+            return None;
+        }
+        let y = taffy.unrounded_layout(child).location.y;
+        taffy_baseline(tree, child, first, depth + 1).map(|b| y + b)
+    };
+    // A flex container's first baseline is its first item's, and an item with
+    // none has one synthesized from its border box: its bottom edge
+    // (css-flexbox-1 §8.5, css-align-3 §9.1). An `inline-flex` whose first
+    // item is empty or holds only collapsible spaces sits that item's bottom
+    // on the line, as Chrome 157 does; rinch went on to the next item's line
+    // (#2580). Only where the first item in DOM order is the one Chrome
+    // picks: not when an item is baseline-aligned (its baseline wins), the
+    // direction is reversed or an item has a non-zero `order` (the startmost
+    // item is then another, and rinch does not reorder items); those keep the
+    // search for the first item with a line, which matches Chrome 157 in the
+    // shapes pinned by `inline_flex_first_baseline_2580_tests.rs`.
+    let flex = taffy
+        .style(taffy_id)
+        .ok()
+        .filter(|s| first && s.display == taffy::Display::Flex);
+    if let Some(container) = flex {
+        let items: Vec<taffy::NodeId> = (0..count)
+            .filter_map(|i| taffy.child_at_index(taffy_id, i).ok())
+            .filter(|&child| in_flow(child))
+            .collect();
+        let baseline_aligned = |child: taffy::NodeId| {
+            taffy.style(child).is_ok_and(|s| {
+                s.align_self
+                    .or(container.align_items)
+                    .is_some_and(|a| a.keyword() == taffy::style::AlignItemsKeyword::Baseline)
+            })
+        };
+        let ordered = |child: taffy::NodeId| {
+            tree.taffy_map
+                .get(&child)
+                .and_then(|&id| tree.nodes.get(id))
+                .is_some_and(|n| n.computed_style.order != 0)
+        };
+        let reversed = matches!(
+            container.flex_direction,
+            taffy::FlexDirection::RowReverse | taffy::FlexDirection::ColumnReverse
+        );
+        let in_dom_order = !reversed && !items.iter().any(|&c| baseline_aligned(c) || ordered(c));
+        if let (true, Some(&item)) = (in_dom_order, items.first()) {
+            let item_layout = taffy.unrounded_layout(item);
+            let baseline = taffy_baseline(tree, item, true, depth + 1);
+            return Some(item_layout.location.y + baseline.unwrap_or(item_layout.size.height));
+        }
+    }
+    let found = if first {
+        (0..count).find_map(at)
+    } else {
+        (0..count).rev().find_map(at)
+    };
+    found.or_else(|| marker_line_baseline(tree, taffy_id).map(|b| top + b))
+}
+
+/// The baseline of the line an empty list item's outside marker stands in
+/// (`Node::marker_line_floor`): an item with no line box of its own is given
+/// the marker's line, at the top of its content box, and lines an
+/// `inline-block` list up by it as Chrome 157 does — by the bottom edge, the
+/// line around `<ul style="display: inline-block"><li></li></ul>` stood 25px
+/// tall where Chrome's is 20.
+fn marker_line_baseline(tree: &crate::node::NodeTree, taffy_id: taffy::NodeId) -> Option<f32> {
+    let &dom = tree.taffy_map.get(&taffy_id)?;
+    let node = tree.nodes.get(dom)?;
+    node.marker_line_floor?;
+    let marker = node.children.iter().copied().find(|&c| {
+        tree.nodes
+            .get(c)
+            .is_some_and(|n| n.is_pseudo_element && n.tag() == Some("rinch-marker"))
+    })?;
+    // The marker's text is measured either as its own IFC or as a text leaf.
+    let text = tree.nodes.get(marker)?.children.first().copied();
+    [Some(marker), text]
+        .into_iter()
+        .flatten()
+        .find_map(|id| tree.atomic_line_baselines.get(&id)?.last()?.2)
+}
+
+/// The `white-space-collapse` parley 0.12 is handed for an element's text:
+/// which of its spaces hang at a line's end (CSS Text 4 §4.3). rinch
+/// collapses white space itself ([`IfcText`]), so everything parley sees is
+/// preserved — `Preserve` (hangs at a soft wrap, and only as far as it
+/// overflows before a forced break or the end) — except `break-spaces`, whose
+/// spaces never hang (`BreakSpaces`, #1043).
+pub(crate) fn white_space_hanging(
+    white_space: crate::computed_style::WhiteSpaceValue,
+) -> parley::style::WhiteSpaceCollapse {
+    match white_space {
+        crate::computed_style::WhiteSpaceValue::BreakSpaces => {
+            parley::style::WhiteSpaceCollapse::BreakSpaces
+        }
+        _ => parley::style::WhiteSpaceCollapse::Preserve,
+    }
+}
+
+/// An atomic inline's top and bottom margins, in CSS px: its line lines up
+/// its **margin box** (CSS 2.1 §10.8: the height of an inline-block's or a
+/// replaced element's inline box is its margin box's), so they grow the line,
+/// and a box with no baseline sits its bottom margin edge on it. A `<img
+/// style="margin-bottom: 16px">` in a line of its own took 16px less in
+/// rinch than in Chrome (#1405). `auto` is 0; a percentage (of the
+/// containing block's width) is not resolved and counts 0. The horizontal
+/// margins are still left out (#1405).
+pub(crate) fn atomic_vertical_margins(style: &crate::computed_style::ComputedStyle) -> (f32, f32) {
+    use crate::computed_style::LengthPercentageAutoValue as M;
+    let px = |m: M| match m {
+        M::Length(px) => px,
+        _ => 0.0,
+    };
+    (px(style.margin_top), px(style.margin_bottom))
+}
+
+/// An atomic inline's `vertical-align` as parley 0.12 lines a box up by it
+/// (CSS 2.1 §10.8.1; #663): every keyword, and a length or percentage (of the
+/// box's own `line-height`) raising it. Before 0.12 an atomic inline sat on
+/// the baseline whatever it declared. A text span's `vertical-align` is a
+/// parley length too ([`RinchDocument::span_vertical_align`], #1357).
+pub(crate) fn atomic_vertical_align(
+    style: &crate::computed_style::ComputedStyle,
+    scale: f32,
+) -> parley::style::VerticalAlign {
+    use parley::style::VerticalAlign as V;
+    match style.vertical_align {
+        VerticalAlignValue::Baseline => V::BASELINE,
+        VerticalAlignValue::Sub => V::SUB,
+        VerticalAlignValue::Super => V::SUPER,
+        VerticalAlignValue::Top => V::TOP,
+        VerticalAlignValue::Bottom => V::BOTTOM,
+        VerticalAlignValue::Middle => V::MIDDLE,
+        VerticalAlignValue::TextTop => V::TEXT_TOP,
+        VerticalAlignValue::TextBottom => V::TEXT_BOTTOM,
+        VerticalAlignValue::LengthPercentage(lp) => {
+            V::length(lp.resolve(style.line_height_px()) * scale)
+        }
+    }
+}
+
+/// Whether `v` is a `vertical-align` keyword parley places by font metrics
+/// or by the line rather than by a shift rinch computes (#1357).
+pub(crate) fn is_metrics_vertical_align(v: VerticalAlignValue) -> bool {
+    matches!(
+        v,
+        VerticalAlignValue::Top
+            | VerticalAlignValue::Middle
+            | VerticalAlignValue::Bottom
+            | VerticalAlignValue::TextTop
+            | VerticalAlignValue::TextBottom
+    )
+}
+
+/// A measure's `LayoutOutput` with its first baseline (#1013).
+///
+/// `compute_leaf_layout` reports `Baselines::NONE` whatever the measure did, so
+/// Taffy synthesized every text leaf's and IFC root's baseline from its bottom
+/// border edge, and `align-items: baseline` in a flex or grid row lined items
+/// up by their bottoms. Taffy measures a baseline from the **border-box** top
+/// (`flexbox.rs` adds only the item's top margin), so the content-box baseline
+/// gets the box's top padding and border, resolved exactly as
+/// `compute_leaf_layout` resolves them. A block container above the leaf needs
+/// nothing: Taffy's block algorithm propagates its first in-flow child's.
+pub(crate) fn with_first_baseline(
+    mut out: taffy::LayoutOutput,
+    inputs: &taffy::LayoutInput,
+    style: &taffy::Style,
+    content_baseline: Option<f32>,
+) -> taffy::LayoutOutput {
+    if let Some(baseline) = content_baseline {
+        use taffy::{CoreStyle, ResolveOrZero};
+        let pw = inputs.parent_size.width;
+        let padding = style.padding().resolve_or_zero(pw, |_, _| 0.0);
+        let border = style.border().resolve_or_zero(pw, |_, _| 0.0);
+        out.baselines.first = Some(padding.top + border.top + baseline);
+    }
+    out
+}
+
+/// A text **leaf**'s text — a flex or grid item's own text, measured through
+/// `NodeContext::Text` rather than an IFC — as parley lays it out (#1279,
+/// #1672): its white space processed by its element's `white-space` exactly
+/// as an IFC processes a text node's ([`IfcText::push_text_node`]: collapsed
+/// for `normal`/`nowrap`, spaces collapsed and newlines kept for `pre-line`,
+/// a held space at the end removed, U+2028/U+2029/U+0085 substituted). A
+/// preserved tab stays a tab: a leaf's tabs are not set to their stops
+/// (#1585).
+///
+/// Offsets into a leaf's layout are offsets into this text, as an IFC
+/// root's are into its flat text.
+pub(crate) struct LeafText<'a> {
+    pub text: std::borrow::Cow<'a, str>,
+    /// Its spaces are preserved: only then can they hang or end a line as
+    /// content ([`break_lines_hanging_spaces`],
+    /// [`crate::node::measured_width_of`]).
+    pub preserved: bool,
+    /// The `pre` and `break-spaces` text, whose spaces do not hang.
+    pub unhung: UnhungSpaces,
+}
+
+impl<'a> LeafText<'a> {
+    pub(crate) fn of(raw: &'a str, white_space: crate::computed_style::WhiteSpaceValue) -> Self {
+        use crate::computed_style::WhiteSpaceValue;
+        let mut ifc = IfcText::new(false);
+        ifc.push_text_node(
+            std::borrow::Cow::Borrowed(raw),
+            SpaceCollapse::of(white_space),
+        );
+        ifc.finish();
+        let preserved = ifc.preserved();
+        let tabs = ifc.tab_offsets();
+        let mut text = ifc.into_text();
+        if !tabs.is_empty() {
+            let t = text.to_mut();
+            for at in tabs {
+                t.replace_range(at..at + 1, "\t");
+            }
+        }
+        let mut unhung = UnhungSpaces::default();
+        if !text.is_empty() {
+            match white_space {
+                WhiteSpaceValue::Pre => unhung.pre.push(0..text.len()),
+                WhiteSpaceValue::BreakSpaces => unhung.breaking.push(0..text.len()),
+                _ => {}
+            }
+        }
+        Self {
+            text,
+            preserved,
+            unhung,
+        }
+    }
+}
+
+/// A text leaf shaped and broken at `wrap_width`, and the size its measure
+/// reports ([`crate::node::measured_width_of`]). The one place a leaf's
+/// layout is built: the root compute's measure and an atomic inline's
+/// (`measure_inline_blocks`) both call it.
+///
+/// `percent_basis` is what a percentage `text-indent` is of (#2628): the
+/// item's width when it is known, else 0 (cyclic, as in Chrome 157).
+pub(crate) fn shape_text_leaf(
+    font_cx: &mut parley::FontContext,
+    layout_cx: &mut parley::LayoutContext<Brush>,
+    text: &crate::node::TextMeasure,
+    wrap_width: Option<f32>,
+    percent_basis: f32,
+) -> LeafShape {
+    let leaf = LeafText::of(&text.content, text.white_space);
+    let font_family = crate::fonts::parley_text_family(font_cx, &text.font_family, &leaf.text);
+    let mut builder = layout_cx.ranged_builder(font_cx, &leaf.text, 1.0, true);
+    builder.set_line_break_override(Some(CHROME_LINE_BREAKS));
+    use parley::style::StyleProperty as P;
+    builder.push_default(P::FontSize(text.font_size));
+    if (text.font_weight - 400.0).abs() > 1.0 {
+        builder.push_default(P::FontWeight(parley::style::FontWeight::new(
+            text.font_weight,
+        )));
+    }
+    if let Some(lh) = layout::css_line_height_to_parley(&text.line_height_css) {
+        builder.push_default(P::LineHeight(lh));
+    }
+    font_family.push_to(&mut builder);
+    // So the cached layout can be rendered with a colour (paint draws a leaf
+    // in its parent's current one, #904).
+    builder.push_default(P::Brush(Brush::Solid(text.color)));
+    // Emergency line breaking.
+    builder.push_default(P::OverflowWrap(text.overflow_wrap.to_parley()));
+    builder.push_default(P::WordBreak(text.word_break.to_parley()));
+    builder.push_default(P::LineBreak(text.line_break.to_parley()));
+    builder.push_default(P::Hyphens(hyphens_to_parley(text.hyphens_none)));
+    // letter-/word-spacing (#698). The builder's scale is 1.0, so these are
+    // CSS pixels either way.
+    builder.push_default(P::LetterSpacing(text.letter_spacing));
+    builder.push_default(P::WordSpacing(text.word_spacing));
+    builder.push_default(P::WhiteSpaceCollapse(white_space_hanging(text.white_space)));
+    let mut layout = builder.build(&leaf.text);
+    // A flex or grid container's own text is an anonymous item, whose first
+    // line the container's `text-indent` indents (#2628).
+    if !text.text_indent.is_zero() {
+        layout.set_text_indent(
+            text.text_indent.resolve(percent_basis),
+            text.text_indent.options(),
+        );
+    }
+    let hang = break_lines_hanging_spaces(
+        &mut layout,
+        &leaf.text,
+        wrap_width,
+        leaf.preserved,
+        &leaf.unhung,
+        None,
+        // A text leaf is a flex or grid item, never beside a float.
+        None,
+        None,
+    )
+    .hang;
+    // A flex or grid container's text that is all white space is not
+    // rendered, whatever its `white-space` (css-flexbox-1 §4, css-grid-1
+    // §6): Chrome 155 lays `"   "` out as nothing under `pre-wrap` too. Here
+    // it measures 0x0 with no baseline, but is still an item (#1760).
+    let blank = text
+        .content
+        .bytes()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'));
+    let (width, height) = if blank {
+        (0.0, 0.0)
+    } else {
+        let width = crate::node::measured_width_of(
+            &layout,
+            &leaf.text,
+            leaf.preserved,
+            wrap_width.unwrap_or(f32::INFINITY),
+            &leaf.unhung.breaking,
+        );
+        // A word `break-word` split is still as wide as its min-content
+        // contribution: the whole word (#2363).
+        let width = width.max(crate::node::unbroken_min_content(&layout));
+        (width, layout.height())
+    };
+    LeafShape {
+        layout,
+        hang,
+        width,
+        height,
+        blank,
+    }
+}
+
+/// What [`shape_text_leaf`] answers.
+pub(crate) struct LeafShape {
+    pub layout: parley::Layout<Brush>,
+    pub hang: HangStats,
+    /// The width the measure reports.
+    pub width: f32,
+    /// The height the measure reports.
+    pub height: f32,
+    /// All white space: measured 0x0, and reports no first baseline, so it
+    /// moves no baseline-aligned item. It is still an item (a `gap` is laid
+    /// out beside it), where Chrome makes none (#1760).
+    pub blank: bool,
+}
+
+impl LeafShape {
+    /// Its first line's baseline, from the content-box top; `None` when blank.
+    pub(crate) fn first_baseline(&self) -> Option<f32> {
+        if self.blank {
+            None
+        } else {
+            first_line_baseline(&self.layout)
+        }
+    }
+}
+
+/// The line count to keep when `layout` ends in an empty line parley 0.11.1
+/// commits where CSS has no line box: after an inline box it placed by an
+/// **emergency** break (#1050), or after a forced break that ends the text
+/// (#1172).
+///
+/// **After an overflowing box.** At the start of a line, a box too wide for
+/// any line is consumed and the line committed on the spot
+/// (`BreakReason::Emergency`). When that box was the paragraph's last item the
+/// breaker is not marked done, so its next `break_next` commits one more line
+/// holding nothing. When text came before the box that line still carries an
+/// empty text-run item, so the breaker's own rule that an empty last line adds
+/// no height does not apply, and it is counted at the box's line height: a
+/// 300x80 box wrapped under `"x "` in a 200px paragraph made it 180px tall
+/// where Chrome makes it 105. Parley's `main` still has the same branch
+/// (checked 2026-09-26).
+///
+/// **After a final forced break.** A `<br>` is pushed to parley as `"\n"`, and
+/// parley always lays out one more line after a text-final newline, with an
+/// empty text run in it (its "copy metrics from previous line" hack) — so it
+/// is counted too. A line box after the last forced break exists in CSS only
+/// when something comes after the break: `<div>a<br></div>` and `<pre>a\n</pre>`
+/// are one line in Chrome 153 (rinch made two), `<div><br></div>` one,
+/// `<div>a<br><br></div>` two. What "something" is has been settled before
+/// parley sees the text: a collapsed space, an empty element and an
+/// out-of-flow box put nothing into it ([`IfcText`]), while a preserved space,
+/// an NBSP, and any in-flow atomic inline (even a 0x0 one) do.
+///
+/// Either way it is that line exactly: the last line, ended by the end of the
+/// text (`BreakReason::None`), right after an emergency break with nothing to
+/// paint or hit (no glyph run, no box), or right after a forced break
+/// (`BreakReason::Explicit`) with no text and no box. A line of real content —
+/// even a single space — has a glyph run or text and is kept.
+///
+/// **This is not a `<textarea>`'s rule**, whose value ending in `"\n"` does
+/// show an empty last line in Chrome (where its caret goes). A textarea is laid
+/// out by the form-control text path, not by an IFC, and keeps it. Nor is it
+/// the rich-text editor's, which needs the line for a caret after a trailing
+/// hard break and renders a second `<br>` for it, as ProseMirror does.
+fn phantom_last_line(layout: &parley::Layout<Brush>) -> Option<usize> {
+    use parley::PositionedLayoutItem;
+    use parley::layout::BreakReason;
+    let n = layout.len();
+    if n < 2 {
+        return None;
+    }
+    let last = layout.get(n - 1)?;
+    let prev = layout.get(n - 2)?;
+    if last.break_reason() != BreakReason::None {
+        return None;
+    }
+    let phantom = match prev.break_reason() {
+        BreakReason::Emergency => last.items().next().is_none(),
+        BreakReason::Explicit => {
+            last.text_range().is_empty()
+                && !last
+                    .items()
+                    .any(|item| matches!(item, PositionedLayoutItem::InlineBox(_)))
+        }
+        _ => false,
+    };
+    phantom.then_some(n - 1)
+}
+
+/// Whether `layout`'s lines are the lines its content has at any wider width
+/// (#2540): no line ended at a soft wrap (`Regular` or `Emergency`), so each
+/// one either fitted or had no opportunity to break, and neither changes with
+/// more room, and no atomic inline is lined up in them, whose size can
+/// depend on the width the lines are broken at
+/// ([`AtomicContributions::size`]). A single line of text, or lines every one
+/// of which a `<br>` or a preserved newline ends. The shrink-to-fit re-break
+/// of a box wider than its room (`layout_engine`'s IFC measure, #2425) is
+/// then the same lines and is not built.
+pub(crate) fn lines_hold_when_wider(layout: &parley::Layout<Brush>) -> bool {
+    use parley::layout::BreakReason;
+    layout.inline_boxes().next().is_none()
+        && layout.lines().all(|line| {
+            matches!(
+                line.break_reason(),
+                BreakReason::None | BreakReason::Explicit
+            )
+        })
+}
+
+/// One step of an IFC's parley tree-builder program, recorded by
+/// [`IfcText`] and replayed once the whole IFC has been walked (#1180).
+enum IfcOp<'a> {
+    // 'static, not 'a: every property `inline_style_props` pushes is a Copy
+    // value or (since #677) an owned `FontFamily` resolved through
+    // `fonts::parley_font_family` — nothing in a span borrows from the node
+    // slab's `'a`. `parley::TreeBuilder::push_style_modification_span` takes
+    // its own independent `'s: 'iter` generic pair and resolves each property
+    // within the call, so a `'static` item costs nothing at the replay site
+    // in [`IfcText::finish`].
+    Span(Vec<parley::style::StyleProperty<'static, Brush>>),
+    Pop,
+    Text(std::borrow::Cow<'a, str>),
+    InlineBox(parley::InlineBox),
+    /// Bidi control characters ([`IfcText::push_bidi_control`], #2588):
+    /// text to parley, and nothing that holds an element or a line up. Empty
+    /// once [`IfcText::finish`] has found nothing else in the IFC.
+    Control(&'static str),
+}
+
+/// The text of one inline formatting context on its way to parley, with its
+/// white space collapsed by rinch rather than by parley (#1180).
+///
+/// **Why rinch collapses.** parley 0.11.1's `WhiteSpaceCollapse::Collapse`
+/// collapses and trims per *style span*: it trims a span's start and its end
+/// (`is_span_first` / `is_span_last` in `resolve/tree.rs`). rinch pushes one
+/// span per inline element, so a collapsible space at an element's edge was
+/// removed — `a<span> b</span>` laid out `ab`, `rsx! { p { "Hello" b { "
+/// world" } } }` `Helloworld`. CSS Text 3 §4.1.1 collapses across the whole
+/// inline formatting context: phase I removes a collapsible space that
+/// follows another one, "even one outside the boundary of the inline
+/// containing that space", and phase II removes the spaces at a *line's*
+/// start and end. And its trims took every Unicode `White_Space` character,
+/// where CSS collapses only spaces, tabs and segment breaks — an NBSP at an
+/// edge went too (#1154).
+///
+/// **What this does instead.** The walk hands every text node to
+/// [`Self::push_text_node`] with the collapse mode of the element the text is
+/// in ([`SpaceCollapse`], #1192 — not the root's: CSS applies
+/// `white-space-collapse` per character), which applies both phases in
+/// document order across element boundaries: each run of spaces,
+/// tabs and segment breaks (LF, CR) becomes one space — not U+000C FORM FEED,
+/// which Chrome draws as a character (#1181) — a space after another collapsible space is
+/// removed wherever an element boundary falls between them, and a space at
+/// the start of the IFC or after a `<br>` is removed. A space at the *end*
+/// of the IFC or before a `<br>` cannot be known to be one until the walk
+/// gets there, so the last kept space is held as `pending` and removed then
+/// ([`Self::push_forced_break`], [`Self::finish`]); anything that is
+/// content — any other character, an atomic inline —
+/// confirms it. An out-of-flow box or an empty element is not content. A
+/// space at a *soft* wrap is left to parley, which hangs it (a collapsible
+/// space is never next to another now). The walk's ops are recorded rather than pushed,
+/// because a removed trailing space may sit in a span that has already been
+/// closed, and every op is replayed under `Preserve`, so parley trims
+/// nothing: what it lays out is exactly this text.
+///
+/// **The flat offsets are offsets into that text.** They used to count the
+/// text as pushed, so after any collapsed run every recorded offset — the
+/// DOM↔flat caret maps, an inline background's range, the visibility mask —
+/// was late by what parley had removed. [`Self::len`] is the text as kept so
+/// far, with a held space counted; [`Self::remap`] takes such an offset to
+/// the final text once `finish` has removed the held spaces. A text node's
+/// own DOM↔flat correspondence is its `offset_map` (see
+/// [`crate::node::IfcTextRange`]).
+///
+/// U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR and U+0085 NEXT LINE,
+/// in any mode, and U+000C FORM FEED in preserved text, are handed to parley
+/// as substitutes that lay out the way Chrome 153 draws them, `letter-spacing`
+/// and `word-spacing` aside ([`laid_out_as`], #1181): parley reads
+/// the first two as forced line breaks, where Chrome draws an ordinary
+/// space-wide character with a break opportunity after it (`x&#x2028;y` is
+/// one line). The substitute's length differs from the character's, which
+/// the `offset_map` records like any collapsed run.
+///
+/// Text under `pre`, `pre-wrap` or `break-spaces`, and all the text of a `contenteditable`
+/// root, is pushed verbatim, a tab as one space that the replay widens to
+/// its tab stop ([`TabStops`], #1122) and the characters above as their
+/// substitutes. It is content to the collapsible text around
+/// it: a preserved space confirms a held space before
+/// it and is not collapsible, so a collapsible space right after it is kept,
+/// and a preserved newline is a forced break, as a `<br>` is. `pre-line`
+/// collapses spaces and tabs and keeps each segment break as a forced break.
+pub(crate) struct IfcText<'a> {
+    /// Every text node is pushed verbatim, whatever its own `white-space`: a
+    /// `contenteditable` root, whose caret mapping needs the DOM text.
+    preserve_all: bool,
+    /// Some text was pushed with its spaces preserved ([`SpaceCollapse::Preserve`]).
+    preserved: bool,
+    ops: Vec<IfcOp<'a>>,
+    len: usize,
+    /// Nothing has been kept on this line yet: the IFC's start, or after a
+    /// forced break (a `<br>`, a preserved newline).
+    line_start: bool,
+    /// The last thing kept was a collapsible space.
+    prev_space: bool,
+    /// That space, while it could still turn out to end a line: `(op, byte
+    /// in the op's text, flat offset)`.
+    pending: Option<(usize, usize, usize)>,
+    /// Flat offsets (in [`Self::len`]'s terms) of the held spaces removed,
+    /// ascending.
+    dropped: Vec<usize>,
+    /// The last atomic inline pushed and the flat offset it was pushed at.
+    last_box: Option<(RawNodeId, usize)>,
+    /// The out-of-flow boxes met ([`Self::note_out_of_flow`]), their offsets
+    /// in [`Self::len`]'s terms and no position yet.
+    out_of_flow: Vec<crate::node::OutOfFlowMark>,
+    /// Every preserved tab, in order: `(op, byte in the op's text, flat
+    /// offset in [`Self::len`]'s terms, the `tab-size` of the element its
+    /// text is in)`. A tab is pushed as one space and widened to its tab stop
+    /// when replayed ([`Self::replay`], #1122).
+    tabs: Vec<(usize, usize, usize, crate::computed_style::TabSizeValue)>,
+    /// The `tab-size` of the text pushed next ([`Self::set_tab_size`], #1584).
+    tab_size: crate::computed_style::TabSizeValue,
+    /// An edge box was pushed ([`Self::push_edge_box`], #1426).
+    edge_boxes: bool,
+    /// Whether the text or atomic inline being pushed may wrap
+    /// ([`Self::set_wraps`]).
+    wraps: bool,
+    /// Whether a run of spaces that does not wrap, pushed next, has a break
+    /// opportunity before it: `None` before any content, then what the
+    /// items since the last content (not a collapsible space) say
+    /// ([`Self::open_element`], [`Self::close_element`]).
+    ///
+    /// Chrome 156 decides it item by item, as its line breaker carries the
+    /// opportunity after its last item: text or an atomic inline whose
+    /// element wraps allows it and one whose element does not takes it away;
+    /// an element's end passes it on, and allows it when the element does
+    /// not wrap and the one it closes into does; an element's start allows
+    /// it when that element wraps and takes it away when it does not, even
+    /// an empty one. So `aa<span normal>hello</span> ccc` in a `nowrap` root
+    /// breaks after `hello`, with end padding on the span or a padded child
+    /// too, and so do `aa<span><span normal>hello</span></span> ccc` and
+    /// `aa<span normal><span nowrap>hello</span></span> ccc`; but
+    /// `…hello</span><span></span> ccc` and `…hello</span><span> ccc</span>`
+    /// do not (#2238). An element ends into its nearest ancestor with a box
+    /// (a `display: contents` one has none), text that does not wrap in a
+    /// contents element whose boxed ancestor wraps takes the opportunity
+    /// away, and a `<wbr>` gives one that elements after it do not take
+    /// away ([`Self::push_wbr`], review of #2258).
+    last_wraps: Option<bool>,
+    /// A `<wbr>` was met since the last content ([`Self::push_wbr`]).
+    wbr: bool,
+    /// [`Self::last_wraps`] is an atomic inline's own, passed on by element
+    /// ends only ([`Self::nowrap_text_in_wrapping_box`]).
+    from_box: bool,
+    /// The collapsible spaces of text that may not wrap that
+    /// [`Self::last_wraps`] gives an opportunity before: `(op, byte in the
+    /// op's text)`. Each is handed to parley as wrapping ([`Self::replay`]):
+    /// parley 0.12 decides a soft wrap by the space's own wrap mode (0.11.1
+    /// hung an overflowing space whatever its mode, which broke there too).
+    wrap_spaces: Vec<(usize, usize)>,
+    /// The flat offset (in [`Self::len`]'s terms) of the first space of every
+    /// run of spaces, collapsible (`true`) or preserved, that
+    /// [`Self::last_wraps`] gives an opportunity before
+    /// ([`Self::breaks_before_spaces`]).
+    break_before: Vec<(usize, bool)>,
+    /// Every [`IfcOp::Control`] pushed: `(op, flat offset in [`Self::len`]'s
+    /// terms, closing)`.
+    controls: Vec<(usize, usize, bool)>,
+}
+
+/// Start a new stretch of a DOM↔flat `offset_map` at `(flat, dom)` when the
+/// two have fallen out of step there ([`crate::node::IfcTextRange::offset_map`]).
+fn offset_map_note(map: &mut Vec<(usize, usize)>, flat: usize, dom: usize) {
+    let (f, d) = map.last().copied().unwrap_or((0, 0));
+    if d.wrapping_sub(f) != dom.wrapping_sub(flat) {
+        map.push((flat, dom));
+    }
+}
+
+/// What parley is handed for a character it would lay out differently from
+/// Chrome 153 (#1181), or `None` for one it gets right. `preserved`: the
+/// text's white space is preserved (`pre`, `pre-wrap`).
+///
+/// - U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR: parley reads
+///   either as a forced break (`Whitespace::Newline`, and line-break class BK
+///   in the analysis). Chrome draws a space-wide character under every
+///   `white-space` that is never collapsed, never trimmed or hung at a
+///   line's edge, and has a break opportunity after it. That is an NBSP (a
+///   space's advance, no break before it, kept at a line's end by
+///   [`InlineLayout::measured_width`]) followed by a ZERO WIDTH SPACE (the
+///   break opportunity after it).
+/// - U+0085 NEXT LINE: parley draws a glyph; Chrome draws nothing, with a
+///   break opportunity — a ZERO WIDTH SPACE.
+/// - U+000C FORM FEED under preserved white space: zero-width in Chrome, with
+///   no break opportunity and no `letter-spacing` (`x\fx` at 10px spacing is
+///   37.47px, as `xx`) — so it is removed. Where white space collapses
+///   Chrome draws it as a character, which parley does too (13.8px in
+///   Chrome against parley's 10.3px for the bundled Inter: the glyph differs).
+///
+/// Preserved text takes [`PRESERVED_SUBSTITUTES`], which is also what the
+/// rich-text editor's caret map is told
+/// ([`DomDocument::substituted_char_flat_bytes`]), so the two count the same
+/// flat bytes for each.
+///
+/// [`InlineLayout::measured_width`]: crate::node::InlineLayout::measured_width
+/// [`DomDocument::substituted_char_flat_bytes`]: rinch_core::dom::DomDocument::substituted_char_flat_bytes
+fn laid_out_as(c: char, preserved: bool) -> Option<&'static str> {
+    if !preserved && c == '\u{c}' {
+        return None;
+    }
+    PRESERVED_SUBSTITUTES
+        .iter()
+        .find(|&&(k, _)| k == c)
+        .map(|&(_, sub)| sub)
+}
+
+/// What a `<wbr>` element is laid out as ([`IfcText::push_wbr`]): Chrome 156
+/// breaks `aaaa<wbr>bbbb` in a narrow box, where nothing else in the text
+/// allows it, and draws nothing there.
+pub(crate) const WBR_TEXT: &str = "\u{200b}";
+
+/// What [`laid_out_as`] hands parley for each character in preserved text.
+pub(crate) const PRESERVED_SUBSTITUTES: [(char, &str); 4] = [
+    ('\u{2028}', "\u{a0}\u{200b}"),
+    ('\u{2029}', "\u{a0}\u{200b}"),
+    ('\u{85}', "\u{200b}"),
+    ('\u{c}', ""),
+];
+
+/// The flat bytes each of [`PRESERVED_SUBSTITUTES`] occupies.
+pub(crate) const PRESERVED_SUBSTITUTE_FLAT_BYTES: [(char, usize); 4] = {
+    let mut out = [('\0', 0); 4];
+    let mut i = 0;
+    while i < PRESERVED_SUBSTITUTES.len() {
+        out[i] = (PRESERVED_SUBSTITUTES[i].0, PRESERVED_SUBSTITUTES[i].1.len());
+        i += 1;
+    }
+    out
+};
+
+/// Whether preserved text may hold a tab or a character [`laid_out_as`]
+/// substitutes: a vectorisable scan for their UTF-8 lead bytes (`\t`, `\f`,
+/// `0xC2` for U+0085, `0xE2` for U+2028/U+2029), so ordinary text is pushed
+/// as is at about memchr's cost. A hit is checked char by char.
+fn may_rewrite_preserved(raw: &str) -> bool {
+    raw.as_bytes().chunks(32).any(|chunk| {
+        chunk
+            .iter()
+            .fold(false, |a, &b| a | matches!(b, b'\t' | 0x0C | 0xC2 | 0xE2))
+    }) && raw.contains(|c| c == '\t' || laid_out_as(c, true).is_some())
+}
+
+/// Push `sub`, what [`laid_out_as`] lays one DOM character out as, onto
+/// `out`, the character's DOM text ending at `dom_end`. The map's stretch
+/// already starts at the first character; a position after it, inside the
+/// substitute, maps to the DOM character's end — never into its UTF-8 bytes.
+fn push_substitute(out: &mut String, map: &mut Vec<(usize, usize)>, sub: &str, dom_end: usize) {
+    for (k, ch) in sub.char_indices() {
+        if k > 0 {
+            offset_map_note(map, out.len(), dom_end);
+        }
+        out.push(ch);
+    }
+}
+
+/// How a text node's white space is processed: CSS Text 3
+/// `white-space-collapse`, read from the text's own element (#1192).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpaceCollapse {
+    /// `normal`, `nowrap`: spaces, tabs and segment breaks collapse.
+    Collapse,
+    /// `pre-line`: spaces and tabs collapse, a segment break is a forced
+    /// break and removes the collapsible spaces on both sides of it.
+    PreserveBreaks,
+    /// `pre`, `pre-wrap`, `break-spaces`: everything is kept.
+    Preserve,
+}
+
+impl SpaceCollapse {
+    pub(crate) fn of(white_space: crate::computed_style::WhiteSpaceValue) -> Self {
+        use crate::computed_style::WhiteSpaceValue;
+        match white_space {
+            WhiteSpaceValue::Normal | WhiteSpaceValue::NoWrap => Self::Collapse,
+            WhiteSpaceValue::PreLine => Self::PreserveBreaks,
+            WhiteSpaceValue::Pre | WhiteSpaceValue::PreWrap | WhiteSpaceValue::BreakSpaces => {
+                Self::Preserve
+            }
+        }
+    }
+}
+
+impl<'a> IfcText<'a> {
+    /// `preserve_all`: push every text node verbatim (a `contenteditable`
+    /// root); otherwise each is collapsed by the mode it is pushed with.
+    pub(crate) fn new(preserve_all: bool) -> Self {
+        Self {
+            preserve_all,
+            preserved: preserve_all,
+            ops: Vec::new(),
+            len: 0,
+            line_start: true,
+            prev_space: false,
+            pending: None,
+            dropped: Vec::new(),
+            last_box: None,
+            out_of_flow: Vec::new(),
+            tabs: Vec::new(),
+            tab_size: Default::default(),
+            edge_boxes: false,
+            wraps: true,
+            last_wraps: None,
+            wbr: false,
+            from_box: false,
+            wrap_spaces: Vec::new(),
+            break_before: Vec::new(),
+            controls: Vec::new(),
+        }
+    }
+
+    /// Whether the text or atomic inline pushed next may wrap (the
+    /// `white-space` of the element it is in is not `nowrap` or `pre`): see
+    /// [`Self::last_wraps`].
+    pub(crate) fn set_wraps(&mut self, wraps: bool) {
+        self.wraps = wraps;
+    }
+
+    /// The `tab-size` of the element the text pushed next is in: each tab
+    /// takes its own text's, as in Chrome 155 (#1584).
+    pub(crate) fn set_tab_size(&mut self, tab_size: crate::computed_style::TabSizeValue) {
+        self.tab_size = tab_size;
+    }
+
+    /// An inline element starts, `wraps` by its `white-space`: the
+    /// opportunity before a run of spaces that does not wrap is the
+    /// element's from here ([`Self::last_wraps`]).
+    pub(crate) fn open_element(&mut self, wraps: bool) {
+        if self.last_wraps.is_some() && !self.wbr {
+            self.last_wraps = Some(wraps);
+            self.from_box = false;
+        }
+    }
+
+    /// An inline element ends, `wraps` by its `white-space`, into one that
+    /// `parent_wraps`: the opportunity is passed on, and one is given where
+    /// an element that does not wrap closes into one that does
+    /// ([`Self::last_wraps`]).
+    pub(crate) fn close_element(&mut self, wraps: bool, parent_wraps: bool) {
+        if !wraps && parent_wraps && self.last_wraps.is_some() && !self.wbr {
+            self.last_wraps = Some(true);
+            self.from_box = false;
+        }
+    }
+
+    /// A `<wbr>`: an opportunity whatever the `white-space` (Chrome 156:
+    /// `aa<span nowrap>hello</span><wbr> ccc` breaks after `hello`), which
+    /// elements starting or ending after it, before the next content, do not
+    /// take away (review of #2258). It reaches a run of spaces after it; a
+    /// `<wbr>` right before text that does not wrap gets no opportunity of
+    /// its own here.
+    /// Text that does not wrap starts in a `display: contents` element whose
+    /// nearest boxed ancestor wraps: the opportunity before its spaces goes,
+    /// unless an atomic inline gave it (Chrome 156, review of #2258:
+    /// `aa<span contents nowrap><span normal>hello</span> ccc</span>` in a
+    /// `normal` root does not break after `hello`, and `…[1] ccc</span>`
+    /// breaks after `[1]`), or a `<wbr>`.
+    pub(crate) fn nowrap_text_in_wrapping_box(&mut self) {
+        if self.last_wraps.is_some() && !self.wbr && !self.from_box {
+            self.last_wraps = Some(false);
+        }
+    }
+
+    /// A `<wbr>`'s own opportunity (#2386): a ZERO WIDTH SPACE in the text
+    /// parley lays out ([`WBR_TEXT`]), which UAX #14 breaks after (LB8) and
+    /// [`TextBreaks`] reads the same way. It is not content to white-space
+    /// processing — a space held before it stays held and a space after it
+    /// still collapses (`a <wbr> b` is `a b`, as in Chrome) — and it owns no
+    /// DOM text: its flat bytes lie between the text ranges around it.
+    pub(crate) fn push_wbr(&mut self) {
+        self.last_wraps = Some(true);
+        self.wbr = true;
+        self.ops.push(IfcOp::Text(WBR_TEXT.into()));
+        self.len += WBR_TEXT.len();
+    }
+
+    /// Bidi control characters an element's `unicode-bidi` puts around its
+    /// content ([`inline_bidi_controls`], #2588). Like a `<wbr>`'s character
+    /// they are not content to white-space processing (a space held before
+    /// them stays held, a space after them still collapses: Chrome collapses
+    /// `a <span isolate> b</span>` to `a b`) and own no DOM text; unlike it
+    /// they give no break opportunity. Returns their flat length.
+    ///
+    /// They are not content either: an inline element holding only them
+    /// still gets its [`EMPTY_INLINE_BOX`], and an IFC holding nothing else
+    /// has them removed by [`Self::finish`], so it makes no line (Chrome
+    /// 157: a block holding an empty `isolate` span, or an empty
+    /// `bidi-override` block, is 0 tall).
+    /// `closing`: they end an element's content (PDF/PDI), else they start
+    /// it ([`Self::control_ranges`]).
+    pub(crate) fn push_bidi_control(&mut self, controls: &'static str, closing: bool) -> usize {
+        self.controls.push((self.ops.len(), self.len, closing));
+        self.ops.push(IfcOp::Control(controls));
+        self.len += controls.len();
+        controls.len()
+    }
+
+    /// The runs of spaces that do not wrap and have a break opportunity
+    /// before them ([`Self::last_wraps`]), ascending: the flat offset in the
+    /// final text (after [`Self::finish`]) of each run's first space, and
+    /// whether the run is collapsible. A collapsible space [`Self::finish`]
+    /// removed (held at the end) is left out.
+    pub(crate) fn breaks_before_spaces(&self) -> Vec<(usize, bool)> {
+        self.break_before
+            .iter()
+            .filter(|(f, _)| self.dropped.binary_search(f).is_err())
+            .map(|&(f, collapsible)| (self.remap(f), collapsible))
+            .collect()
+    }
+
+    /// Whether any text was pushed with its spaces preserved: only then can a
+    /// line end in spaces that are content ([`InlineLayout::measured_width`],
+    /// [`break_lines_hanging_spaces`]).
+    pub(crate) fn preserved(&self) -> bool {
+        self.preserved
+    }
+
+    /// The flat length so far, a held space included.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn push_span(&mut self, props: Vec<parley::style::StyleProperty<'static, Brush>>) {
+        self.ops.push(IfcOp::Span(props));
+    }
+
+    pub(crate) fn pop_span(&mut self) {
+        self.ops.push(IfcOp::Pop);
+    }
+
+    /// An atomic inline is content: a held space before it stays, and a
+    /// space after it is not at a line's start.
+    pub(crate) fn push_inline_box(&mut self, inline_box: parley::InlineBox) {
+        self.pending = None;
+        self.line_start = false;
+        self.prev_space = false;
+        self.last_wraps = Some(self.wraps);
+        self.wbr = false;
+        self.from_box = true;
+        self.last_box = Some((inline_box.id as RawNodeId, self.len));
+        self.ops.push(IfcOp::InlineBox(inline_box));
+    }
+
+    /// An inline element's start or end edge box (#1426): `width` CSS px
+    /// (already scaled) of room and no height. Not content to white-space
+    /// processing — CSS collapses spaces across an inline box's padding
+    /// (css-text-3 §4.1.1: "even one outside the boundary of the inline"),
+    /// and removes a space at a line's start whatever padding precedes it —
+    /// so the held space, the line start and the last atomic inline are left
+    /// as they were.
+    ///
+    /// An end box after a forced break that ends the element's content (a
+    /// `<br>`, a preserved newline, with only closing spans after it) goes
+    /// before that break: the element's last fragment is the line the break
+    /// ends, and what follows starts the next line at its edge, as in Chrome
+    /// 155 (review of #1823).
+    /// Where float `float` stands in the content: a box of no size, which the
+    /// line breaker places when it reaches it ([`FLOAT_BOX`]). Like an edge
+    /// box, not content to white-space processing: a float does not end a
+    /// run of spaces (`a <float> b` keeps one space).
+    pub(crate) fn push_float_box(&mut self, float: RawNodeId) {
+        self.ops.push(IfcOp::InlineBox(parley::InlineBox {
+            id: float_box_id(float),
+            index: 0,
+            width: 0.0,
+            height: 0.0,
+            kind: parley::InlineBoxKind::CustomOutOfFlow,
+            baseline: None,
+            vertical_align: parley::style::VerticalAlign::BASELINE,
+        }));
+    }
+
+    /// The number of ops pushed so far: a mark for
+    /// [`Self::push_empty_inline_box`].
+    pub(crate) fn op_count(&self) -> usize {
+        self.ops.len()
+    }
+
+    /// Whether an atomic inline was pushed since op `since`: one its edge
+    /// boxes, an empty element's box and a float's do not count as (#2597).
+    pub(crate) fn holds_inline_box_since(&self, since: usize) -> bool {
+        self.ops[since.min(self.ops.len())..]
+            .iter()
+            .any(|op| matches!(op, IfcOp::InlineBox(b) if !is_edge_box(b.id)))
+    }
+
+    /// An inline element opened at op `since` is closing: when nothing since
+    /// is text or an inline box, give its span an [`EMPTY_INLINE_BOX`] so
+    /// that parley puts its span box on the line (#1463). Like a float's box,
+    /// not content to white-space processing.
+    ///
+    /// The box is no shaping boundary (a parley `Strut` box, #2470): Chrome
+    /// 157 kerns `A<span style="font-size: 32px"></span>V` as `AV` (21px,
+    /// 20.98 without the span). Unless `cuts_shaping`: CSS Text 3 §7.3 breaks
+    /// shaping at the boundary of a box with `vertical-align` other than
+    /// `baseline`, and Chrome does at an empty one too (`A<span
+    /// style="vertical-align: 10px"></span>V` is 22.09, unkerned); the box is
+    /// then `OutOfFlow`, which parley shapes the two sides of apart. (Chrome
+    /// cuts at `0px` as well, which Stylo computes as `baseline`.)
+    /// Non-zero margins, borders and padding are edge boxes, which cut
+    /// shaping already.
+    pub(crate) fn push_empty_inline_box(&mut self, since: usize, cuts_shaping: bool) {
+        let holds = self.ops[since..].iter().any(|op| match op {
+            IfcOp::Text(text) => !text.is_empty(),
+            IfcOp::InlineBox(_) => true,
+            IfcOp::Span(_) | IfcOp::Pop | IfcOp::Control(_) => false,
+        });
+        if holds {
+            return;
+        }
+        self.ops.push(IfcOp::InlineBox(parley::InlineBox {
+            id: EMPTY_INLINE_BOX,
+            index: 0,
+            width: 0.0,
+            height: 0.0,
+            kind: if cuts_shaping {
+                parley::InlineBoxKind::OutOfFlow
+            } else {
+                parley::InlineBoxKind::Strut
+            },
+            baseline: None,
+            vertical_align: parley::style::VerticalAlign::BASELINE,
+        }));
+    }
+
+    pub(crate) fn push_edge_box(&mut self, owner: RawNodeId, end: bool, width: f32) {
+        let edge = IfcOp::InlineBox(parley::InlineBox {
+            id: edge_box_id(owner, end),
+            index: 0,
+            width,
+            height: 0.0,
+            kind: parley::InlineBoxKind::InFlow,
+            baseline: None,
+            vertical_align: parley::style::VerticalAlign::BASELINE,
+        });
+        self.edge_boxes = true;
+        if end {
+            // The last text op, past closing spans and end boxes only.
+            let at = self.ops.iter().rposition(|op| match op {
+                IfcOp::Pop | IfcOp::Control(_) => false,
+                IfcOp::InlineBox(b) => !(is_edge_box(b.id) && b.id & EDGE_BOX_END != 0),
+                _ => true,
+            });
+            if let Some(at) = at
+                && let IfcOp::Text(text) = &self.ops[at]
+                && text.ends_with('\n')
+            {
+                if text.len() > 1 {
+                    // Split the newline off; tabs recorded in this op are
+                    // before it and keep their op and byte.
+                    let IfcOp::Text(text) = &mut self.ops[at] else {
+                        unreachable!()
+                    };
+                    let mut prefix = std::mem::take(text).into_owned();
+                    prefix.pop();
+                    *text = prefix.into();
+                    self.ops.insert(at + 1, IfcOp::Text("\n".into()));
+                    self.shift_ops_after(at + 1);
+                    self.ops.insert(at + 1, edge);
+                    self.shift_ops_after(at + 1);
+                } else {
+                    self.ops.insert(at, edge);
+                    self.shift_ops_after(at);
+                }
+                return;
+            }
+        }
+        self.ops.push(edge);
+    }
+
+    /// An op was inserted at `at`: the recorded op indices from there on
+    /// move up one.
+    fn shift_ops_after(&mut self, at: usize) {
+        for tab in &mut self.tabs {
+            if tab.0 >= at {
+                tab.0 += 1;
+            }
+        }
+        if let Some(p) = &mut self.pending
+            && p.0 >= at
+        {
+            p.0 += 1;
+        }
+    }
+
+    /// Whether any edge box ([`Self::push_edge_box`]) was pushed.
+    pub(crate) fn has_edge_boxes(&self) -> bool {
+        self.edge_boxes
+    }
+
+    /// The node ids of the in-flow atomic inlines pushed, in order (#1238).
+    pub(crate) fn atomic_box_ids(&self) -> impl Iterator<Item = RawNodeId> + '_ {
+        self.ops.iter().filter_map(|op| match op {
+            IfcOp::InlineBox(b)
+                if !is_edge_box(b.id) && b.kind == parley::InlineBoxKind::InFlow =>
+            {
+                Some(b.id as RawNodeId)
+            }
+            _ => None,
+        })
+    }
+
+    /// An out-of-flow box stands here in the content. It is not content — a
+    /// held space before it is neither confirmed nor dropped, and it takes
+    /// no room — but its static position is where it would have been
+    /// (#632): remember the place.
+    pub(crate) fn note_out_of_flow(&mut self, id: RawNodeId) {
+        self.out_of_flow.push(crate::node::OutOfFlowMark {
+            id,
+            flat: self.len,
+            after_box: self.last_box,
+            inline: (0.0, 0.0),
+            block_y: 0.0,
+            block_x: 0.0,
+        });
+    }
+
+    /// The out-of-flow boxes met, with their offsets in the final text
+    /// (after [`Self::finish`]) and no position yet
+    /// ([`resolve_out_of_flow_marks`]).
+    pub(crate) fn out_of_flow_marks(&self) -> Vec<crate::node::OutOfFlowMark> {
+        self.out_of_flow
+            .iter()
+            .map(|mark| crate::node::OutOfFlowMark {
+                flat: self.remap(mark.flat),
+                after_box: mark.after_box.map(|(b, f)| (b, self.remap(f))),
+                ..*mark
+            })
+            .collect()
+    }
+
+    /// A `<br>`: one `"\n"`, a forced break. The held space before it ends
+    /// a line and goes, and the next line starts afresh.
+    pub(crate) fn push_forced_break(&mut self) {
+        self.break_line();
+        self.ops.push(IfcOp::Text("\n".into()));
+        self.len += 1;
+    }
+
+    /// A forced break: the held space before it ends a line and goes, and
+    /// the next line starts afresh.
+    fn break_line(&mut self) {
+        self.drop_pending();
+        self.line_start = true;
+        self.prev_space = false;
+    }
+
+    fn drop_pending(&mut self) {
+        if let Some((op, byte, flat)) = self.pending.take() {
+            if let IfcOp::Text(text) = &mut self.ops[op] {
+                text.to_mut().remove(byte);
+            }
+            self.dropped.push(flat);
+        }
+    }
+
+    /// Push one text node's text (after `text-transform`), white space
+    /// processed by `mode` — its own element's (#1192). Returns its flat
+    /// length — the held space included — and its DOM↔flat `offset_map`
+    /// (empty when the text is pushed byte for byte).
+    ///
+    /// Modes meet at the boundaries CSS Text 3 §4.1 draws. A preserved space
+    /// is not collapsible, so a collapsible space right after one is kept
+    /// (phase I removes a collapsible space only after another *collapsible*
+    /// one), and a collapsible space held before preserved text is not at a
+    /// line's end. A preserved newline, and a `pre-line` one, is a forced
+    /// break, exactly as a `<br>` is: the held space before it goes and the
+    /// collapsible spaces after it start a line.
+    pub(crate) fn push_text_node(
+        &mut self,
+        raw: std::borrow::Cow<'a, str>,
+        mode: SpaceCollapse,
+    ) -> (usize, Vec<(usize, usize)>) {
+        use offset_map_note as note;
+        let mut map = Vec::new();
+        let mode = if self.preserve_all {
+            SpaceCollapse::Preserve
+        } else {
+            mode
+        };
+        if mode == SpaceCollapse::Preserve {
+            if raw.is_empty() {
+                return (0, map);
+            }
+            self.preserved = true;
+            if !self.preserve_all {
+                // Preserved text is content, a space included: it confirms a
+                // held space before it — unless it starts with a newline,
+                // which ends that space's line — and leaves nothing
+                // collapsible behind it. Each newline starts a line.
+                if raw.starts_with('\n') {
+                    self.drop_pending();
+                }
+                self.pending = None;
+                self.prev_space = false;
+                self.line_start = raw.ends_with('\n');
+                if !self.wraps && self.last_wraps == Some(true) && raw.starts_with([' ', '\t']) {
+                    self.break_before.push((self.len, false));
+                }
+                self.last_wraps = Some(self.wraps);
+                self.wbr = false;
+                self.from_box = false;
+            }
+            if !may_rewrite_preserved(raw.as_ref()) {
+                let n = raw.len();
+                self.ops.push(IfcOp::Text(raw));
+                self.len += n;
+                return (n, map);
+            }
+            let op = self.ops.len();
+            let mut out = String::with_capacity(raw.len() + 6);
+            for (i, c) in raw.char_indices() {
+                note(&mut map, out.len(), i);
+                if c == '\t' {
+                    // One space, one flat byte, as the DOM's tab is one
+                    // byte; widened to its stop at replay.
+                    self.tabs
+                        .push((op, out.len(), self.len + out.len(), self.tab_size));
+                    out.push(' ');
+                } else if let Some(sub) = laid_out_as(c, true) {
+                    push_substitute(&mut out, &mut map, sub, i + c.len_utf8());
+                } else {
+                    out.push(c);
+                }
+            }
+            let n = out.len();
+            self.ops.push(IfcOp::Text(out.into()));
+            self.len += n;
+            return (n, map);
+        }
+        let keep_breaks = mode == SpaceCollapse::PreserveBreaks;
+        let op = self.ops.len();
+        // Allocated at the first byte the kept text differs from `raw` in;
+        // until then the kept text is `raw[..i]`.
+        let mut out: Option<String> = None;
+        for (i, c) in raw.char_indices() {
+            if keep_breaks && c == '\n' {
+                // `pre-line`: a segment break is kept, as a forced break.
+                match self.pending {
+                    // The held space is this node's own last kept byte:
+                    // removed here, so no later offset counts it. A map
+                    // entry noted for it now starts an empty stretch, which
+                    // maps nothing differently.
+                    Some((pop, byte, _)) if pop == op => {
+                        let o = out.get_or_insert_with(|| raw[..i].to_string());
+                        debug_assert_eq!(o.len(), byte + 1);
+                        o.truncate(byte);
+                        self.pending = None;
+                        self.line_start = true;
+                        self.prev_space = false;
+                    }
+                    _ => self.break_line(),
+                }
+                let flat = out.as_ref().map_or(i, String::len);
+                note(&mut map, flat, i);
+                if let Some(o) = out.as_mut() {
+                    o.push('\n');
+                }
+                continue;
+            }
+            // CSS Text 3 §4.1.1 collapses spaces, tabs and segment breaks (LF,
+            // and CR, which HTML folds into one). Not U+000C FORM FEED, which
+            // `is_ascii_whitespace` includes: Chrome 153 draws it (#1181).
+            let space = matches!(c, ' ' | '\t' | '\n' | '\r');
+            if space && (self.line_start || self.prev_space) {
+                out.get_or_insert_with(|| raw[..i].to_string());
+                continue;
+            }
+            let sub = laid_out_as(c, false);
+            if space {
+                self.prev_space = true;
+            } else {
+                self.prev_space = false;
+                self.line_start = false;
+                self.pending = None;
+                self.last_wraps = Some(self.wraps);
+                self.wbr = false;
+                self.from_box = false;
+            }
+            if out.is_none() && ((space && c != ' ') || sub.is_some()) {
+                out = Some(raw[..i].to_string());
+            }
+            let flat = out.as_ref().map_or(i, String::len);
+            note(&mut map, flat, i);
+            if space {
+                self.pending = Some((op, flat, self.len + flat));
+                if !self.wraps && self.last_wraps == Some(true) {
+                    self.wrap_spaces.push((op, flat));
+                    self.break_before.push((self.len + flat, true));
+                }
+            }
+            if let Some(o) = out.as_mut() {
+                match sub {
+                    Some(sub) => push_substitute(o, &mut map, sub, i + c.len_utf8()),
+                    None if space => o.push(' '),
+                    None => o.push(c),
+                }
+            }
+        }
+        let text: std::borrow::Cow<'a, str> = match out {
+            Some(o) => o.into(),
+            None => raw,
+        };
+        let n = text.len();
+        if n > 0 {
+            self.ops.push(IfcOp::Text(text));
+        }
+        self.len += n;
+        (n, map)
+    }
+
+    /// Remove a space held at the IFC's end. Called once, after the walk
+    /// and before [`Self::replay`].
+    pub(crate) fn finish(&mut self) {
+        self.drop_pending();
+        // Bidi controls with nothing else to lay out would make parley a
+        // line of their own: they go, and every offset after them moves
+        // back over their bytes ([`Self::remap`]).
+        let content = self.ops.iter().any(|op| match op {
+            IfcOp::Text(text) => !text.is_empty(),
+            IfcOp::InlineBox(b) => b.kind == parley::InlineBoxKind::InFlow,
+            IfcOp::Span(_) | IfcOp::Pop | IfcOp::Control(_) => false,
+        });
+        if !content && !self.controls.is_empty() {
+            for &(op, flat, _) in &self.controls {
+                if let IfcOp::Control(c) = &mut self.ops[op] {
+                    self.dropped.extend(flat..flat + c.len());
+                    *c = "";
+                }
+            }
+            self.dropped.sort_unstable();
+        }
+    }
+
+    /// The flat offsets of the preserved tabs in the final text (after
+    /// [`Self::finish`]), ascending.
+    pub(crate) fn tab_offsets(&self) -> Vec<usize> {
+        self.tabs
+            .iter()
+            .map(|&(_, _, f, _)| self.remap(f))
+            .collect()
+    }
+
+    /// The `tab-size` of each tab of [`Self::tab_offsets`], in its order.
+    pub(crate) fn tab_sizes(&self) -> Vec<crate::computed_style::TabSizeValue> {
+        self.tabs.iter().map(|&(_, _, _, ts)| ts).collect()
+    }
+
+    /// Replay the ops into `builder`, all under `Preserve`: the text is
+    /// already collapsed. May be called again with other `tab_spacing`.
+    ///
+    /// With `emoji_family`, each emoji-presentation cluster of a text is
+    /// pushed in a span of that family ([`crate::fonts::TextFamily`], #1204).
+    /// A cluster is found within one text op; one split across two (an emoji
+    /// and its U+FE0F in two text nodes) is not.
+    ///
+    /// Each preserved tab is its one space in a span of its own, with no
+    /// `word-spacing` and `tab_spacing[i]` (CSS px) of `letter-spacing` for
+    /// the `i`th tab (`set_tab_stops`, #1122): what widens it to its stop.
+    pub(crate) fn replay(
+        &self,
+        builder: &mut parley::TreeBuilder<'_, Brush>,
+        emoji_family: Option<&parley::style::FontFamily<'static>>,
+        tab_spacing: &[f32],
+    ) {
+        // parley 0.12 made `white-space-collapse` a style (`TextStyle::white_space_collapse`),
+        // `Preserve` by default and set by nothing in rinch: the builder collapses nothing.
+        use parley::style::StyleProperty as P;
+        let emoji_span = emoji_family.map(|f| [P::FontFamily(f.clone())]);
+        let push_plain =
+            |builder: &mut parley::TreeBuilder<'_, Brush>, text: &str| match &emoji_span {
+                Some(span) => {
+                    let mut at = 0;
+                    for range in crate::fonts::emoji_presentation_ranges(text) {
+                        if range.start > at {
+                            builder.push_text(&text[at..range.start]);
+                        }
+                        builder.push_style_modification_span(span.iter());
+                        builder.push_text(&text[range.clone()]);
+                        builder.pop_style_span();
+                        at = range.end;
+                    }
+                    if at < text.len() {
+                        builder.push_text(&text[at..]);
+                    }
+                }
+                None => builder.push_text(text),
+            };
+        let mut tab = 0usize;
+        let mut wrap = 0usize;
+        let wrapping = [P::TextWrapMode(parley::style::TextWrapMode::Wrap)];
+        for (i, op) in self.ops.iter().enumerate() {
+            match op {
+                IfcOp::Span(props) => builder.push_style_modification_span(props.iter()),
+                IfcOp::Pop => builder.pop_style_span(),
+                IfcOp::Text(text) => {
+                    let mut at = 0;
+                    while let Some(&(op, byte, _, _)) = self.tabs.get(tab) {
+                        if op != i {
+                            break;
+                        }
+                        if byte > at {
+                            push_plain(builder, &text[at..byte]);
+                        }
+                        let spacing = [
+                            P::LetterSpacing(tab_spacing.get(tab).copied().unwrap_or(0.0)),
+                            P::WordSpacing(0.0),
+                        ];
+                        builder.push_style_modification_span(spacing.iter());
+                        builder.push_text(&text[byte..byte + 1]);
+                        builder.pop_style_span();
+                        at = byte + 1;
+                        tab += 1;
+                    }
+                    while let Some(&(op, byte)) = self.wrap_spaces.get(wrap) {
+                        if op != i {
+                            break;
+                        }
+                        wrap += 1;
+                        // A held space dropped at a line's end is gone.
+                        if text.as_bytes().get(byte) != Some(&b' ') || byte < at {
+                            continue;
+                        }
+                        if byte > at {
+                            push_plain(builder, &text[at..byte]);
+                        }
+                        builder.push_style_modification_span(wrapping.iter());
+                        builder.push_text(&text[byte..byte + 1]);
+                        builder.pop_style_span();
+                        at = byte + 1;
+                    }
+                    if at < text.len() || at == 0 {
+                        push_plain(builder, &text[at..]);
+                    }
+                }
+                IfcOp::InlineBox(b) => push_inline_box(builder, b),
+                IfcOp::Control(c) => {
+                    if !c.is_empty() {
+                        builder.push_text(c);
+                    }
+                }
+            }
+        }
+        let has_content = self.ops.iter().any(|op| match op {
+            IfcOp::Text(text) => !text.is_empty(),
+            IfcOp::Control(c) => !c.is_empty(),
+            IfcOp::InlineBox(_) => true,
+            _ => false,
+        });
+        if !has_content {
+            builder.push_inline_box(parley::InlineBox {
+                id: EMPTY_IFC_BOX,
+                index: 0,
+                width: 0.0,
+                height: 0.0,
+                kind: parley::InlineBoxKind::OutOfFlow,
+                baseline: None,
+                vertical_align: parley::style::VerticalAlign::BASELINE,
+            });
+        }
+    }
+
+    /// Whether any text pushed so far could hold an emoji-presentation
+    /// cluster: a byte at or above 0xE2, the UTF-8 lead byte of U+231A, the
+    /// first `Emoji_Presentation` character (see
+    /// [`crate::fonts::emoji_presentation_ranges`]).
+    pub(crate) fn may_hold_emoji(&self) -> bool {
+        self.ops.iter().any(|op| match op {
+            IfcOp::Text(text) => text.bytes().any(|b| b >= 0xE2),
+            _ => false,
+        })
+    }
+
+    /// A flat offset recorded during the walk, in the final text: less the
+    /// held spaces [`Self::finish`] removed before it.
+    pub(crate) fn remap(&self, flat: usize) -> usize {
+        flat - self.dropped.partition_point(|&d| d < flat)
+    }
+
+    /// The flat bytes of the bidi controls in the final text (after
+    /// [`Self::finish`]), ascending: `(start, end, closing)`. No DOM text owns
+    /// them ([`crate::node::InlineLayout::bidi_control_ranges`]).
+    pub(crate) fn control_ranges(&self) -> Vec<(usize, usize, bool)> {
+        self.controls
+            .iter()
+            .filter_map(|&(op, flat, closing)| match &self.ops[op] {
+                IfcOp::Control(c) if !c.is_empty() => {
+                    let start = self.remap(flat);
+                    Some((start, start + c.len(), closing))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The final length, after [`Self::finish`].
+    pub(crate) fn final_len(&self) -> usize {
+        self.len - self.dropped.len()
+    }
+
+    /// The final text, after [`Self::finish`]: its text ops end to end. A
+    /// single text node's is the node's own text, borrowed, when nothing was
+    /// collapsed.
+    pub(crate) fn into_text(self) -> std::borrow::Cow<'a, str> {
+        let mut texts = self.ops.into_iter().filter_map(|op| match op {
+            IfcOp::Text(t) => Some(t),
+            IfcOp::Control(c) => Some(c.into()),
+            _ => None,
+        });
+        let first = texts.next().unwrap_or_default();
+        texts.fold(first, |mut all, t| {
+            all.to_mut().push_str(&t);
+            all
+        })
+    }
+}
+
+/// Find, in `layout`'s lines, where each out-of-flow box of `marks` would
+/// have sat — its static position (CSS 2.1 §10.3.7, §10.6.4; issues #632 and
+/// #634). `text` is the flat text and `scale` what the layout was built at.
+///
+/// Measured in Chrome 153 (`tests/static_position_tests.rs`):
+///
+/// - a box that was **inline-level** sits where the content before it ends
+///   on its line, at the line box's top — whatever makes that line tall. At
+///   a soft wrap it stays on the line the content before it is on, at the end
+///   of that line's content (a space hung there is not counted); after a
+///   forced break it starts the next line; with nothing before it, it starts
+///   the first line. `text-align` moves it with its line;
+/// - a **block-level** box goes at the content box's left edge, below the
+///   line holding the content before it — or at the first line's top when
+///   nothing precedes it. (After a forced break that is the next line's top:
+///   the same number.)
+///
+/// "The content before it" is the last atomic inline pushed before the box
+/// when no text followed that one ([`crate::node::OutOfFlowMark::after_box`]),
+/// else the cluster of the byte before it.
+pub(crate) fn resolve_out_of_flow_marks(
+    layout: &parley::Layout<Brush>,
+    text: &str,
+    scale: f32,
+    marks: &mut [crate::node::OutOfFlowMark],
+) {
+    use parley::layout::{Cluster, PositionedLayoutItem};
+    if marks.is_empty() {
+        return;
+    }
+    let after_box = |m: &crate::node::OutOfFlowMark| {
+        m.after_box
+            .filter(|&(_, at)| at == m.flat)
+            .map(|(id, _)| id)
+    };
+    // The atomic inlines some box stands right after: line and right edge.
+    let mut boxes: HashMap<RawNodeId, (usize, f32)> = HashMap::new();
+    if marks.iter().any(|m| after_box(m).is_some()) {
+        for (index, line) in layout.lines().enumerate() {
+            for item in line.items() {
+                if let PositionedLayoutItem::InlineBox(b) = item {
+                    boxes.insert(b.id as RawNodeId, (index, b.x + b.width));
+                }
+            }
+        }
+    }
+    // Each line box's top: the lines stack by their line heights. (Not
+    // `block_min_coord`, which leaves a negative half-leading out — the top
+    // of the glyphs' own box, above the line box's when a 32px run stands in
+    // a 20px line.)
+    let mut tops: Vec<f32> = Vec::with_capacity(layout.len() + 1);
+    let mut y = 0.0;
+    for line in layout.lines() {
+        tops.push(y);
+        y += line.metrics().line_height;
+    }
+    tops.push(y);
+    let top = |index: usize| tops.get(index).copied().unwrap_or(y);
+    for mark in marks.iter_mut() {
+        // (x, the line's top, the line's bottom): the end of the content
+        // before the box, or — with the two the same — the start of a line
+        // nothing precedes it on.
+        let at_line_start = |index: usize| {
+            layout.get(index).map(|line| {
+                let m = line.metrics();
+                (m.inline_min_coord + m.offset, top(index), top(index))
+            })
+        };
+        let found = if let Some(&(index, right)) = after_box(mark).and_then(|id| boxes.get(&id)) {
+            Some((right, top(index), top(index + 1)))
+        } else if mark.flat == 0 {
+            at_line_start(0)
+        } else {
+            Cluster::from_byte_index(layout, mark.flat - 1).map(|cluster| {
+                let index = cluster.path().line_index();
+                let line = cluster.line();
+                let m = line.metrics();
+                if text.as_bytes().get(mark.flat - 1) == Some(&b'\n') {
+                    // A forced break: the box starts the next line. A text-
+                    // final break has none (`phantom_last_line`); the box
+                    // still goes below this one.
+                    return at_line_start(index + 1).unwrap_or((
+                        m.inline_min_coord + m.offset,
+                        top(index + 1),
+                        top(index + 1),
+                    ));
+                }
+                let line_start = m.inline_min_coord + m.offset;
+                let start = crate::float_wrap::cluster_x(&cluster).unwrap_or(line_start);
+                let x = if cluster.is_rtl() {
+                    start
+                } else {
+                    // Not past the line's content: a space hung at a soft
+                    // wrap takes no room there.
+                    (start + cluster.advance()).min(line_start + m.advance - m.hanging_advance)
+                };
+                (x, top(index), top(index + 1))
+            })
+        };
+        let (x, top, bottom) = found.unwrap_or((0.0, 0.0, 0.0));
+        mark.inline = (x / scale, top / scale);
+        mark.block_y = bottom / scale;
+    }
+}
+
+/// Break `layout` at `max_width` as `break_all_lines` does, but commit only its
+/// first `keep` lines — what [`phantom_last_line`] leaves.
+fn break_lines_up_to(layout: &mut parley::Layout<Brush>, max_width: Option<f32>, keep: usize) {
+    use parley::layout::YieldData;
+    let max = max_width.unwrap_or(f32::MAX);
+    let mut breaker = layout.break_lines();
+    let state = breaker.state_mut();
+    state.set_layout_max_advance(max);
+    state.set_line_max_advance(max);
+    let mut committed = 0usize;
+    while committed < keep {
+        match skip_float_boxes(&mut breaker) {
+            Some(YieldData::LineBreak(_)) => committed += 1,
+            Some(_) => {}
+            None => break,
+        }
+    }
+    breaker.finish();
+}
+
+/// [`break_lines_hanging_spaces`] for a paragraph none of whose text may
+/// wrap, aligned within `align` (#1237): broken unconstrained, each line
+/// given the content width as its alignment width ([`break_unwrapped`]).
+/// When the paragraph's own width (its widest line, as a measure counts it:
+/// [`crate::node::measured_width_of`]) turns out to lie between that and
+/// `align.up_to` — a shrink-to-fit box floored from it — the lines are
+/// aligned within that width instead; and when parley left an empty line
+/// after a final forced break ([`phantom_last_line`]): for either the
+/// paragraph is broken once more, for both at once.
+fn break_unwrapped_aligned(
+    layout: &mut parley::Layout<Brush>,
+    text: &str,
+    align: AlignWidth,
+    preserves_spaces: bool,
+    unhung: &UnhungSpaces,
+    floats: Option<&FloatBands>,
+) -> HangStats {
+    break_unwrapped(layout, align.width, None, floats);
+    let mut stats = HangStats::default();
+    let own = crate::node::measured_width_of(
+        layout,
+        text,
+        preserves_spaces,
+        f32::INFINITY,
+        &unhung.breaking,
+    );
+    // A box sized from the paragraph's own width is that width rounded to
+    // a whole pixel, either way (`a\nbbb`, 29.39 wide, is a 29px
+    // inline-block; `a\nbbbbbb`, 58.78, a 59px one). Only an auto-width box
+    // has the slack (`up_to > width`); a declared width is aligned within.
+    let widened =
+        align.up_to > align.width && own != align.width && (own - align.width).abs() < 1.0;
+    let width = if widened { own } else { align.width };
+    let keep = phantom_last_line(layout);
+    if widened || keep.is_some() {
+        break_unwrapped(layout, width, keep, floats);
+        stats.passes = u32::from(widened);
+        stats.phantom_rebreaks = u32::from(keep.is_some());
+    }
+    stats
+}
+
+/// Break `layout` unconstrained — only forced breaks end its lines — giving
+/// each line `width` as its alignment width, so that `align` lines it up
+/// within `width` and not within the widest line (#1237); with `limit`, only
+/// that many lines are committed (see [`phantom_last_line`]).
+fn break_unwrapped(
+    layout: &mut parley::Layout<Brush>,
+    width: f32,
+    limit: Option<usize>,
+    floats: Option<&FloatBands>,
+) {
+    use parley::layout::YieldData;
+    let mut breaker = layout.break_lines();
+    let mut committed = 0usize;
+    while limit != Some(committed) {
+        // Beside a float a line starts after it, and is aligned within the
+        // room the floats leave (where its top is: an unwrapped line is not
+        // moved down to fit).
+        let (x, width) = match floats {
+            Some(floats) => {
+                let top = breaker.committed_y() as f32;
+                floats.room(top, top, width)
+            }
+            None => (0.0, width),
+        };
+        let state = breaker.state_mut();
+        state.set_layout_max_advance(f32::MAX);
+        state.set_line_max_advance(f32::MAX);
+        state.set_line_x(x);
+        let Some(yielded) = skip_float_boxes(&mut breaker) else {
+            break;
+        };
+        let YieldData::LineBreak(_) = yielded else {
+            continue;
+        };
+        committed += 1;
+        breaker.set_prior_line_width(width);
+    }
+    breaker.finish();
+}
+
+/// The re-break of [`break_lines_hanging_spaces`], over a layout already
+/// broken at `max`, committing at most `limit` lines when given one: lines
+/// parley ends where CSS does not — next to an edge box (#1426), at a seam
+/// (#1238, #1243), after an overflowing box (#1081), at an overflowing NBSP
+/// ([`unglue`], #1218) or in overflowing `break-spaces` spaces (#1043) — are
+/// committed again where CSS ends them, and lines beside floats are each
+/// given the room the floats leave them. (Hanging spaces, trailing white
+/// space in alignment and justification opportunities were also fixed up
+/// here until parley 0.12 got them right itself.)
+#[allow(clippy::too_many_arguments)]
+fn hang_pass<'p>(
+    layout: &mut parley::Layout<Brush>,
+    text: &str,
+    full: f32,
+    limit: Option<usize>,
+    unhung: &UnhungSpaces,
+    floats: Option<&FloatBands>,
+    mut placer: Option<&mut (dyn PlaceFloats + 'p)>,
+    float_drop: &mut f32,
+) -> HangStats {
+    use parley::layout::{BreakReason, YieldData};
+    let mut stats = HangStats::default();
+    *float_drop = 0.0;
+    // The room beside the floats, which grows as this paragraph places its
+    // own (`placer`), and the floats that did not fit beside the line they
+    // stand in, placed at the next line's top.
+    let mut bands: Option<FloatBands> = floats.cloned();
+    let mut below_line: Vec<RawNodeId> = Vec::new();
+    let units = logical_units(layout, text, unhung);
+    let has_edges = units.iter().any(|u| u.edge != 0);
+    // #1238: parley's breaks next to atomic inlines are not CSS's here.
+    let seams = unhung.active_seams().is_some();
+    let pre_seams = seams && unhung.pre_seams.get();
+    let near_pre = pre_seams.then(|| NearPre::new(&units));
+    // #2390: parley has no break after text that does not wrap, so it may
+    // stop at an earlier opportunity than CSS's.
+    let text_seams = seams && unhung.text_seams;
+    let breaks = TextBreaks::new(text);
+    stats.passes = 1;
+    let mut breaker = layout.break_lines();
+    // The first unit of the line being broken, and the state it starts from.
+    let mut cursor = 0usize;
+    let mut line_start = breaker.state().clone();
+    let mut in_step = true;
+    // Every turn of this loop leaves exactly one line committed: a line broken
+    // again replaces itself.
+    let mut committed = 0usize;
+    loop {
+        if limit == Some(committed) {
+            break;
+        }
+        // Floats that did not fit beside the last line go at this one's top.
+        if let Some(placer) = placer.as_deref_mut() {
+            for float in below_line.drain(..) {
+                let top = breaker.committed_y() as f32;
+                if let Some(now) = placer.place(float, top) {
+                    bands = Some(now);
+                }
+            }
+        }
+        // The room this line has: all of it, or what the floats beside it
+        // leave. Every rebreak of the line below starts from `line_start`,
+        // which carries the line's place.
+        let mut max = match &bands {
+            Some(floats) => {
+                let (room, drop) = place_line_beside_floats(&mut breaker, floats, full);
+                *float_drop += drop;
+                line_start = breaker.state().clone();
+                room
+            }
+            _ => full,
+        };
+        let state = breaker.state_mut();
+        state.set_layout_max_advance(full);
+        state.set_line_max_advance(max);
+        // The line's `text-indent` (#2628): parley takes it off the room it
+        // breaks the line in, and every judgement made here of what fits
+        // takes it off too (`room`). `max` stays the line's whole width,
+        // which its alignment width is.
+        let indent = breaker.line_indent();
+        // #2331: where this line starts, kept while floats may be beside it
+        // (the paragraph's own, placed as it goes, or its context's), and
+        // whether it placed a float of its own after content of its own.
+        let begin = (placer.is_some() || bands.is_some()).then(|| breaker.state().clone());
+        let mut placed_after_content = false;
+        // A float's box: placed at this line's top when it fits beside what
+        // the line holds so far, else at the next line's, and the line's room
+        // narrowed by it (CSS 2.2 §9.5.1). Then on to the line's end.
+        let yielded = loop {
+            match breaker.break_next() {
+                Some(YieldData::InlineBoxBreak(at)) => {
+                    let float = float_box_node(at.inline_box_id);
+                    let width = float.zip(placer.as_deref()).and_then(|(f, p)| p.width(f));
+                    if let (Some(float), Some(width), Some(placer)) =
+                        (float, width, placer.as_deref_mut())
+                    {
+                        let top = breaker.state().line_y() as f32;
+                        if width <= max - indent - at.advance + 0.01 {
+                            if let Some(now) = placer.place(float, top) {
+                                bands = Some(now);
+                                placed_after_content |= at.advance > 0.01;
+                            }
+                            if let Some(bands) = &bands {
+                                let (x, room) = bands.room(top, top, full);
+                                max = room;
+                                for state in [breaker.state_mut(), &mut line_start] {
+                                    state.set_line_x(x);
+                                    state.set_line_max_advance(room);
+                                }
+                            }
+                        } else if !below_line.contains(&float) {
+                            below_line.push(float);
+                        }
+                    } else if placer.is_none() && float.is_some() && bands.is_some() {
+                        // Laid out again beside the floats the paragraph
+                        // placed (its context has them): its own float
+                        // after content of the line was placed beside the
+                        // line by then (#2352: a `nowrap` run holding one
+                        // stays where it is, overflowing).
+                        placed_after_content |= at.advance > 0.01;
+                    }
+                    breaker
+                        .state_mut()
+                        .append_inline_box_to_line(at.advance, 0.0, 0.0);
+                }
+                other => break other,
+            }
+        };
+        let Some(yielded) = yielded else {
+            break;
+        };
+        // Only a committed line ends one; nothing else is yielded here.
+        let YieldData::LineBreak(mut data) = yielded else {
+            continue;
+        };
+        committed += 1;
+        // What the line's content has, its indent taken off (#2628).
+        let room = max - indent;
+        if !in_step {
+            continue;
+        }
+        // #1426: a break parley made next to an edge box where CSS does
+        // not break is moved to where it does. #1238: with seams, so is
+        // every soft wrap — parley breaks after every box whatever
+        // `white-space` says, and misses the seams' own opportunities, so it
+        // stops at an earlier one that fits (#1243) — and a line that
+        // overflows — parley appends a box after text that does not wrap
+        // even where CSS breaks before it — is ended where CSS ends it,
+        // whatever ended it. Not an `overflow-wrap` line.
+        let soft = matches!(data.reason, BreakReason::Regular | BreakReason::Emergency);
+        let emergency = data.reason == BreakReason::Emergency;
+        // Whether the line CSS ends below holds a stretch wider than its
+        // room that has no break opportunity (#2331).
+        let mut css_overflows = false;
+        // Whether that line replaced parley's: its metrics are then
+        // parley's line's, and only `css_overflows` speaks for it.
+        let mut rebroken = false;
+        if (has_edges && soft) || seams {
+            let Some(end) = line_end(
+                &units,
+                cursor,
+                data.metrics.advance - breaker.prior_line_hyphen(),
+                prior_text_end(&breaker),
+            ) else {
+                in_step = false;
+                continue;
+            };
+            let wrong = (has_edges
+                && soft
+                && !edge_break_allowed(&units, &breaks, end, emergency, false, pre_seams))
+                || (seams
+                    && !emergency
+                    && ((soft
+                        && (text_seams
+                            || !wrap_allowed_after(&units, end)
+                            || near_pre
+                                .as_ref()
+                                .is_some_and(|n| n.touches(&units, cursor, end, room))))
+                        || line_overflows(&units[cursor..end], room - ending_hyphen(&units, end))))
+                // parley's emergency break after a box too wide for the
+                // line, where `white-space` glues what follows to it.
+                || (seams
+                    && emergency
+                    && end > 0
+                    && units[end - 1].inline_box
+                    && !wrap_allowed_after(&units, end));
+            let css = wrong
+                .then(|| {
+                    stats.css_scans += 1;
+                    css_line(&units, &breaks, cursor, room, pre_seams)
+                })
+                .filter(|css| !same_end(&units, css.0, end));
+
+            if let Some(css) = css {
+                let Some((reason, advance)) =
+                    commit_css_line(&mut breaker, &units, cursor, css, &line_start, max)
+                else {
+                    in_step = false;
+                    continue;
+                };
+                stats.lines += 1;
+                data.reason = reason;
+                data.metrics.advance = advance;
+                css_overflows =
+                    line_overflows(&units[cursor..css.0], room - ending_hyphen(&units, css.0));
+                rebroken = true;
+            }
+        }
+        // #2331: a line beside a float that has too little room there for
+        // its first piece of content, as CSS ends the line (after the rebreak
+        // above, which glues a `nowrap` run parley broke), is moved down to
+        // where the room changes and broken again from its start, and the
+        // next turn places it there as it places any line
+        // (`place_line_beside_floats`, whose trial break is parley's and does
+        // not see the glue). The move counts in `float_drop`. A float the line
+        // placed at its own start counts as beside it, and stays where it was
+        // placed; one placed after content of the line's own does not. Chrome
+        // 156: `<div 556><float 307x36><ib 311>` puts the line at 36 and the
+        // div is 56 tall, not the line's 20; `<float 100x31><span
+        // nowrap><ib 300><ib 303>` puts it at 31.
+        if !placed_after_content
+            && let (Some(begin), Some(floats)) = (&begin, &bands)
+            && (css_overflows
+                || (!rebroken && line_overflows_room(data.reason, &data.metrics, room)))
+        {
+            let top = begin.line_y() as f32;
+            let bottom = top + (data.line_y_end - data.line_y_start) as f32;
+            if floats.room(top, bottom, full).1 < full
+                && let Some(below) = floats.next_change_below(top)
+            {
+                breaker.revert_to(begin.clone());
+                breaker.state_mut().set_line_y(f64::from(below));
+                *float_drop += below - top;
+                committed -= 1;
+                continue;
+            }
+        }
+        // The last line is committed as it is (`BreakReason::None`; an empty
+        // one after a final newline even copies the previous line's advance).
+        if data.reason == BreakReason::None {
+            continue;
+        }
+        // #1081: the white space or forced break after a box parley placed
+        // by its emergency branch belongs on the box's line.
+        if data.reason == BreakReason::Emergency {
+            match fold_after_overflowing_box(
+                &mut breaker,
+                &units,
+                cursor,
+                data.metrics.advance,
+                &line_start,
+                max,
+            ) {
+                Ok(Some(end)) => {
+                    stats.lines += 1;
+                    cursor = end;
+                    line_start = breaker.state().clone();
+                    continue;
+                }
+                Ok(None) => {}
+                Err(()) => {
+                    in_step = false;
+                    continue;
+                }
+            }
+        }
+        // A line that ends at the hang is broken again, from the state it
+        // started from, with room for its content and every space and tab
+        // after it. That can end at a hang again — an NBSP after the spaces
+        // overflows too, and parley hangs NBSP itself — so until it does not.
+        let (mut reason, mut advance) = (data.reason, data.metrics.advance);
+        let mut line_max = room;
+        let mut unglued = false;
+        let mut spaces_broken = false;
+        loop {
+            let Some(end) = line_end(
+                &units,
+                cursor,
+                advance - breaker.prior_line_hyphen(),
+                prior_text_end(&breaker),
+            ) else {
+                in_step = false;
+                break;
+            };
+            // #1218: parley hangs an overflowing NBSP as it hangs a space, and
+            // commits the line after it, where there is no break opportunity.
+            if !unglued
+                && reason == BreakReason::Regular
+                && advance > line_max
+                && end > cursor
+                && units[end - 1].nbsp
+            {
+                unglued = true;
+                let rebreaks = std::cell::Cell::new(0);
+                let again = unglue(
+                    &mut breaker,
+                    &units,
+                    cursor,
+                    end,
+                    &line_start,
+                    (max, indent),
+                    advance,
+                    &rebreaks,
+                );
+                stats.unglue_rebreaks += rebreaks.get();
+                let Some(again) = again else {
+                    in_step = false;
+                    break;
+                };
+                stats.lines += 1;
+                (reason, advance) = again;
+                line_max = room;
+                continue;
+            }
+            // #1043: `break-spaces` spaces never hang. A line parley ended
+            // with such spaces past the room is broken where CSS breaks it.
+            if !spaces_broken && reason == BreakReason::Regular && advance > room + 0.005 {
+                spaces_broken = true;
+                if let Some(again) = break_overflowing_spaces(
+                    &mut breaker,
+                    &units,
+                    cursor,
+                    end,
+                    &line_start,
+                    (max, indent),
+                ) {
+                    stats.lines += 1;
+                    (reason, advance) = again;
+                    line_max = room;
+                    continue;
+                }
+            }
+            cursor = end;
+            line_start = breaker.state().clone();
+            break;
+        }
+    }
+    breaker.finish();
+    stats
+}
+
+/// Put the breaker's next line beside the floats (`floats`) of a paragraph
+/// `full` wide, and return the width it has there and how far it was moved
+/// down to get it.
+///
+/// The room a line has depends on its height, which is known only once it is
+/// broken, so it is broken once on trial with the room where it starts: if
+/// its whole height overlaps a float that leaves less, it gets that. A line
+/// whose content does not fit even its first piece in the room beside a float
+/// (parley's emergency break) is moved down to where the room changes, until
+/// it fits or no float is beside it (CSS 2.2 §9.5).
+fn place_line_beside_floats(
+    breaker: &mut parley::layout::BreakLines<'_, Brush>,
+    floats: &FloatBands,
+    full: f32,
+) -> (f32, f32) {
+    use parley::layout::YieldData;
+    let from = breaker.committed_y() as f32;
+    let mut top = from;
+    // One move per band boundary at most; the guard is against a band that
+    // does not end.
+    for _ in 0..1024 {
+        let (x, width) = floats.room(top, top, full);
+        let state = breaker.state_mut();
+        state.set_line_y(top as f64);
+        state.set_line_x(x);
+        state.set_layout_max_advance(full);
+        state.set_line_max_advance(width);
+        let start = breaker.state().clone();
+        // The end of the paragraph: nothing to place. Not reverted, which
+        // would clear the breaker's "done" and have it yield empty lines for
+        // ever.
+        let Some(trial) = skip_float_boxes(breaker) else {
+            return (width, top - from);
+        };
+        breaker.revert_to(start);
+        let YieldData::LineBreak(line) = trial else {
+            return (width, top - from);
+        };
+        let mut bottom = top + (line.line_y_end - line.line_y_start) as f32;
+        let (mut x, mut room) = floats.room(top, bottom, full);
+        // A band that starts partway down the line leaves it less room than
+        // the trial had, where the line starts. Content that wrapped to that
+        // trial width is not judged against the narrower room: the line is
+        // broken again at it first, and its room read again for the height
+        // it then has, until the room stops narrowing (review of #2374: a
+        // 100x40 float mid-paragraph moved the line below it, Chrome breaks
+        // it beside the float).
+        let mut line = line;
+        for _ in 0..4 {
+            if room >= width - 0.01
+                || !line_overflows_room(line.reason, &line.metrics, room - line.metrics.indent)
+            {
+                break;
+            }
+            let state = breaker.state_mut();
+            state.set_line_x(x);
+            state.set_line_max_advance(room);
+            let start = breaker.state().clone();
+            let Some(again) = skip_float_boxes(breaker) else {
+                break;
+            };
+            breaker.revert_to(start);
+            let YieldData::LineBreak(again) = again else {
+                break;
+            };
+            line = again;
+            bottom = top + (line.line_y_end - line.line_y_start) as f32;
+            let narrower = floats.room(top, bottom, full);
+            if narrower.1 >= room - 0.01 {
+                break;
+            }
+            (x, room) = narrower;
+        }
+        // Its content does not fit: its first piece is wider than the room
+        // (less the line's indent, #2628).
+        if line_overflows_room(line.reason, &line.metrics, room - line.metrics.indent)
+            && room < full
+            && let Some(below) = floats.next_change_below(top)
+        {
+            top = below;
+            continue;
+        }
+        let state = breaker.state_mut();
+        state.set_line_x(x);
+        state.set_line_max_advance(room);
+        return (room, top - from);
+    }
+    (full, top - from)
+}
+
+/// Whether a line parley broke with `reason` and `metrics` holds content
+/// whose first piece is wider than the `room` it was broken in. parley breaks
+/// such a line as an emergency, or keeps the piece whole past the room: when
+/// it ends the paragraph, when a forced break follows it, and when a space
+/// follows it, where parley ends the line `Regular` (#2360: a long word or
+/// URL, `Supercalifragilistic word` beside a 250px float in 300px, stayed
+/// beside the float). So the line's content less the white space that hangs
+/// at its end ([`parley::layout::LineMetrics::hanging_advance`]) is compared
+/// with the room, whatever ended the line.
+fn line_overflows_room(
+    reason: parley::layout::BreakReason,
+    metrics: &parley::layout::LineMetrics,
+    room: f32,
+) -> bool {
+    use parley::layout::BreakReason;
+    reason == BreakReason::Emergency || metrics.advance - metrics.hanging_advance > room + 0.01
+}
+
+/// Break again a line that ends in an inline box parley placed by its
+/// emergency branch, so that the spaces and tabs after the box, or a newline
+/// right after it, end the box's line (#1081). Returns the unit the next line
+/// starts at, `None` when nothing of that kind follows the box (the line is
+/// kept as it is), and `Err` when the unit table and the breaker disagree.
+///
+/// At the start of a line parley 0.11.1 consumes a box too wide for any line
+/// and commits the line on the spot, so whatever follows starts the next
+/// line. CSS puts a forced break on the line it ends (`x <ib><br>` is two
+/// lines in Chrome 155, not three), and white space at a soft wrap hangs —
+/// a collapsible space is removed there — so neither makes a line of its
+/// own. The line is committed again by length: the box and either the run of
+/// spaces and tabs after it ([`LineUnit::hangs`]: not an NBSP, not a `pre` or
+/// `break-spaces` space) or a newline right after it. Spaces that a newline
+/// follows are not folded: Chrome 155 puts them and the break on a line of
+/// their own (`x <ib>  \n` is three lines there, the box's line ending at
+/// the box). A word right after the box, or after the spaces, still starts
+/// the next line.
+fn fold_after_overflowing_box(
+    breaker: &mut parley::layout::BreakLines<'_, Brush>,
+    units: &[LineUnit],
+    cursor: usize,
+    advance: f32,
+    line_start: &parley::layout::BreakerState,
+    max: f32,
+) -> Result<Option<usize>, ()> {
+    let end = line_end(
+        units,
+        cursor,
+        advance - breaker.prior_line_hyphen(),
+        prior_text_end(breaker),
+    )
+    .ok_or(())?;
+    if end == cursor || !units[end - 1].inline_box {
+        return Ok(None);
+    }
+    let spaces = units[end..].iter().take_while(|u| u.hangs).count();
+    let ends_in_newline = units.get(end + spaces).is_some_and(|u| u.newline);
+    // Spaces that a forced break follows do not hang after the box: Chrome 155
+    // puts them, and the break, on a line of their own (`x <ib>  \n` is three
+    // lines). Only a newline right after the box joins its line.
+    if spaces > 0 && ends_in_newline {
+        return Ok(None);
+    }
+    let newline = ends_in_newline;
+    let take = end + spaces + usize::from(newline);
+    if take == end {
+        return Ok(None);
+    }
+    // The table's cursor can sit on the zero-width newline that ended the
+    // line before; a newline is never the first unit of a line.
+    let first = cursor + units[cursor..end].iter().take_while(|u| u.newline).count();
+    let n = units[first..take]
+        .iter()
+        .map(|u| u.counted as usize)
+        .sum::<usize>();
+    breaker.revert_to(line_start.clone());
+    breaker
+        .break_next_with_length(u32::try_from(n).map_err(|_| ())?)
+        .ok_or(())?;
+    breaker.set_prior_line_width(max);
+    Ok(Some(take))
+}
+
+/// Break again a line parley ended by hanging a no-break space (#1218), and
+/// return the reason and advance of the line that replaces it.
+///
+/// U+00A0 is UAX #14 class GL: no break after it, and none before it but
+/// after a space, tab or hyphen (LB12, LB12a). parley 0.11.1's breaker hangs an overflowing one like a space
+/// (`is_space_or_nbsp` in its hang branch) and commits the line right after
+/// it. The line, from `line_start` to `units[end]`, ends in a run of NBSPs
+/// that starts `run_x` along it; CSS puts the break where parley would have
+/// without that branch:
+///
+/// - **Right after an inline box or a hyphen** the run follows: Chrome 153
+///   breaks between an atomic inline and an NBSP, where UAX #14 alone would
+///   glue them, and LB12a allows a break after HY and BA.
+/// - **At the last opportunity before the run.** Broken with room for all
+///   but the unit before the run, that unit overflows and parley takes the
+///   opportunity it last passed — the same one, since an NBSP offers none.
+/// - **Right before the run**, when that is an `overflow-wrap` (emergency)
+///   opportunity and there is no other: the run then starts the next line,
+///   as in Chrome 153. parley says so by answering the first re-break with
+///   an emergency break one unit early, and the line is committed by length.
+/// - **At the first opportunity after the glued word**, when there is none
+///   before the run: the word overflows, to the FIRST opportunity after it.
+///   Found by a galloping search over the units after the run (see the
+///   code): O(log d) breaks of a line d units long, plus one per NBSP in the
+///   gap after the glued word — not one per glued word, which is quadratic
+///   in a chain.
+///
+/// parley's `main` hangs no NBSP since linebender/parley#762 (merged
+/// 2026-09-07, after 0.11.1): this can go with the release that carries it.
+///
+/// Every break it makes is counted in `rebreaks`. `None` when the unit table
+/// and the breaker disagree.
+#[allow(clippy::too_many_arguments)]
+fn unglue(
+    breaker: &mut parley::layout::BreakLines<'_, Brush>,
+    units: &[LineUnit],
+    cursor: usize,
+    end: usize,
+    line_start: &parley::layout::BreakerState,
+    (max, indent): (f32, f32),
+    advance: f32,
+    rebreaks: &std::cell::Cell<u32>,
+) -> Option<(parley::layout::BreakReason, f32)> {
+    use parley::layout::{BreakReason, YieldData};
+    // No following word fits in this much room: it only decides which side
+    // of a width boundary a unit falls.
+    const ROOM: f32 = 0.01;
+    let run = units[cursor..end]
+        .iter()
+        .rev()
+        .take_while(|u| u.nbsp)
+        .count();
+    let run_start = end - run;
+    let run_x = advance - units[run_start..end].iter().map(|u| u.advance).sum::<f32>();
+    type Breaker<'b, 'l> = &'b mut parley::layout::BreakLines<'l, Brush>;
+    let rebreak = |breaker: Breaker<'_, '_>, line_max: f32| -> Option<(BreakReason, f32)> {
+        rebreaks.set(rebreaks.get() + 1);
+        breaker.revert_to(line_start.clone());
+        // `line_max` is what the line's content has: parley takes the
+        // line's indent off what it is given (#2628).
+        let state = breaker.state_mut();
+        state.set_layout_max_advance(line_max + indent);
+        state.set_line_max_advance(line_max + indent);
+        match skip_float_boxes(breaker)? {
+            YieldData::LineBreak(d) => Some((d.reason, d.metrics.advance)),
+            _ => None,
+        }
+    };
+    let ends_in_hung_nbsp = |(reason, adv): (BreakReason, f32), line_max: f32| {
+        reason == BreakReason::Regular
+            && adv > line_max
+            && line_end(units, cursor, adv, None).is_some_and(|e| e > cursor && units[e - 1].nbsp)
+    };
+    // Commit the line up to the run, by length: the line breaker places no
+    // break of its own right before an NBSP.
+    let before_run =
+        |breaker: Breaker<'_, '_>, reason: BreakReason| -> Option<(BreakReason, f32)> {
+            // The table's cursor can sit on the zero-width newline that ended the
+            // line before; a newline is never the first unit of a line.
+            let first = cursor
+                + units[cursor..run_start]
+                    .iter()
+                    .take_while(|u| u.newline)
+                    .count();
+            let before = &units[first..run_start];
+            let width: f32 = before.iter().map(|u| u.advance).sum();
+            if (width - run_x).abs() > 0.005 {
+                return None;
+            }
+            let n = before.iter().map(|u| u.counted as usize).sum::<usize>();
+            rebreaks.set(rebreaks.get() + 1);
+            breaker.revert_to(line_start.clone());
+            breaker.break_next_with_length(u32::try_from(n).ok()?)?;
+            breaker.set_prior_line_width(max);
+            Some((reason, run_x))
+        };
+    // Right after an inline box (Chrome 153 breaks between an atomic inline
+    // and the NBSP after it, as parley does after any box) or a hyphen
+    // (LB12a: no break before GL but after a space, BA or HY).
+    if run_start > cursor && {
+        let u = &units[run_start - 1];
+        u.inline_box || u.breaks_before_glue
+    } {
+        return before_run(breaker, BreakReason::Regular);
+    }
+    if run_start > cursor && run_x > ROOM {
+        let line_max = run_x - ROOM;
+        let a = rebreak(breaker, line_max)?;
+        match a.0 {
+            // Text's emergency break (`overflow-wrap`), one unit early: the
+            // last emergency opportunity is right before the run.
+            BreakReason::Emergency if a.1 <= line_max => {
+                return before_run(breaker, BreakReason::Emergency);
+            }
+            // A regular break, or a box too wide for any line placed alone at
+            // the line's start: the last opportunity before the run.
+            _ if !ends_in_hung_nbsp(a, line_max) => {
+                breaker.set_prior_line_width(max);
+                return Some(a);
+            }
+            // Hung again: there is none.
+            _ => {}
+        }
+    }
+    // No opportunity before the run: the glued word overflows, up to the
+    // first opportunity after the run. Where that is, the breaker answers.
+    // Broken with room for everything before a unit `u` (not an NBSP, space,
+    // tab or newline, and with width), `u` is the first unit to overflow, and
+    // parley breaks at the last opportunity at or before it — so the line
+    // comes back fitting the room exactly when there is an opportunity between
+    // the run and `u`. That is monotone in `u`: a galloping search finds the
+    // first `u` that has one, in O(log d) breaks of a line d units long (a
+    // probe can walk up to about twice the line, where the gallop overshoots)
+    // — not one break per glued word, which is quadratic in a chain of them
+    // (review of #1257). Where in the gap before that `u` the line breaks is
+    // decided after the search, below.
+    let first = cursor + units[cursor..end].iter().take_while(|u| u.newline).count();
+    // (unit index, x where it starts) of every candidate after the run, up to
+    // the forced break that ends the line anyway; extended as the search goes.
+    let mut candidates: Vec<(usize, f32)> = Vec::new();
+    let mut scan = first;
+    let mut scan_x = 0.0f32;
+    let mut more = |upto: usize, candidates: &mut Vec<(usize, f32)>| {
+        while candidates.len() <= upto && scan < units.len() {
+            let u = &units[scan];
+            if u.newline && scan >= end {
+                scan = units.len();
+                break;
+            }
+            if scan >= end && !u.nbsp && !u.hangs && !u.unhung && u.advance > ROOM {
+                candidates.push((scan, scan_x));
+            }
+            scan_x += u.advance;
+            scan += 1;
+        }
+    };
+    // Whether the line broken with room up to candidate `k` fits that room.
+    let fits = |breaker: Breaker<'_, '_>, x: f32| -> Option<bool> {
+        let room = x + ROOM;
+        let c = rebreak(breaker, room)?;
+        Some(!ends_in_hung_nbsp(c, room) && c.1 <= room + 0.005)
+    };
+    let (mut lo, mut hi) = (None::<usize>, None::<usize>);
+    let mut k = 0usize;
+    loop {
+        more(k, &mut candidates);
+        // Past the last candidate: the last one is the last to try.
+        if k >= candidates.len() {
+            match candidates.len().checked_sub(1) {
+                Some(last) if lo.is_none_or(|l| last > l) => k = last,
+                _ => break,
+            }
+        }
+        let x = candidates[k].1;
+        if fits(breaker, x)? {
+            hi = Some(k);
+            break;
+        }
+        lo = Some(k);
+        k = 2 * k + 1;
+    }
+    // The search finds the first candidate `hi` with an opportunity before
+    // it, but breaking with room up to `hi` would take the LAST opportunity
+    // before it, and the gap between two candidates (spaces, NBSPs, zero-width
+    // units) can hold several: CSS takes the first (review of #1257, round 2:
+    // `aaaa~bbbbbb ~ cc` at 40px is `aaaa~bbbbbb ` / `~ cc` in Chrome 153).
+    // There is none up to the candidate before `hi`, so with room up to where
+    // it ends, the next unit overflows and parley commits at the first
+    // opportunity — unless it hangs an NBSP of the gap, which takes one more
+    // break per NBSP there.
+    let before_hi = match hi {
+        Some(mut hi) => {
+            let mut lo = lo;
+            while lo.map_or(0, |l| l + 1) < hi {
+                let mid = (lo.map_or(0, |l| l + 1) + hi) / 2;
+                if fits(breaker, candidates[mid].1)? {
+                    hi = mid;
+                } else {
+                    lo = Some(mid);
+                }
+            }
+            hi.checked_sub(1)
+        }
+        // None up to the forced break or the end of the text: start after the
+        // last candidate.
+        None => candidates.len().checked_sub(1),
+    };
+    let mut through = match before_hi {
+        Some(k) => candidates[k].1 + units[candidates[k].0].advance,
+        None => advance,
+    };
+    let result = loop {
+        let c = rebreak(breaker, through + ROOM)?;
+        // Nothing more taken in (a safety net: every round takes in at least
+        // the NBSP it hung last time).
+        if !ends_in_hung_nbsp(c, through + ROOM) || c.1 <= through {
+            break c;
+        }
+        through = c.1;
+    };
+    breaker.set_prior_line_width(max);
+    Some(result)
+}
+
+/// Break again a line parley ended past `max` in a run of `break-spaces`
+/// spaces or tabs (#1043), and return the reason and advance of the line that
+/// replaces it; `None` when the line is not one, or is right as it is.
+///
+/// parley 0.11.1 hangs an overflowing space whatever the `white-space`, and
+/// commits the line after it. CSS Text 3 §4.1.3 hangs no `break-spaces`
+/// space: one that does not fit starts the next line, and there is a break
+/// opportunity after every one of them. There is none between a word and the
+/// space after it (UAX #14 LB7), so the line, from `line_start` to
+/// `units[end]`, ending in such a run, breaks:
+///
+/// - **after the last space of the run that fits**, when one does: the rest
+///   start the next line (`abc` and ten spaces in 40px is `abc` and two, then
+///   eight, in Chrome 155);
+/// - **at the last opportunity before the word the run follows**, when not
+///   even its first space fits and there is one: the word goes to the next
+///   line with its space (`bullet text ` in 75px is `bullet ` / `text `);
+/// - **after the run's first space**, when there is none: the word and that
+///   space overflow, and the next line starts with the second space
+///   (`abcdef  x` in 20px is `abcdef ` / ` x`). A run that starts the line is
+///   broken after its first space the same way, however narrow the line.
+///
+/// A line committed here is committed by length, as [`unglue`] commits one:
+/// the breaker has no opportunity of its own between two spaces.
+fn break_overflowing_spaces(
+    breaker: &mut parley::layout::BreakLines<'_, Brush>,
+    units: &[LineUnit],
+    cursor: usize,
+    end: usize,
+    line_start: &parley::layout::BreakerState,
+    (max, indent): (f32, f32),
+) -> Option<(parley::layout::BreakReason, f32)> {
+    use parley::layout::{BreakReason, YieldData};
+    const TOL: f32 = 0.005;
+    // No following word fits in this much room: it only decides which side
+    // of a width boundary a unit falls.
+    const ROOM: f32 = 0.01;
+    // The table's cursor can sit on the zero-width newline that ended the
+    // line before; a newline is never the first unit of a line.
+    let first = cursor + units[cursor..end].iter().take_while(|u| u.newline).count();
+    let run = units[first..end]
+        .iter()
+        .rev()
+        .take_while(|u| u.breaks)
+        .count();
+    if run == 0 {
+        return None;
+    }
+    let run_start = end - run;
+    let x = |p: usize| -> f32 { units[cursor..p].iter().map(|u| u.advance).sum() };
+    // What the line's content has, its indent taken off (#2628).
+    let content_max = max - indent;
+    let through = match (run_start + 1..=end)
+        .rev()
+        .find(|&p| x(p) <= content_max + TOL)
+    {
+        // It fits as it is.
+        Some(p) if p == end => return None,
+        Some(p) => p,
+        None => {
+            let word_x = x(run_start);
+            let mut wraps_in_word = false;
+            if run_start > first && word_x > ROOM {
+                breaker.revert_to(line_start.clone());
+                let room = word_x - ROOM;
+                let state = breaker.state_mut();
+                state.set_layout_max_advance(room + indent);
+                state.set_line_max_advance(room + indent);
+                if let Some(YieldData::LineBreak(d)) = skip_float_boxes(breaker) {
+                    let hyphen = breaker.prior_line_hyphen();
+                    // An opportunity `white-space` allows: parley breaks
+                    // after an atomic inline that starts a line whatever its
+                    // root's `white-space` (its wrap mode lags by an atom,
+                    // and a line starts as wrapping), which the seams of a
+                    // `nowrap` root rule out. #1238 corpus `p126`: `[B1][B2]
+                    // [B3]q-r<span nowrap>[B4]dddd <span break-spaces> mm…`
+                    // in a 55px `nowrap` root keeps `[B3]q-r` together.
+                    let allowed = || {
+                        line_end(units, cursor, d.metrics.advance - hyphen, None)
+                            .is_none_or(|e| wrap_allowed_after(units, e))
+                    };
+                    if d.reason == BreakReason::Emergency {
+                        wraps_in_word = true;
+                    } else if d.metrics.advance <= room + TOL && allowed() {
+                        breaker.set_prior_line_width(max);
+                        return Some((d.reason, d.metrics.advance));
+                    }
+                }
+            }
+            if wraps_in_word {
+                run_start
+            } else {
+                run_start + 1
+            }
+        }
+    };
+    let n = units[first..through]
+        .iter()
+        .map(|u| u.counted as usize)
+        .sum::<usize>();
+    breaker.revert_to(line_start.clone());
+    breaker.break_next_with_length(u32::try_from(n).ok()?)?;
+    breaker.set_prior_line_width(max);
+    Some((BreakReason::Regular, x(through)))
+}
+
+/// The preserved text of an inline formatting context whose spaces and tabs
+/// do not hang at a soft wrap, as sorted, disjoint flat byte ranges.
+#[derive(Default)]
+pub(crate) struct UnhungSpaces {
+    /// `pre` text (#1212): it wraps nowhere, so CSS Text 3 §4.1.3 hangs none
+    /// of its spaces and a line ending in them is aligned with them.
+    pub pre: Vec<std::ops::Range<usize>>,
+    /// `break-spaces` text (#1043): its spaces never hang
+    /// ([`LineUnit::breaks`]).
+    pub breaking: Vec<std::ops::Range<usize>>,
+    /// Text whose element does not wrap (`nowrap`, `pre`), filled only for
+    /// an IFC holding edge boxes (#1426) or [`Self::seams`]: no soft wrap
+    /// after it ([`LineUnit::wrap_after`]). Less the collapsible spaces of
+    /// [`Self::space_breaks`], which are handed to parley as wrapping.
+    pub nowrap: Vec<std::ops::Range<usize>>,
+    /// The first space of each run of spaces that does not wrap but has a
+    /// break opportunity before it (`IfcText::last_wraps`, #2238), as a
+    /// sorted flat byte ([`LineUnit::break_before`]).
+    pub space_breaks: Vec<usize>,
+    /// Where `white-space` allows a soft wrap after a text node or an atomic
+    /// inline, in a paragraph broken at a width that holds atomic inlines
+    /// and some element that does not wrap (#1238); `None` otherwise, where
+    /// parley's own rule around boxes is CSS's.
+    pub seams: Option<WrapSeams>,
+    /// [`Self::seams`] are for atomic inlines next to an element that does
+    /// not wrap (#1238): always in force.
+    pub box_seams: bool,
+    /// [`Self::seams`] are for text that does not wrap followed right away
+    /// by text of another element, where the element both are in wraps and
+    /// the characters on either side have an opportunity between them
+    /// ([`RinchDocument::nowrap_text_seams`], #2390): always in force, and
+    /// every soft wrap is looked at again, since parley allows no break after
+    /// text that does not wrap and so stops at an earlier opportunity.
+    pub text_seams: bool,
+    /// The paragraph holds a `pre` element's spaces and is broken at a
+    /// width (#1243): [`Self::seams`] are filled, and in force when
+    /// [`pre_seams_needed`] says so of parley's lines ([`Self::pre_seams`]).
+    pub pre_candidate: bool,
+    /// The paragraph takes [`Self::seams`] for a `pre` element's spaces
+    /// (#1243): [`pre_seam`] and the rules only such a paragraph gets. Set
+    /// by [`break_lines_hanging_spaces`] once parley has broken it.
+    pub pre_seams: std::cell::Cell<bool>,
+    /// Text whose element collapses its spaces (`normal`, `nowrap`,
+    /// `pre-line`), filled only with [`Self::pre_seams`]
+    /// ([`LineUnit::collapsible`]).
+    pub collapsible: Vec<std::ops::Range<usize>>,
+    /// Where a text node whose spaces collapsed away entirely stands, in an
+    /// element the text before it closes into, as a sorted flat byte;
+    /// filled only with [`Self::pre_candidate`]
+    /// ([`RinchDocument::collapsed_after_close`], [`pre_seam`]).
+    pub collapsed: Vec<usize>,
+}
+
+/// Whether `white-space` allows a soft wrap after each text node and each
+/// atomic inline of an inline formatting context, given what follows it
+/// (#1238).
+///
+/// parley 0.11.1 allows a break after every inline box and before one when
+/// the character before it wraps, whatever the `white-space` around the
+/// box. Chrome 155 (and css-text-3 §5) asks the white space of the element
+/// the box or text is in — an inline-block's own `white-space` styles its
+/// contents and plays no part — and, at an element's end, that of the
+/// element it closes into: Chrome's line breaker computes the opportunity
+/// after an item with the `white-space` in effect there, and again at each
+/// close tag after it. So the opportunity after a leaf (a text node or a box)
+/// is allowed when any element from the leaf's parent up to the nearest one
+/// that also contains the next leaf wraps: `aa<span normal>[1][2][3]</span>cc`
+/// in a `nowrap` root breaks after `[1]`, `[2]` and `[3]` but not between
+/// `aa` and `[1]` (the root holds both). Only the edge of a leaf is decided
+/// here; inside a text node the break is its element's, as parley has it.
+///
+/// A run of spaces is different (review of #1878): Chrome decides the
+/// opportunity after it by the spaces' own `white-space`
+/// ([`wrap_allowed_after`]), and the one before it by the items between it
+/// and the content before it, element starts and ends included
+/// (`IfcText::last_wraps`, [`UnhungSpaces::space_breaks`], #2238).
+#[derive(Default)]
+pub(crate) struct WrapSeams {
+    /// The flat byte each text node's run ends at, ascending, and its seam.
+    text_ends: Vec<(usize, Seam)>,
+    /// Each atomic inline's id, ascending, and its seam.
+    boxes: Vec<(u64, Seam)>,
+}
+
+/// What [`WrapSeams`] knows about the end of one leaf.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Seam {
+    /// A soft wrap may follow the leaf.
+    wraps: bool,
+    /// An element closes between this leaf and the next into one that does
+    /// not wrap: `<span pre-wrap>aa  </span>` then a `pre` root's spaces.
+    /// What makes the break between a wrapping run of spaces and a `pre`
+    /// one an ordinary break ([`pre_seam`], #1243).
+    closes_into_nowrap: bool,
+    /// Elements close between this leaf and the next, and none opens: the
+    /// next leaf's element is a proper ancestor of this one's
+    /// (`<span>dd</span>` then its parent's space; [`pre_seam`]).
+    closes: bool,
+}
+
+impl WrapSeams {
+    /// The seams of an IFC whose text runs are `text_ranges` and whose
+    /// inline boxes are `layout`'s.
+    pub(crate) fn of(
+        nodes: &crate::node_slab::NodeSlab,
+        root_id: RawNodeId,
+        text_ranges: &[crate::node::IfcTextRange],
+        layout: &parley::Layout<Brush>,
+    ) -> Self {
+        // Every leaf in logical order: (flat byte, 0 = box / 1 = text, its
+        // index), its node. A box at byte `i` comes before the text at `i`.
+        let mut leaves: Vec<((usize, u8, usize), RawNodeId)> = text_ranges
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.flat_end > r.flat_start)
+            .map(|(i, r)| ((r.flat_start, 1, i), r.node_id))
+            .collect();
+        for (i, b) in layout.inline_boxes().enumerate() {
+            if !is_edge_box(b.id) && b.kind == parley::InlineBoxKind::InFlow {
+                leaves.push(((b.index, 0, i), b.id as RawNodeId));
+            }
+        }
+        leaves.sort_unstable_by_key(|(k, _)| *k);
+        let mut seams = Self::default();
+        for (i, &((_, kind, index), node)) in leaves.iter().enumerate() {
+            let next = leaves.get(i + 1).map(|&(_, next)| next);
+            let seam = Seam {
+                wraps: next.is_none_or(|next| wraps_between(nodes, root_id, node, next)),
+                closes_into_nowrap: next
+                    .is_some_and(|next| closes_into_nowrap(nodes, root_id, node, next)),
+                closes: next.is_some_and(|next| only_closes(nodes, root_id, node, next)),
+            };
+            if kind == 0 {
+                seams.boxes.push((node, seam));
+            } else {
+                seams.text_ends.push((text_ranges[index].flat_end, seam));
+            }
+        }
+        seams.boxes.sort_unstable_by_key(|&(id, _)| id);
+        seams
+    }
+
+    /// The seam after the text run that ends at `byte`; `None` when no run
+    /// ends there.
+    fn after_text(&self, byte: usize) -> Option<Seam> {
+        let i = self.text_ends.partition_point(|&(b, _)| b < byte);
+        self.text_ends
+            .get(i)
+            .filter(|&&(b, _)| b == byte)
+            .map(|&(_, w)| w)
+    }
+
+    /// The seam after the atomic inline `id`.
+    fn after_box(&self, id: u64) -> Option<Seam> {
+        let i = self.boxes.partition_point(|&(b, _)| b < id);
+        self.boxes
+            .get(i)
+            .filter(|&&(b, _)| b == id)
+            .map(|&(_, w)| w)
+    }
+}
+
+/// Whether `next`'s parent element is a proper ancestor of `leaf`'s: elements
+/// close between them and none opens ([`Seam::closes`]).
+fn only_closes(
+    nodes: &crate::node_slab::NodeSlab,
+    root_id: RawNodeId,
+    leaf: RawNodeId,
+    next: RawNodeId,
+) -> bool {
+    let Some(target) = nodes.get_live(next).and_then(|n| n.parent) else {
+        return false;
+    };
+    let mut el = nodes.get(leaf).and_then(|n| n.parent);
+    if el == Some(target) {
+        return false;
+    }
+    while let Some(id) = el {
+        if id == target {
+            return true;
+        }
+        if id == root_id {
+            return false;
+        }
+        el = nodes.get(id).and_then(|n| n.parent);
+    }
+    false
+}
+
+/// Whether an element that closes between `leaf` and `next` — one from
+/// `leaf`'s parent up to, not including, the nearest that also contains
+/// `next` — closes into one that does not wrap
+/// ([`Seam::closes_into_nowrap`]).
+fn closes_into_nowrap(
+    nodes: &crate::node_slab::NodeSlab,
+    root_id: RawNodeId,
+    leaf: RawNodeId,
+    next: RawNodeId,
+) -> bool {
+    let contains_next = |el: RawNodeId| {
+        std::iter::successors(Some(next), |&id| {
+            (id != root_id)
+                .then(|| nodes.get(id).and_then(|n| n.parent))
+                .flatten()
+        })
+        .any(|id| id == el)
+    };
+    let mut el = nodes.get(leaf).and_then(|n| n.parent);
+    while let Some(id) = el {
+        if id == root_id || contains_next(id) {
+            return false;
+        }
+        let Some(parent) = nodes.get(id).and_then(|n| n.parent) else {
+            return false;
+        };
+        let Some(into) = nodes.get_live(parent) else {
+            return false;
+        };
+        if RinchDocument::text_wrap_mode(&into.computed_style) != parley::style::TextWrapMode::Wrap
+        {
+            return true;
+        }
+        el = Some(parent);
+    }
+    false
+}
+
+/// Whether some element from `leaf`'s parent up to the nearest one that also
+/// contains `next` — the IFC root at the most — wraps ([`WrapSeams`]).
+fn wraps_between(
+    nodes: &crate::node_slab::NodeSlab,
+    root_id: RawNodeId,
+    leaf: RawNodeId,
+    next: RawNodeId,
+) -> bool {
+    let contains_next = |el: RawNodeId| {
+        let mut n = Some(next);
+        while let Some(id) = n {
+            if id == el {
+                return true;
+            }
+            if id == root_id {
+                return false;
+            }
+            n = nodes.get(id).and_then(|x| x.parent);
+        }
+        false
+    };
+    // A `display: contents` element has no box, and its `white-space` is
+    // not the one in effect at an element's end there (Chrome 156, review of
+    // #2258: `aa<span contents normal><span nowrap>dddd[1]</span></span>
+    // ccc` in a `nowrap` root has no break after `[1]`).
+    let mut el = nodes.get(leaf).and_then(|n| n.parent);
+    while let Some(id) = el {
+        let Some(node) = nodes.get(id) else {
+            return true;
+        };
+        let contents = id != root_id
+            && node.computed_style.display == crate::computed_style::values::DisplayValue::Contents;
+        if contents {
+            // Passed through: neither its `white-space` nor its holding the
+            // next leaf decides (`<span contents nowrap>[1] [2]</span>` in a
+            // `normal` root breaks between the boxes).
+            el = node.parent;
+            continue;
+        }
+        if RinchDocument::text_wrap_mode(&node.computed_style) == parley::style::TextWrapMode::Wrap
+        {
+            return true;
+        }
+        if id == root_id || contains_next(id) {
+            return false;
+        }
+        el = node.parent;
+    }
+    true
+}
+
+impl UnhungSpaces {
+    /// The seams in force: [`Self::box_seams`], [`Self::text_seams`], or
+    /// [`Self::pre_seams`].
+    fn active_seams(&self) -> Option<&WrapSeams> {
+        self.seams
+            .as_ref()
+            .filter(|_| self.box_seams || self.text_seams || self.pre_seams.get())
+    }
+}
+
+/// An anonymous block box `cleanup_anonymous_block_boxes` took out of its
+/// container but kept in the slab, with the run it was minted for (#964).
+/// `create_anonymous_block_boxes` mints that run's box into it, or frees it.
+pub(crate) struct RetiredAnonBox {
+    id: RawNodeId,
+    parent: RawNodeId,
+    run_members: Vec<RawNodeId>,
+}
+
+/// The boxes one pass retired, found by the first member of their run — a
+/// node is a member of one run at most, so the key names one box — so that
+/// matching every run of a document to its old box is linear in the runs, not
+/// quadratic. A box whose run lost every member (they all moved away) can match
+/// nothing and waits in `unmatched` to be freed.
+#[derive(Default)]
+pub(crate) struct RetiredAnonBoxes {
+    by_first_member: HashMap<RawNodeId, RetiredAnonBox>,
+    unmatched: Vec<RawNodeId>,
+}
+
+impl RetiredAnonBoxes {
+    fn push(&mut self, r: RetiredAnonBox) {
+        match r.run_members.first() {
+            Some(&first) => {
+                if let Some(other) = self.by_first_member.insert(first, r) {
+                    self.unmatched.push(other.id);
+                }
+            }
+            None => self.unmatched.push(r.id),
+        }
+    }
+
+    /// The box retired from `parent` for exactly `run`, if there is one.
+    fn take(&mut self, parent: RawNodeId, run: &[RawNodeId]) -> Option<RetiredAnonBox> {
+        let first = *run.first()?;
+        let r = self.by_first_member.get(&first)?;
+        if r.parent != parent || r.run_members != run {
+            return None;
+        }
+        self.by_first_member.remove(&first)
+    }
+
+    fn into_ids(self) -> impl Iterator<Item = RawNodeId> {
+        self.by_first_member
+            .into_values()
+            .map(|r| r.id)
+            .chain(self.unmatched)
+    }
+}
+
+/// One cluster or inline box of a paragraph, in logical order: what the line
+/// breaker adds to a line's advance, and what the hang pass needs to know.
+struct LineUnit {
+    advance: f32,
+    /// A space or tab that hangs at a soft wrap: one whose element wraps
+    /// (not NBSP, and not a `pre` element's).
+    hangs: bool,
+    /// A space or tab of a `pre` element (#1212): preserved, and CSS Text 3
+    /// §4.1.3 hangs a preserved space only where the text wraps, so the hang
+    /// pass does not widen a line for it and a line ending in it is aligned
+    /// with it as content. (parley hangs the one that overflows right after
+    /// wrapping spaces; such a paragraph takes the seams path, #1243.) A
+    /// `break-spaces` space or tab is one too: it never hangs.
+    unhung: bool,
+    /// A space or tab of a `break-spaces` element (#1043): it never hangs,
+    /// one that does not fit starts the next line, and there is a break
+    /// opportunity after it ([`break_overflowing_spaces`]).
+    breaks: bool,
+    newline: bool,
+    /// A no-break space (U+00A0), which parley hangs and CSS glues (#1218).
+    nbsp: bool,
+    /// A space or NBSP cluster (parley's `is_space_or_nbsp`). A preserved tab
+    /// is one too: it is pushed to parley as a space (#1122).
+    space: bool,
+    /// What [`parley::layout::BreakLines::break_next_with_length`] counts
+    /// for it: a cluster's characters — parley 0.12's clusters are grapheme
+    /// clusters, `ง่` is one cluster of two — an in-flow inline box 1, an
+    /// out-of-flow box 0.
+    counted: u32,
+    /// An in-flow inline box.
+    inline_box: bool,
+    /// An out-of-flow box: a float's ([`FLOAT_BOX`]) or another box that
+    /// takes no room on the line. It makes no break opportunity of its own:
+    /// [`wrap_allowed_after`] looks past it to what precedes it (#2352).
+    out_of_flow: bool,
+    /// A hyphen or another UAX #14 class HY/BA character that is not white
+    /// space: LB12a allows a break between it and an NBSP after it.
+    breaks_before_glue: bool,
+    /// An inline element's edge box (#1426): [`EDGE_START`] or [`EDGE_END`],
+    /// else 0. Not an [`Self::inline_box`].
+    edge: u8,
+    /// `white-space` allows a soft wrap after it: a cluster of text whose
+    /// element wraps, and at the end of a text run or after an atomic
+    /// inline what [`WrapSeams`] answers (#1238). Always for an edge box,
+    /// whose run [`edge_break_allowed`] looks past.
+    wrap_after: bool,
+    /// A cluster of text whose own element wraps (not in
+    /// [`UnhungSpaces::nowrap`]); what decides a break after a space
+    /// ([`wrap_allowed_after`]).
+    own_wrap: bool,
+    /// The first space of a run of spaces that does not wrap but has a break
+    /// opportunity before it ([`UnhungSpaces::space_breaks`]).
+    break_before: bool,
+    /// [`Seam::closes_into_nowrap`] at the end of a text run or after an
+    /// atomic inline.
+    closes_into_nowrap: bool,
+    /// The last cluster of a text node, known only with [`WrapSeams`]
+    /// ([`pre_seam`]).
+    text_end: bool,
+    /// [`Seam::closes`] at the end of a text run.
+    closes: bool,
+    /// A cluster of text whose element collapses its spaces, known only
+    /// with [`UnhungSpaces::pre_seams`] ([`pre_seam`]).
+    collapsible: bool,
+    /// A text node whose spaces collapsed away, in an element the text before
+    /// it closes into, stands right before this cluster
+    /// ([`UnhungSpaces::collapsed`], [`pre_seam`]).
+    after_collapsed: bool,
+    /// The byte a cluster starts at, or a box stands at.
+    byte: usize,
+    /// A cluster of no advance that is not a newline: a soft hyphen, a
+    /// zero-width space, a bidi control. A line whose advance it follows may
+    /// end before or after it, and its text says which ([`line_end`],
+    /// #2604).
+    attaches: bool,
+    /// A soft hyphen that draws a hyphen when a line ends at it: the
+    /// hyphen's advance, which the line must fit (#2614); else 0. Not in
+    /// [`Self::advance`], which is the soft hyphen's own, 0, whether or not
+    /// the layout the table was read from ends a line at it.
+    hyphen: f32,
+    /// A soft hyphen under `hyphens: none` (#2621): no break after it.
+    inert_soft_hyphen: bool,
+    /// A cluster's style index in the layout; 0 for a box.
+    style: u16,
+    /// A space or tab that hangs right after a soft hyphen of its own style,
+    /// or after another such: a line broken after it still ends at the soft
+    /// hyphen and draws its hyphen (#2654, Chrome 157: `Extra&shy; ordinary`
+    /// is `Extra- ` / `ordinary`, under `hyphens: none` too; not when the
+    /// space is another element's, `Extra&shy;<b> </b>ordinary`).
+    keeps_hyphen: bool,
+}
+
+/// Whether a line may end before `units[e]` as far as edge boxes go (#1426).
+///
+/// parley 0.11.1 allows a break after every in-flow inline box and before
+/// one that does not fit, which is right for an atomic inline and wrong for
+/// an edge box ([`EDGE_BOX`]): an element's start padding belongs with its
+/// first content and its end padding with its last. So where edge boxes meet
+/// the break, CSS's answer is asked instead: the break must fall after the
+/// run's end boxes and before its start boxes, and there must be an
+/// opportunity between what precedes and what follows the run — `white-space`
+/// must allow one after what precedes ([`LineUnit::wrap_after`]), and then a
+/// UAX #14 opportunity in the text, or an atomic inline on either side. With
+/// no edge box next to the break, that is the whole question, which
+/// [`css_line`] asks at every unit (#1238). With `emergency` (an
+/// `overflow-wrap` break) only the side of the boxes is checked.
+fn edge_break_allowed(
+    units: &[LineUnit],
+    breaks: &TextBreaks<'_>,
+    e: usize,
+    emergency: bool,
+    between_spaces: bool,
+    pre_seams: bool,
+) -> bool {
+    if e == 0 {
+        return false;
+    }
+    if e >= units.len() {
+        return true;
+    }
+    // `hyphens: none` takes the soft hyphen's opportunity away (#2621).
+    if !emergency && units[e - 1].inert_soft_hyphen {
+        return false;
+    }
+    let mut i0 = e;
+    while i0 > 0 && units[i0 - 1].edge != 0 {
+        i0 -= 1;
+    }
+    let mut i1 = e;
+    while i1 < units.len() && units[i1].edge != 0 {
+        i1 += 1;
+    }
+    let split = i0
+        + units[i0..i1]
+            .iter()
+            .take_while(|u| u.edge == EDGE_END)
+            .count();
+    if i0 < i1 && e != split {
+        return false;
+    }
+    if emergency {
+        return true;
+    }
+    let Some(p) = i0.checked_sub(1).map(|i| &units[i]) else {
+        return false;
+    };
+    let Some(n) = units.get(i1) else {
+        return true;
+    };
+    // A run of spaces that does not wrap, where the items before it give it
+    // an opportunity (`IfcText::last_wraps`, #2238: a wrapping element
+    // closing right before it), breaks before the run (Chrome keeps a `pre`
+    // run at the start of the next line), where UAX #14 has no break before
+    // a space. A collapsible run is wrapping text to parley and here. Asked
+    // before whether what precedes may wrap after it: the opportunity is
+    // the items', not the leaves' (an empty wrapping span between gives it).
+    if is_plain_space(n) && !n.own_wrap && !is_plain_space(p) && n.break_before {
+        return true;
+    }
+    if !wrap_allowed_after(units, i0) {
+        return false;
+    }
+    // With `between_spaces` ([`css_line`]'s scan), `break-spaces` offers an
+    // opportunity after every space (css-text-3 §4.1.3), which UAX #14 does
+    // not between two spaces: Chrome 155 puts trailing ones that overflow
+    // before a forced break on a line of their own (not the forced break
+    // itself, which ends the line the last one is on). A
+    // break parley made there is still looked at again: its line has a
+    // space that does not fit and does not hang (#1043).
+    // Not before a space that hangs after a box and wraps: the opportunity
+    // is after the space, which hangs at the end of the box's line (#2353:
+    // Chrome 156 keeps the space after an overflowing `nowrap` run of boxes
+    // on the run's line, and what follows starts the next line at its
+    // start). A space that does not wrap has no opportunity after it, and
+    // the box's own stays (#1238 `p294`: `[I2]<span nowrap> [B1]</span>`
+    // breaks after `[I2]`).
+    if p.inline_box && n.hangs && n.own_wrap {
+        return false;
+    }
+    if p.newline || p.inline_box || n.inline_box || (between_spaces && p.breaks && !n.newline) {
+        return true;
+    }
+    // A wrapping space then a `break-spaces` one: the first hangs, the
+    // second starts the next line (Chrome 155: ` gggcccc ` / `        b`
+    // for ` ggg<span normal>cccc  </span>        <span pre>b</span>` in a
+    // 70px `break-spaces` root; #1243). Only in a paragraph that takes the
+    // seams for `pre` spaces: elsewhere (the #1426 edge-box path) it is
+    // left as it was.
+    if between_spaces && pre_seams && is_plain_space(p) && p.own_wrap && n.breaks {
+        return true;
+    }
+    // And a run of spaces that wraps then one that does not breaks between
+    // them: the first hangs, the second starts the next line. Before a `pre`
+    // element's spaces, [`css_line`] takes it as [`pre_seam`] says (#1243).
+    if is_plain_space(n) && !n.own_wrap && is_plain_space(p) && p.own_wrap {
+        return true;
+    }
+    breaks.at(n.byte)
+}
+
+/// How Chrome 155 takes the break between a run of spaces that wraps and a
+/// `pre` element's spaces after it (#1243), which [`edge_break_allowed`]
+/// allows; `None` for any other break. Chrome's line breaker finds it by
+/// the text items (text nodes) the run of wrapping spaces lies in, measured
+/// on `w  <span pre>  dd</span>` and its variants in a 50px box, with a
+/// `w` that fits (`aaaa`) and one that overflows (`hhhhhhh`):
+///
+/// - the wrapping spaces' element closes there into one that does not wrap
+///   ([`Seam::closes_into_nowrap`]: `<span pre-wrap>hhhhhhh  </span>` then a
+///   `pre` root's spaces): an ordinary break;
+/// - the run is the end of the text node of the word before it
+///   (`hhhhhhh  <span pre>…`): only when what is before it fits
+///   ([`PreSeam::RewindOnly`]) — Chrome rewinds to it from an overflow later
+///   in the line, and does not stop at it when the word already overflows;
+/// - the run is a text node of its own after the word (`hhhhhhh<span
+///   pre-wrap>  </span><span pre>…`, or the word and the run split into
+///   two text nodes of one element), whether the word wraps or not: only
+///   when the line overflows before the `pre` spaces, in the word or in the
+///   run ([`PreSeam::ForwardOnly`]); `aaaa<span pre-wrap>  </span><span
+///   pre>  dd</span>` stays on one line, as does `<span pre>gggg</span><span
+///   normal> </span><span pre> a</span>`;
+/// - except that a run of *collapsible* spaces right after a wrapping
+///   element that closes there ([`Seam::closes`]: `<span>dd</span> <span
+///   pre>    dd</span>`
+///   in a `normal` or `pre-line` root) is an ordinary break, taken whether
+///   the word fits or overflows (review of #1897: of 100 such variants in
+///   `normal` and `pre-line` roots Chrome lays out 79 as it lays out the
+///   word unwrapped, and rinch now matches Chrome on 95, main on 60; a
+///   preserved run, in a `pre-wrap` root, is the text node of its own
+///   above);
+/// - the run starts in the word's text node and goes on into another: an
+///   ordinary break. A text node whose spaces collapsed away counts when it
+///   is in an element the run's own element closes into
+///   ([`UnhungSpaces::collapsed`]): `<span>…lvWa.   </span> <span pre>  bee…`
+///   breaks before the `pre` spaces, `aaaa ` and ` ` as two text nodes of
+///   one element do not (review of #1897).
+///
+/// A run after an inline box, or at the start of the paragraph, is an
+/// ordinary break, as #1238 has it. Edge boxes at the break are looked
+/// past, as [`edge_break_allowed`] looks past them. Not every case is
+/// Chrome's (#1898).
+fn pre_seam(units: &[LineUnit], e: usize) -> Option<PreSeam> {
+    let mut i0 = e.min(units.len());
+    while i0 > 0 && units[i0 - 1].edge != 0 {
+        i0 -= 1;
+    }
+    let mut i1 = e;
+    while i1 < units.len() && units[i1].edge != 0 {
+        i1 += 1;
+    }
+    let p = &units[i0.checked_sub(1)?];
+    let n = units.get(i1)?;
+    if !(is_plain_space(p) && p.own_wrap && is_plain_space(n) && !n.own_wrap && n.unhung) {
+        return None;
+    }
+    let run = units[..i0]
+        .iter()
+        .rev()
+        .take_while(|u| is_plain_space(u) && u.own_wrap)
+        .count();
+    let r0 = i0 - run;
+    let w = r0
+        .checked_sub(1)
+        .map(|i| &units[i])
+        .filter(|w| !w.inline_box && w.edge == 0 && !w.newline);
+    if let Some(w) = w.filter(|w| w.text_end) {
+        // A run of collapsible spaces right after an element that closes
+        // there (`<span>dd</span> <span pre>…` in a `normal` root) breaks
+        // both ways: when the word fits, and after it when it overflows.
+        return Some(if w.closes && w.own_wrap && units[r0].collapsible {
+            PreSeam::Ordinary
+        } else {
+            PreSeam::ForwardOnly
+        });
+    }
+    if w.is_none() || p.closes_into_nowrap {
+        return Some(PreSeam::Ordinary);
+    }
+    // A run whose element closes into a text node whose spaces collapsed
+    // away (`<span>…lvWa.   </span> <span pre>…`: the root's space between)
+    // goes on into another text node, as Chrome's items have it.
+    Some(
+        if n.after_collapsed || units[r0..i0 - 1].iter().any(|u| u.text_end) {
+            PreSeam::Ordinary
+        } else {
+            PreSeam::RewindOnly
+        },
+    )
+}
+
+/// [`pre_seam`]'s answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PreSeam {
+    /// Taken as any break is.
+    Ordinary,
+    /// Taken only when what is before it fits.
+    RewindOnly,
+    /// Taken only when the line, the run of spaces included, overflows
+    /// before it.
+    ForwardOnly,
+}
+
+/// Whether `white-space` allows a soft wrap after `units[..end]`, edge boxes
+/// at its end looked past: the [`LineUnit::wrap_after`] of its last unit, or
+/// after a newline. After a run of spaces (not `break-spaces` ones, which
+/// offer an opportunity after each) it is the spaces' own `white-space`
+/// ([`LineUnit::own_wrap`]), not the element they close into (review of
+/// #1878, Chrome 155): `<span nowrap>abc def </span>[box]` in a `normal`
+/// root has none. Spaces that do not wrap may have their opportunity before
+/// the run instead, as the items before them say ([`LineUnit::break_before`],
+/// [`edge_break_allowed`]): `aa<span normal>hello</span> ccc` in a `nowrap`
+/// or `pre` root breaks after `hello` (a `pre` root keeps the space at the
+/// start of the next line), but `<span normal>ccc<span nowrap> mm</span>`
+/// does not break: the `nowrap` element opens there.
+///
+/// An out-of-flow box ([`LineUnit::out_of_flow`], a float's) is looked past
+/// too: it gives no opportunity of its own, so the one after it is the
+/// content's before it (#2352: a float inside a `nowrap` run after content of
+/// the run let the line break right after the float; Chrome 156 keeps the
+/// run on one line).
+fn wrap_allowed_after(units: &[LineUnit], end: usize) -> bool {
+    let mut i = end.min(units.len());
+    while i > 0 && (units[i - 1].edge != 0 || units[i - 1].out_of_flow) {
+        i -= 1;
+    }
+    let Some(p) = i.checked_sub(1).map(|i| &units[i]) else {
+        return true;
+    };
+    if is_plain_space(p) {
+        return p.own_wrap;
+    }
+    p.newline || p.wrap_after
+}
+
+/// Whether `node` is a grid container whose text runs are anonymous grid
+/// items (CSS Grid 1 §6.1, #2411): a block-level `display: grid` element that
+/// is not a table (which `display_from_stylo` maps to a grid, and
+/// `table_layout` lays out) and not a control or replaced element (which has
+/// no inner display, #1288).
+/// The `text-indent` an IFC root's lines are broken with (#2628), in px, and
+/// its `each-line` and `hanging`.
+///
+/// A percentage is of the root's content width: the paint layout's
+/// `align_width`, or the room a measure is given. Where the measure is of a
+/// box being sized to fit (a float, an inline-block, an absolutely
+/// positioned box with no width), it is cyclic and counts 0, as in Chrome
+/// 157 (a `13%` float holding `alpha beta` is 79.03 wide, then laid out at
+/// that width with 10.27 of indent); that measure is cached apart
+/// ([`AtomicContributions::fitted`]), so a measure at the same width that is
+/// not sizing the box does not read its lines.
+///
+/// An anonymous block box holds its container's first formatted line only
+/// when no in-flow box comes before it (an out-of-flow one may): text after
+/// a block child, even an empty one, is not indented (Chrome 157).
+pub(crate) fn text_indent_of(
+    nodes: &crate::node_slab::NodeSlab,
+    root_id: RawNodeId,
+    max_width: Option<f32>,
+    align_width: Option<AlignWidth>,
+    atomic: Option<&AtomicContributions<'_>>,
+) -> (f32, parley::IndentOptions) {
+    let ti = nodes[root_id].computed_style.text_indent;
+    let none = (0.0, parley::IndentOptions::default());
+    if ti.is_zero() || !holds_first_formatted_line(nodes, root_id) {
+        return none;
+    }
+    let basis = if !ti.has_percentage() {
+        0.0
+    } else if let Some(a) = align_width {
+        a.width
+    } else if let Some(w) = atomic.and_then(|a| a.known_width) {
+        w
+    } else if let Some(a) = atomic.filter(|a| a.percent_cyclic) {
+        a.fitted.set(true);
+        0.0
+    } else {
+        max_width.filter(|w| w.is_finite()).unwrap_or(0.0)
+    };
+    (ti.resolve(basis), ti.options())
+}
+
+/// Whether IFC root `root_id` holds its block container's first formatted
+/// line: always, but for an anonymous block box with an in-flow box before
+/// it in its container ([`text_indent_of`]).
+fn holds_first_formatted_line(nodes: &crate::node_slab::NodeSlab, root_id: RawNodeId) -> bool {
+    let node = &nodes[root_id];
+    if !node.is_anonymous_block_box {
+        return true;
+    }
+    let Some(container) = node.parent else {
+        return true;
+    };
+    for &kid in RinchDocument::box_tree_children(nodes, container).iter() {
+        if kid == root_id {
+            return true;
+        }
+        let Some(k) = nodes.get_live(kid) else {
+            continue;
+        };
+        match k.inline_flow_role() {
+            InlineFlowRole::Comment | InlineFlowRole::NoBox | InlineFlowRole::OutOfFlow => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+pub(crate) fn is_grid_container(node: &Node) -> bool {
+    use crate::computed_style::values::{DisplayValue, TablePart};
+    node.computed_style.display == DisplayValue::Grid
+        && node.computed_style.table_part == TablePart::None
+        && !crate::replaced::ignores_inner_display(node)
+}
+
+/// Whether `node` is a text node holding only white space: "characters that
+/// can be affected by the white-space property" (CSS Grid 1 §6.1, CSS Flexbox
+/// 1 §4), which CSS Text 3 §4.1 lists as spaces, tabs and segment breaks (and a
+/// form feed, which Chrome drops with them). An
+/// empty text node counts (it holds no other character). A text run of these
+/// alone in a grid or flex container is not rendered, whatever its
+/// `white-space` (#2443).
+pub(crate) fn is_white_space_text(node: &Node) -> bool {
+    node.text_content().is_some_and(is_white_space_only)
+}
+
+/// Whether text node `id` is white space right after a cell that stands in
+/// an anonymous inline-table (`table_layout::wrap_cell_in_inline_table`),
+/// past comments and other white space: Chrome 157 takes such a text node
+/// into the anonymous table, where white space is dropped, so neither the
+/// space between two cells (`<span cell>12</span> <span cell>34</span>`)
+/// nor the one before an element after a cell is laid out. Text that
+/// starts with a space keeps it (`<span cell>12</span> y`), and so does a
+/// space before a cell.
+pub(crate) fn is_blank_after_inline_cell(
+    nodes: &crate::node_slab::NodeSlab,
+    id: RawNodeId,
+) -> bool {
+    let Some(node) = nodes.get(id) else {
+        return false;
+    };
+    if !is_white_space_text(node) {
+        return false;
+    }
+    // Such a cell's parent is an inline, or a row (`display: contents`) in
+    // one: a block's blank text, the common case, is not looked at further.
+    use crate::computed_style::values::DisplayValue;
+    node.parent.and_then(|p| nodes.get(p)).is_some_and(|p| {
+        matches!(
+            p.computed_style.display,
+            DisplayValue::Inline | DisplayValue::Contents
+        )
+    }) && crate::table_layout::follows_inline_cell_in(nodes, id)
+}
+
+/// Whether `text` holds nothing but spaces, tabs, segment breaks and form
+/// feeds, which Chrome drops between flex and grid items as it drops a space
+/// (#2443). A no-break space is not white space here: it is text.
+pub(crate) fn is_white_space_only(text: &str) -> bool {
+    text.chars()
+        .all(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{c}'))
+}
+
+/// A space or tab that is not a no-break space nor a `break-spaces` one: a
+/// run of them has one opportunity ([`wrap_allowed_after`]).
+fn is_plain_space(u: &LineUnit) -> bool {
+    u.space && !u.nbsp && !u.breaks
+}
+
+/// Chrome's soft wrap opportunity after a run of spaces, whatever follows
+/// (Blink's `NextBreakablePosition`): UAX #14 has none before a zero-width
+/// space (LB7) or a closing punctuation mark (LB13). parley's breaker is
+/// handed it ([`CHROME_LINE_BREAKS`]), and [`TextBreaks`] agrees.
+fn space_run_break(before: char, after: char) -> bool {
+    before == ' ' && !matches!(after, ' ' | '\t')
+}
+
+/// [`space_run_break`] at `byte` of `text`.
+fn after_a_space_run(text: &str, byte: usize) -> bool {
+    byte > 0
+        && text.as_bytes().get(byte - 1) == Some(&b' ')
+        && text[byte..]
+            .chars()
+            .next()
+            .is_some_and(|after| space_run_break(' ', after))
+}
+
+/// Blink's ASCII pair table (`kAsciiLineBreakTable`, written by
+/// `character_property_data_generator.cc`): for two printable ASCII
+/// characters in a row, whether a line may break between them. Blink reads
+/// it in `NextBreakablePosition` *instead of* ICU for every such pair, so it
+/// overrides UAX #14 both ways. It glues `/`, `!`, `|` and `}` to what
+/// follows, where UAX #14 breaks after them before a letter (SY, EX, BA and
+/// CL have no rule against `÷ AL`, LB31): a URL breaks after every `/`
+/// under UAX #14 and stays whole in Chrome (#2369, #1910). It breaks before
+/// `(`, `<`, `[` and `{` after most marks, after `-` and `?` before most
+/// characters, and glues the rest. The same table as parley's own
+/// `CHROMIUM_LINE_BREAK_OVERRIDE` (whose table and `LineBreakContext`
+/// constructor are private, so [`TextBreaks`] could not ask it), and
+/// `tests/url_line_break_2369_tests.rs` pins all 8,836 pairs against
+/// Chrome 156, between letters and between digits.
+static CHROME_ASCII_PAIRS: parley::AsciiLineBreakTable<5> = {
+    use parley::AsciiLineBreakTableBuilder as B;
+    // The printable ASCII range `'!'..=0x7F`.
+    const ALL: std::ops::RangeInclusive<char> = '!'..='\u{7f}';
+    B::new()
+        .with_pairs(ALL, ALL, false)
+        .with_pairs(ALL, '('..='(', true)
+        .with_pairs(ALL, '<'..='<', true)
+        .with_pairs(ALL, '['..='[', true)
+        .with_pairs(ALL, '{'..='{', true)
+        .with_pairs('-'..='-', ALL, true)
+        .with_pairs('?'..='?', ALL, true)
+        .with_pairs('-'..='-', '$'..='$', false)
+        .with_pairs(ALL, '!'..='!', false)
+        .with_pairs('?'..='?', '"'..='"', false)
+        .with_pairs('?'..='?', '\''..='\'', false)
+        .with_pairs(ALL, ')'..=')', false)
+        .with_pairs(ALL, ','..=',', false)
+        .with_pairs(ALL, '.'..='.', false)
+        .with_pairs(ALL, '/'..='/', false)
+        .with_pairs('-'..='-', '0'..='9', false)
+        .with_pairs(ALL, ':'..=':', false)
+        .with_pairs(ALL, ';'..=';', false)
+        .with_pairs(ALL, '?'..='?', false)
+        .with_pairs(ALL, ']'..=']', false)
+        .with_pairs(ALL, '}'..='}', false)
+        .with_pairs('$'..='$', ALL, false)
+        .with_pairs('\''..='\'', ALL, false)
+        .with_pairs('('..='(', ALL, false)
+        .with_pairs('/'..='/', ALL, false)
+        .with_pairs('0'..='9', ALL, false)
+        .with_pairs('<'..='<', ALL, false)
+        .with_pairs('@'..='@', ALL, false)
+        .with_pairs('A'..='Z', ALL, false)
+        .with_pairs('['..='[', ALL, false)
+        .with_pairs('^'..='`', ALL, false)
+        .with_pairs('a'..='z', ALL, false)
+        .with_pairs('{'..='{', ALL, false)
+        .with_pairs('\u{7f}'..='\u{7f}', ALL, false)
+        .build::<5>()
+};
+
+/// Chrome's answer for the opportunity between `before` and `after`, with
+/// `before_before` the character before them: `Some` where Blink decides
+/// without ICU, `None` where UAX #14 (parley's ICU4X segmenter) answers.
+///
+/// - After a run of spaces, always ([`space_run_break`]).
+/// - A hyphen before a digit: only after an ASCII letter or digit
+///   (`cccc-1234` breaks, `x -5` and `(-5)` do not — a minus sign), which
+///   Blink decides before its table (`ShouldBreakAfter`); UAX #14 LB25 has
+///   none there at all.
+/// - Any other pair of printable ASCII characters: [`CHROME_ASCII_PAIRS`].
+fn chrome_break(before_before: Option<char>, before: char, after: char) -> Option<bool> {
+    if space_run_break(before, after) {
+        return Some(true);
+    }
+    if before == '-' && after.is_ascii_digit() {
+        return Some(before_before.is_some_and(|c| c.is_ascii_alphanumeric()));
+    }
+    if hebrew_hyphen_break(before_before, before, after) {
+        return Some(true);
+    }
+    CHROME_ASCII_PAIRS.lookup(before, after)
+}
+
+/// UAX #14 LB21a as Unicode 15.1 has it, `HL (HY | BA) × [^HL]` (the soft
+/// hyphen is class HH in the Unicode 17 data ICU4X carries, and is BA in
+/// 15.1): a Hebrew letter, a hyphen or a soft hyphen, and another Hebrew
+/// letter has a break after the hyphen (#2622). The segmenter parley and [`TextBreaks`] use has
+/// the older rule, which allows none after `HL HY` or `HL BA`; Chrome 157
+/// breaks `שלום&shy;עולם` and `שלום-עולם` in 1px at the hyphen.
+fn hebrew_hyphen_break(before_before: Option<char>, before: char, after: char) -> bool {
+    use icu_properties::CodePointMapData;
+    use icu_properties::props::LineBreak;
+    // Cheap first: every pair of the text comes through here.
+    if !matches!(after, '\u{5d0}'..='\u{5f2}' | '\u{fb1d}'..='\u{fb4f}') {
+        return false;
+    }
+    let lb = CodePointMapData::<LineBreak>::new();
+    lb.get(after) == LineBreak::HebrewLetter
+        && matches!(
+            lb.get(before),
+            LineBreak::Hyphen | LineBreak::UnambiguousHyphen | LineBreak::BreakAfter
+        )
+        && before_before.is_some_and(|c| lb.get(c) == LineBreak::HebrewLetter)
+}
+
+/// [`chrome_break`], where Blink consults it (#2388): not under
+/// `line-break: anywhere` (Blink's `kBreakCharacter` breaks around every
+/// grapheme and never reads its pair table, and parley has already put an
+/// opportunity there), and under `word-break: break-all` only to add an
+/// opportunity — Blink's `ShouldBreakFast` returns early only on the table's
+/// "break", so its "no break" leaves the break-all rule (parley's segmenter
+/// under `BreakAll`) to decide. `keep-all` reads the table as `normal` does.
+fn chrome_override(cx: parley::LineBreakContext) -> Option<bool> {
+    if cx.line_break == parley::style::LineBreak::Anywhere {
+        return None;
+    }
+    let chrome = chrome_break(cx.before_before, cx.before, cx.after);
+    if cx.word_break == parley::style::WordBreak::BreakAll && chrome == Some(false) {
+        return None;
+    }
+    chrome
+}
+
+/// CSS `hyphens` as parley's (#2621): `none`, or `manual` (`auto` has no
+/// dictionary here and is `manual`).
+pub(crate) fn hyphens_to_parley(none: bool) -> parley::style::Hyphens {
+    if none {
+        parley::style::Hyphens::None
+    } else {
+        parley::style::Hyphens::Manual
+    }
+}
+
+/// [`chrome_break`] as parley's line-break override: every builder whose
+/// layout rinch breaks into lines sets it (`aaaa~bbbbbb ␣ZWSP␣cc` at 40px
+/// is `aaaa~bbbbbb ` / `ZWSP cc` in Chrome 153; parley alone broke after the
+/// ZWSP's space; `https://example.com/a/long/url` is one line in Chrome 156,
+/// and parley alone broke it after each slash).
+pub(crate) static CHROME_LINE_BREAKS: &parley::LineBreakOverrideFn =
+    &(chrome_override as fn(parley::LineBreakContext) -> Option<bool>);
+
+/// The UAX #14 break opportunities of a paragraph's text, as parley's own
+/// analysis finds them: the same segmenter, with the complex-script
+/// dictionaries parley's `complex-scripts` feature turns on, so a line this
+/// re-breaks keeps the breaks inside Thai, Lao, Khmer and Burmese words
+/// (review of #1878). Segmented once, the first time a break is asked
+/// about, over the whole text, under `word-break: normal` and `line-break:
+/// strict` (parley splits the text where they change, #2388; this does not,
+/// so a line re-broken here inside `break-all` or `anywhere` text keeps the
+/// `normal` answer). Less one kind:
+/// a break between a complex-context (`SA`) character and a letter or
+/// digit of another script, which ICU4X's dictionary segmenter reports and
+/// UAX #14 does not (LB1 resolves `SA` to `AL`, and LB28 keeps `AL AL`
+/// together): Chrome 155 has none between `ภาษาไทยง่ายมาก` and `w`.
+struct TextBreaks<'t> {
+    text: &'t str,
+    positions: std::cell::OnceCell<Vec<usize>>,
+}
+
+impl<'t> TextBreaks<'t> {
+    fn new(text: &'t str) -> Self {
+        Self {
+            text,
+            positions: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Whether there is an opportunity at `byte`.
+    fn at(&self, byte: usize) -> bool {
+        if after_a_space_run(self.text, byte) {
+            return true;
+        }
+        if let Some(chrome) = chrome_break_at(self.text, byte) {
+            return chrome;
+        }
+        self.positions
+            .get_or_init(|| {
+                let mut options = icu_segmenter::options::LineBreakOptions::default();
+                options.word_option = Some(icu_segmenter::options::LineBreakWordOption::Normal);
+                icu_segmenter::LineSegmenter::new_dictionary(options)
+                    .segment_str(self.text)
+                    .filter(|&b| !complex_context_seam(self.text, b))
+                    .collect()
+            })
+            .binary_search(&byte)
+            .is_ok()
+    }
+}
+
+/// [`chrome_break`] at `byte` of `text`, for the lines [`css_line`] breaks
+/// (#1426, #1238, #1243): the same answer parley's breaker gets from
+/// [`CHROME_LINE_BREAKS`] (review of #1897 measured the glue after `!`,
+/// `/`, `|` and `}`; #2369 the whole table).
+fn chrome_break_at(text: &str, byte: usize) -> Option<bool> {
+    let head = text.get(..byte)?;
+    let mut back = head.chars().rev();
+    let before = back.next()?;
+    let after = text.get(byte..)?.chars().next()?;
+    chrome_break(back.next(), before, after)
+}
+
+/// Whether `byte` of `text` lies between a complex-context (`SA`) character
+/// and a letter or digit (`AL`, `HL`, `NU`) — UAX #14 has no break there
+/// ([`TextBreaks`]).
+fn complex_context_seam(text: &str, byte: usize) -> bool {
+    use icu_properties::CodePointMapData;
+    use icu_properties::props::LineBreak;
+    let (Some(before), Some(after)) = (
+        text.get(..byte).and_then(|t| t.chars().next_back()),
+        text.get(byte..).and_then(|t| t.chars().next()),
+    ) else {
+        return false;
+    };
+    let lb = CodePointMapData::<LineBreak>::new();
+    let letter = |c: char| {
+        matches!(
+            lb.get(c),
+            LineBreak::Alphabetic | LineBreak::HebrewLetter | LineBreak::Numeric
+        )
+    };
+    let sa = |c: char| lb.get(c) == LineBreak::ComplexContext;
+    (sa(before) && letter(after)) || (letter(before) && sa(after))
+}
+
+/// Where CSS ends the line that starts at `units[cursor]`, by the
+/// opportunities [`edge_break_allowed`] allows (#1426, #1238): the unit one
+/// past its end, and its advance.
+///
+/// That is the last allowed break whose content (its hanging spaces left
+/// out) fits `max`, or, when none fits, the first allowed break — the
+/// unbreakable stretch overflows, as in CSS — or a forced break, whichever
+/// comes first.
+fn css_line(
+    units: &[LineUnit],
+    breaks: &TextBreaks<'_>,
+    cursor: usize,
+    max: f32,
+    pre_seams: bool,
+) -> (usize, f32) {
+    // The table's cursor can sit on the zero-width newline that ended the
+    // line before; a newline is never the first unit of a line.
+    let first = cursor + units[cursor..].iter().take_while(|u| u.newline).count();
+    let mut x = 0.0f32;
+    // The run of hanging spaces the line would end in.
+    let mut hanging = 0.0f32;
+    let mut fit: Option<(usize, f32)> = None;
+    let mut chosen = None;
+    // Whether the line holds anything in flow yet. Out-of-flow boxes (a float
+    // or an absolutely positioned box, `counted` 0) before it make no line
+    // of their own: a break right after them would leave the line empty and
+    // put what follows on a line of its own below it (#2331: `<float><span
+    // nowrap>` 600px wide in 560 was two lines, Chrome 156 keeps one).
+    let mut in_flow = false;
+    for e in first + 1..=units.len() {
+        let u = &units[e - 1];
+        in_flow |= u.counted > 0;
+        if u.newline {
+            // The forced break ends the line, unless what is before it
+            // overflows and an earlier break fits.
+            chosen = Some(fit.filter(|_| x - hanging > max + 0.005).unwrap_or((e, x)));
+            break;
+        }
+        x += u.advance;
+        // An element's end edge box right after hanging spaces hangs with
+        // them (review of #1878: Chrome 155 fits `<span padding:0 3px>[B]q-r
+        // </span>` and a forced break in 71.5px, the content less the space
+        // and the end padding, 71.18px; at 71px it breaks after `q-`).
+        hanging = if u.hangs || (u.edge == EDGE_END && hanging > 0.0) {
+            hanging + u.advance
+        } else {
+            0.0
+        };
+        if !in_flow || !edge_break_allowed(units, breaks, e, false, true, pre_seams) {
+            continue;
+        }
+        let seam = pre_seams.then(|| pre_seam(units, e)).flatten();
+        if seam == Some(PreSeam::ForwardOnly) && x <= max + 0.005 {
+            continue;
+        }
+        // A line that ends at a soft hyphen draws a hyphen, and must fit
+        // with it (#2614); the last line draws none.
+        let hyphen = ending_hyphen(units, e);
+        if x - hanging + hyphen <= max + 0.005 {
+            fit = Some((e, x + hyphen));
+        } else if seam != Some(PreSeam::RewindOnly) {
+            chosen = Some(fit.unwrap_or((e, x + hyphen)));
+            break;
+        }
+    }
+    chosen.or(fit).unwrap_or((units.len(), x))
+}
+
+/// Commit, in place of the line parley just ended, the line from
+/// `units[cursor]` to `units[e]` (exclusive) whose advance is `advance`
+/// ([`css_line`]), and return its reason and advance; `None` when the unit
+/// table and the breaker disagree.
+fn commit_css_line(
+    breaker: &mut parley::layout::BreakLines<'_, Brush>,
+    units: &[LineUnit],
+    cursor: usize,
+    (e, advance): (usize, f32),
+    line_start: &parley::layout::BreakerState,
+    max: f32,
+) -> Option<(parley::layout::BreakReason, f32)> {
+    use parley::layout::BreakReason;
+    let first = cursor + units[cursor..].iter().take_while(|u| u.newline).count();
+    let n = units[first..e]
+        .iter()
+        .map(|u| u.counted as usize)
+        .sum::<usize>();
+    breaker.revert_to(line_start.clone());
+    breaker.break_next_with_length(u32::try_from(n).ok()?)?;
+    breaker.set_prior_line_width(max);
+    let reason = if e >= units.len() {
+        BreakReason::None
+    } else if units[e - 1].newline {
+        BreakReason::Explicit
+    } else {
+        BreakReason::Regular
+    };
+    Some((reason, advance))
+}
+
+/// The hyphen a line that ends before `units[end]` draws at its end, a soft
+/// hyphen it ends at ([`LineUnit::hyphen`], #2614); 0 for the last line.
+/// An inline element's end edge boxes right before the break are looked past:
+/// the hyphen is drawn inside the element, before its end padding, border
+/// and margin (Chrome 157: `Ex<span border-right:3px>tra&shy;</span>` ends
+/// its line `Extra-` and then the border, 47.66 wide), and so are the spaces
+/// that hang right after the soft hyphen ([`LineUnit::keeps_hyphen`], #2654).
+fn ending_hyphen(units: &[LineUnit], end: usize) -> f32 {
+    if end >= units.len() {
+        return 0.0;
+    }
+    let mut i = end;
+    while i > 0 && units[i - 1].edge == EDGE_END {
+        i -= 1;
+    }
+    // The spaces a line broken after them hangs, right after the soft hyphen
+    // (#2654), whose `hyphens: none` then does not matter.
+    let spaces = units[..i]
+        .iter()
+        .rev()
+        .take_while(|u| u.keeps_hyphen)
+        .count();
+    let Some(u) = (i - spaces).checked_sub(1).map(|j| &units[j]) else {
+        return 0.0;
+    };
+    if spaces == 0 && u.inert_soft_hyphen {
+        return 0.0;
+    }
+    u.hyphen
+}
+
+/// Whether a line's content — its units less the spaces that hang at its
+/// end, end edge boxes after them counted as content ([`css_line`]) — is
+/// wider than `max`. With seams every soft wrap is looked at again
+/// (#1243); this sends the last line and one before a forced break through
+/// [`css_line`] too when it overflows.
+fn line_overflows(line: &[LineUnit], max: f32) -> bool {
+    let advance: f32 = line.iter().map(|u| u.advance).sum();
+    // The trailing run of hanging spaces and end edge boxes, from its
+    // first space on (as [`css_line`] counts it).
+    let run = line
+        .iter()
+        .rev()
+        .take_while(|u| u.hangs || u.edge == EDGE_END)
+        .count();
+    let hanging: f32 = line[line.len() - run..]
+        .iter()
+        .skip_while(|u| !u.hangs)
+        .map(|u| u.advance)
+        .sum();
+    advance - hanging > max + 0.005
+}
+
+/// Whether a paragraph that holds a `pre` element's spaces takes the seams
+/// for them (#1243), asked of its text and of the lines parley broke it
+/// into: a `pre` element's text that starts with a space or tab right after
+/// text that wraps (a run of wrapping spaces before it is a [`pre_seam`],
+/// where parley has no break; a word of a wrapping element that closes
+/// there has its break before the `pre` run, [`UnhungSpaces::space_breaks`]),
+/// or a soft-wrapped line that parley ended in a `pre` space (it hung one,
+/// breaking the `pre` run) or right before `pre` text (it went back to its
+/// last break when the `pre` text overflowed, where CSS may hang the spaces
+/// before it, or break later). None of these, and parley's breaks stand: a
+/// paragraph whose `pre` spaces start it, or follow other text that does
+/// not wrap, and whose lines parley does not end next to them, pays no pass
+/// for them.
+fn pre_seams_needed(layout: &parley::Layout<Brush>, text: &str, unhung: &UnhungSpaces) -> bool {
+    use parley::layout::BreakReason;
+    let is_space = |b: usize| matches!(text.as_bytes().get(b), Some(b' ' | b'\t'));
+    let pre_space = |b: usize| is_space(b) && in_ranges(&unhung.pre, b);
+    let seam = unhung.pre.iter().any(|r| {
+        r.start > 0
+            && pre_space(r.start)
+            && !in_ranges(&unhung.pre, r.start - 1)
+            && (!in_ranges(&unhung.nowrap, r.start - 1)
+                || unhung.space_breaks.binary_search(&r.start).is_ok())
+    });
+    // A wrapping space right before `break-spaces` ones: CSS breaks between
+    // them (the first hangs, the run starts the next line, Chrome 155), and
+    // UAX #14 has no break between two spaces, so parley ends the line after
+    // the first `break-spaces` space instead (parley 0.11.1 hung that one
+    // and broke there too, the hang pass then moving it).
+    let breaking_space = |b: usize| is_space(b) && in_ranges(&unhung.breaking, b);
+    let wrapping_space = |b: usize| {
+        is_space(b)
+            && !in_ranges(&unhung.breaking, b)
+            && !in_ranges(&unhung.pre, b)
+            && !in_ranges(&unhung.nowrap, b)
+    };
+    let after_wrapping_space = |e: usize| {
+        let mut s = e;
+        while s > 0 && breaking_space(s - 1) {
+            s -= 1;
+        }
+        s < e && s > 0 && wrapping_space(s - 1)
+    };
+    seam || layout.lines().any(|line| {
+        matches!(
+            line.break_reason(),
+            BreakReason::Regular | BreakReason::Emergency
+        ) && {
+            let e = line.text_range().end;
+            (e > 0 && pre_space(e - 1))
+                || (e < text.len() && in_ranges(&unhung.pre, e))
+                || after_wrapping_space(e)
+        }
+    })
+}
+
+/// Where a paragraph's `pre` spaces are, for the cheap test that sends a
+/// soft-wrapped line of it to [`css_line`] (#1243): only a line that can
+/// reach a `pre` space — one on the line, or the next one after it within
+/// the room — can end elsewhere for a [`pre_seam`] than where parley ended
+/// it. Built once per pass.
+struct NearPre {
+    /// The first `pre` space at or after each unit (`units.len()` for none).
+    next: Vec<usize>,
+    /// The advance of `units[..i]`.
+    x: Vec<f32>,
+}
+
+impl NearPre {
+    fn new(units: &[LineUnit]) -> Self {
+        let mut next = vec![units.len(); units.len() + 1];
+        for i in (0..units.len()).rev() {
+            next[i] = if units[i].unhung && !units[i].breaks {
+                i
+            } else {
+                next[i + 1]
+            };
+        }
+        let mut x = Vec::with_capacity(units.len() + 1);
+        let mut acc = 0.0f32;
+        x.push(acc);
+        for u in units {
+            acc += u.advance;
+            x.push(acc);
+        }
+        Self { next, x }
+    }
+
+    /// Whether the line from `units[cursor]` to `units[end]` holds a `pre`
+    /// space, or the first one after it is within `max` of the line's start,
+    /// the hanging spaces right before it left out.
+    fn touches(&self, units: &[LineUnit], cursor: usize, end: usize, max: f32) -> bool {
+        let p = self.next[cursor.min(units.len())];
+        if p >= units.len() {
+            return false;
+        }
+        if p <= end {
+            return true;
+        }
+        let hanging: f32 = units[cursor..p]
+            .iter()
+            .rev()
+            .take_while(|u| u.hangs)
+            .map(|u| u.advance)
+            .sum();
+        self.x[p] - self.x[cursor] - hanging <= max + 0.005
+    }
+}
+
+/// Whether a line ending before `units[a]` ends where one ending before
+/// `units[b]` does: nothing but zero-width units (a newline, an out-of-flow
+/// box) lies between them.
+fn same_end(units: &[LineUnit], a: usize, b: usize) -> bool {
+    units[a.min(b)..a.max(b)].iter().all(|u| u.advance <= 0.005)
+}
+
+/// Whether some soft-wrapped line of `layout` begins or ends with an edge
+/// box (#1426): the cheap test that sends a paragraph through [`hang_pass`]
+/// for [`css_line`]. A break edge boxes are not next to is parley's
+/// own, and a break next to one is always looked at again.
+fn any_line_split_at_edge(layout: &parley::Layout<Brush>) -> bool {
+    use parley::PositionedLayoutItem;
+    use parley::layout::BreakReason;
+    let edge = |item: Option<PositionedLayoutItem<'_, Brush>>| matches!(item, Some(PositionedLayoutItem::InlineBox(b)) if is_edge_box(b.id));
+    if !layout.inline_boxes().any(|b| is_edge_box(b.id)) {
+        return false;
+    }
+    // Items are in visual order: on a right-to-left line the logical end is
+    // the first item, so both ends of every line next to a soft wrap are
+    // looked at.
+    let mut prev_soft = false;
+    for line in layout.lines() {
+        let soft = matches!(
+            line.break_reason(),
+            BreakReason::Regular | BreakReason::Emergency
+        );
+        if (prev_soft || soft) && (edge(line.items().next()) || edge(line.items().last())) {
+            return true;
+        }
+        prev_soft = soft;
+    }
+    false
+}
+
+/// [`LineUnit::edge`] of an inline element's inline-start box.
+const EDGE_START: u8 = 1;
+/// [`LineUnit::edge`] of an inline element's inline-end box.
+const EDGE_END: u8 = 2;
+
+/// Whether `node`'s computed CSS `direction` is `ltr`: read from the nearest
+/// node at or above it with a Stylo style (an anonymous block box has none
+/// and inherits its container's). `ltr` when nothing has one.
+pub(crate) fn css_direction_is_ltr(nodes: &crate::node_slab::NodeSlab, node: RawNodeId) -> bool {
+    let mut at = Some(node);
+    while let Some(id) = at {
+        let Some(n) = nodes.get(id) else { break };
+        let data = n.stylo_element_data.borrow();
+        if let Some(primary) = data.as_ref().and_then(|d| d.styles.get_primary()) {
+            return primary.writing_mode.is_bidi_ltr();
+        }
+        at = n.parent;
+    }
+    true
+}
+
+/// Take `byte` out of the sorted, disjoint `ranges`, splitting the one that
+/// holds it.
+fn remove_byte(ranges: &mut Vec<std::ops::Range<usize>>, byte: usize) {
+    let i = ranges.partition_point(|r| r.end <= byte);
+    let Some(r) = ranges.get(i).filter(|r| r.contains(&byte)).cloned() else {
+        return;
+    };
+    let mut keep = Vec::with_capacity(2);
+    if r.start < byte {
+        keep.push(r.start..byte);
+    }
+    if byte + 1 < r.end {
+        keep.push(byte + 1..r.end);
+    }
+    ranges.splice(i..=i, keep);
+}
+
+/// Whether `byte` is in one of the sorted, disjoint `ranges`.
+fn in_ranges(ranges: &[std::ops::Range<usize>], byte: usize) -> bool {
+    let i = ranges.partition_point(|r| r.end <= byte);
+    ranges.get(i).is_some_and(|r| r.contains(&byte))
+}
+
+/// Every cluster and inline box of `layout`, in the logical order the line
+/// breaker walks them. Read from an already broken layout: each cluster is on
+/// exactly one line. A space in one of the `unhung` ranges is
+/// [`LineUnit::unhung`], and in a `break-spaces` one [`LineUnit::breaks`] too.
+fn logical_units(
+    layout: &parley::Layout<Brush>,
+    text: &str,
+    unhung: &UnhungSpaces,
+) -> Vec<LineUnit> {
+    // (byte, 0 = inline box / 1 = cluster, index within its kind) → unit.
+    let mut keyed: Vec<((usize, u8, usize), LineUnit)> = Vec::new();
+    for line in layout.lines() {
+        for run in line.runs() {
+            for c in run.clusters() {
+                let range = c.text_range();
+                let n = keyed.len();
+                let space = is_hanging_space(text, &c);
+                let pre = space && in_ranges(&unhung.pre, range.start);
+                let breaks = space && in_ranges(&unhung.breaking, range.start);
+                let own_wrap = !in_ranges(&unhung.nowrap, range.start);
+                let seam = unhung.active_seams().and_then(|s| s.after_text(range.end));
+                // A soft hyphen a line of the broken layout ends at draws its
+                // hyphen, in its advance (#2614).
+                let soft_hyphen = c.soft_hyphen();
+                let advance =
+                    c.advance() - soft_hyphen.filter(|h| h.drawn).map_or(0.0, |h| h.advance);
+                let is_soft_hyphen = text.get(range.clone()) == Some("\u{ad}");
+                keyed.push((
+                    (range.start, 1, n),
+                    LineUnit {
+                        advance,
+                        hangs: space && !pre && !breaks,
+                        unhung: pre || breaks,
+                        breaks,
+                        newline: c.is_hard_line_break(),
+                        nbsp: c.is_space_or_nbsp()
+                            && text
+                                .get(range.clone())
+                                .is_some_and(|t| t.starts_with('\u{a0}')),
+                        space: c.is_space_or_nbsp(),
+                        counted: text
+                            .get(range.clone())
+                            .map_or(1, |t| t.chars().count() as u32),
+                        inline_box: false,
+                        out_of_flow: false,
+                        breaks_before_glue: text
+                            .get(range.clone())
+                            .and_then(|t| t.chars().next_back())
+                            .is_some_and(breaks_before_glue),
+                        edge: 0,
+                        wrap_after: seam.map_or(own_wrap, |s| s.wraps),
+                        own_wrap,
+                        break_before: unhung.space_breaks.binary_search(&range.start).is_ok(),
+                        closes_into_nowrap: seam.is_some_and(|s| s.closes_into_nowrap),
+                        text_end: seam.is_some(),
+                        closes: seam.is_some_and(|s| s.closes),
+                        collapsible: in_ranges(&unhung.collapsible, range.start),
+                        after_collapsed: unhung.collapsed.binary_search(&range.start).is_ok(),
+                        byte: range.start,
+                        attaches: advance <= 0.005 && !c.is_hard_line_break(),
+                        hyphen: soft_hyphen.map_or(0.0, |h| h.advance),
+                        inert_soft_hyphen: is_soft_hyphen
+                            && c.style().hyphens() == parley::style::Hyphens::None,
+                        style: c.style_index(),
+                        keeps_hyphen: false,
+                    },
+                ));
+            }
+        }
+    }
+    for (i, b) in layout.inline_boxes().enumerate() {
+        let in_flow = matches!(b.kind, parley::InlineBoxKind::InFlow);
+        let seam = unhung.active_seams().and_then(|s| s.after_box(b.id));
+        let advance = if in_flow { b.width } else { 0.0 };
+        keyed.push((
+            (b.index, 0, i),
+            LineUnit {
+                advance,
+                hangs: false,
+                unhung: false,
+                breaks: false,
+                newline: false,
+                nbsp: false,
+                space: false,
+                counted: u32::from(in_flow),
+                inline_box: in_flow && !is_edge_box(b.id),
+                out_of_flow: !in_flow,
+                breaks_before_glue: false,
+                edge: match edge_box_owner(b.id) {
+                    Some((_, false)) => EDGE_START,
+                    Some((_, true)) => EDGE_END,
+                    None => 0,
+                },
+                wrap_after: seam.is_none_or(|s| s.wraps),
+                own_wrap: true,
+                break_before: false,
+                closes_into_nowrap: seam.is_some_and(|s| s.closes_into_nowrap),
+                text_end: false,
+                closes: false,
+                collapsible: false,
+                after_collapsed: false,
+                byte: b.index,
+                attaches: false,
+                hyphen: 0.0,
+                inert_soft_hyphen: false,
+                style: 0,
+                keeps_hyphen: false,
+            },
+        ));
+    }
+    // A box at byte `i` comes before the text at `i` (the builder splits the
+    // run there).
+    keyed.sort_unstable_by_key(|(k, _)| *k);
+    let mut units: Vec<LineUnit> = keyed.into_iter().map(|(_, u)| u).collect();
+    for i in 1..units.len() {
+        let (before, after) = units.split_at_mut(i);
+        let (p, u) = (&before[i - 1], &mut after[0]);
+        u.keeps_hyphen = u.hangs
+            && p.edge == 0
+            && !p.inline_box
+            && (p.hyphen > 0.0 || p.keeps_hyphen)
+            && p.style == u.style;
+    }
+    units
+}
+
+/// Where a line that starts at `units[start]` and has `advance` ends: the index
+/// one past its last unit. `None` when the table cannot account for the advance
+/// (it overshoots, or runs out) — the table and the breaker disagree.
+///
+/// The first unit at which the running sum reaches the advance is taken. Zero
+/// width units right after it — a newline, a box, but see the characters
+/// below — may belong to this line or the next; either way they add nothing
+/// to the next line's sum, and a line that hangs a space ends on that space,
+/// which has width.
+///
+/// An edge box of a negative inline margin has a negative width (#2406), so
+/// the sum can pass the advance and come back: past it, the edge boxes right
+/// after are added too, and the line ends after the one that brings the sum
+/// back to the advance. (`abc<span style="margin-left:-3px">def</span>`
+/// broken after the box: the sum passed the line's advance at `c`, the line
+/// was taken for one the table could not account for, and parley's break
+/// inside the word stood. Review of #2450.)
+///
+/// Zero-width characters right after it ([`LineUnit::attaches`]) are this
+/// line's when the line's text, which ends at `text_end`
+/// ([`parley::layout::BreakLines::prior_line_text_range`]), holds them
+/// ([`attached_end`]). parley ends a line broken at a soft hyphen or a
+/// zero-width space after it, at the advance of the text before it; taken
+/// for the next line's, the character was counted again by the line
+/// [`commit_css_line`] counted from it, which ended one character early
+/// (#2604: `Extra&shy;ordinary` came out as `Extra` / `o` / `rdinary`). The
+/// advance cannot tell: after a space a soft hyphen has an opportunity on
+/// each side, and the line takes the later when it fits and the earlier when
+/// it overflows. With no `text_end` the line ends before them.
+fn line_end(
+    units: &[LineUnit],
+    start: usize,
+    advance: f32,
+    text_end: Option<usize>,
+) -> Option<usize> {
+    const TOL: f32 = 0.005;
+    if advance <= TOL {
+        return Some(attached_end(units, start, text_end));
+    }
+    let mut acc = 0.0f32;
+    for (i, u) in units.iter().enumerate().skip(start) {
+        acc += u.advance;
+        if acc >= advance - TOL {
+            if acc <= advance + TOL {
+                return Some(attached_end(units, i + 1, text_end));
+            }
+            let mut back = acc;
+            for (j, edge) in units.iter().enumerate().skip(i + 1) {
+                if edge.edge == 0 {
+                    break;
+                }
+                back += edge.advance;
+                if (back - advance).abs() <= TOL {
+                    return Some(attached_end(units, j + 1, text_end));
+                }
+            }
+            return None;
+        }
+    }
+    None
+}
+
+/// `end`, moved past the zero-width characters right after it
+/// ([`LineUnit::attaches`]) that the line's text, ending at byte `text_end`,
+/// holds.
+fn attached_end(units: &[LineUnit], mut end: usize, text_end: Option<usize>) -> usize {
+    let Some(text_end) = text_end else {
+        return end;
+    };
+    while units
+        .get(end)
+        .is_some_and(|u| u.attaches && u.byte < text_end)
+    {
+        end += 1;
+    }
+    end
+}
+
+/// Where the text of the line `breaker` committed last ends
+/// ([`line_end`]'s `text_end`).
+fn prior_text_end(breaker: &parley::layout::BreakLines<'_, Brush>) -> Option<usize> {
+    breaker.prior_line_text_range().map(|r| r.end)
+}
+
+/// Spaces and tabs hang; NBSP does not (§4.1.3 hangs white space, and NBSP is
+/// not white space for this rule — it glues).
+fn is_hanging_space(text: &str, c: &parley::layout::Cluster<'_, Brush>) -> bool {
+    c.is_space_or_nbsp() && matches!(text.get(c.text_range()), Some(" " | "\t"))
+}
+
+/// Whether `c` is of UAX #14 class HY or BA and not white space — after
+/// which LB12a allows a break before a no-break space (the common members;
+/// spaces and tabs hang instead).
+fn breaks_before_glue(c: char) -> bool {
+    matches!(
+        c,
+        '-' | '|'
+            | '\u{ad}'
+            | '\u{58a}'
+            | '\u{5be}'
+            | '\u{2010}'
+            | '\u{2012}'
+            | '\u{2013}'
+            | '\u{2027}'
+    )
+}
+
+/// Whether some line holds an inline box parley placed by its emergency
+/// branch and the next line starts with a space, tab or newline (#1081): the
+/// cheap test that sends a paragraph through [`hang_pass`] for
+/// [`fold_after_overflowing_box`].
+fn any_emergency_box_line_before_white_space(layout: &parley::Layout<Brush>, text: &str) -> bool {
+    use parley::PositionedLayoutItem;
+    use parley::layout::BreakReason;
+    let mut lines = layout.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line.break_reason() != BreakReason::Emergency
+            || !line.items().last().is_some_and(
+                |item| matches!(item, PositionedLayoutItem::InlineBox(b) if !is_edge_box(b.id)),
+            )
+        {
+            continue;
+        }
+        if let Some(next) = lines.peek()
+            && text
+                .get(next.text_range().start..)
+                .and_then(|t| t.chars().next())
+                .is_some_and(|c| matches!(c, ' ' | '\t' | '\n'))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 impl RinchDocument {
     /// Build inline layouts for all IFC roots after Taffy layout.
     ///
     /// Uses the computed width from Taffy as the available width for Parley line breaking.
     pub(crate) fn build_ifc_layouts(&mut self, paint_layout_cx: &mut parley::LayoutContext<Brush>) {
-        // Discover all IFC roots (cheap O(n) walk — just checks a field per node).
-        let mut ifc_roots: Vec<usize> = Vec::new();
-        for (id, node) in &self.tree.nodes {
+        // Every kept root with a relative span is refreshed below, so the
+        // roots an inset change named (#2412) need no list of their own.
+        self.tree.relative_offset_roots.clear();
+        // Discover all IFC roots. From `NodeTree::ifc_root_registry` rather
+        // than the slab (layout audit F12): every node the structural passes
+        // made a root is registered, and the test below — the one this walk
+        // always applied to every slab node — decides which still are, in the
+        // same ascending order. An entry that fails it is dropped; a node only
+        // becomes a root again through a structural pass, which re-registers it.
+        let mut ifc_roots: Vec<RawNodeId> = Vec::new();
+        let mut stale: Vec<RawNodeId> = Vec::new();
+        for &id in &self.tree.ifc_root_registry {
+            let Some(node) = self.tree.nodes.get(id) else {
+                stale.push(id);
+                continue;
+            };
             if !node.is_element() {
+                stale.push(id);
                 continue;
             }
             // Only block containers can be IFC roots — and **this gate is
@@ -196,26 +5764,21 @@ impl RinchDocument {
             // would have missed it) — over 67 constructed shapes and all of
             // `-p rinch-dom -p rinch`. **Zero.**
             //
-            // Kept rather than deleted: the four sites asking this question are
-            // one authority since #614, and a redundant fourth agreement costs a
+            // Kept rather than deleted: the three sites asking this question are
+            // one authority since #614, and a redundant agreement costs a
             // `matches!` while a site that has stopped asking is how #518, #476
-            // and #568 happened. (Three of the four ask it bare; the fourth,
-            // `apply_empty_block_line_floor`, subtracts the atomic inlines —
-            // #592, and stated at that site.)
+            // and #568 happened. (There were four until #296 removed the
+            // one-line floor for childless blocks, `apply_empty_block_line_floor`,
+            // the one site that subtracted the atomic inlines.)
             //
-            // **"Redundant" means something different at each of the other three,
-            // and lumping them together was this comment's own error.** Two are
-            // load-bearing with witnesses: the same mutation fails 9 tests at
-            // `create_anonymous_block_boxes`' phase-1 scan and 7 at
-            // `setup_inline_formatting_contexts`' root scan, six and four of them
-            // pre-dating this change. The third,
-            // `apply_empty_block_line_floor`, is a *third* category rather than a
-            // second redundancy — its mutant is green like this one's, but for an
-            // unrelated reason: its arm is **reached constantly** and what is
-            // unobserved is the consequence (see that function's own doc). So this
-            // site is the only one of the four whose arm nothing can reach in a way
-            // that matters.
+            // **"Redundant" means something different at each site.** The other
+            // two are load-bearing with witnesses: the same mutation fails 9
+            // tests at `create_anonymous_block_boxes`' phase-1 scan and 7 at
+            // `setup_inline_formatting_contexts`' root scan (counts from when
+            // this comment was written, before #296). So this site is the only
+            // one whose arm nothing can reach in a way that matters.
             if !node.display_mode.is_block_container() {
+                stale.push(id);
                 continue;
             }
             // `ifc_children`, not `children`: an anonymous block box holds its
@@ -229,13 +5792,25 @@ impl RinchDocument {
             });
             if is_ifc {
                 ifc_roots.push(id);
+            } else {
+                stale.push(id);
             }
         }
+        for id in stale {
+            self.tree.ifc_root_registry.remove(&id);
+        }
 
-        // Only rebuild Parley TextLayouts for dirty IFC roots (the expensive part).
-        // When dirty_ifc_text_roots is empty, rebuild all (structural IFC change).
-        let rebuild_all = self.tree.dirty_ifc_text_roots.is_empty();
-
+        // Only the roots that need it are re-shaped (the expensive part): a
+        // root is rebuilt when it is dirty, has no layout, or has a layout
+        // built at a different width — the check after `max_width` below.
+        //
+        // There used to be a second, earlier skip: whenever *any* root was
+        // dirty, every non-dirty root was skipped before its width was
+        // looked at. So a width change with no restyle of its own — a flex
+        // item narrowed because a sibling's text grew, the sibling being the
+        // dirty one — kept its glyphs broken at the old width, overflowing its
+        // box. A root with no layout was skipped the same way, and would have
+        // had nothing to paint. The width comparison below is the whole rule.
         for root_id in ifc_roots {
             // Skip collapsed blocks (virtualized) — no Parley work needed.
             // Drop any existing text_layout to free memory.
@@ -243,109 +5818,305 @@ impl RinchDocument {
                 self.tree.nodes[root_id].text_layout = None;
                 continue;
             }
-
-            // Skip IFC roots that aren't dirty (scoped rebuild).
-            // This turns O(all_roots) Parley work into O(dirty_roots).
-            if !rebuild_all && !self.tree.dirty_ifc_text_roots.contains(&root_id) {
+            // A hollow control (#1159): its children are its value, which
+            // `paint_input_value` draws; nothing lays them out as content.
+            // A canvas, video or iframe renders none of its children (#1173).
+            if crate::replaced::ignores_inner_display(&self.tree.nodes[root_id]) {
+                self.tree.nodes[root_id].text_layout = None;
                 continue;
             }
 
+            let max_width = self.ifc_paint_max_width(root_id);
             let node = &self.tree.nodes[root_id];
 
-            // Use content-box width (subtract padding+border) for line breaking.
-            // For auto-width elements, don't re-constrain text to measured width
-            // as floating-point precision can cause unwanted line breaks.
-            let max_width = {
-                let cs = &node.computed_style;
-                let padding_h = cs.padding_left.to_px() + cs.padding_right.to_px();
-                let border_h = cs.border_left_width.to_px() + cs.border_right_width.to_px();
-                let content_width = node.layout.width - padding_h - border_h;
-                if content_width > 0.0 {
-                    // An auto-width element is sized to its content: its box width is
-                    // the text's max-content width (+ padding/border) measured with NO
-                    // wrap, then ROUNDED DOWN to an integer pixel — losing strictly
-                    // less than 1px of the text's true width. So the paint layout here
-                    // must allow up to 1px more than `content_width`, or it re-wraps
-                    // the text at a space inside a box that was sized for one line
-                    // (the box says one line, the glyphs render two). A 0.5px
-                    // tolerance can't absorb a full 1px floor; 1.0px provably can
-                    // (`natural - content_width == frac(natural) < 1.0`). Explicit-
-                    // width elements get no tolerance — they should wrap at their width.
-                    //
-                    // The question is about the **used** size, not the declared
-                    // one, so it is `lays_out_as_auto` (#626): `width:
-                    // max-content` shrink-wraps exactly as `auto` does today,
-                    // so its box was measured and floored the same way and it
-                    // needs the same slack. Reading `is_auto()` here gave such a
-                    // box 0px and re-wrapped its text inside a box sized for one
-                    // line — the box unchanged, the glyphs on two.
-                    let tolerance = if cs.width.lays_out_as_auto() {
-                        1.0
-                    } else {
-                        0.0
-                    };
-                    Some(content_width + tolerance)
-                } else {
-                    None
-                }
-            };
-
             // Skip Parley rebuild if text hasn't changed and the layout already
-            // exists with the same max_width. The existing text_layout is still valid.
+            // exists with the same max_width and alignment width (#1237: an
+            // auto-width root and one declared a pixel wider break at the
+            // same width and align within different ones). The existing
+            // text_layout is still valid.
             if !self.tree.dirty_ifc_text_roots.contains(&root_id) {
                 if let Some(existing) = &node.text_layout {
-                    let old_max_width = existing.max_width;
-                    let new_max_width = max_width.unwrap_or(f32::INFINITY);
-                    if (old_max_width - new_max_width).abs() < 0.01 {
+                    // `==` first: a root laid out unconstrained stores
+                    // `INFINITY`, and `INFINITY - INFINITY` is NaN, which no
+                    // tolerance admits, so without it every such root was
+                    // reshaped on every layout pass that changed no text
+                    // (ifc_unconstrained_width_skip_tests). Since #2382 a
+                    // root's paint layout always has a width, a zero one
+                    // included, so it stores none; the guard stays for free.
+                    let same = |old: f32, new: f32| old == new || (old - new).abs() < 0.01;
+                    if same(existing.max_width, max_width)
+                        && same(existing.align_width, self.ifc_content_width(root_id))
+                        && existing.float_bands.as_ref() == self.tree.ifc_float_bands.get(&root_id)
+                    {
+                        // Kept lines, whose relative offsets may still owe a
+                        // resolve (#2457, #2412).
+                        if !existing.relative_spans.is_empty()
+                            || !existing.relative_spans_resting.is_empty()
+                        {
+                            self.refresh_relative_spans(root_id);
+                        }
                         continue; // Skip — text_layout is still valid
                     }
                 }
             }
 
-            let mut inline_layout = Self::build_inline_layout(
-                &self.tree.nodes,
-                root_id,
-                max_width,
-                1.0,
-                &mut self.font_cx,
-                paint_layout_cx,
-            );
-
-            // text-overflow: ellipsis — if text overflows the container, truncate and add "…"
-            {
-                use crate::computed_style::{OverflowValue, TextOverflowValue, WhiteSpaceValue};
-                let cs = &self.tree.nodes[root_id].computed_style;
-                let container_width = max_width.unwrap_or(f32::INFINITY);
-                if matches!(cs.text_overflow, TextOverflowValue::Ellipsis)
-                    && matches!(
-                        cs.white_space,
-                        WhiteSpaceValue::NoWrap | WhiteSpaceValue::Pre
-                    )
-                    && matches!(cs.overflow_x, OverflowValue::Hidden | OverflowValue::Clip)
-                    && inline_layout.layout.width() > container_width
-                    && container_width > 0.0
-                {
-                    // Collect text content from the inline layout
-                    let full_text = inline_layout.text_content.clone();
-                    if !full_text.is_empty() {
-                        inline_layout = Self::build_ellipsis_layout(
-                            &self.tree.nodes,
-                            root_id,
-                            &full_text,
-                            container_width,
-                            1.0,
-                            &mut self.font_cx,
-                            paint_layout_cx,
-                        );
-                    }
-                }
+            // A root outside the document is not shaped (#1069): nothing
+            // paints it. `set_text_content` and `remove_child` take a subtree's
+            // marks with it (#1073), but the whole-document structural pass
+            // still walks the slab and marks detached subtrees again, so this
+            // is where a disconnected root is turned away. Asked only of a
+            // root about to be shaped, so a settled document pays nothing.
+            // Its old layout is dropped and so is its registration: attaching
+            // it again seeds a structural pass, which registers it, and it has
+            // no layout to keep, so it is shaped then
+            // (`a_reattached_orphan_ifc_root_lays_out_as_a_fresh_one`).
+            if self.depth_if_connected(root_id).is_none() {
+                self.tree.nodes[root_id].text_layout = None;
+                self.tree.ifc_root_registry.remove(&root_id);
+                continue;
             }
 
-            // Write positions from Parley layout back to child nodes
-            // Walk the layout lines to find positioned inline boxes and text runs
-            self.write_inline_positions(root_id, &inline_layout);
+            self.shape_ifc_root_paint_layout(root_id, max_width, paint_layout_cx);
+        }
+    }
 
-            self.tree.nodes[root_id].text_layout = Some(Box::new(inline_layout));
+    /// An IFC root's content-box width, never below 0.
+    ///
+    /// A zero-width box is a width, not "unconstrained" (#2382): `width: 0`,
+    /// `max-width: 0`, a zero-width float or a flex item shrunk to nothing
+    /// takes every break opportunity its text has, as in Chrome 156, the
+    /// same lines as `width: 1px`. This used to answer `None` for a content
+    /// width that was not positive, and the paint layout was then broken with
+    /// no limit — one line of max-content text in a box its measure had
+    /// sized for five lines.
+    fn ifc_content_width(&self, root_id: RawNodeId) -> f32 {
+        let node = &self.tree.nodes[root_id];
+        let cs = &node.computed_style;
+        let padding_h = cs.padding_left.to_px() + cs.padding_right.to_px();
+        let border_h = cs.border_left_width.to_px() + cs.border_right_width.to_px();
+        let content_width = node.layout.width - padding_h - border_h;
+        content_width.max(0.0)
+    }
+
+    /// The width an IFC root's paint layout is broken at: its content-box
+    /// width, with the auto-width slack below. Always a width, 0 included
+    /// (#2382); whether the text may wrap at all is `build_inline_layout`'s
+    /// question, from `white-space`.
+    fn ifc_paint_max_width(&self, root_id: RawNodeId) -> f32 {
+        // Use content-box width (subtract padding+border) for line breaking.
+        // For auto-width elements, don't re-constrain text to measured width
+        // as floating-point precision can cause unwanted line breaks.
+        let cs = &self.tree.nodes[root_id].computed_style;
+        let content_width = self.ifc_content_width(root_id);
+        // An auto-width element is sized to its content: its box width is
+        // the text's max-content width (+ padding/border) measured with NO
+        // wrap, then ROUNDED DOWN to an integer pixel — losing strictly
+        // less than 1px of the text's true width. So the paint layout here
+        // must allow up to 1px more than `content_width`, or it re-wraps
+        // the text at a space inside a box that was sized for one line
+        // (the box says one line, the glyphs render two). A 0.5px
+        // tolerance can't absorb a full 1px floor; 1.0px provably can
+        // (`natural - content_width == frac(natural) < 1.0`). Explicit-
+        // width elements get no tolerance — they should wrap at their width.
+        //
+        // The question is whether the width was *derived* rather than
+        // declared, so it is `is_auto_or_keyword` (#626, #691): a
+        // `width: max-content` box is measured and floored the same
+        // way `auto` is and needs the same slack. Reading `is_auto()`
+        // here gave such a box 0px and re-wrapped its text inside a
+        // box sized for one line — the box unchanged, the glyphs on
+        // two.
+        //
+        // A box with no room was not rounded down to 0 from a width its
+        // text needs, so it gets no slack (#2382): a pixel of slack fitted
+        // two 2px-font glyphs a line in a box laid out with one each.
+        let tolerance = if cs.width.is_auto_or_keyword() && content_width > 0.0 {
+            1.0
+        } else {
+            0.0
+        };
+        content_width + tolerance
+    }
+
+    /// Shape `root_id`'s paint layout at `max_width` and store it — the
+    /// rebuild half of [`Self::build_ifc_layouts`], which decides *whether*.
+    fn shape_ifc_root_paint_layout(
+        &mut self,
+        root_id: RawNodeId,
+        max_width: f32,
+        paint_layout_cx: &mut parley::LayoutContext<Brush>,
+    ) {
+        self.tree.perf.bump(crate::perf::Counter::ShapeIfcBuild);
+        // A paragraph that does not wrap is aligned within the content box
+        // itself, without the auto-width slack `max_width` carries (#1237).
+        let align_width = Some(AlignWidth {
+            width: self.ifc_content_width(root_id),
+            up_to: max_width,
+        });
+        let (mut inline_layout, font_family_resolves) = Self::build_inline_layout(
+            &self.tree.nodes,
+            root_id,
+            Some(max_width),
+            align_width,
+            1.0,
+            &mut self.font_cx,
+            paint_layout_cx,
+            None,
+            self.tree.ifc_float_bands.get(&root_id),
+            // The floats were placed by the measure; their room is in the
+            // bands it recorded.
+            None,
+        );
+        self.tree.perf.add(
+            crate::perf::Counter::InlineFontFamilyResolves,
+            font_family_resolves,
+        );
+        inline_layout.hang.record(&self.tree.perf);
+
+        // text-overflow: ellipsis — every line whose content overflows the
+        // container is cut and ends in "…" (#1091), at paint time over these
+        // very lines (#1100). CSS Overflow 3 §3.2 asks
+        // the question per line box, after wrapping, and so does Chrome 153:
+        // an unbreakable word under `white-space: normal`, a `nowrap` span
+        // inside a wrapping root and each long line of `pre` text all
+        // overflow a line.
+        {
+            use crate::computed_style::{OverflowValue, TextOverflowValue};
+            let cs = &self.tree.nodes[Self::ellipsis_style_owner(&self.tree.nodes, root_id)]
+                .computed_style;
+            let container_width = max_width;
+            // A grid (or flex) container holding only text is laid out
+            // here as an IFC root, but that text is an anonymous item of
+            // the container, which does not clip — so no "…", as in
+            // Chrome (#904's second review). It is the only ellipsis
+            // site since #982 (`ellipsis_route_tests.rs`).
+            let text_overflow = matches!(cs.text_overflow, TextOverflowValue::Ellipsis)
+                && !cs.display.is_flex_or_grid_container()
+                // A `-webkit-box` that does not clamp lays its text out as
+                // Chrome's anonymous flex item, which does not clip (#1703).
+                && !(cs.webkit_box && cs.line_clamp.is_none())
+                && matches!(cs.overflow_x, OverflowValue::Hidden | OverflowValue::Clip)
+                && container_width.is_finite()
+                && container_width > 0.0
+                // Cheap: the widest line, which parley already knows.
+                && inline_layout.layout.width() > container_width;
+            // A `-webkit-line-clamp` ends its last kept line in "…" whatever
+            // `text-overflow` and `overflow` say (#1703).
+            let clamp_line = inline_layout
+                .clamped_line()
+                .and(inline_layout.line_clamp)
+                .map(|n| n - 1);
+            if text_overflow || clamp_line.is_some() {
+                if let Some(cut) = Self::ellipsis_cut(
+                    &self.tree.nodes,
+                    root_id,
+                    &inline_layout,
+                    container_width,
+                    text_overflow,
+                    clamp_line,
+                    &mut self.font_cx,
+                    paint_layout_cx,
+                ) {
+                    self.tree.perf.bump(crate::perf::Counter::EllipsisBuilds);
+                    // The "…", shaped once; the cut itself is found in the
+                    // lines already shaped.
+                    self.tree.perf.add(crate::perf::Counter::EllipsisShapes, 1);
+                    inline_layout.ellipsis = Some(Box::new(cut));
+                }
+            }
+        }
+
+        // The relative inline elements' offsets (#1425, #2346), against the
+        // containing block, before the boxes they move are written.
+        self.resolve_relative_spans(root_id, &mut inline_layout);
+
+        // Write positions from Parley layout back to child nodes
+        // Walk the layout lines to find positioned inline boxes and text runs
+        self.write_inline_positions(root_id, &inline_layout);
+
+        // The out-of-flow boxes whose static position these lines hold
+        // (#632). Each is placed again from them: it was read back before
+        // they existed.
+        let marked: Vec<RawNodeId> = inline_layout.out_of_flow.iter().map(|m| m.id).collect();
+
+        self.tree.nodes[root_id].text_layout = Some(Box::new(inline_layout));
+        self.tree.text_layout_epoch += 1;
+        let stamp = self.tree.text_layout_epoch;
+        self.tree.text_layout_stamps.insert(root_id, stamp);
+        // Each box is told where its note is, last to first: a box noted
+        // twice (hoisted out of an inline element in an anonymous box's run)
+        // keeps the first, its real place.
+        for (index, &id) in marked.iter().enumerate().rev() {
+            if let Some(node) = self.tree.nodes.get_mut(id) {
+                node.static_ifc_root = Some((root_id, index));
+            }
+        }
+        for id in marked {
+            crate::out_of_flow::place_static_after_lines(&mut self.tree, id);
+        }
+        // New glyphs are a paint change whether or not the root's box
+        // moved: a span that left the line (`display: none`) or changed
+        // its text reaches the screen only through this root. Paint-only:
+        // the layout that asked for this rebuild has already run.
+        self.tree.paint_dirty_nodes.push(root_id);
+        // New lines can move an outside list marker that sits on them.
+        self.tree.note_marker_move(root_id, true);
+    }
+
+    /// Shape one IFC root's paint layout as `build_ifc_layouts` would, **even
+    /// though it is outside the document**, which that function declines to
+    /// do (#1069). Test support only.
+    ///
+    /// `walk_inline_children`'s `_ => break` arm has no known connected route
+    /// (#615's argument): in a document, an in-flow block inside an inline
+    /// element splits it (#513), so the walk never meets the block. Its only witnesses lay a detached
+    /// subtree out, where the fold that splits the inline does not reach
+    /// (`ifc_classifier_tests`, #615). Once detached roots stopped being
+    /// shaped they needed this to reach the walk. The marking half they also
+    /// pin is still reached by the whole-document pass itself.
+    #[doc(hidden)]
+    pub fn shape_ifc_root_for_tests(&mut self, root: rinch_core::dom::NodeId) {
+        debug_assert!(
+            self.tree
+                .nodes
+                .get(root.0)
+                .is_some_and(|n| n.ifc_children().iter().any(|&c| self
+                    .tree
+                    .nodes
+                    .get(c)
+                    .is_some_and(|c| c.ifc_root == Some(root.0)))),
+            "shape_ifc_root_for_tests: node {} is not an IFC root (no child carries its mark)",
+            root.0
+        );
+        let max_width = self.ifc_paint_max_width(root.0);
+        let mut cx = std::mem::take(&mut self.layout_cx);
+        self.shape_ifc_root_paint_layout(root.0, max_width, &mut cx);
+        self.layout_cx = cx;
+    }
+
+    /// The node whose style decides an IFC root's `text-overflow: ellipsis`
+    /// (#1071): the root itself, unless it is an anonymous block box, when it
+    /// is the box's `parent` — its block container.
+    ///
+    /// An anonymous box carries only the inherited properties
+    /// ([`crate::computed_style::ComputedStyle::for_anonymous_box`]), and
+    /// `text-overflow` and `overflow` are not inherited — yet its lines are its
+    /// block container's lines, clipped by that container's `overflow`, and
+    /// Chrome 153 draws the container's "…" on them. The boxes of a `<span>`
+    /// split around a block child (#513) are minted with the span's block
+    /// container as their `parent` too, which is the box Chrome asks.
+    /// `white-space` is read there as well; the box inherits it, so the answer
+    /// is the same.
+    ///
+    /// The anonymous box holds none of what this reads, so a restyle of the
+    /// container must re-shape it: `invalidate_text_measure_for_node` drops
+    /// every box in the container's `run_boxes`
+    /// (`ellipsis_anonymous_box_tests.rs`).
+    fn ellipsis_style_owner(nodes: &crate::node_slab::NodeSlab, root_id: RawNodeId) -> RawNodeId {
+        let root = &nodes[root_id];
+        match root.parent {
+            Some(parent) if root.is_anonymous_block_box => parent,
+            _ => root_id,
         }
     }
 
@@ -353,25 +6124,47 @@ impl RinchDocument {
     ///
     /// Uses the exact layouts built during Taffy measurement to ensure
     /// paint uses identical text shaping results.
-    /// Also handles text-overflow: ellipsis by truncating text and appending "…"
-    /// when the parent has overflow: hidden + white-space: nowrap + text-overflow: ellipsis.
+    ///
+    /// No `text-overflow: ellipsis` is built here. A text leaf is the text of
+    /// a flex or grid container (behind any `display: contents` wrappers),
+    /// which is an anonymous item that does not clip — Chrome 153 draws no
+    /// "…" there (#904) — and a box that does clip its text with an ellipsis
+    /// is an IFC root, whose "…" is built in `build_ifc_layouts`
+    /// (`ellipsis_route_tests.rs`). This site had its own rebuild until #982.
     pub(crate) fn copy_cached_text_layouts(
         &mut self,
-        cache: HashMap<(usize, u32), parley::layout::Layout<Brush>>,
+        cache: HashMap<(RawNodeId, u32), parley::layout::Layout<Brush>>,
     ) {
-        use crate::computed_style::{OverflowValue, TextOverflowValue, WhiteSpaceValue};
-
-        // First collect node IDs and their layouts to apply
-        let updates: Vec<(usize, parley::layout::Layout<Brush>)> = self
-            .tree
-            .nodes
-            .iter()
+        // First collect node IDs and their layouts to apply. Only a node the
+        // compute measured can have an entry, so walk the cache's nodes rather
+        // than the slab (layout audit F12): a node absent from the cache was
+        // skipped by every arm below anyway. Ascending, as the slab walk was.
+        let mut measured: Vec<RawNodeId> = cache.keys().map(|&(id, _)| id).collect();
+        measured.sort_unstable();
+        measured.dedup();
+        let updates: Vec<(RawNodeId, parley::layout::Layout<Brush>)> = measured
+            .into_iter()
+            .filter_map(|id| self.tree.nodes.get(id).map(|node| (id, node)))
             .filter_map(|(id, node)| {
                 if node.ifc_root.is_some() {
                     return None;
                 } // Skip IFC-managed nodes
                 if !matches!(&node.kind, NodeKind::Text(_)) {
                     return None;
+                }
+
+                // The final width the measure was called with is the box's
+                // **unrounded** width: Taffy rounds `layout` to whole pixels,
+                // and a 45.34px min-content grid column rounded to 45 missed its
+                // own layout and fell through to the unwrapped max-content one
+                // below — one line painted across a box laid out for seven
+                // (#904's review, found on an `inline-grid`).
+                let unrounded = node
+                    .taffy_id
+                    .and_then(|t| self.tree.taffy.unrounded_layout(t).size.width.into())
+                    .filter(|w: &f32| *w > 0.0);
+                if let Some(layout) = unrounded.and_then(|w| cache.get(&(id, w.to_bits()))) {
+                    return Some((id, layout.clone()));
                 }
 
                 let width = node.layout.width;
@@ -405,212 +6198,176 @@ impl RinchDocument {
             })
             .collect();
 
-        // Collect ellipsis rebuild requests: (node_id, text_content, available_width)
-        let mut ellipsis_rebuilds: Vec<(usize, String, f32)> = Vec::new();
-
         // Apply the updates with alignment
         for (id, mut layout) in updates {
             // Get text-align from parent's computed style
-            let parent_id = self.tree.nodes[id].parent;
-            let alignment = parent_id
-                .and_then(|p| self.tree.nodes.get(p))
+            let alignment = self.tree.nodes[id]
+                .parent
+                .and_then(|p| self.tree.nodes.get_live(p))
                 .map(|p| p.computed_style.text_align.to_parley())
                 .unwrap_or(parley::layout::Alignment::Start);
-
-            // Check if text-overflow: ellipsis applies
-            let needs_ellipsis =
-                parent_id
-                    .and_then(|p| self.tree.nodes.get(p))
-                    .is_some_and(|parent| {
-                        matches!(
-                            parent.computed_style.text_overflow,
-                            TextOverflowValue::Ellipsis
-                        ) && matches!(
-                            parent.computed_style.white_space,
-                            WhiteSpaceValue::NoWrap | WhiteSpaceValue::Pre
-                        ) && matches!(
-                            parent.computed_style.overflow_x,
-                            OverflowValue::Hidden | OverflowValue::Clip
-                        )
-                    });
-
-            if needs_ellipsis {
-                let parent_width = parent_id
-                    .and_then(|p| self.tree.nodes.get(p))
-                    .map(|p| p.layout.width)
-                    .unwrap_or(f32::INFINITY);
-
-                // Check if text overflows its parent
-                if layout.width() > parent_width && parent_width > 0.0 {
-                    if let NodeKind::Text(text_data) = &self.tree.nodes[id].kind {
-                        ellipsis_rebuilds.push((id, text_data.content.clone(), parent_width));
-                        continue; // Skip normal caching; will be rebuilt below
-                    }
-                }
-            }
-
-            // Apply alignment before caching
-            layout.align(alignment, parley::layout::AlignmentOptions::default());
-
-            self.tree.nodes[id].cached_text_parley = Some(Box::new(layout));
-        }
-
-        // Rebuild layouts for text nodes that need ellipsis truncation
-        for (id, content, available_width) in ellipsis_rebuilds {
-            let parent_id = self.tree.nodes[id].parent;
-            let parent = parent_id.and_then(|p| self.tree.nodes.get(p));
-            let font_size = parent.map(|p| p.computed_style.font_size).unwrap_or(16.0);
-            let font_weight = parent
-                .map(|p| p.computed_style.font_weight)
-                .unwrap_or(400.0);
-            let font_family = parent
-                .map(|p| {
-                    if p.computed_style.font_family.is_empty() {
-                        "sans-serif".to_string()
-                    } else {
-                        p.computed_style.font_family.clone()
-                    }
-                })
-                .unwrap_or_else(|| "sans-serif".to_string());
-            let color = parent
-                .and_then(|p| p.computed_style.color)
-                .unwrap_or_else(|| {
-                    peniko::color::AlphaColor::<peniko::color::Srgb>::from_rgba8(0, 0, 0, 255)
-                });
-            let line_height = parent.and_then(|p| p.computed_style.line_height.to_parley());
-            let (letter_spacing, word_spacing) = parent
-                .map(|p| {
-                    (
-                        p.computed_style.letter_spacing,
-                        p.computed_style.word_spacing,
-                    )
-                })
-                .unwrap_or((0.0, 0.0));
-            let alignment = parent
-                .map(|p| p.computed_style.text_align.to_parley())
-                .unwrap_or(parley::layout::Alignment::Start);
-
-            // Measure the ellipsis "…" width first
-            let ellipsis = "…";
-            let ellipsis_width = {
-                let mut builder =
-                    self.layout_cx
-                        .ranged_builder(&mut self.font_cx, ellipsis, 1.0, true);
-                builder.push_default(parley::style::StyleProperty::FontSize(font_size));
-                if (font_weight - 400.0).abs() > 1.0 {
-                    builder.push_default(parley::style::StyleProperty::FontWeight(
-                        parley::style::FontWeight::new(font_weight),
-                    ));
-                }
-                builder.push_default(parley::style::StyleProperty::FontFamily(
-                    parley::style::FontFamily::Source(std::borrow::Cow::Owned(font_family.clone())),
-                ));
-                push_spacing(&mut builder, letter_spacing, word_spacing);
-                let mut layout = builder.build(ellipsis);
-                layout.break_all_lines(None);
-                layout.width()
-            };
-
-            let target_width = available_width - ellipsis_width;
-            if target_width <= 0.0 {
-                // Not even room for the ellipsis — just show ellipsis
-                let mut builder =
-                    self.layout_cx
-                        .ranged_builder(&mut self.font_cx, ellipsis, 1.0, true);
-                builder.push_default(parley::style::StyleProperty::FontSize(font_size));
-                builder.push_default(parley::style::StyleProperty::Brush(Brush::Solid(color)));
-                builder.push_default(parley::style::StyleProperty::FontFamily(
-                    parley::style::FontFamily::Source(std::borrow::Cow::Owned(font_family)),
-                ));
-                if (font_weight - 400.0).abs() > 1.0 {
-                    builder.push_default(parley::style::StyleProperty::FontWeight(
-                        parley::style::FontWeight::new(font_weight),
-                    ));
-                }
-                if let Some(lh) = line_height {
-                    builder.push_default(parley::style::StyleProperty::LineHeight(lh));
-                }
-                push_spacing(&mut builder, letter_spacing, word_spacing);
-                let mut layout = builder.build(ellipsis);
-                layout.break_all_lines(None);
-                layout.align(alignment, parley::layout::AlignmentOptions::default());
-                self.tree.nodes[id].cached_text_parley = Some(Box::new(layout));
-                continue;
-            }
-
-            // Binary search for the longest prefix that fits within target_width
-            let chars: Vec<char> = content.chars().collect();
-            let mut lo: usize = 0;
-            let mut hi: usize = chars.len();
-            let mut best_len = 0;
-
-            while lo <= hi {
-                let mid = (lo + hi) / 2;
-                if mid == 0 {
-                    lo = 1;
-                    continue;
-                }
-                let prefix: String = chars[..mid].iter().collect();
-                let mut builder =
-                    self.layout_cx
-                        .ranged_builder(&mut self.font_cx, &prefix, 1.0, true);
-                builder.push_default(parley::style::StyleProperty::FontSize(font_size));
-                if (font_weight - 400.0).abs() > 1.0 {
-                    builder.push_default(parley::style::StyleProperty::FontWeight(
-                        parley::style::FontWeight::new(font_weight),
-                    ));
-                }
-                builder.push_default(parley::style::StyleProperty::FontFamily(
-                    parley::style::FontFamily::Source(std::borrow::Cow::Owned(font_family.clone())),
-                ));
-                push_spacing(&mut builder, letter_spacing, word_spacing);
-                let mut layout = builder.build(&prefix);
-                layout.break_all_lines(None);
-
-                if layout.width() <= target_width {
-                    best_len = mid;
-                    lo = mid + 1;
-                } else {
-                    if mid == 0 {
-                        break;
-                    }
-                    hi = mid - 1;
-                }
-            }
-
-            // Build final layout with truncated text + ellipsis
-            let truncated: String = chars[..best_len]
-                .iter()
-                .collect::<String>()
-                .trim_end()
-                .to_string()
-                + ellipsis;
-            let mut builder =
-                self.layout_cx
-                    .ranged_builder(&mut self.font_cx, &truncated, 1.0, true);
-            builder.push_default(parley::style::StyleProperty::FontSize(font_size));
-            builder.push_default(parley::style::StyleProperty::Brush(Brush::Solid(color)));
-            builder.push_default(parley::style::StyleProperty::FontFamily(
-                parley::style::FontFamily::Source(std::borrow::Cow::Owned(font_family)),
-            ));
-            if (font_weight - 400.0).abs() > 1.0 {
-                builder.push_default(parley::style::StyleProperty::FontWeight(
-                    parley::style::FontWeight::new(font_weight),
-                ));
-            }
-            if let Some(lh) = line_height {
-                builder.push_default(parley::style::StyleProperty::LineHeight(lh));
-            }
-            push_spacing(&mut builder, letter_spacing, word_spacing);
-            let mut layout = builder.build(&truncated);
-            layout.break_all_lines(None);
             layout.align(alignment, parley::layout::AlignmentOptions::default());
             self.tree.nodes[id].cached_text_parley = Some(Box::new(layout));
+            self.tree.text_layout_epoch += 1;
+            let stamp = self.tree.text_layout_epoch;
+            self.tree.text_layout_stamps.insert(id, stamp);
         }
     }
 
+    /// Resolve each relative inline element's offset (#1425, #2346; CSS 2.1
+    /// §9.4.3) against its containing block, and set the spans that move
+    /// nothing aside (`InlineLayout::relative_spans_resting`), so an IFC whose
+    /// relative spans are only containing blocks (a tooltip's anchor) pays
+    /// nothing at paint. Run when the lines are built and again, over the
+    /// spans kept and set aside alike, whenever kept lines may owe a new
+    /// offset ([`Self::refresh_relative_spans`]); the out-of-flow marks are
+    /// moved by the difference, so a second resolve does not add twice.
+    ///
+    /// The containing block is the block container holding the line: the
+    /// root, or the element an anonymous block box stands in. A percentage
+    /// `left`/`right` is of its content width; a percentage `top`/`bottom` of
+    /// its content height when that is definite (as layout took it,
+    /// [`note_containing_block_height`]), and otherwise
+    /// computes to `auto` (CSS 2.1 §9.3.2) — measured in Chrome 156. Of an
+    /// over-constrained pair, `top` wins, and `left` in a left-to-right
+    /// containing block (`right` in a right-to-left one).
+    pub(crate) fn resolve_relative_spans(&self, root_id: RawNodeId, inline: &mut InlineLayout) {
+        if inline.relative_spans.is_empty() && inline.relative_spans_resting.is_empty() {
+            return;
+        }
+        let nodes = &self.tree.nodes;
+        let root = &nodes[root_id];
+        let cb = root
+            .parent
+            .filter(|_| root.is_anonymous_block_box)
+            .and_then(|p| nodes.get_live(p))
+            .unwrap_or(root);
+        let cs = &cb.computed_style;
+        let width = cb.layout.width
+            - cs.padding_left.to_px()
+            - cs.padding_right.to_px()
+            - cs.border_left_width.to_px()
+            - cs.border_right_width.to_px();
+        let height = root.containing_block_height_definite.get().then(|| {
+            cb.layout.height
+                - cs.padding_top.to_px()
+                - cs.padding_bottom.to_px()
+                - cs.border_top_width.to_px()
+                - cs.border_bottom_width.to_px()
+        });
+        let ltr = element_is_ltr(cb);
+        // Where each out-of-flow box's static position was moved to by the
+        // offsets resolved so far, to move it by the change alone.
+        // The marks and spans are kept with the root's lines across layouts,
+        // so their ids are looked up checked (#2748).
+        let mark_offset = |inline: &InlineLayout, mark: &crate::node::OutOfFlowMark| {
+            nodes
+                .get(mark.id)
+                .and_then(|n| n.parent)
+                .map_or((0.0, 0.0), |parent| {
+                    inline.element_relative_offset(parent, |id| nodes.get(id))
+                })
+        };
+        let before: Vec<(f32, f32)> = if inline.relative_spans.is_empty() {
+            Vec::new()
+        } else {
+            inline
+                .out_of_flow
+                .iter()
+                .map(|m| mark_offset(inline, m))
+                .collect()
+        };
+        let mut spans = std::mem::take(&mut inline.relative_spans);
+        spans.append(&mut inline.relative_spans_resting);
+        spans.retain_mut(|span| {
+            let Some(owner) = nodes.get(span.owner) else {
+                return false;
+            };
+            // A static stacking-context span (#2869) is kept for its range
+            // and moves nothing: its insets do not apply.
+            (span.dx, span.dy) = if owner.computed_style.position
+                == crate::computed_style::PositionValue::Relative
+            {
+                relative_inset_offset(&owner.computed_style, width, height, ltr)
+            } else {
+                (0.0, 0.0)
+            };
+            true
+        });
+        // In the order they were met, which nothing reads but a comparison.
+        spans.sort_by_key(|s| (s.start, s.end, s.owner));
+        let (moving, resting): (Vec<_>, Vec<_>) =
+            spans.into_iter().partition(|s| s.dx != 0.0 || s.dy != 0.0);
+        inline.relative_spans = moving;
+        inline.relative_spans_resting = resting;
+        if before.is_empty() && inline.relative_spans.is_empty() {
+            return;
+        }
+        // An out-of-flow box's static position is where it would be in the
+        // line, which the relative inline elements around it move too:
+        // Chrome 156 puts an `auto`-inset box in a `left: 5px; top: 3px` span
+        // 5px right of and 3px below where it stands without the offset.
+        let mut marks = std::mem::take(&mut inline.out_of_flow);
+        for (i, mark) in marks.iter_mut().enumerate() {
+            let (bx, by) = before.get(i).copied().unwrap_or((0.0, 0.0));
+            let (ax, ay) = mark_offset(inline, mark);
+            let (dx, dy) = (ax - bx, ay - by);
+            mark.inline = (mark.inline.0 + dx, mark.inline.1 + dy);
+            mark.block_x += dx;
+            mark.block_y += dy;
+        }
+        inline.out_of_flow = marks;
+    }
+
+    /// Resolve the relative inline offsets of `root_id`'s **kept** lines
+    /// again (#2457, #2412), and when one moved, move what follows it: the
+    /// atomic inlines (`write_inline_positions`), the out-of-flow boxes whose
+    /// static position the lines hold, the fragments a box hung from a span
+    /// is placed against, and the root's paint. Its lines are not rebuilt:
+    /// an offset sizes nothing and breaks no line. Asked by
+    /// [`Self::build_ifc_layouts`] of every root it keeps that has a
+    /// relative span: the containing block's size or definiteness may have
+    /// changed since the offsets were resolved, or an inset of a span
+    /// (the cascade keeps the lines for that, `same_relative_offset_inputs`).
+    /// Answers whether anything moved.
+    pub(crate) fn refresh_relative_spans(&mut self, root_id: RawNodeId) -> bool {
+        let Some(mut inline) = self.tree.nodes[root_id].text_layout.take() else {
+            return false;
+        };
+        let before = inline.relative_spans.clone();
+        self.resolve_relative_spans(root_id, &mut inline);
+        if inline.relative_spans == before {
+            self.tree.nodes[root_id].text_layout = Some(inline);
+            return false;
+        }
+        self.tree
+            .perf
+            .bump(crate::perf::Counter::RelativeSpanRefreshes);
+        self.write_inline_positions(root_id, &inline);
+        // Measured again from the moved lines when a box asks.
+        inline.span_fragments.clear();
+        let marked: Vec<RawNodeId> = inline.out_of_flow.iter().map(|m| m.id).collect();
+        self.tree.nodes[root_id].text_layout = Some(inline);
+        // The lines are drawn elsewhere: whoever measured them by stamp
+        // (the editor's margin pass) looks again.
+        self.tree.text_layout_epoch += 1;
+        let stamp = self.tree.text_layout_epoch;
+        self.tree.text_layout_stamps.insert(root_id, stamp);
+        for id in marked {
+            crate::out_of_flow::place_static_after_lines(&mut self.tree, id);
+        }
+        // Text, backgrounds and decorations read the spans at paint, and the
+        // ink past the lines moves with them.
+        self.tree.paint_dirty_nodes.push(root_id);
+        true
+    }
+
     /// Write computed positions from an InlineLayout back into child node layout fields.
-    pub(crate) fn write_inline_positions(&mut self, root_id: usize, inline_layout: &InlineLayout) {
+    pub(crate) fn write_inline_positions(
+        &mut self,
+        root_id: RawNodeId,
+        inline_layout: &InlineLayout,
+    ) {
         let root_layout = self.tree.nodes[root_id].layout;
 
         // Walk Parley layout lines to find positioned items
@@ -621,10 +6378,46 @@ impl RinchDocument {
                         // Text runs don't map to individual child nodes
                     }
                     parley::layout::PositionedLayoutItem::InlineBox(positioned_box) => {
-                        let child_id = positioned_box.id as usize;
-                        if let Some(child) = self.tree.nodes.get_mut(child_id) {
-                            child.layout.x = positioned_box.x;
-                            child.layout.y = positioned_box.y;
+                        if is_edge_box(positioned_box.id) {
+                            continue;
+                        }
+                        let child_id = positioned_box.id as RawNodeId;
+                        // Moved by every relatively positioned inline element
+                        // around it (#2346): its line placed it where it would
+                        // be without them.
+                        let (dx, dy) = (!inline_layout.relative_spans.is_empty())
+                            .then_some(child_id)
+                            .and_then(|c| self.tree.nodes.get_live(c)?.parent)
+                            .map_or((0.0, 0.0), |p| {
+                                inline_layout
+                                    .element_relative_offset(p, |id| self.tree.nodes.get(id))
+                            });
+                        if let Some(child) = self.tree.nodes.get_live_mut(child_id) {
+                            // The inline box is its margin box on the block
+                            // axis ([`atomic_vertical_margins`]).
+                            let x = positioned_box.x + dx;
+                            let y = positioned_box.y
+                                + atomic_vertical_margins(&child.computed_style).0
+                                + dy;
+                            // A move is a move, whoever makes it: push the box
+                            // paint-dirty like any other layout change, so the
+                            // region clears where it was painted and draws where
+                            // it went — its own box *and* anything it carries
+                            // outside the IFC root's box (an absolute child),
+                            // which the root's own rect does not reach. Its
+                            // `prev_layout` stays the painted box until a paint
+                            // consumes it. Review of #880, probe N: unpushed, the
+                            // chip's absolute kid was neither drawn at its new
+                            // spot nor cleared from its old one.
+                            let moved = child.layout.x != x || child.layout.y != y;
+                            child.layout.x = x;
+                            child.layout.y = y;
+                            if moved {
+                                self.tree.paint_dirty_nodes.push(child_id);
+                                // An absolute box placed past this one is
+                                // owed a second look (`out_of_flow`).
+                                self.tree.abs_late_moves = true;
+                            }
                         }
                     }
                 }
@@ -633,15 +6426,18 @@ impl RinchDocument {
 
         // For text nodes that are direct children, set their layout to reflect
         // the actual IFC content extent (not the constrained container height).
-        // This is critical for scroll containers: compute_content_height uses
-        // children's layout bounds to determine if content overflows.
+        // A scroll container's range no longer reads these boxes:
+        // `paint::scrollbar::content_extents` measures an IFC root's inline
+        // layout itself (#396), because a text node under a `display: contents`
+        // wrapper or an inline span gets no box here at all, and a skipped
+        // root never rewrites this one (#873).
         let ifc_content_height = inline_layout.layout.height();
-        let children: Vec<usize> = self.tree.nodes[root_id].children.clone();
+        let children: Vec<RawNodeId> = self.tree.nodes[root_id].children.clone();
         for child_id in children {
-            if let Some(child) = self.tree.nodes.get(child_id)
+            if let Some(child) = self.tree.nodes.get_live(child_id)
                 && child.is_text()
                 && child.ifc_root == Some(root_id)
-                && let Some(child) = self.tree.nodes.get_mut(child_id)
+                && let Some(child) = self.tree.nodes.get_live_mut(child_id)
             {
                 child.layout.x = 0.0;
                 child.layout.y = 0.0;
@@ -663,41 +6459,118 @@ impl RinchDocument {
     ///
     /// It is now the same shape as [`Self::cleanup_ifc_measure_leaves`]: forget
     /// the Taffy node, forget the slab entry, and rebuild whatever list held it.
-    fn cleanup_anonymous_block_boxes(&mut self) {
-        let anon_ids = std::mem::take(&mut self.tree.anonymous_block_boxes);
+    ///
+    /// With a `scope` (a scoped pass, `crate::ifc_scope`), only the boxes the
+    /// scope's containers hold are removed — plus any **orphan**: a box whose
+    /// container has left the slab or no longer lists it, which a freed subtree
+    /// (`set_inner_html`) leaves behind and which no container in any scope
+    /// would ever reach again.
+    ///
+    /// **A box whose container still lists it is retired, not freed** (#964):
+    /// it keeps its slab entry, its paint layout and its measured sizes (with
+    /// the content signature), and is handed back in [`RetiredAnonBoxes`] for
+    /// `create_anonymous_block_boxes` to mint the same run's box into. A
+    /// whole-document pass re-mints every box in the document whatever changed
+    /// (a theme change), and a scoped pass every box of its containers; freeing
+    /// them re-shaped each box's text, because both the paint layout and the
+    /// cached measures (with the content signature `refresh_ifc_signatures`
+    /// compares) went with the box. An orphan is freed as before.
+    fn cleanup_anonymous_block_boxes(
+        &mut self,
+        scope: Option<&crate::ifc_scope::IfcScope>,
+    ) -> RetiredAnonBoxes {
+        let all = std::mem::take(&mut self.tree.anonymous_block_boxes);
+        let anon_ids = match scope {
+            None => all,
+            Some(scope) => {
+                let nodes = &self.tree.nodes;
+                let (go, keep): (Vec<RawNodeId>, Vec<RawNodeId>) =
+                    all.into_iter().partition(|&b| {
+                        let Some(anon) = nodes.get(b) else {
+                            return true;
+                        };
+                        let Some(p) = anon.parent else { return true };
+                        scope.rootable.contains(&p)
+                            || nodes
+                                .get_live(p)
+                                .is_none_or(|pn| !pn.run_boxes.contains(&b))
+                    });
+                self.tree.anonymous_block_boxes = keep;
+                go
+            }
+        };
+        let mut retired = RetiredAnonBoxes::default();
         if anon_ids.is_empty() {
-            return;
+            return retired;
         }
 
         // The containers whose Taffy child lists held these boxes — read from
         // the box's own `parent`, which it keeps (see
         // `create_anonymous_block_boxes`).
-        let mut parents_affected: Vec<usize> = Vec::new();
+        let mut parents_affected: Vec<RawNodeId> = Vec::new();
         for &anon_id in &anon_ids {
             let Some(anon) = self.tree.nodes.get(anon_id) else {
                 continue;
             };
             let members = anon.run_members.clone();
-            if let Some(p) = anon.parent
+            // Listed by a live container: retired for the run's next box.
+            let listed_by = anon.parent.filter(|&p| {
+                self.tree
+                    .nodes
+                    .get(p)
+                    .is_some_and(|pn| pn.run_boxes.contains(&anon_id))
+            });
+            if let Some(p) = listed_by
                 && !parents_affected.contains(&p)
             {
                 parents_affected.push(p);
             }
             for m in members {
-                if let Some(member) = self.tree.nodes.get_mut(m) {
+                // Only a member that still names this box: a freed member's
+                // slab id can have been handed to an unrelated node since.
+                if let Some(member) = self.tree.nodes.get_mut(m)
+                    && member.run_box == Some(anon_id)
+                {
                     member.run_box = None;
                     member.ifc_root = None;
                 }
             }
 
             // Remove anonymous Taffy node (children are detached, not deleted)
-            if let Some(anon_taffy) = self.tree.nodes[anon_id].taffy_id {
+            if let Some(anon_taffy) = self.tree.nodes[anon_id].taffy_id.take() {
                 self.tree.taffy_map.remove(&anon_taffy);
                 let _ = self.tree.taffy.remove(anon_taffy);
             }
 
+            if let Some(parent) = listed_by {
+                // Retired: the entry stays, inert — no parent, no run, no Taffy
+                // node — so its id is not handed to anything else before
+                // `create_anonymous_block_boxes` decides whether the run is
+                // still there. Its measured sizes stay in the cache under the
+                // same id.
+                let node = &mut self.tree.nodes[anon_id];
+                node.parent = None;
+                node.run_out_of_flow.clear();
+                retired.push(RetiredAnonBox {
+                    id: anon_id,
+                    parent,
+                    run_members: std::mem::take(&mut node.run_members),
+                });
+                continue;
+            }
+
             // Remove anonymous DOM node from slab
             self.tree.nodes.remove(anon_id);
+            // And its measured sizes, for `remove_subtree`'s reason: the slab
+            // recycles the id, and the box minted next — very often for the
+            // same run, so with the same content signature — would otherwise
+            // be answered sizes measured under the old box's inherited style.
+            // (A box keeps its container's typography, and a restyle of the
+            // container after a move reaches no root the members name: the
+            // move cleared their marks. Found by the scoped pass's random
+            // differential; the whole-document pass hid it by re-minting every
+            // box in a different id order.)
+            self.tree.ifc_measure_cache.remove(&anon_id);
         }
 
         // Rebuild each affected parent's Taffy children through the one
@@ -709,10 +6582,22 @@ impl RinchDocument {
             // point invariant C at freed indices — and send
             // `box_tree_children` down the substituting path for a container
             // with nothing to substitute.
-            if let Some(p) = self.tree.nodes.get_mut(parent_id) {
+            if let Some(p) = self.tree.nodes.get_live_mut(parent_id) {
                 p.run_boxes.clear();
             }
             self.rebuild_effective_taffy_children(parent_id);
+        }
+        retired
+    }
+
+    /// Free the retired boxes `create_anonymous_block_boxes` did not mint a run
+    /// into: their run is gone, or has changed.
+    fn free_retired_anonymous_boxes(&mut self, retired: RetiredAnonBoxes) {
+        for id in retired.into_ids() {
+            self.tree.nodes.remove(id);
+            // `remove_subtree`'s reason, as for a freed box above: the slab
+            // recycles the id.
+            self.tree.ifc_measure_cache.remove(&id);
         }
     }
 
@@ -722,7 +6607,7 @@ impl RinchDocument {
     ///
     /// See [`Self::collect_effective_taffy_children`] (the order) and
     /// [`Self::taffy_child_list_owners`] (whose list, and why bottom-up).
-    fn rebuild_effective_taffy_children(&mut self, node_id: usize) {
+    fn rebuild_effective_taffy_children(&mut self, node_id: RawNodeId) {
         for owner in Self::taffy_child_list_owners(&self.tree.nodes, node_id) {
             let Some(owner_taffy) = self.tree.nodes.get(owner).and_then(|n| n.taffy_id) else {
                 continue;
@@ -741,8 +6626,28 @@ impl RinchDocument {
     /// this runs first and unconditionally. `taffy.remove` detaches the leaf
     /// from its parent whether or not it is still attached (an interim
     /// `sync_display_contents` rebuild may already have dropped it).
-    fn cleanup_ifc_measure_leaves(&mut self) {
-        let leaves = std::mem::take(&mut self.tree.ifc_measure_leaves);
+    ///
+    /// With a `scope`, only the leaves of roots in it — and of roots that have
+    /// left the slab — are removed.
+    fn cleanup_ifc_measure_leaves(&mut self, scope: Option<&crate::ifc_scope::IfcScope>) {
+        let leaves: Vec<(RawNodeId, taffy::NodeId)> = match scope {
+            None => std::mem::take(&mut self.tree.ifc_measure_leaves)
+                .into_iter()
+                .collect(),
+            Some(scope) => {
+                let nodes = &self.tree.nodes;
+                let go: Vec<RawNodeId> = self
+                    .tree
+                    .ifc_measure_leaves
+                    .keys()
+                    .copied()
+                    .filter(|r| scope.rootable.contains(r) || !nodes.contains(*r))
+                    .collect();
+                go.into_iter()
+                    .filter_map(|r| self.tree.ifc_measure_leaves.remove(&r).map(|l| (r, l)))
+                    .collect()
+            }
+        };
         for (root_id, leaf) in leaves {
             let _ = self.tree.taffy.remove(leaf);
             // `remove` does not dirty the old parent. The mutation that made
@@ -766,7 +6671,7 @@ impl RinchDocument {
     /// re-measure must call this beside it. (Marking the leaf also dirties the
     /// root — propagation is upward — but the sites keep their own root mark:
     /// most roots have no leaf.)
-    pub(crate) fn mark_ifc_measure_dirty(&mut self, root_id: usize) {
+    pub(crate) fn mark_ifc_measure_dirty(&mut self, root_id: RawNodeId) {
         if let Some(&leaf) = self.tree.ifc_measure_leaves.get(&root_id) {
             let _ = self.tree.taffy.mark_dirty(leaf);
         }
@@ -823,9 +6728,9 @@ impl RinchDocument {
     /// member is still a unit of it. Change what a unit is and all three move
     /// together — the third exists to say so out loud if they ever do not.
     pub(crate) fn collect_run_units(
-        nodes: &slab::Slab<Node>,
-        node_id: usize,
-        out: &mut Vec<usize>,
+        nodes: &crate::node_slab::NodeSlab,
+        node_id: RawNodeId,
+        out: &mut Vec<RawNodeId>,
     ) {
         Self::collect_run_units_for(nodes, node_id, node_id, out);
     }
@@ -836,16 +6741,16 @@ impl RinchDocument {
     /// of, because a hoisted out-of-flow box (#591) is a unit of exactly one
     /// owner and is recognised by comparing `hoisted_out_of_flow_to` with it.
     fn collect_run_units_for(
-        nodes: &slab::Slab<Node>,
-        node_id: usize,
-        owner: usize,
-        out: &mut Vec<usize>,
+        nodes: &crate::node_slab::NodeSlab,
+        node_id: RawNodeId,
+        owner: RawNodeId,
+        out: &mut Vec<RawNodeId>,
     ) {
         let Some(node) = nodes.get(node_id) else {
             return;
         };
         for &child_id in &node.children {
-            let Some(child) = nodes.get(child_id) else {
+            let Some(child) = nodes.get_live(child_id) else {
                 continue;
             };
             // A hoisted out-of-flow box is a unit of its **host** and of nothing
@@ -900,16 +6805,16 @@ impl RinchDocument {
     /// nested non-atomic inlines and `display: contents` wrappers, and only
     /// where `hosts_hoisted_out_of_flow` says there is something to find.
     fn collect_hoisted_out_of_flow(
-        nodes: &slab::Slab<Node>,
-        inline_id: usize,
-        owner: usize,
-        out: &mut Vec<usize>,
+        nodes: &crate::node_slab::NodeSlab,
+        inline_id: RawNodeId,
+        owner: RawNodeId,
+        out: &mut Vec<RawNodeId>,
     ) {
         let Some(node) = nodes.get(inline_id) else {
             return;
         };
         for &child_id in &node.children {
-            let Some(child) = nodes.get(child_id) else {
+            let Some(child) = nodes.get_live(child_id) else {
                 continue;
             };
             if child.hoisted_out_of_flow_to == Some(owner) {
@@ -928,13 +6833,30 @@ impl RinchDocument {
     /// Per CSS spec, when a block container has both inline-level and block-level
     /// children, consecutive runs of inline children are wrapped in anonymous
     /// block boxes. These boxes become IFC roots for text layout.
-    fn create_anonymous_block_boxes(&mut self) {
+    fn create_anonymous_block_boxes(
+        &mut self,
+        scope: Option<&crate::ifc_scope::IfcScope>,
+        mut retired: RetiredAnonBoxes,
+    ) {
         // Phase 1: Detect mixed-content block containers
-        let mut containers: Vec<(usize, Vec<Vec<usize>>)> = Vec::new();
+        // Each run with the out-of-flow boxes standing inside it
+        // (`Node::run_out_of_flow`).
+        type Run = (Vec<RawNodeId>, Vec<(usize, RawNodeId)>);
+        let mut containers: Vec<(RawNodeId, Vec<Run>)> = Vec::new();
         // Reused across containers so the per-node walk allocates once.
-        let mut effective: Vec<usize> = Vec::new();
+        let mut effective: Vec<RawNodeId> = Vec::new();
 
-        for (id, node) in &self.tree.nodes {
+        // A scoped pass looks only at its own containers: a box is minted for
+        // a block container's run, and every block container that could need
+        // one differently from last pass is a container of the scope.
+        let candidates: Vec<RawNodeId> = match scope {
+            None => self.tree.nodes.iter().map(|(id, _)| id).collect(),
+            Some(scope) => scope.containers.clone(),
+        };
+        for id in candidates {
+            let Some(node) = self.tree.nodes.get(id) else {
+                continue;
+            };
             if !node.is_element() || node.is_anonymous_block_box {
                 continue;
             }
@@ -960,7 +6882,7 @@ impl RinchDocument {
             effective.clear();
             Self::collect_run_units(&self.tree.nodes, id, &mut effective);
 
-            let role_of = |c: usize| {
+            let role_of = |c: RawNodeId| {
                 self.tree
                     .nodes
                     .get(c)
@@ -1008,13 +6930,25 @@ impl RinchDocument {
                 .iter()
                 .any(|&c| role_of(c) == InlineFlowRole::InFlowBlock);
 
-            if !(has_inline && has_block) {
+            // A **grid container** wraps every run of its text in an anonymous
+            // grid item, block children or none (CSS Grid 1 §6.1: "each child
+            // text sequence is wrapped in an anonymous block container grid
+            // item"). Its inline-level children are blockified items already,
+            // so the runs here are text and the boxless wrappers around it.
+            // Without this, a grid holding only text was an IFC root itself
+            // and broke the text at its own width, not its track's (#2411).
+            // A run of nothing but white space is minted too, and hidden below
+            // (#2443). A table is a grid in rinch (`display_from_stylo`) and is
+            // left to `table_layout`, which hides its own blank runs.
+            let grid = is_grid_container(node);
+            if !(has_inline && (has_block || grid)) {
                 continue;
             }
 
             // Group consecutive inline children into runs
-            let mut runs: Vec<Vec<usize>> = Vec::new();
-            let mut current_run: Vec<usize> = Vec::new();
+            let mut runs: Vec<Run> = Vec::new();
+            let mut current_run: Vec<RawNodeId> = Vec::new();
+            let mut current_out_of_flow: Vec<(usize, RawNodeId)> = Vec::new();
 
             for &child_id in &effective {
                 match role_of(child_id) {
@@ -1025,7 +6959,24 @@ impl RinchDocument {
                     // cannot prevent when a real block sibling is present. A
                     // `display: none` child is boxless too (#366) and used to
                     // end the run the same wrong way.
-                    InlineFlowRole::Comment | InlineFlowRole::NoBox | InlineFlowRole::OutOfFlow => {
+                    //
+                    // Where it stood in the run is kept, for its static
+                    // position (#632) — before the run's first member too:
+                    // Taffy's sibling order puts such a box at the top of
+                    // the run's box, but an inline-level one starts the
+                    // first line, which `text-align` moves. A block that
+                    // arrives while the run is still empty takes the boxes
+                    // before it out again: they stand in no line.
+                    InlineFlowRole::OutOfFlow => {
+                        // (A box hoisted out of an inline element (#591)
+                        // is a unit right after that element, so it is kept
+                        // here too; the walk of the element meets it first,
+                        // in its real place, and the first note is the one
+                        // read.)
+                        current_out_of_flow.push((current_run.len(), child_id));
+                        continue;
+                    }
+                    InlineFlowRole::Comment | InlineFlowRole::NoBox => {
                         continue;
                     }
                     // A wrapper never reaches here: `collect_run_units`
@@ -1037,13 +6988,18 @@ impl RinchDocument {
                     // disagree about a node (#518).
                     InlineFlowRole::InFlowBlock => {
                         if !current_run.is_empty() {
-                            runs.push(std::mem::take(&mut current_run));
+                            runs.push((
+                                std::mem::take(&mut current_run),
+                                std::mem::take(&mut current_out_of_flow),
+                            ));
+                        } else {
+                            current_out_of_flow.clear();
                         }
                     }
                 }
             }
             if !current_run.is_empty() {
-                runs.push(current_run);
+                runs.push((current_run, current_out_of_flow));
             }
 
             if !runs.is_empty() {
@@ -1069,9 +7025,20 @@ impl RinchDocument {
         for (parent_id, runs) in containers {
             let guard = self.tree.guard.clone();
 
-            for run in runs {
+            for (run, run_out_of_flow) in runs {
+                // The box this run had last pass, retired by
+                // `cleanup_anonymous_block_boxes` (#964): same container, same
+                // members in the same order. Minted into its slab entry, so its
+                // id — which its measures are cached under and an out-of-flow
+                // box's `static_ifc_root` names — does not move. (Anything
+                // else the run's lines are built from, the out-of-flow boxes
+                // standing in it included, is in the content signature.)
+                let kept = retired.take(parent_id, &run);
                 // Create anonymous block box DOM node
-                let anon_id = self.tree.nodes.vacant_key();
+                let anon_id = match &kept {
+                    Some(r) => r.id,
+                    None => self.tree.nodes.vacant_key(),
+                };
                 let mut anon_node = Node::element(anon_id, "div", guard.clone());
                 anon_node.is_anonymous_block_box = true;
                 anon_node.display_mode = DisplayMode::Block;
@@ -1113,6 +7080,7 @@ impl RinchDocument {
                 // construction rather than by enumeration.
                 anon_node.parent = Some(parent_id);
                 anon_node.run_members = run.clone();
+                anon_node.run_out_of_flow = run_out_of_flow;
                 // Inherited properties only (CSS 2.1 §9.2.1.1). Cloning the
                 // parent's whole style gave the anonymous box a box model its
                 // Taffy style (below) does not have, and paint double-counted
@@ -1128,26 +7096,68 @@ impl RinchDocument {
                     &self.tree.nodes[parent_id].computed_style,
                 );
 
-                // Create Taffy node for the anonymous box
-                let anon_taffy = self
-                    .tree
-                    .taffy
-                    .new_leaf(taffy::Style {
-                        display: taffy::Display::Block,
-                        ..Default::default()
-                    })
-                    .unwrap();
+                // Create Taffy node for the anonymous box. In a grid container
+                // a run of nothing but white space is not rendered, "just as if
+                // its text nodes were display:none" (CSS Grid 1 §6.1), so it
+                // takes no cell (#2443): its box is `display: none`, which grid
+                // placement skips.
+                let blank_grid_run = is_grid_container(&self.tree.nodes[parent_id])
+                    && run
+                        .iter()
+                        .all(|&m| is_white_space_text(&self.tree.nodes[m]));
+                let mut anon_style = taffy::Style {
+                    display: if blank_grid_run {
+                        taffy::Display::None
+                    } else {
+                        taffy::Display::Block
+                    },
+                    ..Default::default()
+                };
+                // A run in a legacy `-webkit-box` is one of its flex items,
+                // with a `-webkit-box-flex` of 0 (#2581).
+                let container = &self.tree.nodes[parent_id].computed_style;
+                if container.webkit_box && container.line_clamp.is_none() {
+                    crate::computed_style::taffy_conversion::legacy_item_taffy_style(
+                        &mut anon_style,
+                        0.0,
+                        container.webkit_box_vertical,
+                    );
+                }
+                let anon_taffy = self.tree.taffy.new_leaf(anon_style).unwrap();
                 anon_node.taffy_id = Some(anon_taffy);
                 self.tree.taffy_map.insert(anon_taffy, anon_id);
 
-                // Insert anonymous node into slab
-                self.tree.nodes.insert(anon_node);
+                match kept {
+                    Some(_) => {
+                        // The old box's layout and measures are kept as they
+                        // stand, exactly as a box outside a scoped pass keeps
+                        // them: whatever has touched them since the last pass
+                        // has already dropped them. A restyle of the container
+                        // drops the layouts of every box it lists
+                        // (`invalidate_text_layout_for_node`, through
+                        // `run_boxes`), a change to a member drops its box's,
+                        // and `refresh_ifc_signatures`, which runs after this,
+                        // drops a box whose content signature moved. What it
+                        // was last laid out and painted at is kept for damage
+                        // (`prev_layout`, `painted`), as a box that stayed would.
+                        let old = &mut self.tree.nodes[anon_id];
+                        anon_node.text_layout = old.text_layout.take();
+                        anon_node.layout = old.layout;
+                        anon_node.prev_layout = old.prev_layout;
+                        anon_node.painted = old.painted.take();
+                        self.tree.nodes[anon_id] = anon_node;
+                    }
+                    None => {
+                        // Insert anonymous node into slab
+                        self.tree.nodes.insert(anon_node);
+                    }
+                }
 
                 // Point every member at its box. This is what
                 // `box_tree_children` reads, and it must be set before the
                 // Taffy rebuild below, which consults it.
                 for &child_id in &run {
-                    if let Some(child) = self.tree.nodes.get_mut(child_id) {
+                    if let Some(child) = self.tree.nodes.get_live_mut(child_id) {
                         child.run_box = Some(anon_id);
                     }
                 }
@@ -1175,9 +7185,12 @@ impl RinchDocument {
             // so that the detach has something to detach *from*, which is what
             // keeps a member's Taffy node from being left parented to the
             // container.
-            let new_boxes: Vec<usize> = self
-                .tree
-                .anonymous_block_boxes
+            // The container's own `run_boxes` rather than the document-wide
+            // list: the boxes whose parent is this container are exactly the
+            // ones it lists, in the order they were minted, so the filter below
+            // selects the same ones — without an O(every box) scan per container.
+            let new_boxes: Vec<RawNodeId> = self.tree.nodes[parent_id]
+                .run_boxes
                 .iter()
                 .copied()
                 .filter(|&b| {
@@ -1212,6 +7225,7 @@ impl RinchDocument {
             }
             self.rebuild_effective_taffy_children(parent_id);
         }
+        self.free_retired_anonymous_boxes(retired);
     }
 
     /// Recompute [`Node::contributes_in_flow_block`] for every node, bottom-up
@@ -1243,7 +7257,11 @@ impl RinchDocument {
     /// block box (an in-flow `Block`) contributes `true`.
     fn recompute_contributes_in_flow_block(
         &mut self,
-    ) -> Vec<(usize, Option<usize>, Option<usize>)> {
+        scope: Option<&crate::ifc_scope::IfcScope>,
+    ) -> Vec<(RawNodeId, Option<RawNodeId>, Option<RawNodeId>)> {
+        if let Some(scope) = scope {
+            return self.recompute_contributes_in_flow_block_scoped(scope);
+        }
         // **The clear is defence, not a fix, and that is measured**: the mutant
         // that deletes these lines survives `-p rinch-dom -p rinch` (51
         // targets), including the transition fixture written to catch exactly
@@ -1253,7 +7271,9 @@ impl RinchDocument {
         // anonymous block box, which is minted fresh with its value every pass,
         // and a node detached from the document root, which nothing reads while
         // it is detached and which the walk reaches again the moment it is
-        // re-attached (a structural change sets `ifc_dirty`).
+        // re-attached (attaching seeds a structural pass over the subtree).
+        // A *scoped* pass (`crate::ifc_scope`) never clears it: it recomputes
+        // only its own regions and leaves a detached subtree as it was.
         //
         // It is kept because "nothing reads it while detached" is an argument
         // about every current reader, and the direction it fails in is the bad
@@ -1269,7 +7289,7 @@ impl RinchDocument {
         // the walk, so the clear is what turns its `Some(host)` into `None`, and
         // the change list below is what then takes it out of the host's Taffy
         // list. Snapshot first so the change can be seen.
-        let mut previous: Vec<(usize, Option<usize>)> = Vec::new();
+        let mut previous: Vec<(RawNodeId, Option<RawNodeId>)> = Vec::new();
         for (id, node) in self.tree.nodes.iter_mut() {
             node.contributes_in_flow_block = false;
             if node.hoisted_out_of_flow_to.is_some() {
@@ -1302,10 +7322,10 @@ impl RinchDocument {
         // `box_tree_parent` and the list owner agree. (`is_split_inline` cannot
         // be consulted on the way down anyway — `contributes_in_flow_block` is
         // folded on the way up.)
-        let mut ctx: std::collections::HashMap<usize, (Option<usize>, bool)> =
+        let mut ctx: std::collections::HashMap<RawNodeId, (Option<RawNodeId>, bool)> =
             std::collections::HashMap::new();
         ctx.insert(self.tree.root_id, (Some(self.tree.root_id), false));
-        let mut stack: Vec<(usize, bool)> = vec![(self.tree.root_id, false)];
+        let mut stack: Vec<(RawNodeId, bool)> = vec![(self.tree.root_id, false)];
         while let Some((id, folded)) = stack.pop() {
             if !folded {
                 stack.push((id, true));
@@ -1333,7 +7353,7 @@ impl RinchDocument {
                     (Some(id), false)
                 };
                 ctx.insert(id, child_ctx);
-                let children: Vec<usize> = node.children.clone();
+                let children: Vec<RawNodeId> = node.children.clone();
                 self.tree.nodes[id].hoisted_out_of_flow_to = hoisted_to;
                 for &child_id in children.iter() {
                     stack.push((child_id, false));
@@ -1364,7 +7384,7 @@ impl RinchDocument {
             // not, so the O(1) gate in `box_tree_children` fires for exactly
             // the lists that must be rebuilt from units.
             let hosts = node.children.iter().any(|&c| {
-                self.tree.nodes.get(c).is_some_and(|child| {
+                self.tree.nodes.get_live(c).is_some_and(|child| {
                     child.hoisted_out_of_flow_to.is_some()
                         || (child.hosts_hoisted_out_of_flow
                             && (child.inline_flow_role() == InlineFlowRole::Contents
@@ -1380,8 +7400,8 @@ impl RinchDocument {
         // The hosts that changed, for `rehome_hoisted_out_of_flow`: every box
         // that was hoisted last pass and is hoisted elsewhere or not at all now,
         // and every box hoisted for the first time.
-        let mut changes: Vec<(usize, Option<usize>, Option<usize>)> = Vec::new();
-        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut changes: Vec<(RawNodeId, Option<RawNodeId>, Option<RawNodeId>)> = Vec::new();
+        let mut seen: std::collections::HashSet<RawNodeId> = std::collections::HashSet::new();
         for (id, old) in previous {
             seen.insert(id);
             let new = self
@@ -1397,6 +7417,106 @@ impl RinchDocument {
             if node.hoisted_out_of_flow_to.is_some() && !seen.contains(&id) {
                 changes.push((id, None, node.hoisted_out_of_flow_to));
             }
+        }
+        changes
+    }
+
+    /// [`Self::recompute_contributes_in_flow_block`] over a scoped pass's
+    /// regions only (`crate::ifc_scope`).
+    ///
+    /// The whole-document walk derives every value from the node's position
+    /// under the nearest formatting container, and a formatting container
+    /// **resets** the context its children see — `(Some(itself), false)`,
+    /// whatever lies above it. So each region is walked on its own, from its
+    /// container, and produces the values the whole-document walk would:
+    ///
+    /// - every region node's `hoisted_out_of_flow_to` (a stop node's too — its
+    ///   hoisting is decided by the region it sits in);
+    /// - a transparent node's `contributes_in_flow_block` and
+    ///   `hosts_hoisted_out_of_flow`, folded post-order from its children as
+    ///   the full walk folds them;
+    /// - a stop node's `contributes_in_flow_block`, which for a formatting
+    ///   container is its role alone. Its `hosts_hoisted_out_of_flow` reads
+    ///   its own children and belongs to its own region — left alone unless it
+    ///   is a container of this scope too;
+    /// - the container's own `hosts_hoisted_out_of_flow` and
+    ///   `contributes_in_flow_block` (its own hoisting belongs to its parent's
+    ///   region).
+    fn recompute_contributes_in_flow_block_scoped(
+        &mut self,
+        scope: &crate::ifc_scope::IfcScope,
+    ) -> Vec<(RawNodeId, Option<RawNodeId>, Option<RawNodeId>)> {
+        use crate::ifc_scope::is_inline_transparent;
+        let mut changes: Vec<(RawNodeId, Option<RawNodeId>, Option<RawNodeId>)> = Vec::new();
+        let hosts_of = |nodes: &crate::node_slab::NodeSlab, id: RawNodeId| -> bool {
+            nodes[id].children.iter().any(|&c| {
+                nodes.get_live(c).is_some_and(|child| {
+                    child.hoisted_out_of_flow_to.is_some()
+                        || (child.hosts_hoisted_out_of_flow
+                            && (child.inline_flow_role() == InlineFlowRole::Contents
+                                || (child.is_element()
+                                    && child.display_mode == DisplayMode::Inline)))
+                })
+            })
+        };
+        for &container in &scope.containers {
+            // (node, folded, host, crossed)
+            let mut stack: Vec<(RawNodeId, bool, Option<RawNodeId>, bool)> = self.tree.nodes
+                [container]
+                .children
+                .iter()
+                .map(|&c| (c, false, Some(container), false))
+                .collect();
+            while let Some((id, folded, host, crossed)) = stack.pop() {
+                let Some(node) = self.tree.nodes.get(id) else {
+                    continue;
+                };
+                let role = node.inline_flow_role();
+                let transparent = is_inline_transparent(node);
+                if folded {
+                    let value = node.children.iter().any(|&c| {
+                        self.tree
+                            .nodes
+                            .get(c)
+                            .is_some_and(|child| child.contributes_in_flow_block)
+                    });
+                    let hosts = hosts_of(&self.tree.nodes, id);
+                    let n = &mut self.tree.nodes[id];
+                    n.contributes_in_flow_block = value;
+                    n.hosts_hoisted_out_of_flow = hosts;
+                    continue;
+                }
+                let hoisted_to = if role == InlineFlowRole::OutOfFlow && crossed {
+                    host
+                } else {
+                    None
+                };
+                let old = node.hoisted_out_of_flow_to;
+                if old != hoisted_to {
+                    changes.push((id, old, hoisted_to));
+                }
+                if transparent {
+                    let child_crossed = crossed || role != InlineFlowRole::Contents;
+                    let children = node.children.clone();
+                    self.tree.nodes[id].hoisted_out_of_flow_to = hoisted_to;
+                    stack.push((id, true, host, crossed));
+                    for c in children {
+                        stack.push((c, false, host, child_crossed));
+                    }
+                } else {
+                    let n = &mut self.tree.nodes[id];
+                    n.hoisted_out_of_flow_to = hoisted_to;
+                    n.contributes_in_flow_block = role == InlineFlowRole::InFlowBlock;
+                    if n.children.is_empty() {
+                        n.hosts_hoisted_out_of_flow = false;
+                    }
+                }
+            }
+            let role = self.tree.nodes[container].inline_flow_role();
+            let hosts = hosts_of(&self.tree.nodes, container);
+            let n = &mut self.tree.nodes[container];
+            n.contributes_in_flow_block = role == InlineFlowRole::InFlowBlock;
+            n.hosts_hoisted_out_of_flow = hosts;
         }
         changes
     }
@@ -1426,8 +7546,11 @@ impl RinchDocument {
     /// inline element left the document has no new host and no live owner; its
     /// edge was already cut at mutation time by `taffy_detach_contribution`,
     /// and the old host's rebuild here is the second lock on the same door.
-    fn rehome_hoisted_out_of_flow(&mut self, changes: Vec<(usize, Option<usize>, Option<usize>)>) {
-        let mut owners: Vec<usize> = Vec::new();
+    fn rehome_hoisted_out_of_flow(
+        &mut self,
+        changes: Vec<(RawNodeId, Option<RawNodeId>, Option<RawNodeId>)>,
+    ) {
+        let mut owners: Vec<RawNodeId> = Vec::new();
         for (id, old, new) in changes {
             for host in [old, new].into_iter().flatten() {
                 if self.tree.nodes.contains(host) && !owners.contains(&host) {
@@ -1486,7 +7609,7 @@ impl RinchDocument {
     /// gate would have to answer "will this pass split it again", and the pass
     /// that follows answers that anyway by re-splitting; a wrong gate here is
     /// the class of bug this function exists to fix.
-    fn restore_split_inlines(&mut self, was_split: Vec<usize>) {
+    fn restore_split_inlines(&mut self, was_split: Vec<RawNodeId>) {
         for id in was_split {
             if !self.tree.nodes.contains(id) {
                 continue;
@@ -1494,6 +7617,70 @@ impl RinchDocument {
             self.rebuild_effective_taffy_children(id);
             if let Some(owner) = Self::effective_taffy_owner(&self.tree.nodes, id) {
                 self.rebuild_effective_taffy_children(owner);
+            }
+        }
+    }
+
+    /// Hide the white-space-only text items of flex and inline-grid containers
+    /// (#2443): CSS Flexbox 1 §4 and CSS Grid 1 §6.1 render a child text run of
+    /// nothing but white space "as if its text nodes were display:none", so it
+    /// is no item — it takes no grid cell, no `gap` and no share of
+    /// `justify-content`'s free space. A text child of such a container stays a
+    /// Taffy text leaf, so the leaf's own `display` says so; every other text
+    /// unit a container in scope holds gets the default back, for a text node
+    /// that moved or whose container changed its `display`. (A block-level
+    /// grid's text is an anonymous item, hidden where it is minted,
+    /// `create_anonymous_block_boxes`.)
+    fn hide_blank_text_items(&mut self, scope: Option<&crate::ifc_scope::IfcScope>) {
+        // Formatting containers only, as a scoped pass's `containers` are: a
+        // `display: contents` wrapper is not one, and visiting it would hand
+        // its text — a unit of the flex container above it — the default
+        // `display` back, the winner then decided by slab order.
+        let candidates: Vec<RawNodeId> = match scope {
+            None => self
+                .tree
+                .nodes
+                .iter()
+                .filter(|(_, n)| crate::ifc_scope::is_formatting_container(n))
+                .map(|(id, _)| id)
+                .collect(),
+            Some(scope) => scope.containers.clone(),
+        };
+        let shown = taffy::Display::DEFAULT;
+        let mut units: Vec<RawNodeId> = Vec::new();
+        for id in candidates {
+            let Some(node) = self.tree.nodes.get_live(id) else {
+                continue;
+            };
+            if !node.is_element() || node.is_anonymous_block_box {
+                continue;
+            }
+            let item_container = matches!(
+                node.display_mode,
+                DisplayMode::Flex | DisplayMode::InlineFlex | DisplayMode::InlineGrid
+            ) && !crate::replaced::ignores_inner_display(node);
+            units.clear();
+            Self::collect_run_units(&self.tree.nodes, id, &mut units);
+            for &u in &units {
+                let n = &self.tree.nodes[u];
+                if !matches!(n.kind, NodeKind::Text(_)) {
+                    continue;
+                }
+                let Some(t) = n.taffy_id else {
+                    continue;
+                };
+                let want = if item_container && is_white_space_text(n) {
+                    taffy::Display::None
+                } else {
+                    shown
+                };
+                if let Ok(old) = self.tree.taffy.style(t)
+                    && old.display != want
+                {
+                    let mut st = old.clone();
+                    st.display = want;
+                    let _ = self.tree.taffy.set_style(t, st);
+                }
             }
         }
     }
@@ -1521,20 +7708,35 @@ impl RinchDocument {
     /// block relative to the `<a>` while paint reaches it directly from the
     /// container (the `<a>` is not in the box tree and its `layout` is zeroed), so
     /// it is drawn over that sibling.
-    fn split_inline_boxes(&mut self) {
-        let split: Vec<usize> = self
-            .tree
-            .nodes
-            .iter()
-            .filter(|(_, node)| node.is_split_inline())
-            .map(|(id, _)| id)
-            .collect();
+    ///
+    /// With a `scope`, only the scope's region nodes are looked at, and the
+    /// entries the pass did not reach are kept (`kept`: what
+    /// `setup_inline_formatting_contexts` left in the list after taking the
+    /// in-scope ones out to restore).
+    fn split_inline_boxes(&mut self, scope: Option<&crate::ifc_scope::IfcScope>) {
+        let split: Vec<RawNodeId> = match scope {
+            None => self
+                .tree
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.is_split_inline())
+                .map(|(id, _)| id)
+                .collect(),
+            Some(scope) => scope
+                .transparent_region()
+                .filter(|&id| self.tree.nodes.get(id).is_some_and(|n| n.is_split_inline()))
+                .collect(),
+        };
+        let kept: Vec<RawNodeId> = match scope {
+            None => Vec::new(),
+            Some(_) => std::mem::take(&mut self.tree.split_inlines),
+        };
         if split.is_empty() {
-            self.tree.split_inlines.clear();
+            self.tree.split_inlines = kept;
             return;
         }
 
-        let mut owners: Vec<usize> = Vec::new();
+        let mut owners: Vec<RawNodeId> = Vec::new();
         for &id in &split {
             if let Some(owner) = Self::effective_taffy_owner(&self.tree.nodes, id)
                 && !owners.contains(&owner)
@@ -1546,7 +7748,36 @@ impl RinchDocument {
             self.rebuild_effective_taffy_children(owner);
         }
 
-        self.tree.split_inlines = split;
+        let mut all = kept;
+        all.extend(split);
+        self.tree.split_inlines = all;
+    }
+
+    /// Whether any ancestor of `id` (not `id` itself) has computed `display:
+    /// none`.
+    ///
+    /// `display` does not inherit, so a node's own computed style says
+    /// nothing about whether an ancestor's `display: none` keeps it from
+    /// being rendered at all — the chain has to be walked, as
+    /// `style_resolution::StyleResolver::ancestors_are_rendered` walks it for
+    /// the transition start gate (#703). This is `setup_inline_formatting_contexts`'s
+    /// own copy rather than a shared call: that one is private to
+    /// `style_resolution` and additionally understands the restyle pass's
+    /// "was hidden before this cascade" list, which has no analogue here —
+    /// a layout pass only ever asks about the *current* tree.
+    fn has_display_none_ancestor(nodes: &crate::node_slab::NodeSlab, id: RawNodeId) -> bool {
+        use crate::computed_style::values::DisplayValue;
+        let mut current = nodes.get(id).and_then(|n| n.parent);
+        while let Some(pid) = current {
+            let Some(parent) = nodes.get_live(pid) else {
+                break;
+            };
+            if parent.computed_style.display == DisplayValue::None {
+                return true;
+            }
+            current = parent.parent;
+        }
+        false
     }
 
     /// Detect IFC roots and mark inline children.
@@ -1556,36 +7787,51 @@ impl RinchDocument {
     /// text children use IFC — this avoids maintaining two measurement
     /// paths (standalone Taffy vs IFC) and the sync bugs that arise when
     /// elements transition between them during editing.
-    pub(crate) fn setup_inline_formatting_contexts(&mut self) {
+    ///
+    /// With a `scope` (`crate::ifc_scope`) every step runs over the scope's
+    /// containers and their regions only, and everything else keeps the state
+    /// the last pass that reached it left: its splices, boxes, splits, leaves,
+    /// marks and root contexts, and so Taffy's cached layout for it.
+    pub(crate) fn setup_inline_formatting_contexts(
+        &mut self,
+        scope: Option<&crate::ifc_scope::IfcScope>,
+    ) {
         // Before everything else: the classification every pass below consumes.
         // `collect_run_units` reads it, so `box_tree_children` and therefore
         // `collect_effective_taffy_children` do — which means the cleanups and
         // the rebuilds below all do. Reading a previous pass's value here would
         // rebuild a Taffy child list from a classification this pass is about to
         // contradict; see the function's own doc.
-        let hoist_changes = self.recompute_contributes_in_flow_block();
+        let hoist_changes = self.recompute_contributes_in_flow_block(scope);
 
         // Clean up the previous pass's measure leaves, anonymous block boxes and
         // splits, then recreate all three for the current DOM state.
-        self.cleanup_ifc_measure_leaves();
-        let was_split = std::mem::take(&mut self.tree.split_inlines);
-        self.cleanup_anonymous_block_boxes();
+        self.cleanup_ifc_measure_leaves(scope);
+        let was_split = match scope {
+            None => std::mem::take(&mut self.tree.split_inlines),
+            Some(scope) => {
+                // Restore the in-scope entries (and any that left the slab);
+                // keep the rest, which `split_inline_boxes` appends to.
+                let nodes = &self.tree.nodes;
+                let (go, keep): (Vec<RawNodeId>, Vec<RawNodeId>) =
+                    std::mem::take(&mut self.tree.split_inlines)
+                        .into_iter()
+                        .partition(|&id| scope.nodes.contains(&id) || !nodes.contains(id));
+                self.tree.split_inlines = keep;
+                go
+            }
+        };
+        let retired = self.cleanup_anonymous_block_boxes(scope);
         self.restore_split_inlines(was_split);
         // Before the boxes are minted, like the split restore, so a host's
         // rebuilt list names members rather than boxes that are about to exist
         // (#591).
         self.rehome_hoisted_out_of_flow(hoist_changes);
-        self.create_anonymous_block_boxes();
+        self.create_anonymous_block_boxes(scope, retired);
         // After the boxes exist, so the container's rebuilt list names them
         // rather than their members (#513).
-        self.split_inline_boxes();
-
-        // Put back every box a past marking pass took out and that is no longer
-        // the IFC's to hold (#597). Before the marking pass below, so that a
-        // rebuilt list is re-detached by it: the rebuild restores the owner's
-        // *whole* effective child list, inline children included, and the pass
-        // that follows removes exactly the ones that are still inline content.
-        self.reattach_departed_ifc_children();
+        self.split_inline_boxes(scope);
+        self.hide_blank_text_items(scope);
 
         // `ifc_root` is *derived* state — "this node's boxes are drawn by that
         // IFC, so the paint tree-walk must skip it" — and the marking pass below
@@ -1599,12 +7845,54 @@ impl RinchDocument {
         // module's contents handling exists to avoid. This pass recomputes every
         // mark, so reset them all first rather than trying to invalidate at each
         // mutation site.
-        for (_id, node) in self.tree.nodes.iter_mut() {
-            node.ifc_root = None;
+        //
+        // A scoped pass resets the marks of its regions only — which include
+        // every stop node, whose mark is its region's to give — and never a
+        // container's own: that one belongs to the region *above* it. The two
+        // registries lose the same entries, and the marking below puts back
+        // the ones that still hold.
+        let candidates: Vec<RawNodeId> = match scope {
+            None => {
+                for (_id, node) in self.tree.nodes.iter_mut() {
+                    node.ifc_root = None;
+                }
+                self.tree.ifc_root_registry.clear();
+                self.tree.atomic_inline_registry.clear();
+                self.tree.nodes.iter().map(|(id, _)| id).collect()
+            }
+            Some(scope) => {
+                for &(id, _, stop) in &scope.region {
+                    if let Some(node) = self.tree.nodes.get_mut(id) {
+                        node.ifc_root = None;
+                    }
+                    self.tree.atomic_inline_registry.remove(&id);
+                    if !stop {
+                        self.tree.ifc_root_registry.remove(&id);
+                    }
+                }
+                let mut c: Vec<RawNodeId> = Vec::new();
+                for &container in &scope.containers {
+                    self.tree.ifc_root_registry.remove(&container);
+                    c.push(container);
+                    c.extend(self.tree.nodes[container].run_boxes.iter().copied());
+                }
+                c
+            }
+        };
+        // Old boxes (freed by the cleanup above) may still be registered.
+        if let Some(scope) = scope {
+            for &id in &scope.nodes {
+                if !self.tree.nodes.contains(id) {
+                    self.tree.ifc_root_registry.remove(&id);
+                }
+            }
         }
 
-        let mut ifc_roots: Vec<usize> = Vec::new();
-        for (id, node) in &self.tree.nodes {
+        let mut ifc_roots: Vec<RawNodeId> = Vec::new();
+        for id in candidates {
+            let Some(node) = self.tree.nodes.get(id) else {
+                continue;
+            };
             if !node.is_element() {
                 continue;
             }
@@ -1621,6 +7909,22 @@ impl RinchDocument {
             // never an IFC root itself.
             if node.computed_style.display == crate::computed_style::values::DisplayValue::Contents
             {
+                continue;
+            }
+            // A `display: none` element generates no box at all — not even
+            // the degenerate one `Contents` leaves to its nearest real
+            // ancestor — so it establishes no inline formatting context
+            // over its own subtree either. Before this, a hidden block with
+            // inline children (`div{display:none}<span>text</span>`) was
+            // still made an IFC root: its children were detached from Taffy
+            // and a Parley `InlineLayout` was built for text that can never
+            // paint, on every rebuild-all pass (#509). The marking pass's
+            // existing `NoBox` arm (`mark_inline_descendants`,
+            // `inline_flow_role`) already detaches a `display: none`
+            // *child* of some other root the same way `Contents` is
+            // detached above, so skipping here loses no coverage — it only
+            // stops this node from being asked to run that pass on itself.
+            if node.computed_style.display == crate::computed_style::values::DisplayValue::None {
                 continue;
             }
 
@@ -1685,8 +7989,8 @@ impl RinchDocument {
             // An anonymous box still classifies over its **run**: its
             // `children` are empty because it is not in the element tree
             // (#566), and its units would be empty for the same reason.
-            let mut unit_buf: Vec<usize> = Vec::new();
-            let own_children: &[usize] = if node.is_anonymous_block_box {
+            let mut unit_buf: Vec<RawNodeId> = Vec::new();
+            let own_children: &[RawNodeId] = if node.is_anonymous_block_box {
                 &node.run_members
             } else {
                 Self::collect_run_units(&self.tree.nodes, id, &mut unit_buf);
@@ -1695,7 +7999,7 @@ impl RinchDocument {
             let mut has_non_comment_inline = false;
             let mut all_children_are_comments = !own_children.is_empty();
             for &child_id in own_children {
-                let Some(child) = self.tree.nodes.get(child_id) else {
+                let Some(child) = self.tree.nodes.get_live(child_id) else {
                     continue;
                 };
                 if child.run_box.is_some() && !node.is_anonymous_block_box {
@@ -1733,20 +8037,61 @@ impl RinchDocument {
             // until #586 and is deleted; the measurement is in that issue, and
             // the short form is that it never once decided this condition
             // across the whole suite.
-            if has_non_comment_inline || all_children_are_comments {
+            // A childless block container is **not** floored at a line (#296):
+            // with no in-flow content it has no line box, so its auto height is
+            // 0 (CSS 2.1 §10.6.3), as in every browser. The floor that used to
+            // be written here was written for `<input>`/`<textarea>`, which had
+            // no content height, and also carried a blockified `<br>` and the
+            // non-text input types; the line-sized ones are measured now (#297,
+            // `form_control.rs`).
+            //
+            // A control or replaced element is a root whatever its children
+            // are (#1178, #1288): the UA sheet makes every element child of one
+            // `display: none`, the marking pass detaches those from Taffy — one
+            // attached `None` child left the measure unreachable and the
+            // element collapsed to 0x0 — and the hollow arm below gives it its
+            // own measure context.
+            let hollow_with_children =
+                !own_children.is_empty() && crate::replaced::ignores_inner_display(node);
+            if (has_non_comment_inline || all_children_are_comments || hollow_with_children)
+                // A node whose own `display` isn't `none` can still sit under
+                // an ancestor that is: `display` does not inherit, so this
+                // node's own computed style says nothing about whether it is
+                // rendered at all (css-display-3 §2.4, the "not being
+                // rendered" rule #703 reads the same way for transitions).
+                // Such a subtree is never painted and Taffy's own compute
+                // does not descend past the `display: none` ancestor to
+                // begin with, so marking a node here buys nothing but a
+                // Parley `InlineLayout` that this pass rebuilds every time
+                // it runs (#826 measured it growing with the hidden
+                // subtree's text, unboundedly, for as long as the subtree
+                // exists). Walked only here, once per node this loop has
+                // already decided would otherwise be a root — not once per
+                // candidate — so the O(depth) cost lands on the small set
+                // that would otherwise pay far more.
+                && !Self::has_display_none_ancestor(&self.tree.nodes, id)
+            {
                 ifc_roots.push(id);
-            } else if own_children.is_empty() {
-                // Always call set_style for consistent Taffy invalidation, even
-                // when the floor does not apply.
-                if let Some(taffy_id) = node.taffy_id
-                    && let Ok(style) = self.tree.taffy.style(taffy_id)
-                {
-                    let mut style = style.clone();
-                    apply_empty_block_line_floor(node, &mut style);
-                    let _ = self.tree.taffy.set_style(taffy_id, style);
-                }
             }
         }
+
+        self.tree
+            .ifc_root_registry
+            .extend(ifc_roots.iter().copied());
+        // Put back every box a past marking pass took out and that is no longer
+        // the IFC's to hold (#597). After root discovery, because whether a
+        // departed box stays out depends on whether its owner is a root *this*
+        // pass, not merely whether it could be one: a block whose last inline
+        // child went `display: none` is no root, and its hidden children must
+        // rejoin its Taffy list as they would in a document built that way.
+        // Before the marking pass below, so that a rebuilt list is re-detached
+        // by it: the rebuild restores the owner's *whole* effective child list,
+        // inline children included, and the pass that follows removes exactly
+        // the ones that are still inline content. On a scoped pass the roots
+        // are the scope containers' and their run boxes' — and so is every
+        // candidate's owner, since the candidates are the scope's regions — so
+        // the gate stays exact there too.
+        self.reattach_departed_ifc_children(&ifc_roots, scope);
 
         for &root_id in &ifc_roots {
             let root_taffy = match self.tree.nodes[root_id].taffy_id {
@@ -1809,9 +8154,10 @@ impl RinchDocument {
             // makes the container (the CSS containing block) rather than the
             // anonymous box the Taffy parent it resolves its insets against.
             // For an anonymous box root this is its run, verbatim (#566).
-            let root_scan: Vec<usize> = Self::box_tree_children(&self.tree.nodes, root_id).to_vec();
+            let root_scan: Vec<RawNodeId> =
+                Self::box_tree_children(&self.tree.nodes, root_id).to_vec();
             for &child_id in &root_scan {
-                let Some(child) = self.tree.nodes.get(child_id) else {
+                let Some(child) = self.tree.nodes.get_live(child_id) else {
                     continue;
                 };
                 match child.inline_flow_role() {
@@ -1869,10 +8215,24 @@ impl RinchDocument {
                 // below-the-line static position for auto-inset absolute
                 // children. Appending it would silently move them to
                 // content-top.
-                let _ = self
-                    .tree
-                    .taffy
-                    .set_children(root_taffy, &out_of_flow_children);
+                //
+                // Floats are the exception: they go **before** the leaf,
+                // which places them (rinch's Taffy fork leaves a float right
+                // before a measure leaf to it: `PendingFloat`,
+                // `float_wrap::is_measure_leaf`) at the top of the line each
+                // stands in, as its line breaker reaches it, and wraps its
+                // lines around them (`float_wrap`).
+                let (floats, absolute): (Vec<_>, Vec<_>) =
+                    out_of_flow_children.iter().partition(|&&t| {
+                        self.tree
+                            .taffy_map
+                            .get(&t)
+                            .and_then(|&id| self.tree.nodes.get_live(id))
+                            .is_some_and(|n| n.computed_style.float.is_floated())
+                    });
+                let leaf_index = floats.len();
+                let ordered: Vec<taffy::NodeId> = floats.into_iter().chain(absolute).collect();
+                let _ = self.tree.taffy.set_children(root_taffy, &ordered);
                 let Ok(leaf) = self.tree.taffy.new_leaf_with_context(
                     taffy::Style {
                         display: taffy::Display::Block,
@@ -1882,7 +8242,10 @@ impl RinchDocument {
                 ) else {
                     continue;
                 };
-                let _ = self.tree.taffy.insert_child_at_index(root_taffy, 0, leaf);
+                let _ = self
+                    .tree
+                    .taffy
+                    .insert_child_at_index(root_taffy, leaf_index, leaf);
                 self.tree.ifc_measure_leaves.insert(root_id, leaf);
 
                 // The context is a **move**, not a copy: the root itself has
@@ -1894,6 +8257,58 @@ impl RinchDocument {
                     && matches!(ctx, NodeContext::InlineRoot(_))
                 {
                     *ctx = NodeContext::Element;
+                }
+            } else if crate::replaced::ignores_inner_display(&self.tree.nodes[root_id]) {
+                // A hollow control (#1159): its children are its value, not
+                // content, so it is measured exactly as a childless control is
+                // — the context `sync_form_control_measure` gives one — and
+                // `build_ifc_layouts` shapes nothing for it. Written only when
+                // it differs, so a pass that finds it already hollow leaves
+                // Taffy's cache alone.
+                // A canvas, video or iframe is hollow the same way (#1173):
+                // its children are fallback content a browser does not
+                // render, and it keeps its natural-size context.
+                let want =
+                    crate::replaced::replaced_context(&self.tree.nodes[root_id]).or_else(|| {
+                        crate::form_control::hollow_control_context(
+                            &self.tree.nodes[root_id],
+                            &mut self.font_cx,
+                            &mut self.layout_cx,
+                            self.tree.font_generation,
+                            &self.tree.perf,
+                        )
+                    });
+                let have = self.tree.taffy.get_node_context(root_taffy);
+                let same = match (&want, have) {
+                    (
+                        Some(NodeContext::FormControl {
+                            content_width: aw,
+                            content_height: ah,
+                        }),
+                        Some(NodeContext::FormControl {
+                            content_width: bw,
+                            content_height: bh,
+                        }),
+                    ) => aw == bw && ah == bh,
+                    (
+                        Some(NodeContext::Replaced {
+                            width: aw,
+                            height: ah,
+                            ratio: ar,
+                            aspect: aa,
+                        }),
+                        Some(NodeContext::Replaced {
+                            width: bw,
+                            height: bh,
+                            ratio: br,
+                            aspect: ba,
+                        }),
+                    ) => aw == bw && ah == bh && ar == br && aa == ba,
+                    (None, None) => true,
+                    _ => false,
+                };
+                if !same {
+                    let _ = self.tree.taffy.set_node_context(root_taffy, want);
                 }
             } else {
                 // Today's path: the root's own (now childless) Taffy node
@@ -1922,13 +8337,34 @@ impl RinchDocument {
         // while now having Taffy children. That context is dead data: Taffy
         // consults a measure function only on a childless node (the leaf
         // invariant on [`NodeContext::InlineRoot`]), so clearing it is
-        // observationally identical — which is exactly why this sweep is
-        // restricted to nodes whose Taffy node *has children*. A childless
-        // stale carrier is deliberately left alone: its measure IS reachable,
-        // so clearing it would change measure behaviour. The `children > 0`
-        // guard is load-bearing — do not widen it.
-        let roots_this_pass: std::collections::HashSet<usize> = ifc_roots.iter().copied().collect();
-        for (id, node) in &self.tree.nodes {
+        // observationally identical, and the write is in place.
+        //
+        // A **childless** stale carrier is no dead data: Taffy measures it, as
+        // an IFC with no members — one empty line, and its cached sizes and
+        // baseline from when it had some (#896). A block emptied by
+        // `set_inner_html("")`, or whose only text went, kept that line where
+        // a fresh layout of the same tree has a plain empty leaf (no context,
+        // `0x0`, no baseline): the first item of an `inline-flex` lined the
+        // chip up by the line it no longer had. Its context goes too, through
+        // `set_node_context`, which dirties it: its size changes.
+        //
+        // A scoped pass sweeps its own nodes: only a container of the scope can
+        // have stopped being a root (its units are what changed), or a region
+        // node whose own display changed — and that puts it in the scope too.
+        let roots_this_pass: std::collections::HashSet<RawNodeId> =
+            ifc_roots.iter().copied().collect();
+        let sweep: Vec<RawNodeId> = match scope {
+            None => self.tree.nodes.iter().map(|(id, _)| id).collect(),
+            Some(scope) => {
+                let mut v: Vec<RawNodeId> = scope.rootable.iter().copied().collect();
+                v.sort_unstable();
+                v
+            }
+        };
+        for id in sweep {
+            let Some(node) = self.tree.nodes.get(id) else {
+                continue;
+            };
             if roots_this_pass.contains(&id) {
                 continue;
             }
@@ -1942,19 +8378,40 @@ impl RinchDocument {
                 continue;
             }
             if self.tree.taffy.children(taffy_id).map_or(0, |c| c.len()) == 0 {
+                let _ = self.tree.taffy.set_node_context(taffy_id, None);
                 continue;
             }
             if let Some(ctx) = self.tree.taffy.get_node_context_mut(taffy_id) {
                 // In-place write, not `set_node_context`, which would
                 // `mark_dirty` the node and invalidate Taffy's layout cache —
-                // the sweep must be observationally neutral.
+                // the sweep must be observationally neutral here.
                 *ctx = NodeContext::Element;
             }
         }
 
         #[cfg(debug_assertions)]
         {
-            let violations = self.ifc_leaf_invariant_violations();
+            let mut violations = self.ifc_leaf_invariant_violations();
+            // A scoped pass sets up nothing outside the document: a detached
+            // subtree keeps whatever state it left with (an element emptied by
+            // `set_text_content` and then removed still holds its new text as
+            // a Taffy child of its `InlineRoot`), and attaching it seeds it
+            // again. Everything **connected** must hold — including what the
+            // scope did not reach, which is the claim this checks.
+            if scope.is_some() {
+                let nodes = &self.tree.nodes;
+                let root = self.tree.root_id;
+                violations.retain(|&id| {
+                    let mut cur = Some(id);
+                    while let Some(c) = cur {
+                        if c == root {
+                            return true;
+                        }
+                        cur = nodes.get_live(c).and_then(|n| n.parent);
+                    }
+                    false
+                });
+            }
             debug_assert!(
                 violations.is_empty(),
                 "IFC leaf invariant violated (#466): Taffy node(s) carrying \
@@ -1970,10 +8427,10 @@ impl RinchDocument {
     /// Every violation of the IFC leaf invariant (#466): DOM nodes whose Taffy
     /// node carries [`NodeContext::InlineRoot`] while having Taffy children.
     ///
-    /// Taffy 0.12 consults a measure function only on a node with zero
+    /// Taffy (0.12 and 0.14 alike) consults a measure function only on a node with zero
     /// children, so a non-leaf carrying `InlineRoot` can never be measured —
     /// an auto-height IFC root in that state collapses to `h = 0`. After
-    /// [`Self::setup_inline_formatting_contexts`] this must be empty; a
+    /// `Self::setup_inline_formatting_contexts` this must be empty; a
     /// `debug_assertions` check there enforces it.
     ///
     /// Coverage note: this walks DOM-owned Taffy nodes (elements and anonymous
@@ -1982,7 +8439,7 @@ impl RinchDocument {
     /// future change hands the context to yet another kind of carrier, that
     /// carrier must be added to this walk. A measure-leaf violation is
     /// reported under its IFC root's DOM id.
-    pub fn ifc_leaf_invariant_violations(&self) -> Vec<usize> {
+    pub fn ifc_leaf_invariant_violations(&self) -> Vec<RawNodeId> {
         let mut violations = Vec::new();
         for (id, node) in &self.tree.nodes {
             let Some(taffy_id) = node.taffy_id else {
@@ -2043,13 +8500,13 @@ impl RinchDocument {
     /// and it is stated rather than silently skipped.
     pub fn dom_tree_violations(&self) -> Vec<String> {
         let mut out = Vec::new();
-        let mut seen_child: std::collections::HashMap<usize, usize> =
+        let mut seen_child: std::collections::HashMap<RawNodeId, RawNodeId> =
             std::collections::HashMap::new();
 
         for (id, node) in &self.tree.nodes {
             // C: children must name live slab entries.
             for &c in &node.children {
-                if self.tree.nodes.get(c).is_none() {
+                if self.tree.nodes.get_live(c).is_none() {
                     out.push(format!(
                         "C freed child: {id} lists {c}, which is not in the slab"
                     ));
@@ -2119,7 +8576,7 @@ impl RinchDocument {
             }
             // C: a parent must name a live slab entry.
             if let Some(p) = node.parent
-                && self.tree.nodes.get(p).is_none()
+                && self.tree.nodes.get_live(p).is_none()
             {
                 out.push(format!(
                     "C freed parent: {id}.parent is {p}, which is not in the slab"
@@ -2146,7 +8603,7 @@ impl RinchDocument {
         // assertion from silent to firing on every box, every frame.
         for (id, node) in &self.tree.nodes {
             let Some(p) = node.parent else { continue };
-            let Some(parent) = self.tree.nodes.get(p) else {
+            let Some(parent) = self.tree.nodes.get_live(p) else {
                 continue; // reported as "C freed parent" above
             };
             let in_children = parent.children.contains(&id);
@@ -2268,7 +8725,7 @@ impl RinchDocument {
             }
             // The container's unit list, from the very function the
             // classification grouped this run out of.
-            let mut units: Vec<usize> = Vec::new();
+            let mut units: Vec<RawNodeId> = Vec::new();
             if let Some(container) = node.parent {
                 Self::collect_run_units(&self.tree.nodes, container, &mut units);
             }
@@ -2376,7 +8833,7 @@ impl RinchDocument {
     /// rules.
     ///
     /// **Reachable from *which* roots.** Not the document root alone.
-    /// [`Self::inline_block_measure_roots`] is a second, legitimate category:
+    /// `Self::inline_block_measure_roots` is a second, legitimate category:
     /// an atomic inline inside an IFC is detached from its parent's tree on
     /// purpose and `measure_inline_blocks` computes it as a Taffy **root**, so
     /// its subtree is laid out correctly while being unreachable from the
@@ -2828,7 +9285,10 @@ impl RinchDocument {
     /// wrapper for every `if`/`match`/`for`). **Deleting it is a behaviour change
     /// in a direction no test can see**, which is the #585 standard for keeping
     /// it.
-    fn contents_is_inline_transparent(nodes: &slab::Slab<Node>, node_id: usize) -> bool {
+    fn contents_is_inline_transparent(
+        nodes: &crate::node_slab::NodeSlab,
+        node_id: RawNodeId,
+    ) -> bool {
         nodes
             .get(node_id)
             .is_none_or(|node| !node.contributes_in_flow_block)
@@ -2854,12 +9314,12 @@ impl RinchDocument {
     /// the wrapper was judged transparent, which the scan answers only when no
     /// such box exists at any depth.
     fn collect_contents_out_of_flow(
-        nodes: &slab::Slab<Node>,
-        wrapper_id: usize,
+        nodes: &crate::node_slab::NodeSlab,
+        wrapper_id: RawNodeId,
         out: &mut Vec<taffy::NodeId>,
     ) {
         for &child_id in &nodes[wrapper_id].children {
-            let Some(child) = nodes.get(child_id) else {
+            let Some(child) = nodes.get_live(child_id) else {
                 continue;
             };
             match child.inline_flow_role() {
@@ -2882,26 +9342,6 @@ impl RinchDocument {
                 | InlineFlowRole::InFlowBlock => {}
             }
         }
-    }
-
-    /// Whether `owner` could be discovered as an IFC root by
-    /// [`Self::setup_inline_formatting_contexts`]' root scan — the half of that
-    /// scan that reads the node alone, without asking whether it currently
-    /// holds any inline content.
-    ///
-    /// Deliberately the *looser* half. A caller wanting "will the marking pass
-    /// detach my child again" gets `true` from this for a container that has
-    /// since lost all its inline content, and heals a node the pass then leaves
-    /// attached — which is correct, because such a container is not an IFC root
-    /// and the box belongs in its list. The converse mistake, answering `true`
-    /// for a node that cannot be a root at all, is the one that strands a box,
-    /// so the two clauses here must stay exactly the root scan's two.
-    fn can_establish_ifc(nodes: &slab::Slab<Node>, owner: usize) -> bool {
-        nodes.get(owner).is_some_and(|n| {
-            n.is_element()
-                && n.display_mode.is_block_container()
-                && n.computed_style.display != crate::computed_style::values::DisplayValue::Contents
-        })
     }
 
     /// Restore every box a previous [`Self::mark_inline_descendants`] pass
@@ -2935,8 +9375,9 @@ impl RinchDocument {
     /// - the node's own role today. Only `Inline`, `Comment` and `NoBox` are
     ///   ever detached, so a departed node whose role is now `InFlowBlock` or
     ///   `OutOfFlow` is one no IFC will take back.
-    /// - whether its owner can still *be* an IFC root
-    ///   ([`Self::can_establish_ifc`]). The role half alone leaves a text node
+    /// - whether its owner **is** an IFC root on this pass — the `ifc_roots`
+    ///   the root scan just found, which is why this runs after that scan. The
+    ///   role half alone leaves a text node
     ///   stranded for ever when the **container** stops being a block container:
     ///   a text node's role is `Inline` whatever happens to it, so the gate
     ///   skipped it, while no marking pass runs for a root that is no longer
@@ -2949,12 +9390,18 @@ impl RinchDocument {
     /// A child that is still hidden under an owner that is still a root keeps
     /// its record and stays out.
     ///
-    /// The owner half is only ever *permissive*: it heals a node the marking
-    /// pass is about to re-detach at worst, which is the direction this whole
-    /// function is safe in (see the ordering section below). It is not free —
-    /// the steady state now walks to each departed node's owner rather than
-    /// stopping at its role — but that walk already ran for every node the gate
-    /// let through, and only on an `ifc_dirty` pass.
+    /// The owner half used to ask only whether the owner *could* be a root —
+    /// a block container that is not `display: contents` — and that stranded a
+    /// box. A block whose last rendered inline child is switched to
+    /// `display: none` can still establish an IFC but no longer does, so no
+    /// marking pass runs for it, and every child it had detached (the newly
+    /// hidden span, and a hidden sibling detached under #487) stayed out of its
+    /// Taffy list for good. The block kept the one-line box it measured as a
+    /// root: 22px where the same document built hidden measures 0
+    /// (`hidden_last_inline_tests`). Asking about the roots this pass actually
+    /// found is exact rather than permissive. It is not free — the steady state
+    /// walks to each departed node's owner and builds one set of the roots —
+    /// but only on a structural pass, and on a scoped one only over its regions.
     ///
     /// **What the gate is measured to do, and what it is not.** Its first job is
     /// that the steady state costs nothing. Its second is that it does not
@@ -3010,10 +9457,25 @@ impl RinchDocument {
     /// In the steady state it does nothing at all: a node that is still inline
     /// content fails the gate, so no list is rebuilt and no Taffy node is
     /// dirtied on a pass where nothing crossed.
-    fn reattach_departed_ifc_children(&mut self) {
-        let mut departed: Vec<usize> = Vec::new();
-        let mut owners: Vec<usize> = Vec::new();
-        for (id, node) in &self.tree.nodes {
+    fn reattach_departed_ifc_children(
+        &mut self,
+        ifc_roots: &[RawNodeId],
+        scope: Option<&crate::ifc_scope::IfcScope>,
+    ) {
+        let mut departed: Vec<RawNodeId> = Vec::new();
+        let roots: std::collections::HashSet<RawNodeId> = ifc_roots.iter().copied().collect();
+        let mut owners: Vec<RawNodeId> = Vec::new();
+        // A node can only stop being inline content of its IFC through a
+        // change to itself or to the container holding it, and either one puts
+        // it in the scope of a scoped pass.
+        let candidates: Vec<RawNodeId> = match scope {
+            None => self.tree.nodes.iter().map(|(id, _)| id).collect(),
+            Some(scope) => scope.region.iter().map(|r| r.0).collect(),
+        };
+        for id in candidates {
+            let Some(node) = self.tree.nodes.get(id) else {
+                continue;
+            };
             if !node.ifc_detached {
                 continue;
             }
@@ -3026,7 +9488,7 @@ impl RinchDocument {
                 // detach it. Keep the record and leave it alone; otherwise fall
                 // through and heal.
                 InlineFlowRole::Inline | InlineFlowRole::Comment | InlineFlowRole::NoBox
-                    if owner.is_some_and(|o| Self::can_establish_ifc(&self.tree.nodes, o)) =>
+                    if owner.is_some_and(|o| roots.contains(&o)) =>
                 {
                     continue;
                 }
@@ -3101,8 +9563,8 @@ impl RinchDocument {
     /// Taffy, on its own.
     fn mark_inline_descendants(
         &mut self,
-        root_id: usize,
-        node_id: usize,
+        root_id: RawNodeId,
+        node_id: RawNodeId,
         root_taffy: taffy::NodeId,
     ) {
         // Read the root's Taffy children once. Taffy hands back an owned `Vec`,
@@ -3112,9 +9574,9 @@ impl RinchDocument {
         // An anonymous block box reaches its run through `run_members`, not
         // `children` — it has none, and is not in the element tree at all
         // (#566). Every other node walks its children as before.
-        let children: Vec<usize> = self.tree.nodes[node_id].ifc_children().to_vec();
+        let children: Vec<RawNodeId> = self.tree.nodes[node_id].ifc_children().to_vec();
         for child_id in children {
-            let (role, is_inline_element, child_taffy) = match self.tree.nodes.get(child_id) {
+            let (role, is_inline_element, child_taffy) = match self.tree.nodes.get_live(child_id) {
                 Some(c) => (
                     c.inline_flow_role(),
                     c.is_element() && c.display_mode == DisplayMode::Inline,
@@ -3140,8 +9602,11 @@ impl RinchDocument {
                     if !Self::contents_is_inline_transparent(&self.tree.nodes, child_id) {
                         break;
                     }
-                    if let Some(c) = self.tree.nodes.get_mut(child_id) {
+                    if let Some(c) = self.tree.nodes.get_live_mut(child_id) {
                         c.ifc_root = Some(root_id);
+                        if c.display_mode.is_atomic_inline() {
+                            self.tree.atomic_inline_registry.insert(child_id);
+                        }
                     }
                     self.mark_inline_descendants(root_id, child_id, root_taffy);
                 }
@@ -3150,19 +9615,51 @@ impl RinchDocument {
                 // IFC discovery (`build_ifc_layouts` finds roots by marked
                 // children) seeing a comment-only container.
                 InlineFlowRole::Comment | InlineFlowRole::Inline => {
+                    // Detach from the Taffy node's *actual current parent*
+                    // (`taffy.parent`), not from a test against
+                    // `root_taffy_children` (#653, review of #1333). That test
+                    // only ever matches a member whose own `taffy_id` is a
+                    // *direct* Taffy child of the outermost root — true for a
+                    // `<span>` found at this recursion's top level, never true
+                    // for a text node (or anything else) nested one level
+                    // deeper inside it, because *its* Taffy parent is the
+                    // span's Taffy node, not the root's. Such a member used to
+                    // be marked `ifc_root = Some(root_id)` with its Taffy
+                    // attachment left untouched, orphaned only as a side
+                    // effect of the span above it being detached — and if
+                    // that attachment was ever reachable and computed again
+                    // (e.g. the span briefly became its own IFC root on an
+                    // intervening `display` toggle, #1333's review fixture),
+                    // the stale box it picked up then survived every pass
+                    // after, forever, with nothing to correct it. Asking Taffy
+                    // for the actual parent instead removes the member from
+                    // wherever it really is, at any nesting depth, so no
+                    // lingering attachment is ever left for a later,
+                    // unrelated reachability change to feed a real compute.
                     if let Some(child_taffy) = child_taffy
-                        && root_taffy_children.contains(&child_taffy)
+                        && let Some(actual_parent) = self.tree.taffy.parent(child_taffy)
                     {
-                        let _ = self.tree.taffy.remove_child(root_taffy, child_taffy);
+                        let _ = self.tree.taffy.remove_child(actual_parent, child_taffy);
                         // Record the departure (#597). Only where the removal
-                        // actually happened: a node this root never held is not
-                        // this root's to claim.
-                        if let Some(c) = self.tree.nodes.get_mut(child_id) {
+                        // actually happened: a node with no current Taffy
+                        // parent is already detached and is not this root's to
+                        // claim.
+                        if let Some(c) = self.tree.nodes.get_live_mut(child_id) {
                             c.ifc_detached = true;
                         }
                     }
-                    if let Some(c) = self.tree.nodes.get_mut(child_id) {
+                    if let Some(c) = self.tree.nodes.get_live_mut(child_id) {
                         c.ifc_root = Some(root_id);
+                        // A member is no text leaf: its root lays out and
+                        // paints its text. A leaf layout left from when it was
+                        // a flex or grid item's text answered the caret and
+                        // glyph queries (#970). Only a text node can hold one;
+                        // for an element taking this arm (a span, an atomic
+                        // inline) the clear is a no-op.
+                        c.cached_text_parley = None;
+                        if c.display_mode.is_atomic_inline() {
+                            self.tree.atomic_inline_registry.insert(child_id);
+                        }
                     }
                     // Everything inside a `display: inline` element belongs to this
                     // IFC too. Marking the `<a>` and stopping was enough for text —
@@ -3198,7 +9695,7 @@ impl RinchDocument {
                     // on [`NodeContext::InlineRoot`]): the container collapsed to
                     // `h = 0` with its visible text laid out but never given a
                     // box. Detach it like the inline children. When it becomes
-                    // visible again, the display change sets `ifc_dirty` and
+                    // visible again, the display change seeds a structural pass and
                     // `sync_display_contents`'s rebuild re-attaches it from DOM
                     // order. Not marked with `ifc_root` — it is not this IFC's
                     // content, it is nobody's content.
@@ -3219,7 +9716,7 @@ impl RinchDocument {
                     // `read_layout_results` that already exists for exactly this
                     // hazard. Zeroing here as well would be a second authority
                     // for the same fact, and this pass does not run on every
-                    // frame (`ifc_dirty` gates it) while that one does.
+                    // frame (only a structural change runs it) while that one does.
                     if let Some(child_taffy) = child_taffy
                         && root_taffy_children.contains(&child_taffy)
                     {
@@ -3229,7 +9726,7 @@ impl RinchDocument {
                         // role, not the arm that removed it, so a child that is
                         // still `display: none` is skipped and one that has
                         // become block-level is restored.
-                        if let Some(c) = self.tree.nodes.get_mut(child_id) {
+                        if let Some(c) = self.tree.nodes.get_live_mut(child_id) {
                             c.ifc_detached = true;
                         }
                     }
@@ -3338,19 +9835,29 @@ impl RinchDocument {
     /// #597's second mechanism, and it is the classic way an exemption ends up
     /// wider than its author believes. This seed set cannot acquire it,
     /// because there is nothing to keep in step: one expression, two readers.
+    ///
+    /// It reads `NodeTree::atomic_inline_registry` rather than the slab: every
+    /// node the marking pass ever gave an `ifc_root` to while it was atomic is
+    /// registered, and the predicate below is applied to each entry exactly as
+    /// it was applied to each slab node, so the answer is the same set at
+    /// O(atomic inlines) instead of O(document).
     pub(crate) fn inline_block_measure_roots(&self) -> Vec<taffy::NodeId> {
         let mut out: Vec<(usize, taffy::NodeId)> = Vec::new();
-        for (_id, node) in &self.tree.nodes {
+        for &id in &self.tree.atomic_inline_registry {
+            let Some(node) = self.tree.nodes.get(id) else {
+                continue;
+            };
+            // A box outside the document is not measured (#1040): nothing
+            // paints it, and attaching it again seeds a structural pass that
+            // sizes it then. A detach clears the subtree's marks (#1073), but
+            // this is the whole-document pass, which walks the slab and marks
+            // detached subtrees again, so the registry names their atomic
+            // inlines again.
             if node.ifc_root.is_some()
                 && node.display_mode.is_atomic_inline()
                 && let Some(taffy_id) = node.taffy_id
+                && let Some(depth) = self.depth_if_connected(id)
             {
-                let mut depth = 0usize;
-                let mut cur = node.parent;
-                while let Some(p) = cur {
-                    depth += 1;
-                    cur = self.tree.nodes.get(p).and_then(|n| n.parent);
-                }
                 out.push((depth, taffy_id));
             }
         }
@@ -3369,6 +9876,65 @@ impl RinchDocument {
         // drift.
         out.sort_by_key(|a| std::cmp::Reverse(a.0));
         out.into_iter().map(|(_, t)| t).collect()
+    }
+
+    /// The scoped pass's share of [`Self::compute_inline_block_layouts`]
+    /// (`crate::ifc_scope`): size the atomic inlines the pass placed — the
+    /// stop nodes of its regions that sit in an IFC — whose Taffy node is
+    /// dirty. One that is clean was measured before and nothing inside it has
+    /// changed since (any change inside it marks it: its subtree is a Taffy
+    /// tree of its own), so its detached compute would be a cache hit.
+    ///
+    /// Queued first, for `remeasure_dirty_atomic_inlines` at the end of the
+    /// pass: every atomic inline **at or above** a container of the scope —
+    /// a change inside a container can resize every one around it, and the
+    /// IFC that lines such a box up is outside this scope, so only the
+    /// before/after comparison that function makes will re-measure that IFC.
+    /// Measured here, a box is taken off that queue: its IFC is in this
+    /// scope and its signature carries the new size.
+    pub(crate) fn measure_scoped_atomic_inlines(&mut self, scope: &crate::ifc_scope::IfcScope) {
+        for &c in &scope.containers {
+            self.mark_atomic_inline_dirty(c);
+        }
+        let mut targets: Vec<(usize, RawNodeId, taffy::NodeId)> = Vec::new();
+        for &(id, _, stop) in &scope.region {
+            if !stop {
+                continue;
+            }
+            let Some(node) = self.tree.nodes.get(id) else {
+                continue;
+            };
+            let (Some(_), Some(taffy_id)) = (node.ifc_root, node.taffy_id) else {
+                continue;
+            };
+            if !node.display_mode.is_atomic_inline() {
+                continue;
+            }
+            // Not dirty: measured already — unless it never was as an atomic
+            // inline, and so has no baseline to line it up by (#663).
+            if node.atomic_baseline_known && !self.tree.taffy.dirty(taffy_id).unwrap_or(true) {
+                continue;
+            }
+            let mut depth = 0usize;
+            let mut cur = node.parent;
+            while let Some(p) = cur {
+                depth += 1;
+                cur = self.tree.nodes.get_live(p).and_then(|n| n.parent);
+            }
+            targets.push((depth, id, taffy_id));
+        }
+        if targets.is_empty() {
+            return;
+        }
+        // Innermost first, as `inline_block_measure_roots` orders them: an
+        // outer box's compute reads an inner one's size.
+        targets.sort_by_key(|t| std::cmp::Reverse(t.0));
+        let measure: Vec<(taffy::NodeId, Option<f32>)> =
+            targets.iter().map(|&(_, _, t)| (t, None)).collect();
+        self.measure_inline_blocks(&measure);
+        for &(_, id, _) in &targets {
+            self.tree.dirty_atomic_inlines.remove(&id);
+        }
     }
 
     /// Pre-compute layout for inline-block children that were detached from Taffy.
@@ -3391,6 +9957,15 @@ impl RinchDocument {
         for id in std::mem::take(&mut self.tree.dirty_atomic_inlines) {
             if let Some(taffy_id) = self.tree.nodes.get(id).and_then(|n| n.taffy_id) {
                 let _ = self.tree.taffy.mark_dirty(taffy_id);
+            }
+        }
+        // Every box is measured again: none of the min-content sizes stands.
+        self.tree.atomic_min_content.clear();
+        // And the line around a box that lost one is measured again, as
+        // `remeasure_dirty_atomic_inlines` has it for the boxes it measures.
+        for id in std::mem::take(&mut self.tree.atomic_min_dropped) {
+            if let Some(root_id) = self.tree.nodes.get(id).and_then(|n| n.ifc_root) {
+                self.invalidate_ifc_of_atomic_inline(root_id);
             }
         }
         let ib_taffy_ids: Vec<(taffy::NodeId, Option<f32>)> = self
@@ -3433,12 +10008,26 @@ impl RinchDocument {
     /// dirty a measure without dirtying the IFC structure — a restyle that
     /// changed something, and `set_text_content` — which between them are five
     /// call sites (`dom_impl/mod.rs` twice, `style_resolution/mod.rs`,
-    /// `dom_document_impl.rs`, `layout_engine.rs`). Every *structural* mutation
-    /// sets `ifc_dirty` instead, which measures the lot — and re-measures
-    /// whatever this function marked, see the body; this must not be added to
-    /// those paths, where it would cost an ancestor walk per `append_child` on
-    /// first build and buy nothing.
-    pub(crate) fn mark_atomic_inline_dirty(&mut self, node_id: usize) {
+    /// `dom_document_impl.rs`, `layout_engine.rs`). A *structural* mutation
+    /// seeds a structural pass instead (`crate::ifc_scope`), which sizes what
+    /// it placed and calls this itself for every container it set up (the
+    /// atomic inlines around a changed container are outside its scope, and
+    /// this set is how they get re-measured) — so the mutation verbs must not
+    /// call it too, where it would cost an ancestor walk per `append_child` on
+    /// first build and buy nothing. Only a pending **whole-document** pass
+    /// (`ifc_dirty`) takes the other arm below, since that pass sizes every
+    /// atomic inline anyway.
+    pub(crate) fn mark_atomic_inline_dirty(&mut self, node_id: RawNodeId) {
+        self.mark_atomic_inline_dirty_for(node_id, true);
+    }
+
+    /// [`Self::mark_atomic_inline_dirty`], saying whether the change can
+    /// move a **size**. `sizes: false` is a change that re-shapes text
+    /// without re-wrapping it — a colour — after which each box is measured
+    /// again (its interior's glyphs are new) but its min-content width
+    /// stands (#1476): dropping it sent a colour-only hover on a chip in a
+    /// flex item through the min-content compute and a second root compute.
+    pub(crate) fn mark_atomic_inline_dirty_for(&mut self, node_id: RawNodeId, sizes: bool) {
         // On an `ifc_dirty` pass there is nothing to accumulate — that pass
         // measures every atomic inline in the document — but **measuring is not
         // re-measuring** (#784). `measure_inline_blocks` asks Taffy, and an
@@ -3462,6 +10051,13 @@ impl RinchDocument {
                     }
                 } else {
                     self.tree.dirty_atomic_inlines.insert(id);
+                }
+                // Its min-content size is no longer what was measured (#1476).
+                if sizes
+                    && !self.tree.atomic_min_content.is_empty()
+                    && self.tree.atomic_min_content.remove(&id).is_some()
+                {
+                    self.tree.atomic_min_dropped.insert(id);
                 }
             }
             cur = node.parent;
@@ -3491,11 +10087,46 @@ impl RinchDocument {
         }
         let dirty = std::mem::take(&mut self.tree.dirty_atomic_inlines);
 
-        // (depth, node id, taffy id, enclosing IFC root). The predicate is
-        // `inline_block_measure_roots`' — a node may have been removed, or have
-        // stopped being an atomic inline, since it was marked.
-        let mut targets: Vec<(usize, usize, taffy::NodeId, usize)> = Vec::new();
-        for id in dirty {
+        // A worklist keyed (depth, id), popped deepest first — an outer atomic
+        // inline sizes its `InlineBox` from the inner one's `Node::layout`.
+        // Same order, same reason, as `inline_block_measure_roots`.
+        //
+        // The input order this undoes is ascending node id, i.e. creation
+        // order, i.e. shallowest-first for a tree built parent-first — which is
+        // why `dirty_atomic_inlines` is a `BTreeSet` and must stay one. Under a
+        // `HashSet` the order was per-process random and the fixture that pins
+        // this line killed a sort-deleted mutant only **8** times in 25 runs —
+        // it missed it the other 17. It now kills it 25 times in 25. See that
+        // field's doc.
+        //
+        // A box no longer in the document is dropped, not measured (#1040):
+        // nothing paints what it holds. A detach clears the subtree's marks
+        // (#1073), so such an entry is usually skipped below for its missing
+        // `ifc_root` anyway — but a whole-document pass in the same layout
+        // marks a detached subtree again. Dropping the entry loses nothing: attaching
+        // the box again seeds a structural pass that sizes it.
+        // `a_detached_atomic_inline_is_sized_again_when_reattached` pins that
+        // for a box whose content changed before the detach with no layout in
+        // between, with and without a change while it was out, under a scoped
+        // and a whole-document pass.
+        let mut pending: std::collections::BTreeSet<(usize, RawNodeId)> = dirty
+            .into_iter()
+            .filter_map(|id| self.depth_if_connected(id).map(|depth| (depth, id)))
+            .collect();
+
+        // One box at a time, and each box's IFC invalidated — and every atomic
+        // inline around that IFC queued — **before** the next box is measured.
+        // An outer atomic inline lays its own IFC out around the inner one,
+        // and that IFC's measure is cached on a Taffy node inside the outer
+        // box's subtree: sized in one batch, the outer box read the measure its
+        // IFC had cached against the inner box's *old* size and kept the old
+        // width, and one sized earlier in the pass for another reason was never
+        // sized again (both found by the scoped pass's random differential).
+        let mut changed = false;
+        while let Some((depth, id)) = pending.pop_last() {
+            // The predicate is `inline_block_measure_roots`' — a node may have
+            // been removed, or have stopped being an atomic inline, since it
+            // was marked.
             let Some(node) = self.tree.nodes.get(id) else {
                 continue;
             };
@@ -3505,77 +10136,85 @@ impl RinchDocument {
             if !node.display_mode.is_atomic_inline() {
                 continue;
             }
-            let mut depth = 0usize;
-            let mut cur = node.parent;
-            while let Some(p) = cur {
-                depth += 1;
-                cur = self.tree.nodes.get(p).and_then(|n| n.parent);
-            }
-            targets.push((depth, id, taffy_id, root_id));
-        }
-        if targets.is_empty() {
-            return false;
-        }
-        // Deepest first — an outer atomic inline sizes its `InlineBox` from the
-        // inner one's `Node::layout`. Same order, same reason, as
-        // `inline_block_measure_roots`.
-        //
-        // The input order this undoes is ascending node id, i.e. creation
-        // order, i.e. shallowest-first for a tree built parent-first — which is
-        // why `dirty_atomic_inlines` is a `BTreeSet` and must stay one. Under a
-        // `HashSet` the order was per-process random and the fixture that pins
-        // this line killed a sort-deleted mutant only **8** times in 25 runs —
-        // it missed it the other 17. It now kills it 25 times in 25. See that
-        // field's doc.
-        targets.sort_by_key(|t| std::cmp::Reverse(t.0));
-
-        let before: Vec<(f32, f32)> = targets
-            .iter()
-            .map(|&(_, id, _, _)| {
-                let n = &self.tree.nodes[id];
-                (n.layout.width, n.layout.height)
-            })
-            .collect();
-
-        // Taffy caches a measure per (node, available space), and the previous
-        // pass measured these at exactly the available space this one will ask
-        // for — so without a mark the stale size is served straight back.
-        for &(_, _, taffy_id, _) in &targets {
+            let before = (node.layout.width, node.layout.height);
+            // Where the box lines up on its line (#896): an edit inside it can
+            // move its baseline and leave its size alone — an `inline-flex`
+            // whose first item lost the only line it had takes its baseline
+            // from the next item.
+            let baseline_before = node.atomic_baseline;
+            // A box inside that was resolved against its containing block
+            // (a percentage width) is lined up at the size that gave it, so
+            // this box's `auto` size would depend on what its containing
+            // block was before the change. Measured as `auto` first — what
+            // a fresh layout has when it measures this box — and resolved
+            // again after the compute, as every such box is.
+            self.reset_resolved_atomic_inlines_inside(id, depth, false);
+            // Taffy caches a measure per (node, available space), and the
+            // previous pass measured this box at exactly the available space
+            // this one will ask for — so without a mark the stale size is
+            // served straight back.
             let _ = self.tree.taffy.mark_dirty(taffy_id);
-        }
-        let measure: Vec<(taffy::NodeId, Option<f32>)> =
-            targets.iter().map(|&(_, _, t, _)| (t, None)).collect();
-        self.measure_inline_blocks(&measure);
-
-        // An IFC root that line-broke against the stale box has to break again.
-        // `resolve_percentage_inline_blocks` does the same three things for the
-        // same reason; the fourth, clearing the whole `ifc_measure_cache`, is
-        // deliberately narrowed to the affected roots here — this pass runs for
-        // an ordinary text edit, where flushing every root's cached measure is
-        // the cost the dirty set exists to avoid.
-        let mut changed = false;
-        for (i, &(_, id, _, root_id)) in targets.iter().enumerate() {
+            self.measure_inline_blocks(&[(taffy_id, None)]);
             let now = {
                 let n = &self.tree.nodes[id];
                 (n.layout.width, n.layout.height)
             };
-            if (now.0 - before[i].0).abs() <= 0.5 && (now.1 - before[i].1).abs() <= 0.5 {
+            // A box whose min-content width was dropped contributes
+            // something else to a narrower line even at the size it had
+            // (review 2 of #1488): a text edit that kept the box's size left
+            // the flex item around it at its old width for good, Taffy
+            // serving the item's min-content answer made from the old text.
+            let dropped = !self.tree.atomic_min_dropped.is_empty()
+                && self.tree.atomic_min_dropped.remove(&id);
+            let baseline_moved = match (baseline_before, self.tree.nodes[id].atomic_baseline) {
+                (Some(a), Some(b)) => (a - b).abs() > 0.01,
+                (a, b) => a.is_some() != b.is_some(),
+            };
+            if !dropped
+                && !baseline_moved
+                && (now.0 - before.0).abs() <= 0.5
+                && (now.1 - before.1).abs() <= 0.5
+            {
                 continue;
             }
+            // An IFC root that line-broke against the stale box has to break
+            // again. `resolve_percentage_inline_blocks` does the same three
+            // things for the same reason; the fourth, clearing the whole
+            // `ifc_measure_cache`, is deliberately narrowed to the affected
+            // roots here — this pass runs for an ordinary text edit, where
+            // flushing every root's cached measure is the cost the dirty set
+            // exists to avoid.
             changed = true;
             if let Some(root) = self.tree.nodes.get_mut(root_id) {
                 root.text_layout = None;
             }
             self.tree.dirty_ifc_text_roots.insert(root_id);
-            self.tree
-                .ifc_measure_cache
-                .retain(|&(rid, _), _| rid != root_id);
+            // The root's signature hashes the box's size, which has just moved
+            // with no structural pass to sign it.
+            self.tree.forget_ifc_measures_and_signature(root_id);
             if let Some(root_taffy) = self.tree.nodes.get(root_id).and_then(|n| n.taffy_id) {
                 let _ = self.tree.taffy.mark_dirty(root_taffy);
             }
             // The measure may live on the root's measure leaf, which a mark on
             // the root does not reach — dirty propagates up, not down (#466).
             self.mark_ifc_measure_dirty(root_id);
+            // That IFC is inside every atomic inline above the box, whose sizes
+            // it feeds: those are measured again, after it.
+            let mut cur = self.tree.nodes.get(id).and_then(|n| n.parent);
+            while let Some(a) = cur {
+                let Some(an) = self.tree.nodes.get(a) else {
+                    break;
+                };
+                // `a` is an ancestor of a connected box, so it is connected:
+                // `depth_if_connected` is asked for its depth here, not used
+                // as a filter, and has no `None` to give.
+                if an.display_mode.is_atomic_inline()
+                    && let Some(depth) = self.depth_if_connected(a)
+                {
+                    pending.insert((depth, a));
+                }
+                cur = an.parent;
+            }
         }
         changed
     }
@@ -3597,102 +10236,379 @@ impl RinchDocument {
         // Split-borrow so the closure captures only `tree.nodes`, leaving
         // `tree.nodes.get_mut` free after the call returns.
         let nodes = &tree.nodes;
-        let _ = tree.taffy.compute_layout_with_measure(
+        let perf = &tree.perf;
+        let (min_content, resolved_at, percent_resolved_at, min_requests) = (
+            &tree.atomic_min_content,
+            &tree.keyword_inline_cb_width,
+            &tree.percent_inline_cb_width,
+            &tree.atomic_min_requests,
+        );
+        // The layouts this compute's text leaves are measured with, kept for
+        // paint (#904) — see `NodeTree::atomic_leaf_layouts`.
+        let mut leaf_layouts: HashMap<(RawNodeId, u32), parley::layout::Layout<Brush>> =
+            HashMap::new();
+        // Each IFC root's and text leaf's line baselines, by the content
+        // width it was measured at (#663): `NodeTree::atomic_line_baselines`.
+        let mut baselines: Vec<(RawNodeId, crate::node::LineBaselines)> = Vec::new();
+        // The bands the box's own IFC roots were laid out beside, as the
+        // root compute keeps them (`NodeTree::ifc_float_bands`): `None` for a
+        // root laid out with none.
+        let mut float_bands: HashMap<RawNodeId, Option<crate::float_wrap::FloatBands>> =
+            HashMap::new();
+        perf.bump(crate::perf::Counter::InlineBlockComputes);
+        let _ = tree.taffy.compute_layout_with_block_measure(
             taffy_id,
             avail,
-            |known_dims, avail_space, _node_id, context, _style| {
-                let max_width = match avail_space.width {
-                    taffy::AvailableSpace::Definite(w) => Some(w),
-                    taffy::AvailableSpace::MaxContent => None,
-                    taffy::AvailableSpace::MinContent => Some(0.0),
+            |inputs, measured_id, context, style, block_ctx| {
+                // As the root compute does (`run_taffy_compute`): the room
+                // the floats leave the lines, and the floats the paragraph
+                // places itself.
+                let block_ctx =
+                    block_ctx.filter(|_| matches!(context, Some(NodeContext::InlineRoot(_))));
+                // Asked only its width beside its own floats (#2326), as in
+                // the root compute.
+                let (block_ctx, intrinsic) = match block_ctx {
+                    Some(ctx) if ctx.is_intrinsic() => (None, Some(&*ctx)),
+                    other => (other, None),
                 };
-                match context {
-                    Some(NodeContext::InlineRoot(root_id)) => {
-                        let root_id = *root_id;
-                        if let Some(est_h) = nodes[root_id].estimated_height {
-                            return taffy::Size {
-                                width: known_dims.width.unwrap_or(0.0),
-                                height: known_dims.height.unwrap_or(est_h),
-                            };
-                        }
-                        let inline_layout = Self::build_inline_layout(
-                            nodes, root_id, max_width, 1.0, font_cx, layout_cx,
-                        );
-                        taffy::Size {
-                            width: known_dims.width.unwrap_or(inline_layout.layout.width()),
-                            height: known_dims.height.unwrap_or(inline_layout.layout.height()),
-                        }
+                let leaf_box = block_ctx
+                    .as_ref()
+                    .and_then(|_| crate::float_wrap::LeafBox::of(&inputs, style));
+                let floats = block_ctx
+                    .as_deref()
+                    .map(|ctx| crate::float_wrap::FloatBands::of_leaf(ctx, &inputs, style))
+                    .filter(|bands| !bands.is_empty());
+                let places_floats = block_ctx
+                    .as_deref()
+                    .is_some_and(|ctx| !ctx.pending_floats().is_empty());
+                // Taffy 0.14's measure returns a `LayoutOutput`; the leaf
+                // algorithm (box-sizing, min/max clamps) is what Taffy 0.12's
+                // `TaffyView` ran around the size this body returns, with the
+                // same `0.0` calc resolver. The first line's baseline goes to
+                // Taffy too (#1013): an `inline-flex` / `inline-grid` with
+                // `align-items: baseline` aligns its own items by it.
+                // Whether its containing block's height is definite, as this
+                // final layout takes it (#2427).
+                crate::ifc::note_containing_block_height(
+                    nodes,
+                    measured_id,
+                    context.as_deref(),
+                    &inputs,
+                );
+                let mut first_baseline: Option<f32> = None;
+                // A compressible replaced box asked an intrinsic size, as in
+                // the root compute (`replaced::min_content_style`, #2424).
+                // The box whose lines a measure breaks has no width yet: it is
+                // being sized to fit them (`AtomicContributions::fits_compressible`).
+                let sizing_to_fit = crate::replaced::sizing_to_fit(&inputs, style);
+                let compressed = match context {
+                    Some(NodeContext::Replaced { .. } | NodeContext::Image { .. }) => {
+                        crate::replaced::min_content_style(&inputs, style)
                     }
-                    Some(NodeContext::Text(text)) => {
-                        if text.content.is_empty() {
-                            return taffy::Size::ZERO;
-                        }
-                        let mut builder =
-                            layout_cx.ranged_builder(font_cx, &text.content, 1.0, true);
-                        builder
-                            .push_default(parley::style::StyleProperty::FontSize(text.font_size));
-                        if (text.font_weight - 400.0).abs() > 1.0 {
-                            builder.push_default(parley::style::StyleProperty::FontWeight(
-                                parley::style::FontWeight::new(text.font_weight),
-                            ));
-                        }
-                        if let Some(lh) = layout::css_line_height_to_parley(&text.line_height_css) {
-                            builder.push_default(parley::style::StyleProperty::LineHeight(lh));
-                        }
-                        let font_stack = if !text.font_family.is_empty() {
-                            std::borrow::Cow::Owned(text.font_family.clone())
-                        } else {
-                            std::borrow::Cow::Borrowed("sans-serif")
+                    _ => None,
+                };
+                let style = compressed.as_ref().unwrap_or(style);
+                let out = taffy::compute_leaf_layout(
+                    inputs,
+                    style,
+                    |_, _| 0.0,
+                    |known_dims, avail_space| {
+                        let max_width = match avail_space.width {
+                            taffy::AvailableSpace::Definite(w) => Some(w),
+                            taffy::AvailableSpace::MaxContent => None,
+                            taffy::AvailableSpace::MinContent => Some(0.0),
                         };
-                        builder.push_default(parley::style::StyleProperty::FontFamily(
-                            parley::style::FontFamily::Source(font_stack),
-                        ));
-                        // Apply overflow-wrap for emergency line-breaking
-                        builder.push_default(parley::style::StyleProperty::OverflowWrap(
-                            text.overflow_wrap.to_parley(),
-                        ));
-                        // letter-/word-spacing (#698). The builder's scale is
-                        // 1.0 here, so these are CSS pixels either way.
-                        builder.push_default(parley::style::StyleProperty::LetterSpacing(
-                            text.letter_spacing,
-                        ));
-                        builder.push_default(parley::style::StyleProperty::WordSpacing(
-                            text.word_spacing,
-                        ));
-                        let mut layout = builder.build(&text.content);
-                        // If no_wrap is set (white-space: nowrap), don't constrain width
-                        let wrap_width = if text.no_wrap {
-                            None
-                        } else {
-                            known_dims.width.or(max_width)
-                        };
-                        layout.break_all_lines(wrap_width);
-                        taffy::Size {
-                            width: known_dims.width.unwrap_or(layout.width()),
-                            height: known_dims.height.unwrap_or(layout.height()),
-                        }
-                    }
-                    Some(NodeContext::Image { width, height, .. }) => {
-                        let iw = *width as f32;
-                        let ih = *height as f32;
-                        if iw == 0.0 || ih == 0.0 {
-                            return taffy::Size::ZERO;
-                        }
-                        taffy::Size {
-                            width: known_dims.width.unwrap_or(iw),
-                            height: known_dims.height.unwrap_or_else(|| {
-                                if let Some(kw) = known_dims.width {
-                                    ih * (kw / iw)
-                                } else {
-                                    ih
+                        match context {
+                            Some(NodeContext::InlineRoot(root_id)) => {
+                                let root_id = *root_id;
+                                if let Some(est_h) = nodes[root_id].estimated_height {
+                                    return taffy::Size {
+                                        width: known_dims.width.unwrap_or(0.0),
+                                        height: known_dims.height.unwrap_or(est_h),
+                                    };
                                 }
-                            }),
+                                perf.bump(crate::perf::Counter::ShapeAtomicInline);
+                                let mut placer = block_ctx
+                                    .zip(leaf_box)
+                                    .filter(|_| places_floats)
+                                    .map(|(ctx, leaf)| crate::float_wrap::BlockFloats {
+                                        ctx,
+                                        nodes,
+                                        leaf,
+                                    });
+                                let atomic = AtomicContributions {
+                                    wrap_width: max_width,
+                                    min_content,
+                                    resolved_at,
+                                    percent_resolved_at,
+                                    requests: min_requests,
+                                    fits_compressible: sizing_to_fit,
+                                    percent_cyclic: sizing_to_fit,
+                                    known_width: known_dims.width,
+                                    fitted: std::cell::Cell::new(false),
+                                };
+                                let (inline_layout, font_family_resolves) =
+                                    Self::build_inline_layout(
+                                        nodes,
+                                        root_id,
+                                        max_width,
+                                        None,
+                                        1.0,
+                                        font_cx,
+                                        layout_cx,
+                                        Some(&atomic),
+                                        floats.as_ref(),
+                                        placer.as_mut().map(|p| p as &mut dyn PlaceFloats),
+                                    );
+                                if inputs.run_mode == taffy::RunMode::PerformLayout {
+                                    let last = match &placer {
+                                        Some(p) => Some(p.leaf.bands(p.ctx)),
+                                        None => floats.clone(),
+                                    }
+                                    .filter(|bands| !bands.is_empty());
+                                    float_bands.insert(root_id, last);
+                                }
+                                perf.add(
+                                    crate::perf::Counter::InlineFontFamilyResolves,
+                                    font_family_resolves,
+                                );
+                                inline_layout.hang.record(perf);
+                                first_baseline = first_line_baseline(&inline_layout.layout);
+                                if let Some(ctx) = intrinsic {
+                                    // As the root compute: at a definite room
+                                    // the floats go on the max-content lines,
+                                    // then the room clamps.
+                                    let measured = inline_layout.measured_width();
+                                    let width = match max_width {
+                                        Some(room) => {
+                                            let atomic = AtomicContributions {
+                                                wrap_width: None,
+                                                min_content,
+                                                resolved_at,
+                                                percent_resolved_at,
+                                                requests: min_requests,
+                                                fits_compressible: false,
+                                                percent_cyclic: false,
+                                                known_width: None,
+                                                fitted: std::cell::Cell::new(false),
+                                            };
+                                            let (max, resolves) = Self::build_inline_layout(
+                                                nodes,
+                                                root_id,
+                                                None,
+                                                None,
+                                                1.0,
+                                                font_cx,
+                                                layout_cx,
+                                                Some(&atomic),
+                                                None,
+                                                None,
+                                            );
+                                            perf.add(
+                                                crate::perf::Counter::InlineFontFamilyResolves,
+                                                resolves,
+                                            );
+                                            crate::float_wrap::intrinsic_width_beside_floats(
+                                                ctx,
+                                                nodes,
+                                                &max.layout,
+                                                max.measured_width(),
+                                                Some((room, measured)),
+                                            )
+                                        }
+                                        None => crate::float_wrap::intrinsic_width_beside_floats(
+                                            ctx,
+                                            nodes,
+                                            &inline_layout.layout,
+                                            measured,
+                                            None,
+                                        ),
+                                    };
+                                    return taffy::Size {
+                                        width: known_dims.width.unwrap_or(width),
+                                        height: known_dims
+                                            .height
+                                            .unwrap_or(inline_layout.content_height()),
+                                    };
+                                }
+                                // Fit-content at a definite room, as the
+                                // root compute answers (#2330).
+                                let width = known_dims.width.unwrap_or(
+                                    if floats.is_some() || places_floats {
+                                        inline_layout.measured_width()
+                                    } else {
+                                        inline_layout.fit_content_width()
+                                    },
+                                );
+                                // A percentage `text-indent` counted 0 in
+                                // the width (#2628): the lines are those of
+                                // that width, with it resolved against it.
+                                let at_width = (sizing_to_fit
+                                    && floats.is_none()
+                                    && !places_floats
+                                    && nodes[root_id].computed_style.text_indent.has_percentage())
+                                .then(|| {
+                                    let atomic = AtomicContributions {
+                                        wrap_width: Some(width),
+                                        fits_compressible: false,
+                                        percent_cyclic: false,
+                                        known_width: Some(width),
+                                        fitted: std::cell::Cell::new(false),
+                                        ..atomic
+                                    };
+                                    let (lines, resolves) = Self::build_inline_layout(
+                                        nodes,
+                                        root_id,
+                                        Some(width),
+                                        None,
+                                        1.0,
+                                        font_cx,
+                                        layout_cx,
+                                        Some(&atomic),
+                                        None,
+                                        None,
+                                    );
+                                    perf.add(
+                                        crate::perf::Counter::InlineFontFamilyResolves,
+                                        resolves,
+                                    );
+                                    lines
+                                });
+                                let lines = at_width.as_ref().unwrap_or(&inline_layout);
+                                if at_width.is_some() {
+                                    first_baseline = first_line_baseline(&lines.layout);
+                                }
+                                let height = known_dims.height.unwrap_or(lines.content_height());
+                                baselines.push((
+                                    root_id,
+                                    (
+                                        width,
+                                        height,
+                                        first_baseline,
+                                        last_line_baseline(&lines.layout),
+                                    ),
+                                ));
+                                taffy::Size { width, height }
+                            }
+                            Some(NodeContext::Text(text)) => {
+                                if text.content.is_empty() {
+                                    return taffy::Size::ZERO;
+                                }
+                                perf.bump(crate::perf::Counter::ShapeAtomicInline);
+                                // If no_wrap is set (white-space: nowrap), don't constrain width
+                                let wrap_width = if text.no_wrap {
+                                    None
+                                } else {
+                                    known_dims.width.or(max_width)
+                                };
+                                let leaf = shape_text_leaf(
+                                    font_cx,
+                                    layout_cx,
+                                    text,
+                                    wrap_width,
+                                    known_dims.width.unwrap_or(0.0),
+                                );
+                                leaf.hang.record(perf);
+                                first_baseline = leaf.first_baseline();
+                                let last = if leaf.blank {
+                                    None
+                                } else {
+                                    last_line_baseline(&leaf.layout)
+                                };
+                                let layout = leaf.layout;
+                                let size = taffy::Size {
+                                    width: known_dims.width.unwrap_or(leaf.width),
+                                    height: known_dims.height.unwrap_or(leaf.height),
+                                };
+                                baselines.push((
+                                    text.node_id,
+                                    (size.width, size.height, first_baseline, last),
+                                ));
+                                // Keyed exactly as the root compute keys its own text
+                                // leaves, so `copy_cached_text_layouts` picks between
+                                // them by the same rule.
+                                let wrap_bits = wrap_width.map(|w| w.to_bits()).unwrap_or(u32::MAX);
+                                leaf_layouts.insert((text.node_id, wrap_bits), layout);
+                                size
+                            }
+                            Some(NodeContext::Image {
+                                natural,
+                                aspect,
+                                alt,
+                                ..
+                            }) => crate::replaced::measure_image(
+                                *natural,
+                                *aspect,
+                                alt.as_ref(),
+                                known_dims,
+                                style,
+                                inputs.parent_size,
+                                inputs.sizing_mode == taffy::SizingMode::InherentSize,
+                                inputs.available_space,
+                            ),
+                            Some(NodeContext::FormControl {
+                                content_width,
+                                content_height,
+                            }) => crate::form_control::measure(
+                                *content_width,
+                                *content_height,
+                                known_dims,
+                            ),
+                            Some(NodeContext::Replaced {
+                                width,
+                                height,
+                                ratio,
+                                aspect,
+                            }) => crate::replaced::contribution(
+                                crate::replaced::measure(
+                                    (*width, *height),
+                                    aspect.used_ratio(*ratio),
+                                    known_dims,
+                                    style,
+                                    inputs.parent_size,
+                                    inputs.sizing_mode == taffy::SizingMode::InherentSize,
+                                ),
+                                style,
+                                known_dims,
+                                inputs.available_space,
+                                inputs.parent_size,
+                                inputs.sizing_mode == taffy::SizingMode::InherentSize,
+                            ),
+                            _ => taffy::Size::ZERO,
                         }
-                    }
-                    _ => taffy::Size::ZERO,
-                }
+                    },
+                );
+                with_first_baseline(out, &inputs, style, first_baseline)
             },
+            |leaf, context| crate::float_wrap::is_measure_leaf(nodes, leaf, context),
         );
+        tree.atomic_leaf_layouts.extend(leaf_layouts);
+        for (id, record) in baselines {
+            let (width, height, ..) = record;
+            let entry = tree.atomic_line_baselines.entry(id).or_default();
+            // Measured from content it no longer has: set aside, once, for
+            // this compute's records (`NodeTree::forget_line_baselines`).
+            if !tree.line_baselines_superseded.is_empty()
+                && tree.line_baselines_superseded.remove(&id)
+            {
+                tree.stale_line_baselines.insert(id, std::mem::take(entry));
+            }
+            entry.retain(|e| (e.0 - width).abs() > 0.01 || (e.1 - height).abs() > 0.01);
+            if entry.len() >= 8 {
+                entry.remove(0);
+            }
+            entry.push(record);
+        }
+        for (root, bands) in float_bands {
+            match bands {
+                Some(bands) => {
+                    tree.ifc_float_bands.insert(root, bands);
+                }
+                None => {
+                    tree.ifc_float_bands.remove(&root);
+                }
+            }
+        }
     }
 
     /// Measure a set of detached atomic inlines (`inline-block`, `inline-flex`,
@@ -3719,11 +10635,16 @@ impl RinchDocument {
     ///   auto-width box 700 wide. An atomic inline is shrink-to-fit
     ///   (CSS 2.1 §10.3.5). Measured: `min-width: 50%` of a 700px cell with the
     ///   text `"hi"` came out **700** where it must be 350.
-    ///   The repair is to measure the content's own width at max-content first
-    ///   and **pin** it as `size.width` for the definite pass, because
-    ///   `clamped_style_size` is `.or`'d ahead of `available_space_based_size`
-    ///   while percentage `min-`/`max-width` still resolve against the
-    ///   containing block. Only for an auto-width box: an explicit `width` is
+    ///   The repair is to **pin** a width as `size.width` for the definite
+    ///   pass, because `clamped_style_size` is `.or`'d ahead of
+    ///   `available_space_based_size` while percentage `min-`/`max-width`
+    ///   still resolve against the containing block. Since #658 that width is
+    ///   the box's shrink-to-fit width, which
+    ///   [`Self::resolve_root_width_keyword`] resolves for `auto` as for
+    ///   `fit-content` (it used to be a separate "pass A" pinning the
+    ///   max-content width, never capped); an `auto` box that fits is
+    ///   measured under max-content space instead. Only for an auto-width
+    ///   box: an explicit `width` is
     ///   already the answer that branch reaches for.
     /// - **A leaf's min/max clamp is applied *after* its measure ran.** So a
     ///   `max-width` that bites leaves the box narrow with an interior laid out
@@ -3741,7 +10662,35 @@ impl RinchDocument {
     /// returns, so nothing outside this function ever sees it; the node's
     /// computed style, which is what the next pass re-derives from, is untouched.
     fn measure_inline_blocks(&mut self, targets: &[(taffy::NodeId, Option<f32>)]) {
+        self.measure_inline_blocks_with(targets, false);
+    }
+
+    /// [`Self::measure_inline_blocks`], or, with `at_pinned_width`, the
+    /// measure [`Self::relayout_atomic_inline_at_its_width`] runs: each box's
+    /// `width` is pinned at the width it already has and `available_width`
+    /// is that width, **not** its containing block's, so the box's own
+    /// percentages are not resolved against it (see
+    /// [`Self::own_percentage_widths`]).
+    fn measure_inline_blocks_with(
+        &mut self,
+        targets: &[(taffy::NodeId, Option<f32>)],
+        at_pinned_width: bool,
+    ) {
         for &(taffy_id, available_width) in targets {
+            // Measured as `auto` (no containing-block width): a keyword box's
+            // cached size no longer stands (#691).
+            if available_width.is_none()
+                && !(self.tree.keyword_inline_cb_width.is_empty()
+                    && self.tree.percent_inline_cb_width.is_empty())
+                && let Some(&nid) = self.tree.taffy_map.get(&taffy_id)
+            {
+                self.tree.keyword_inline_cb_width.remove(&nid);
+                // Nor a percentage box's (#2136).
+                self.tree.percent_inline_cb_width.remove(&nid);
+                if !self.tree.atomic_cb_height.is_empty() {
+                    self.tree.atomic_cb_height.remove(&nid);
+                }
+            }
             let definite = |w: f32| taffy::Size {
                 width: taffy::AvailableSpace::Definite(w),
                 height: taffy::AvailableSpace::MaxContent,
@@ -3751,42 +10700,99 @@ impl RinchDocument {
                 height: taffy::AvailableSpace::MaxContent,
             };
 
-            let Ok(original) = self.tree.taffy.style(taffy_id).cloned() else {
+            let Ok(mut original) = self.tree.taffy.style(taffy_id).cloned() else {
                 continue;
             };
-            let block_root = original.display == taffy::Display::Block;
-            let auto_width = original.size.width.is_auto();
-            let clampable = !original.max_size.width.is_auto();
-            let mut pinned = false;
-
-            // Pass A — the content's own width, so the definite pass below can
-            // be given a basis without being given a stretch.
-            if block_root && auto_width && available_width.is_some() {
-                Self::compute_atomic_inline_root(
-                    &mut self.tree,
-                    &mut self.font_cx,
-                    &mut self.layout_cx,
-                    taffy_id,
-                    max_content,
-                );
-                // **`unrounded_layout`, not `layout`.** Taffy rounds a final
-                // layout to whole pixels, and pinning the *rounded* width is
-                // pinning a width the content does not fit in: a 580.37px
-                // max-content line pinned at 580 re-broke into two lines, so
-                // the box came out 580 wide with an interior laid out for 400.
-                // Measured — this is the difference between `(580, 20)` and
-                // `(580, 40)` on `min-width: 10%` in a 400px cell.
-                let natural = self.tree.taffy.unrounded_layout(taffy_id).size.width;
-                let mut style = original.clone();
-                style.size.width = taffy::Dimension::length(natural);
-                let _ = self.tree.taffy.set_style(taffy_id, style);
-                pinned = true;
+            if available_width.is_none()
+                && let Some(&nid) = self.tree.taffy_map.get(&taffy_id)
+            {
+                if original.size.width.is_auto() && self.subtree_uses_percentage(taffy_id) {
+                    self.tree.auto_inline_percent_content.insert(nid);
+                } else if !self.tree.auto_inline_percent_content.is_empty() {
+                    self.tree.auto_inline_percent_content.remove(&nid);
+                }
             }
+            // `declared` is what goes back afterwards; `None` while nothing
+            // is pinned, so a box with nothing to pin costs no clone.
+            let mut declared: Option<taffy::Style> = None;
+            // The sizes the box resolves against its containing block where
+            // an in-flow child gets them from its parent (#1277, #1420,
+            // #1480): first, so that the keyword measures below see them.
+            // Measured with a basis (`available_width` is the containing
+            // block's width, or in a pinned pass the box's own), the basis
+            // is the containing block's, from the IFC the box is laid out in.
+            if available_width.is_some()
+                && let Some(&nid) = self.tree.taffy_map.get(&taffy_id)
+                && self.tree.contains(nid)
+                && Self::pins_containing_block_sizes(&self.tree.nodes[nid].computed_style)
+                && let Some(root_id) = self.tree.nodes[nid].ifc_root
+                && let Some(cb_width) = self.containing_block_inner_width(root_id)
+            {
+                let cb_height = self.containing_block_inner_height(root_id);
+                let before = original.clone();
+                if self.pin_containing_block_sizes(nid, &mut original, cb_width, cb_height) {
+                    declared = Some(before);
+                    let _ = self.tree.taffy.set_style(taffy_id, original.clone());
+                }
+            }
+            // A Taffy root ignores a sizing keyword on its own `size` (#691),
+            // so a keyword width is resolved here and handed to the passes
+            // below as the length (or `auto`) it means.
+            let keyword_width =
+                self.resolve_root_width_keyword(taffy_id, &original, available_width);
+            if let Some(w) = keyword_width {
+                declared.get_or_insert_with(|| original.clone());
+                original.size.width = w;
+                let _ = self.tree.taffy.set_style(taffy_id, original.clone());
+            }
+            // The box's own percentage `width`/`min-width`/`max-width`
+            // resolve against its containing block's width, not against the
+            // space the passes below hand Taffy, which can be wider (#2140)
+            // — and a `calc()` one has no Taffy form at all (#2146).
+            let basis = if at_pinned_width {
+                OwnPercentageBasis::PinnedWidth
+            } else {
+                OwnPercentageBasis::ContainingBlock(available_width)
+            };
+            if let Some(own) = self.own_percentage_widths(taffy_id, basis) {
+                declared.get_or_insert_with(|| original.clone());
+                if let Some(w) = own.width {
+                    original.size.width = w;
+                }
+                if let Some(w) = own.min {
+                    original.min_size.width = w;
+                }
+                if let Some(w) = own.max {
+                    original.max_size.width = w;
+                }
+                let _ = self.tree.taffy.set_style(taffy_id, original.clone());
+            }
+            let block_root = original.display == taffy::Display::Block;
+            let clampable = !original.max_size.width.is_auto();
+            let mut pinned = declared.is_some();
 
-            // Pass B — the measure the caller asked for.
-            let avail = match available_width {
-                Some(w) => definite(w),
-                None => max_content,
+            // There used to be a pass A here (#592): an `auto` width given a
+            // containing-block width was measured at max-content and that
+            // width pinned, so the definite pass below had a basis for a
+            // percentage without stretching the box. An `auto` width given a
+            // containing-block width is now resolved to its shrink-to-fit
+            // length above (#658), which is that pin capped at the containing
+            // block — unrounded, for the reason that pass gave: a 580.37px
+            // max-content line pinned at 580 re-broke into two lines.
+
+            // Pass B — the measure the caller asked for. Never narrower than
+            // a width resolved above: one allowed up to a pixel past its
+            // containing block (see `resolve_root_width_keyword`) re-broke
+            // its last word onto a second line under the narrower space.
+            let resolved_width = keyword_width
+                .filter(|w| w.tag() == taffy::CompactLength::LENGTH_TAG)
+                .map(|w| w.value());
+            let avail = match (available_width, resolved_width) {
+                (Some(w), Some(r)) => definite(w.max(r)),
+                // An `auto` box that fits (see `resolve_root_width_keyword`).
+                (Some(_), None) if original.size.width.is_auto() => max_content,
+                (Some(w), None) => definite(w),
+                (None, _) => max_content,
             };
             Self::compute_atomic_inline_root(
                 &mut self.tree,
@@ -3806,10 +10812,16 @@ impl RinchDocument {
             // nothing across `-p rinch-dom -p rinch` — a whole extra compute per
             // percentage-sized atomic inline, buying nothing any test can see.
             if block_root && clampable {
-                // Unrounded, for the reason pass A gives.
+                // Unrounded: a rounded-down width is one the content does
+                // not fit in (a 580.37px line pinned at 580 re-broke).
                 let used = self.tree.taffy.unrounded_layout(taffy_id).size.width;
                 let mut style = original.clone();
-                style.size.width = taffy::Dimension::length(used);
+                style.size.width = taffy::Dimension::length(self.sizing_box_width(
+                    taffy_id,
+                    &original,
+                    used,
+                    available_width,
+                ));
                 let _ = self.tree.taffy.set_style(taffy_id, style);
                 pinned = true;
                 Self::compute_atomic_inline_root(
@@ -3827,146 +10839,1294 @@ impl RinchDocument {
             if let Ok(taffy_layout) = self.tree.taffy.layout(taffy_id) {
                 let layout_size = taffy_layout.size;
                 let node_id = self.tree.taffy_map.get(&taffy_id).copied();
+                let baseline = node_id.and_then(|nid| atomic_inline_baseline(&self.tree, nid));
                 if let Some(nid) = node_id
                     && let Some(node) = self.tree.nodes.get_mut(nid)
                 {
                     node.layout.width = layout_size.width;
                     node.layout.height = layout_size.height;
+                    node.atomic_baseline = baseline;
+                    node.atomic_baseline_known = true;
                 }
             }
 
             if pinned {
-                let _ = self.tree.taffy.set_style(taffy_id, original);
+                let _ = self
+                    .tree
+                    .taffy
+                    .set_style(taffy_id, declared.unwrap_or(original));
             }
         }
     }
 
-    /// Whether any of this style's inline-axis sizes is a percentage, and so needs
-    /// a containing-block width to resolve against.
-    fn has_percentage_inline_size(style: &crate::computed_style::ComputedStyle) -> bool {
-        use crate::computed_style::DimensionValue::Percent;
-        matches!(style.width, Percent(_))
-            || matches!(style.min_width, Percent(_))
-            || matches!(style.max_width, Percent(_))
+    /// The width a detached atomic-inline root takes for a **sizing keyword**
+    /// on its own `width` (#691), as a length — or `auto` where the keyword
+    /// needs a containing-block width this pass was not given. `None` when the
+    /// width is not a keyword.
+    ///
+    /// Taffy lays the keywords out on a box it computes as a child, but a
+    /// *root*'s own size keyword is resolved to nothing, so the root falls
+    /// back to `auto` under whatever available space it is handed — and every
+    /// atomic inline is a root here. So:
+    ///
+    /// - `max-content` and `min-content` are a compute of the box with an
+    ///   `auto` width under `AvailableSpace::MaxContent` / `MinContent`. With no
+    ///   containing-block width, `max-content` needs no compute at all: `auto`
+    ///   under max-content space is exactly what pass B does with it.
+    /// - `fit-content` is `min(max-content, max(min-content, stretch))` and
+    ///   `stretch` is the containing block's inner width less the box's
+    ///   margins, so both need `available_width`. Without one (the pass before
+    ///   the root compute) they lay out as `auto`, and
+    ///   [`Self::resolve_percentage_inline_blocks`] measures them again once
+    ///   the containing block has a width.
+    ///
+    /// Widths are measured as unrounded border-box widths: a rounded-down
+    /// width is one the content does not fit in (a 580.37px line pinned at 580
+    /// re-broke). The length returned is for the box's own `box-sizing` box
+    /// ([`Self::sizing_box_width`]): it goes into the box's `width`, which
+    /// Taffy reads as a content width for a `content-box` box (#1278).
+    fn resolve_root_width_keyword(
+        &mut self,
+        taffy_id: taffy::NodeId,
+        declared: &taffy::Style,
+        available_width: Option<f32>,
+    ) -> Option<taffy::Dimension> {
+        use taffy::CompactLength as C;
+        use taffy::ResolveOrZero;
+        let width = declared.size.width;
+        // An `auto` width is shrink-to-fit on an atomic inline (CSS 2.1
+        // §10.3.9), which is `fit-content` (css-sizing-3 §3.1) — but only
+        // once there is a containing-block width to fit (#658). Without one
+        // it is measured as Taffy measures `auto` under max-content space.
+        let auto = width.is_auto();
+        if auto && available_width.is_none() {
+            return None;
+        }
+        // Not on a replaced element with a natural width: its `auto` width
+        // is that one, clamped by its `min-width`/`max-width` (CSS 2.1
+        // §10.3.2), which its measure computes with its percentages resolved
+        // against the containing block. Its padding, border and margins go outside that
+        // and may overflow the line, as in Chrome 157 (#2442): fitted to the
+        // containing block less its margins, `<img style="max-width: 100%;
+        // padding: 5%">` in 300px was 300 wide, the padding inside the 100%,
+        // where Chrome gives 330.
+        if auto && crate::replaced::has_natural_width(self.tree.taffy.get_node_context(taffy_id)) {
+            return None;
+        }
+        if !auto && !width.is_sizing_keyword() {
+            return None;
+        }
+        let measure = |this: &mut Self, space: taffy::AvailableSpace| -> f32 {
+            let mut probe = declared.clone();
+            probe.size.width = taffy::Dimension::auto();
+            let _ = this.tree.taffy.set_style(taffy_id, probe);
+            Self::compute_atomic_inline_root(
+                &mut this.tree,
+                &mut this.font_cx,
+                &mut this.layout_cx,
+                taffy_id,
+                taffy::Size {
+                    width: space,
+                    height: taffy::AvailableSpace::MaxContent,
+                },
+            );
+            this.tree.taffy.unrounded_layout(taffy_id).size.width
+        };
+        // `min(max-content, max(min-content, stretch))`. The max-content
+        // width is measured first: when it fits, it is the answer and the
+        // min-content compute is not needed.
+        //
+        // "Fits" and the result both allow one pixel: an IFC lines an atomic
+        // inline up at its *rounded* `Node::layout` size, so a box whose
+        // only content is another one has a min-content width (and so a
+        // containing block) up to a pixel narrower than that box's unrounded
+        // max-content width — capped there, the inner box wrapped its last
+        // word onto a second line (an `inline-block` around an
+        // `inline-block`, 544.0 against 544.3).
+        //
+        // The max-content answer is handed back a hundredth of a pixel
+        // wider: laid out again at exactly its own max-content width, a
+        // line can break (measured: `"x y z"` in a padded `inline-block`,
+        // 32.64 wide, came out two lines tall), and a width that has room
+        // for its content must not wrap it. It rounds to the same pixel.
+        //
+        // The min-content width of an `auto` box is kept
+        // (`NodeTree::atomic_min_content`, #1476): an inline formatting
+        // context that lines the box up needs it too, and it stands until
+        // something inside the box changes. Its own min-content compute can
+        // meet a box inside it whose min-content size is not known yet; those
+        // are measured and the compute run again.
+        let this_max = std::cell::Cell::new(f32::INFINITY);
+        // Checked (#723): `taffy_map` keeps an element's entry after the node
+        // is freed (`remove_subtree` leaves it and the Taffy node), so the id
+        // it hands back may name a slot's next occupant. The indexing below
+        // relies on this filter.
+        let node_id = self
+            .tree
+            .taffy_map
+            .get(&taffy_id)
+            .copied()
+            .filter(|&n| self.tree.contains(n));
+        let fit_content = |this: &mut Self, stretch: f32| -> f32 {
+            // From before the max-content compute: a flex item inside the
+            // box is asked for its min-content size by that compute too, and
+            // Taffy keeps the answer — made with a stand-in — for the
+            // min-content compute below, which then asks nothing.
+            let mut asked = this.tree.atomic_min_requests.borrow().len();
+            // A box still resolved (it has not been measured as `auto`
+            // since, so nothing inside it changed) whose min-content width
+            // is known needs neither probe: its max-content width is the
+            // one the last resolution measured. This is a capped chip whose
+            // container was resized — one compute a pixel, not two.
+            let remembered = node_id.filter(|n| {
+                auto && this.tree.keyword_inline_cb_width.contains_key(n)
+                    && this.tree.atomic_min_content.contains_key(n)
+            });
+            let max = match remembered {
+                Some(n) => this.tree.nodes[n].natural_max_width,
+                None => {
+                    let max = measure(this, taffy::AvailableSpace::MaxContent);
+                    if auto && let Some(n) = node_id {
+                        this.tree.nodes[n].natural_max_width = max;
+                    }
+                    max
+                }
+            };
+            this_max.set(max + 0.01);
+            if atomic_inline_fits(max, stretch) {
+                return max + 0.01;
+            }
+            let known = node_id
+                .filter(|_| auto)
+                .and_then(|n| this.tree.atomic_min_content.get(&n))
+                .copied();
+            let min = known.unwrap_or_else(|| {
+                let mut min = measure(this, taffy::AvailableSpace::MinContent);
+                for _ in 0..8 {
+                    let inner = this.tree.atomic_min_requests.borrow_mut().split_off(asked);
+                    if !inner.iter().any(|&r| this.wants_min_content(r)) {
+                        break;
+                    }
+                    this.measure_atomic_min_contents(inner, false);
+                    asked = this.tree.atomic_min_requests.borrow().len();
+                    min = measure(this, taffy::AvailableSpace::MinContent);
+                }
+                if auto && let Some(n) = node_id {
+                    this.tree.atomic_min_content.insert(n, min);
+                }
+                min
+            });
+            atomic_inline_capped_width(min, max, stretch).unwrap_or(max + 0.01)
+        };
+        let stretch = available_width.map(|cb| {
+            let margin = declared.margin.resolve_or_zero(Some(cb), |_, _| 0.0);
+            (cb - margin.left - margin.right).max(0.0)
+        });
+        let resolved = match width.tag() {
+            // An `auto` box that fits is measured as `auto`, under
+            // max-content space — exactly what a measure with no
+            // containing-block width does — rather than pinned at that
+            // width: a pinned line can break where the unpinned one did not
+            // (an inline formatting context holding an absolute box's
+            // placeholder does, pre-existing), and then a box resolved here
+            // and one a whole-document pass left alone came out at two
+            // heights. Not when a percentage in it, or its own, needs that
+            // width as its basis (#662): that box is pinned.
+            _ if auto => stretch.and_then(|stretch| {
+                let w = fit_content(self, stretch);
+                let max = this_max.get();
+                let percent_content = self
+                    .tree
+                    .taffy_map
+                    .get(&taffy_id)
+                    .is_some_and(|n| self.tree.auto_inline_percent_content.contains(n));
+                // Its own percentage `min-`/`max-width` needs the basis too.
+                let own_percent = [declared.min_size.width, declared.max_size.width]
+                    .iter()
+                    .any(|d| d.into_raw().tag() == C::PERCENT_TAG);
+                (w < max || percent_content || own_percent).then_some(w)
+            }),
+            C::MAX_CONTENT_TAG if available_width.is_none() => None,
+            C::MAX_CONTENT_TAG => Some(measure(self, taffy::AvailableSpace::MaxContent)),
+            C::MIN_CONTENT_TAG => Some(measure(self, taffy::AvailableSpace::MinContent)),
+            C::FIT_CONTENT_KEYWORD_TAG => stretch.map(|stretch| fit_content(self, stretch)),
+            C::STRETCH_TAG => stretch,
+            // `fit-content(<length-percentage>)` — rinch never produces one.
+            _ => None,
+        };
+        Some(resolved.map_or(taffy::Dimension::auto(), |w| {
+            taffy::Dimension::length(self.sizing_box_width(taffy_id, declared, w, available_width))
+        }))
     }
 
-    /// Re-measure inline-blocks whose inline size is a percentage, now that their
-    /// containing block has a computed width (issue #120).
-    ///
-    /// `compute_inline_block_layouts` runs *before* the root Taffy compute, so a
-    /// percentage width has nothing to resolve against and collapses to
-    /// min-content. This runs *after* that compute, when the containing block's
-    /// width is real, and re-measures against it.
-    ///
-    /// Returns `true` if any inline-block changed size — the caller must then
-    /// re-run the root compute so the enclosing IFCs line-break against the
-    /// corrected boxes. Returns `false` (doing no work) when no inline-block has a
-    /// percentage inline size, which is the overwhelmingly common case.
-    ///
-    /// Only the *inline* axis is corrected. A percentage height on an inline-block
-    /// resolves against a containing-block height that is itself usually content-
-    /// derived, so there is no non-circular basis to feed back here.
-    pub(crate) fn resolve_percentage_inline_blocks(&mut self) -> bool {
-        // What to re-measure, and what to compare against afterwards:
-        // targets  = (taffy id, containing block inner width)
-        // affected = (node id, IFC root id, width before, height before)
-        let mut targets: Vec<(taffy::NodeId, Option<f32>)> = Vec::new();
-        let mut affected: Vec<(usize, usize, f32, f32)> = Vec::new();
+    /// The `width` that makes Taffy node `taffy_id`, styled `style`,
+    /// `border_box` wide: the border-box width itself for a `border-box` box,
+    /// less its horizontal padding and border for a `content-box` one. A
+    /// measured width written back as a border-box width made a padded
+    /// `content-box` box grow by its padding, and again on every layout
+    /// (#1278). The padding is resolved against `cb_width`, the containing
+    /// block's width, when it is known; otherwise the box's last layout's is
+    /// taken (a percentage padding resolves against the containing block,
+    /// which a detached atomic inline's own compute does not have).
+    fn sizing_box_width(
+        &self,
+        taffy_id: taffy::NodeId,
+        style: &taffy::Style,
+        border_box: f32,
+        cb_width: Option<f32>,
+    ) -> f32 {
+        use taffy::ResolveOrZero;
+        if style.box_sizing == taffy::BoxSizing::BorderBox {
+            return border_box;
+        }
+        let inset = match cb_width {
+            Some(cb) => {
+                let padding = style.padding.resolve_or_zero(Some(cb), |_, _| 0.0);
+                let border = style.border.resolve_or_zero(Some(cb), |_, _| 0.0);
+                padding.left + padding.right + border.left + border.right
+            }
+            None => {
+                let l = self.tree.taffy.unrounded_layout(taffy_id);
+                l.padding.left + l.padding.right + l.border.left + l.border.right
+            }
+        };
+        (border_box - inset).max(0.0)
+    }
 
-        for (id, node) in &self.tree.nodes {
+    /// Whether a box in `root`'s own Taffy subtree (not `root` itself, and not
+    /// inside a nested atomic inline, which is a root of its own) has a
+    /// percentage that resolves against its containing block's width (#662):
+    /// an inline size, a flex basis, a padding or margin on any side, a gap,
+    /// or a horizontal inset. Asked when an `auto`-width atomic inline is
+    /// measured with no containing-block width, so it costs one walk per
+    /// measure, not one per layout pass.
+    fn subtree_uses_percentage(&self, root: taffy::NodeId) -> bool {
+        use taffy::CompactLength as C;
+        let pct = |c: taffy::CompactLength| c.tag() == C::PERCENT_TAG;
+        let mut stack = self.tree.taffy.children(root).unwrap_or_default();
+        while let Some(n) = stack.pop() {
+            let Ok(s) = self.tree.taffy.style(n) else {
+                continue;
+            };
+            if pct(s.size.width.into_raw())
+                || pct(s.min_size.width.into_raw())
+                || pct(s.max_size.width.into_raw())
+                || pct(s.flex_basis.into_raw())
+                || pct(s.padding.left.into_raw())
+                || pct(s.padding.right.into_raw())
+                || pct(s.padding.top.into_raw())
+                || pct(s.padding.bottom.into_raw())
+                || pct(s.margin.left.into_raw())
+                || pct(s.margin.right.into_raw())
+                || pct(s.margin.top.into_raw())
+                || pct(s.margin.bottom.into_raw())
+                || pct(s.gap.width.into_raw())
+                || pct(s.inset.left.into_raw())
+                || pct(s.inset.right.into_raw())
+            {
+                return true;
+            }
+            if let Ok(children) = self.tree.taffy.children(n) {
+                stack.extend(children);
+            }
+        }
+        false
+    }
+
+    /// The Taffy values an atomic inline's own percentage `width`,
+    /// `min-width` and `max-width` take when it is measured against a
+    /// containing block `cb_width` wide, or `None` when it has none.
+    ///
+    /// A detached atomic inline is a Taffy *root*, and a root resolves its
+    /// own percentages against the available space it is computed under.
+    /// That is the containing block only while nothing widens it, and
+    /// `measure_inline_blocks` does: its pass B never hands a box less than a
+    /// width resolved for it, and its pass C recomputes at the box's own
+    /// used width. A `max-width: 100%` over content wider than the block
+    /// was so resolved against the content's width and capped nothing
+    /// (#2140; Chrome caps it at the block and lets the content overflow).
+    /// A mixed `calc()` has no Taffy form at all — its Taffy style holds only
+    /// its length part (`DimensionValue::to_taffy`) — and a root's is not
+    /// reached by `resolve_layout_calcs`, so `width: calc(50% + 10px)` was
+    /// laid out at `10px` (#2146). Both are resolved here to lengths.
+    ///
+    /// With no containing-block width (the measure before the root
+    /// compute), a plain percentage is left to Taffy, which resolves it
+    /// against max-content space as `auto`; a `calc()` is made `auto` the
+    /// same way, not its length part. [`Self::resolve_percentage_inline_blocks`]
+    /// measures the box again once the block has a width.
+    ///
+    /// For [`OwnPercentageBasis::PinnedWidth`] (the box laid out again at the
+    /// width it has, its `width` pinned there) the pin is kept, and a
+    /// percentage `min-width`/`max-width` is made `auto`: the pinned width
+    /// already obeys them, and the only basis that pass has is the box's own
+    /// width. Resolved against that, a `width: 50%` box halved on every
+    /// layout (review of #2152), and a `calc()` one kept only its length part.
+    fn own_percentage_widths(
+        &self,
+        taffy_id: taffy::NodeId,
+        basis: OwnPercentageBasis,
+    ) -> Option<OwnPercentageWidths> {
+        use crate::computed_style::DimensionValue as D;
+        let nid = self
+            .tree
+            .taffy_map
+            .get(&taffy_id)
+            .copied()
+            .filter(|&n| self.tree.contains(n))?;
+        let style = &self.tree.nodes[nid].computed_style;
+        if !Self::has_percentage_inline_size(style) {
+            return None;
+        }
+        // `Some(length)` for a resolved size, `Some(None)` for `auto`, `None`
+        // to leave the Taffy value as it is.
+        let (cb_width, pinned) = match basis {
+            OwnPercentageBasis::ContainingBlock(cb) => (cb, false),
+            OwnPercentageBasis::PinnedWidth => (None, true),
+        };
+        let resolve = |v: D| -> Option<Option<f32>> {
+            match (v, cb_width) {
+                (D::Percent(_) | D::Calc { .. }, _) if pinned => Some(None),
+                (D::Percent(p), Some(cb)) => Some(Some((p * cb).max(0.0))),
+                (D::Calc { .. }, Some(cb)) => Some(v.resolve_calc(cb)),
+                (D::Calc { .. }, None) => Some(None),
+                _ => None,
+            }
+        };
+        let own = OwnPercentageWidths {
+            width: resolve(style.width).filter(|_| !pinned).map(|w| match w {
+                Some(w) => taffy::Dimension::length(w),
+                None => taffy::Dimension::auto(),
+            }),
+            min: resolve(style.min_width).map(|w| match w {
+                Some(w) => taffy::LengthPercentageAuto::length(w),
+                None => taffy::LengthPercentageAuto::auto(),
+            }),
+            max: resolve(style.max_width).map(|w| match w {
+                Some(w) => taffy::LengthPercentageAuto::length(w),
+                None => taffy::LengthPercentageAuto::auto(),
+            }),
+        };
+        (own.width.is_some() || own.min.is_some() || own.max.is_some()).then_some(own)
+    }
+
+    /// Pin into `style` (the Taffy style of atomic inline `nid`) the values
+    /// of the box's own that an in-flow child resolves against its parent
+    /// and a detached root cannot: a percentage or `calc()` `height`,
+    /// `min-height` or `max-height` and a `height: stretch`, against the
+    /// containing block's content height `cb_height` (`Some` only where it
+    /// is definite), and a percentage or `calc()` padding against its width
+    /// `cb_width`. Returns whether it changed anything.
+    ///
+    /// A Taffy root's percentage basis is the available space it is
+    /// computed under (`compute_root_layout` hands `available_space` down as
+    /// `parent_size`), and `measure_inline_blocks` computes every box under
+    /// max-content height, and an `auto` box that fits under max-content
+    /// width. So `height: 50%` in a 300px block came out `auto` (#1420), a
+    /// root's own `height: stretch` is resolved by nobody (#1277), and
+    /// `padding: 0 10%` on a box that fits resolved against nothing (#1480).
+    /// Pinned as lengths, they are the values Taffy gives an in-flow child
+    /// with that `parent_size`: a length `height` goes into the root's known
+    /// height, definite, so a percentage inside the box resolves against it
+    /// too.
+    ///
+    /// An indefinite height leaves a percentage to Taffy (no basis: `auto`,
+    /// CSS 2.1 §10.5), and makes a `calc()` with a percentage `auto` the
+    /// same way, not its length part; `stretch` is then `auto` as well.
+    fn pin_containing_block_sizes(
+        &self,
+        nid: RawNodeId,
+        style: &mut taffy::Style,
+        cb_width: f32,
+        cb_height: Option<f32>,
+    ) -> bool {
+        use crate::computed_style::DimensionValue as D;
+        use crate::computed_style::IntrinsicSize::Stretch;
+        use crate::computed_style::LengthPercentageValue as P;
+        let cs = &self.tree.nodes[nid].computed_style;
+        let mut changed = false;
+        // `Some(Some(px))` a length, `Some(None)` `auto`, `None` untouched.
+        let block = |v: D| -> Option<Option<f32>> {
+            match (v, cb_height) {
+                (D::Percent(p), Some(h)) => Some(Some((p * h).max(0.0))),
+                (D::Calc { .. }, Some(h)) => Some(v.resolve_calc(h)),
+                (D::Calc { .. }, None) => Some(None),
+                _ => None,
+            }
+        };
+        let height = match (cs.height, cb_height) {
+            (D::Intrinsic(Stretch), Some(h)) => {
+                // The margin box fills the containing block (css-sizing-4
+                // §3.1); a vertical margin's percentage is of its width.
+                let m = cs.margin_top.resolve(cb_width).unwrap_or(0.0)
+                    + cs.margin_bottom.resolve(cb_width).unwrap_or(0.0);
+                let mut border_box = (h - m).max(0.0);
+                if style.box_sizing == taffy::BoxSizing::ContentBox {
+                    let pad = |p: P| p.resolve(cb_width).max(0.0);
+                    border_box = (border_box
+                        - pad(cs.padding_top)
+                        - pad(cs.padding_bottom)
+                        - cs.border_top_width.to_px()
+                        - cs.border_bottom_width.to_px())
+                    .max(0.0);
+                }
+                Some(Some(border_box))
+            }
+            (D::Intrinsic(Stretch), None) => Some(None),
+            (v, _) => block(v),
+        };
+        if let Some(h) = height {
+            style.size.height = h.map_or(taffy::Dimension::auto(), taffy::Dimension::length);
+            changed = true;
+        }
+        let lpa = |h: Option<f32>| {
+            h.map_or(taffy::LengthPercentageAuto::auto(), |h| {
+                taffy::LengthPercentageAuto::length(h)
+            })
+        };
+        if let Some(h) = block(cs.min_height) {
+            style.min_size.height = lpa(h);
+            changed = true;
+        }
+        if let Some(h) = block(cs.max_height) {
+            style.max_size.height = lpa(h);
+            changed = true;
+        }
+        let pad = |p: P, slot: &mut taffy::LengthPercentage| {
+            if matches!(p, P::Percent(_) | P::Calc { .. }) {
+                *slot = taffy::LengthPercentage::length(p.resolve(cb_width).max(0.0));
+                true
+            } else {
+                false
+            }
+        };
+        changed |= pad(cs.padding_top, &mut style.padding.top);
+        changed |= pad(cs.padding_right, &mut style.padding.right);
+        changed |= pad(cs.padding_bottom, &mut style.padding.bottom);
+        changed |= pad(cs.padding_left, &mut style.padding.left);
+        changed
+    }
+
+    /// Whether any of this style's block-axis sizes resolves against the
+    /// containing block's height: a percentage or `calc()` `height`,
+    /// `min-height` or `max-height`, or `height: stretch`
+    /// ([`Self::pin_containing_block_sizes`]).
+    fn needs_containing_block_height(style: &crate::computed_style::ComputedStyle) -> bool {
+        use crate::computed_style::DimensionValue::{Calc, Intrinsic, Percent};
+        use crate::computed_style::IntrinsicSize::Stretch;
+        matches!(style.height, Percent(_) | Calc { .. } | Intrinsic(Stretch))
+            || matches!(style.min_height, Percent(_) | Calc { .. })
+            || matches!(style.max_height, Percent(_) | Calc { .. })
+    }
+
+    /// Whether any of this style's own values is resolved against its
+    /// containing block by [`Self::pin_containing_block_sizes`]: a block-axis
+    /// size, or a percentage padding (#1480).
+    fn pins_containing_block_sizes(style: &crate::computed_style::ComputedStyle) -> bool {
+        Self::needs_containing_block_height(style) || has_percentage_padding(style)
+    }
+
+    /// The content height of the box an atomic inline in `root_id`'s IFC is
+    /// laid out in — the root, or its parent for an anonymous block box —
+    /// where it is definite as the last layout took it
+    /// ([`Node::containing_block_height_definite`], #2427) **and does not
+    /// depend on the box itself**.
+    ///
+    /// The last layout's height of that block includes the box at the size
+    /// it was pinned to, so it can be the basis only where the block's height
+    /// does not come from its content. Fed back otherwise, it grows on every
+    /// layout: a `<td height=200>` around an `<img style="height: 100%">`
+    /// was 200 tall, then 204 (the line's strut below the picture), 208, …
+    /// So the basis is
+    /// - for a **table cell**, its own specified `height` as a content
+    ///   height (Chrome 157: `height: 200px; padding: 10px` gives a
+    ///   `height: 50%` child 100, at `border-box` 90) — never the height it
+    ///   was laid out at, which grows with its content, and nothing for a
+    ///   cell with none, even in a taller row (Chrome: `auto`). Not
+    ///   Chrome's: Chrome also resolves it in a cell of a `<table
+    ///   height>` (a 200px table's cell gives 194), rinch takes it as
+    ///   `auto` there;
+    /// - for a block whose own `height` is not `auto`, its laid-out content
+    ///   height (that height is its specified one);
+    /// - for an `auto`-height block Taffy calls definite, its laid-out height
+    ///   only where its parent fixes it: a flex or grid item of a container
+    ///   with a non-`auto` height, or an absolutely positioned box with both
+    ///   `top` and `bottom`. A stretched item of an `auto`-height container
+    ///   is sized by its line, which the box itself is in (not Chrome's:
+    ///   Chrome takes the line's height with the box as `auto`).
+    fn containing_block_inner_height(&self, root_id: RawNodeId) -> Option<f32> {
+        use crate::computed_style::DimensionValue as D;
+        use crate::computed_style::LengthPercentageAutoValue as M;
+        use crate::computed_style::PositionValue as P;
+        let root = self.tree.nodes.get(root_id)?;
+        if !root.containing_block_height_definite.get() {
+            return None;
+        }
+        let cb = root
+            .parent
+            .filter(|_| root.is_anonymous_block_box)
+            .and_then(|p| self.tree.nodes.get(p))
+            .unwrap_or(root);
+        let cs = &cb.computed_style;
+        let layout = self.tree.taffy.unrounded_layout(cb.taffy_id?);
+        let inset_y =
+            layout.padding.top + layout.padding.bottom + layout.border.top + layout.border.bottom;
+        if cb.table_cell.is_some() {
+            let D::Length(h) = cs.height else {
+                return None;
+            };
+            let inner = if cs.box_sizing_border_box {
+                h - inset_y
+            } else {
+                h
+            };
+            return Some(inner.max(0.0));
+        }
+        let fixed = match cs.height {
+            D::Auto => {
+                let parent_fixed = cb.is_flex_or_grid_item.get()
+                    && cb
+                        .parent
+                        .and_then(|p| self.tree.nodes.get(p))
+                        .is_some_and(|p| !matches!(p.computed_style.height, D::Auto));
+                let inset_fixed = matches!(cs.position, P::Absolute | P::Fixed)
+                    && !matches!(cs.top, M::Auto)
+                    && !matches!(cs.bottom, M::Auto);
+                parent_fixed || inset_fixed
+            }
+            D::Length(_) | D::Percent(_) | D::Calc { .. } => true,
+            // `stretch` fills its parent; the content keywords are sized
+            // from the content.
+            D::Intrinsic(k) => matches!(k, crate::computed_style::IntrinsicSize::Stretch),
+        };
+        if !fixed {
+            return None;
+        }
+        let inner = layout.size.height - inset_y;
+        inner.is_finite().then_some(inner.max(0.0))
+    }
+
+    /// Whether any of this style's inline-axis sizes is a percentage, alone
+    /// or in a mixed `calc()` (#2146).
+    fn has_percentage_inline_size(style: &crate::computed_style::ComputedStyle) -> bool {
+        use crate::computed_style::DimensionValue::{Calc, Percent};
+        matches!(style.width, Percent(_) | Calc { .. })
+            || matches!(style.min_width, Percent(_) | Calc { .. })
+            || matches!(style.max_width, Percent(_) | Calc { .. })
+    }
+
+    /// Whether any of this style's inline-axis sizes needs a containing-block
+    /// width to resolve against: a percentage (alone or in a `calc()`,
+    /// #2146), a `fit-content` or `stretch`
+    /// width (#691 — see [`Self::resolve_root_width_keyword`]), or an `auto`
+    /// one, which is shrink-to-fit and so capped at the containing block
+    /// (#658).
+    fn needs_containing_block_width(style: &crate::computed_style::ComputedStyle) -> bool {
+        use crate::computed_style::DimensionValue::{Auto, Calc, Intrinsic, Percent};
+        use crate::computed_style::IntrinsicSize::{FitContent, Stretch};
+        matches!(
+            style.width,
+            Auto | Percent(_) | Calc { .. } | Intrinsic(FitContent | Stretch)
+        ) || matches!(style.min_width, Percent(_) | Calc { .. })
+            || matches!(style.max_width, Percent(_) | Calc { .. })
+    }
+
+    /// Size the atomic inlines whose width needs their containing block's —
+    /// a percentage (#120), a `fit-content`/`stretch` keyword (#691), or
+    /// `auto`, which is shrink-to-fit (#658) — now that the containing block
+    /// has a computed width.
+    ///
+    /// `compute_inline_block_layouts` runs *before* the root Taffy compute, so
+    /// such a width has nothing to resolve against (a percentage collapses to
+    /// min-content, `auto` comes out at max-content). This runs *after* that
+    /// compute, when the containing block's width is real, and re-measures
+    /// against it.
+    ///
+    /// Returns `true` if any atomic inline changed size — the caller must then
+    /// re-run the root compute so the enclosing IFCs line-break against the
+    /// corrected boxes. **It looks at every `auto`-width atomic inline on
+    /// every pass**: one measured as `auto` that fits its block (the
+    /// overwhelmingly common case — a button, a badge) costs a
+    /// containing-block lookup and one comparison, and is not measured.
+    ///
+    /// A box with a block-axis size of its own resolved against the
+    /// containing block's height (a percentage, a `calc()`, `stretch`) or a
+    /// percentage padding is measured here too, never skipped by the fit
+    /// test: [`Self::pin_containing_block_sizes`] resolves those against the
+    /// IFC's containing block, its height only where the last layout took it
+    /// as definite (#1277, #1420, #1480). Its record carries that height
+    /// (`NodeTree::atomic_cb_height`).
+    ///
+    /// Last, it measures the min-content size of every `auto` box a measure
+    /// asked for since the last pass (`NodeTree::atomic_min_requests`,
+    /// #1476 — see [`AtomicContributions`]) and says so in
+    /// `NodeTree::atomic_contributions_changed`: the caller then runs this
+    /// pass once more after the compute, because a container sized from
+    /// that box can come out narrower than the box, which is only then too
+    /// wide for it.
+    pub(crate) fn resolve_percentage_inline_blocks(&mut self) -> bool {
+        // The boxes to resolve, keyed (depth, id): popped outermost first,
+        // one at a time (see the two phases below).
+        let mut pending: std::collections::BTreeSet<(usize, RawNodeId)> =
+            std::collections::BTreeSet::new();
+
+        // The registry, not the slab (layout audit F8/F12): this runs after
+        // every root compute, and only an atomic inline in an IFC qualifies.
+        // Entries that no longer qualify are dropped here — a node only gains
+        // an `ifc_root` from the marking pass, which registers it again.
+        {
+            let nodes = &self.tree.nodes;
+            self.tree.atomic_inline_registry.retain(|&id| {
+                nodes
+                    .get(id)
+                    .is_some_and(|n| n.ifc_root.is_some() && n.display_mode.is_atomic_inline())
+            });
+        }
+        // Whether any percentage-sized atomic inline is in the registry.
+        let mut any_percent = false;
+        let percent_content = !self.tree.auto_inline_percent_content.is_empty();
+        let any_keyword = !self.tree.keyword_inline_cb_width.is_empty();
+        for &id in &self.tree.atomic_inline_registry {
+            let Some(node) = self.tree.nodes.get(id) else {
+                continue;
+            };
+            let (Some(root_id), Some(_)) = (node.ifc_root, node.taffy_id) else {
+                continue;
+            };
+            let style = &node.computed_style;
+            // A box with a value of its own resolved against its containing
+            // block's height or (a padding) width is never skipped by the
+            // fit test below: measured as `auto` it had no basis for them.
+            let pins = Self::pins_containing_block_sizes(style);
+            if !node.display_mode.is_atomic_inline()
+                || !(pins || Self::needs_containing_block_width(style))
+            {
+                continue;
+            }
+            let percent = Self::has_percentage_inline_size(style);
+            any_percent |= percent;
+            let Some(inner_width) = self.containing_block_inner_width(root_id) else {
+                continue;
+            };
+            // An `auto` width measured as `auto` since it was last resolved
+            // (no `keyword_inline_cb_width` entry) is at its max-content
+            // width, and one that fits is already its shrink-to-fit width
+            // (#658): nothing to measure, and nothing to record — a narrower
+            // containing block later finds it too wide here and resolves it
+            // then. Not when a percentage inside the box needs the width it
+            // has as its basis (#662). This is the path every ordinary
+            // atomic inline (a `<button>`, a badge) takes on every pass, so
+            // it is asked first and as cheaply as it can be: the box's own
+            // margins from its computed style when they are lengths.
+            if !percent
+                && !pins
+                && matches!(style.width, crate::computed_style::DimensionValue::Auto)
+                && !(any_keyword && self.tree.keyword_inline_cb_width.contains_key(&id))
+                && !(percent_content && self.tree.auto_inline_percent_content.contains(&id))
+            {
+                use crate::computed_style::LengthPercentageAutoValue as M;
+                let margin = |m: M| match m {
+                    M::Auto => Some(0.0),
+                    M::Length(px) => Some(px),
+                    _ => None,
+                };
+                let margins = match (margin(style.margin_left), margin(style.margin_right)) {
+                    (Some(l), Some(r)) => l + r,
+                    _ => {
+                        use taffy::ResolveOrZero;
+                        let Ok(s) = self.tree.taffy.style(node.taffy_id.unwrap()) else {
+                            continue;
+                        };
+                        let m = s.margin.resolve_or_zero(Some(inner_width), |_, _| 0.0);
+                        m.left + m.right
+                    }
+                };
+                if node.layout.width <= inner_width - margins + 0.5 {
+                    continue;
+                }
+            }
+            // A box that needs the width only for a `fit-content`/`stretch`
+            // keyword (#691) or an `auto` width (#658) is sized from that
+            // width and its own content alone. Its content changing
+            // re-measures it as `auto` first, which drops this entry, so an
+            // entry at the same width means nothing moved: skip the two or
+            // three computes. A percentage size is the same (#2136): its
+            // own record, at the same width, means it was resolved there and
+            // nothing inside it or about it has been measured since.
+            let resolved_at = if percent {
+                &self.tree.percent_inline_cb_width
+            } else {
+                &self.tree.keyword_inline_cb_width
+            };
+            // And, for a block-axis size, at the same containing-block
+            // height (or one as indefinite).
+            if !resolved_at.is_empty()
+                && resolved_at
+                    .get(&id)
+                    .is_some_and(|&w| (w - inner_width).abs() < 0.01)
+                && (!Self::needs_containing_block_height(style)
+                    || self.tree.atomic_cb_height.get(&id).is_some_and(|&h| {
+                        let now = self.containing_block_inner_height(root_id);
+                        match (h, now) {
+                            (Some(a), Some(b)) => (a - b).abs() < 0.01,
+                            (a, b) => a.is_none() && b.is_none(),
+                        }
+                    }))
+            {
+                continue;
+            }
+            // Asked last: it walks the ancestors. A box outside the document
+            // is not measured (#1040).
+            if let Some(depth) = self.depth_if_connected(id) {
+                pending.insert((depth, id));
+            }
+        }
+        // A fitting box that holds a box sized against its containing block
+        // — one recorded in `keyword_inline_cb_width`, or one with a
+        // percentage size — is resolved after all. Measured as `auto`, it
+        // was lined up with that box at the size it was resolved to, not at
+        // its natural contribution, so its max-content width is not its
+        // natural one and the fit test proves nothing (the box inside is
+        // reset first, see phase 1). Without this a capped box kept the
+        // `inline-flex` around it as narrow as the cap had made it, where a
+        // whole-document pass widened both again. Built only when there can
+        // be such a box: usually there is none, and it costs a walk up from
+        // each.
+        if any_percent || any_keyword {
+            let mut holds_resolved: std::collections::HashSet<RawNodeId> =
+                std::collections::HashSet::new();
+            {
+                let nodes = &self.tree.nodes;
+                let inner = self.tree.keyword_inline_cb_width.keys().copied().chain(
+                    self.tree
+                        .atomic_inline_registry
+                        .iter()
+                        .copied()
+                        .filter(|&id| {
+                            any_percent
+                                && nodes.get(id).is_some_and(|n| {
+                                    Self::has_percentage_inline_size(&n.computed_style)
+                                })
+                        }),
+                );
+                for id in inner {
+                    let mut cur = nodes.get(id).and_then(|n| n.parent);
+                    while let Some(a) = cur {
+                        let Some(an) = nodes.get(a) else {
+                            break;
+                        };
+                        if an.display_mode.is_atomic_inline() && !holds_resolved.insert(a) {
+                            break;
+                        }
+                        cur = an.parent;
+                    }
+                }
+            }
+            for id in holds_resolved {
+                // The boxes the fit test can have left alone: an `auto`
+                // width with no entry of its own. (One already queued is
+                // queued once.)
+                let Some(n) = self.tree.nodes.get(id) else {
+                    continue;
+                };
+                if n.ifc_root.is_none()
+                    || n.taffy_id.is_none()
+                    || !matches!(
+                        n.computed_style.width,
+                        crate::computed_style::DimensionValue::Auto
+                    )
+                    || Self::has_percentage_inline_size(&n.computed_style)
+                    || self.tree.keyword_inline_cb_width.contains_key(&id)
+                {
+                    continue;
+                }
+                if let Some(depth) = self.depth_if_connected(id) {
+                    pending.insert((depth, id));
+                }
+            }
+        }
+
+        // Two phases.
+        //
+        // 1. Resolve the boxes against their containing blocks **outermost
+        //    first**: a box's containing block is laid out inside every
+        //    atomic inline around it, so its width is only known once those
+        //    are resolved. Before an outer box is resolved, every box inside
+        //    it that is resolved here is measured again as `auto` (no
+        //    containing-block width), so the outer box's min- and max-content
+        //    probes see their natural contributions — what a fresh layout,
+        //    which measures every atomic inline that way before the root
+        //    compute, shows them — and not whatever an earlier pass resolved
+        //    them to. Without that the answer depended on history, and the
+        //    scoped and whole-document passes disagreed (#1327).
+        // 2. Lay the boxes **around** a box that changed size out again,
+        //    innermost first, at the width each already has (see below).
+        let mut around: std::collections::BTreeSet<(usize, RawNodeId)> =
+            std::collections::BTreeSet::new();
+        let mut changed = false;
+        // A measure that lined a box up at a stand-in size (#1476, see the
+        // end of this function) left that answer in Taffy's cache and the
+        // IFC's own. A box resolved below is sized by computes that would be
+        // served it — the min-content width of a box around the asked one
+        // came out as wide as the stand-in — so those answers go first; the
+        // measures that replace them ask again, and are answered there.
+        let asked: Vec<RawNodeId> = self.tree.atomic_min_requests.borrow().clone();
+        for id in asked {
+            if self.tree.atomic_min_content.contains_key(&id) {
+                continue;
+            }
+            let Some(root_id) = self.tree.nodes.get(id).and_then(|n| n.ifc_root) else {
+                continue;
+            };
+            if let Some(root_taffy) = self.tree.nodes.get(root_id).and_then(|n| n.taffy_id) {
+                let _ = self.tree.taffy.mark_dirty(root_taffy);
+            }
+            self.mark_ifc_measure_dirty(root_id);
+            self.tree.forget_ifc_measures(root_id);
+        }
+        while let Some((depth, id)) = pending.pop_first() {
+            let Some(node) = self.tree.nodes.get(id) else {
+                continue;
+            };
             let (Some(root_id), Some(taffy_id)) = (node.ifc_root, node.taffy_id) else {
                 continue;
             };
-            if !node.display_mode.is_atomic_inline()
-                || !Self::has_percentage_inline_size(&node.computed_style)
-            {
+            if !node.display_mode.is_atomic_inline() {
                 continue;
             }
-            // The IFC root is this box's containing block by construction:
-            // an IFC root is a block container, which no inline-level box and
-            // no flex container is.
-            let Some(cb_taffy) = self.tree.nodes[root_id].taffy_id else {
-                continue;
-            };
-            let Ok(cb) = self.tree.taffy.layout(cb_taffy) else {
-                continue;
-            };
-            let inner_width = cb.size.width
-                - cb.padding.left
-                - cb.padding.right
-                - cb.border.left
-                - cb.border.right;
-            if !inner_width.is_finite() || inner_width <= 0.0 {
-                continue;
+            let keyword_only = !Self::has_percentage_inline_size(&node.computed_style);
+            for (inner_depth, inner) in self.reset_resolved_atomic_inlines_inside(id, depth, true) {
+                pending.insert((inner_depth, inner));
             }
-            targets.push((taffy_id, Some(inner_width)));
-            affected.push((id, root_id, node.layout.width, node.layout.height));
+            let Some(available) = self.containing_block_inner_width(root_id) else {
+                continue;
+            };
+            let before = {
+                let n = &self.tree.nodes[id];
+                (n.layout.width, n.layout.height)
+            };
+            // Taffy caches per (node, available space); the first pass
+            // measured these under MaxContent, so mark them dirty to force a
+            // real re-measure.
+            let _ = self.tree.taffy.mark_dirty(taffy_id);
+            // Not resolved since it was last measured as `auto`: the size
+            // it has is its natural one (#1476, `Node::natural_inline_size`).
+            // A percentage box's too: a max-content measure lines it up there
+            // (regress-017).
+            let resolved = if keyword_only {
+                &self.tree.keyword_inline_cb_width
+            } else {
+                &self.tree.percent_inline_cb_width
+            };
+            if !resolved.contains_key(&id) {
+                self.tree.nodes[id].natural_inline_size = before;
+            }
+            self.measure_inline_blocks(&[(taffy_id, Some(available))]);
+            if keyword_only {
+                self.tree.keyword_inline_cb_width.insert(id, available);
+            } else {
+                self.tree.percent_inline_cb_width.insert(id, available);
+            }
+            if Self::needs_containing_block_height(&self.tree.nodes[id].computed_style) {
+                let height = self.containing_block_inner_height(root_id);
+                self.tree.atomic_cb_height.insert(id, height);
+            }
+            if self.atomic_inline_resized(id, root_id, before) {
+                changed = true;
+                self.queue_atomic_inlines_around(id, &mut around);
+            }
         }
+        // Phase 2. **At the width each already has**, not sized again: the
+        // box inside was sized against a containing block inside them, so
+        // its new width is a cyclic contribution, which CSS takes as `auto` —
+        // what they were sized with (css-sizing-3 §5.2.1). Sized again, an
+        // `inline-block` around a `width: 50%` child shrank to half, and
+        // Chrome's does not (#662). Before #658 they were not laid out again
+        // at all, and kept the height they had with the box's old size — an
+        // `inline-flex` around a capped box stayed one line tall on a fresh
+        // layout while a scoped pass, re-measuring it for an unrelated
+        // change, got it right.
+        while let Some((_, id)) = around.pop_last() {
+            let Some(node) = self.tree.nodes.get(id) else {
+                continue;
+            };
+            let (Some(root_id), Some(taffy_id)) = (node.ifc_root, node.taffy_id) else {
+                continue;
+            };
+            let before = (node.layout.width, node.layout.height);
+            let _ = self.tree.taffy.mark_dirty(taffy_id);
+            self.relayout_atomic_inline_at_its_width(taffy_id);
+            if self.atomic_inline_resized(id, root_id, before) {
+                changed = true;
+                self.queue_atomic_inlines_around(id, &mut around);
+            }
+        }
+        // The boxes a measure — in the root compute, or in one of the
+        // computes above — lined up at their max-content size for want of a
+        // min-content one (#1476). One capped above has it by now.
+        let asked = std::mem::take(&mut *self.tree.atomic_min_requests.borrow_mut());
+        // Asked at all: some measure used a stand-in, whether its box was
+        // measured here or by the capping above, so the pass has to look
+        // again after the compute that uses the real size.
+        self.tree.atomic_contributions_changed = !asked.is_empty();
+        let measured = !asked.is_empty() && self.measure_atomic_min_contents(asked, true);
+        changed || measured
+    }
 
-        if targets.is_empty() {
+    /// Phase 1's reset (see `resolve_percentage_inline_blocks`): measure
+    /// again as `auto`, innermost first, every atomic inline inside `outer`
+    /// that is sized against its containing block, and return them (with
+    /// their depths) to be resolved after `outer`. Walks `outer`'s subtree,
+    /// which is only done for a box that is being resolved anyway.
+    ///
+    /// With `plain` false, only the boxes an IFC measure lines up at the size
+    /// they have — not the plain shrink-to-fit ones, which it lines up at
+    /// their own min- and max-content sizes whatever they were resolved to
+    /// ([`AtomicContributions`]).
+    fn reset_resolved_atomic_inlines_inside(
+        &mut self,
+        outer: RawNodeId,
+        outer_depth: usize,
+        plain: bool,
+    ) -> Vec<(usize, RawNodeId)> {
+        let mut found: Vec<(usize, RawNodeId)> = Vec::new();
+        let mut stack: Vec<(RawNodeId, usize)> = self
+            .tree
+            .nodes
+            .get(outer)
+            .map(|n| n.children.iter().map(|&c| (c, outer_depth + 1)).collect())
+            .unwrap_or_default();
+        while let Some((id, depth)) = stack.pop() {
+            let Some(n) = self.tree.nodes.get(id) else {
+                continue;
+            };
+            if n.display_mode.is_atomic_inline()
+                && n.ifc_root.is_some()
+                && n.taffy_id.is_some()
+                && (Self::needs_containing_block_width(&n.computed_style)
+                    || Self::pins_containing_block_sizes(&n.computed_style))
+                && (plain || plain_shrink_to_fit_margins(&n.computed_style).is_none())
+            {
+                found.push((depth, id));
+            }
+            stack.extend(n.children.iter().map(|&c| (c, depth + 1)));
+        }
+        found.sort_by_key(|&(d, _)| std::cmp::Reverse(d));
+        for &(_, id) in &found {
+            let n = &self.tree.nodes[id];
+            let (Some(root_id), Some(taffy_id)) = (n.ifc_root, n.taffy_id) else {
+                continue;
+            };
+            let before = (n.layout.width, n.layout.height);
+            let _ = self.tree.taffy.mark_dirty(taffy_id);
+            // Drops its `keyword_inline_cb_width` entry, so it is resolved
+            // again below.
+            self.measure_inline_blocks(&[(taffy_id, None)]);
+            self.atomic_inline_resized(id, root_id, before);
+        }
+        found
+    }
+
+    /// Whether the atomic inline `id` came out at another size than
+    /// `before`; if so, the IFC `root_id` it is laid out in, which line-broke
+    /// against the stale box, is invalidated.
+    fn atomic_inline_resized(
+        &mut self,
+        id: RawNodeId,
+        root_id: RawNodeId,
+        before: (f32, f32),
+    ) -> bool {
+        let now = {
+            let n = &self.tree.nodes[id];
+            (n.layout.width, n.layout.height)
+        };
+        if (now.0 - before.0).abs() <= 0.5 && (now.1 - before.1).abs() <= 0.5 {
             return false;
         }
+        self.invalidate_ifc_of_atomic_inline(root_id);
+        true
+    }
 
-        // Taffy caches per (node, available space); the first pass measured these
-        // under MaxContent, so mark them dirty to force a real re-measure.
-        for &(taffy_id, _) in &targets {
-            let _ = self.tree.taffy.mark_dirty(taffy_id);
+    /// Have IFC `root_id` measured and line-broken again: an atomic inline
+    /// on its lines changed size, or what it contributes to a measure did.
+    fn invalidate_ifc_of_atomic_inline(&mut self, root_id: RawNodeId) {
+        // One checked lookup for both (#723): a root that is gone has nothing
+        // to re-measure, and its Taffy id must not be read off the slot's
+        // next occupant.
+        let Some(root) = self.tree.nodes.get_mut(root_id) else {
+            return;
+        };
+        root.text_layout = None;
+        let root_taffy = root.taffy_id;
+        self.tree.dirty_ifc_text_roots.insert(root_id);
+        if let Some(root_taffy) = root_taffy {
+            let _ = self.tree.taffy.mark_dirty(root_taffy);
         }
-        self.measure_inline_blocks(&targets);
+        // The measure may be cached on the root's measure leaf rather than
+        // the root itself — dirty propagates up, not down (#466).
+        self.mark_ifc_measure_dirty(root_id);
+        // Measures cached under the stale size would be served straight
+        // back. Only this root's: it used to clear the whole cache, which
+        // re-shaped every IFC root in the document whenever one
+        // percentage-sized chip moved by half a pixel. The signature goes
+        // with them: it hashes the chip's old size.
+        self.tree.forget_ifc_measures_and_signature(root_id);
+    }
 
+    /// Measure the min-content size of each `auto`-width atomic inline in
+    /// `ids` that an IFC measure asked for and did not find (#1476; see
+    /// [`AtomicContributions`]), and record it in
+    /// `NodeTree::atomic_min_content`. Returns whether any IFC has to be
+    /// measured again — a box whose min-content width is narrower than the
+    /// max-content width it was lined up at in its place.
+    ///
+    /// The compute of one box can ask for boxes inside it; those are
+    /// measured first and the box again. Afterwards the box is measured as
+    /// `auto` once more, which is the state every measure with no
+    /// containing-block width leaves a box in: the min-content compute left
+    /// its interior laid out at that width.
+    ///
+    /// Costs two computes of the box, once, until something inside it
+    /// changes — and only for a box some line was too narrow for.
+    ///
+    /// `around`: also measure again, as `auto`, every atomic inline around a
+    /// box whose answer changed. The IFC that lined the box up is inside
+    /// each of them, in a detached compute the root compute does not reach.
+    /// Not from inside the measure of one of those boxes
+    /// (`resolve_root_width_keyword`), which is laying it out anyway.
+    fn measure_atomic_min_contents(&mut self, ids: Vec<RawNodeId>, around: bool) -> bool {
+        let mut stack = ids;
         let mut changed = false;
-        for &(id, root_id, prev_w, prev_h) in &affected {
-            let node = &self.tree.nodes[id];
-            if (node.layout.width - prev_w).abs() > 0.5 || (node.layout.height - prev_h).abs() > 0.5
+        // Every round measures a box or puts strictly deeper ones ahead of
+        // it, so this ends; the count is a guard, not a budget.
+        let mut rounds_left = 100_000u32;
+        while let Some(id) = stack.pop() {
+            rounds_left -= 1;
+            if rounds_left == 0 {
+                break;
+            }
+            if self.tree.atomic_min_content.contains_key(&id) {
+                continue;
+            }
+            let Some(node) = self.tree.nodes.get(id) else {
+                continue;
+            };
+            let (Some(root_id), Some(taffy_id)) = (node.ifc_root, node.taffy_id) else {
+                continue;
+            };
+            if !node.display_mode.is_atomic_inline() || !keeps_min_content(&node.computed_style) {
+                continue;
+            }
+            let Some(depth) = self.depth_if_connected(id) else {
+                continue;
+            };
+            // The boxes inside this one that some measure has asked for
+            // come first: Taffy holds answers made with their stand-ins (a
+            // flex item's min-content size, from any compute of this box),
+            // and the compute below would be served them and ask nothing.
+            let inside: Vec<RawNodeId> = {
+                let asked = self.tree.atomic_min_requests.borrow();
+                let mut inside: Vec<RawNodeId> = stack
+                    .iter()
+                    .chain(asked.iter())
+                    .copied()
+                    .filter(|&r| r != id && self.wants_min_content(r) && self.is_inside(r, id))
+                    .collect();
+                inside.sort_unstable();
+                inside.dedup();
+                inside
+            };
+            if !inside.is_empty() {
+                stack.push(id);
+                stack.extend(inside);
+                continue;
+            }
+            // A box inside that is lined up at the size it was resolved to
+            // (a percentage width, a `fit-content` one) is measured as
+            // `auto` first, as phase 1 of `resolve_percentage_inline_blocks`
+            // does and for its reason; the next pass resolves it again.
+            if !self
+                .reset_resolved_atomic_inlines_inside(id, depth, false)
+                .is_empty()
             {
                 changed = true;
-                // This IFC root's inline layout was measured against the stale box.
-                if let Some(root_taffy) = self.tree.nodes[root_id].taffy_id {
-                    let _ = self.tree.taffy.mark_dirty(root_taffy);
-                }
-                // The measure may be cached on the root's measure leaf rather
-                // than the root itself — dirty propagates up, not down (#466).
-                self.mark_ifc_measure_dirty(root_id);
+            }
+            let before = {
+                let n = &self.tree.nodes[id];
+                (n.layout.width, n.layout.height)
+            };
+            let asked = self.tree.atomic_min_requests.borrow().len();
+            let _ = self.tree.taffy.mark_dirty(taffy_id);
+            Self::compute_atomic_inline_root(
+                &mut self.tree,
+                &mut self.font_cx,
+                &mut self.layout_cx,
+                taffy_id,
+                taffy::Size {
+                    width: taffy::AvailableSpace::MinContent,
+                    height: taffy::AvailableSpace::MaxContent,
+                },
+            );
+            let inner = self.tree.atomic_min_requests.borrow_mut().split_off(asked);
+            let min = self.tree.taffy.unrounded_layout(taffy_id).size.width;
+            let _ = self.tree.taffy.mark_dirty(taffy_id);
+            self.measure_inline_blocks(&[(taffy_id, None)]);
+            // The boxes inside that it asked for first, then this one
+            // again. Only the ones that will be measured: one that cannot
+            // be would be asked for again by every compute of this box.
+            let inner: Vec<RawNodeId> = inner
+                .into_iter()
+                .filter(|&r| r != id && self.wants_min_content(r) && self.is_inside(r, id))
+                .collect();
+            if !inner.is_empty() {
+                stack.push(id);
+                stack.extend(inner);
+                continue;
+            }
+            self.tree.atomic_min_content.insert(id, min);
+            let natural = self.tree.nodes[id].layout.width;
+            let resized = self.atomic_inline_resized(id, root_id, before);
+            // The `auto` measure above laid the box's interior out with no
+            // containing block, so a percentage inside it lost its basis
+            // (#662): the pass has to resolve the box again, whether or not
+            // anything else about it changed (review of #1488).
+            if self.tree.auto_inline_percent_content.contains(&id) {
+                changed = true;
+            }
+            if !resized && min + 1.0 >= natural {
+                continue;
+            }
+            if !resized {
+                self.invalidate_ifc_of_atomic_inline(root_id);
+            }
+            changed = true;
+            if around && let Some(parent) = self.tree.nodes[id].parent {
+                self.mark_atomic_inline_dirty(parent);
             }
         }
-
-        if changed {
-            // Measures cached under the stale inline-block sizes would be served
-            // straight back on the second pass, re-introducing the collapse.
-            self.tree.ifc_measure_cache.clear();
+        if around {
+            self.remeasure_dirty_atomic_inlines();
         }
         changed
+    }
+
+    /// Whether `id` is a box [`Self::measure_atomic_min_contents`] measures
+    /// and has not measured yet: a connected atomic inline in an IFC whose
+    /// width is plain shrink-to-fit.
+    fn wants_min_content(&self, id: RawNodeId) -> bool {
+        !self.tree.atomic_min_content.contains_key(&id)
+            && self.tree.nodes.get(id).is_some_and(|n| {
+                n.ifc_root.is_some()
+                    && n.taffy_id.is_some()
+                    && n.display_mode.is_atomic_inline()
+                    && keeps_min_content(&n.computed_style)
+            })
+            && self.depth_if_connected(id).is_some()
+    }
+
+    /// Whether `node` is a descendant of `ancestor`.
+    fn is_inside(&self, node: RawNodeId, ancestor: RawNodeId) -> bool {
+        let mut cur = self.tree.nodes.get(node).and_then(|n| n.parent);
+        while let Some(p) = cur {
+            if p == ancestor {
+                return true;
+            }
+            cur = self.tree.nodes.get_live(p).and_then(|n| n.parent);
+        }
+        false
+    }
+
+    /// Queue every atomic inline above `id` for phase 2 of
+    /// `resolve_percentage_inline_blocks`: the IFC `id` changed in is inside
+    /// each of them, and the root compute does not reach them (each is a
+    /// detached root of its own).
+    fn queue_atomic_inlines_around(
+        &self,
+        id: RawNodeId,
+        around: &mut std::collections::BTreeSet<(usize, RawNodeId)>,
+    ) {
+        let mut cur = self.tree.nodes.get(id).and_then(|n| n.parent);
+        while let Some(a) = cur {
+            let Some(an) = self.tree.nodes.get(a) else {
+                break;
+            };
+            if an.display_mode.is_atomic_inline()
+                && an.ifc_root.is_some()
+                && let Some(depth) = self.depth_if_connected(a)
+            {
+                around.insert((depth, a));
+            }
+            cur = an.parent;
+        }
+    }
+
+    /// Lay a detached atomic inline out again at the width it already has
+    /// (unrounded), so its interior and its height follow a change inside it
+    /// while its width stays — see `resolve_percentage_inline_blocks`.
+    fn relayout_atomic_inline_at_its_width(&mut self, taffy_id: taffy::NodeId) {
+        let Ok(declared) = self.tree.taffy.style(taffy_id).cloned() else {
+            return;
+        };
+        let w = self.tree.taffy.unrounded_layout(taffy_id).size.width;
+        let mut pinned = declared.clone();
+        pinned.size.width =
+            taffy::Dimension::length(self.sizing_box_width(taffy_id, &declared, w, None));
+        let _ = self.tree.taffy.set_style(taffy_id, pinned);
+        self.measure_inline_blocks_with(&[(taffy_id, Some(w))], true);
+        let _ = self.tree.taffy.set_style(taffy_id, declared);
+    }
+
+    /// The inner (content-box) width of the box an atomic inline in
+    /// `root_id`'s IFC is laid out in, from the last root compute. The IFC
+    /// root is that box's containing block by construction: an IFC root is a
+    /// block container, which no inline-level box and no flex container is.
+    fn containing_block_inner_width(&self, root_id: RawNodeId) -> Option<f32> {
+        let cb_taffy = self.tree.nodes.get(root_id)?.taffy_id?;
+        // Unrounded: a box whose max-content width is its containing
+        // block's (an `inline-block` around one other) would be capped at a
+        // whole-pixel rounding of it, and wrap.
+        let cb = self.tree.taffy.unrounded_layout(cb_taffy);
+        let inner_width =
+            cb.size.width - cb.padding.left - cb.padding.right - cb.border.left - cb.border.right;
+        inner_width.is_finite().then_some(inner_width.max(0.0))
     }
 
     /// Build a Parley inline layout for an IFC root node.
     ///
     /// Walks the IFC root's children, collecting text nodes and inline elements
     /// into a single Parley TreeBuilder layout. Returns the InlineLayout.
+    /// Returns the built layout and the number of per-span `font-family`
+    /// resolutions `inline_style_props` actually performed (review of #1326);
+    /// see the doc on [`Counter::InlineFontFamilyResolves`](crate::perf::Counter::InlineFontFamilyResolves).
+    ///
+    /// `align_width` is the width a paragraph none of whose text may wrap is
+    /// aligned in ([`AlignWidth`]) — from the root's content width, for the paint layout — or
+    /// `None` for a measure, which reads no line's position (#1237; see
+    /// [`break_lines_hanging_spaces`]).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_inline_layout(
-        nodes: &slab::Slab<Node>,
-        root_id: usize,
+        nodes: &crate::node_slab::NodeSlab,
+        root_id: RawNodeId,
         max_width: Option<f32>,
+        align_width: Option<AlignWidth>,
         scale: f32,
         font_cx: &mut parley::FontContext,
         layout_cx: &mut parley::LayoutContext<Brush>,
-    ) -> InlineLayout {
+        atomic: Option<&AtomicContributions<'_>>,
+        floats: Option<&FloatBands>,
+        mut placer: Option<&mut (dyn PlaceFloats + '_)>,
+    ) -> (InlineLayout, u64) {
         // Get root style properties from typed ComputedStyle
         let root_computed = &nodes[root_id].computed_style;
         let root_font_size = root_computed.font_size * scale;
-        let root_color = root_computed.color.unwrap_or_else(|| {
-            peniko::color::AlphaColor::<peniko::color::Srgb>::from_rgba8(0, 0, 0, 255)
-        });
+        let root_color = root_text_color(root_computed);
 
-        let font_family: std::borrow::Cow<'static, str> = if root_computed.font_family.is_empty() {
-            "sans-serif".into()
-        } else {
-            root_computed.font_family.clone().into()
-        };
+        let font_family = crate::fonts::parley_font_family(font_cx, &root_computed.font_family);
 
         let mut root_text_style = parley::style::TextStyle {
             font_size: root_font_size,
             brush: Brush::Solid(root_color),
-            font_family: parley::style::FontFamily::Source(font_family),
+            font_family,
             ..Default::default()
         };
 
@@ -4017,6 +12177,12 @@ impl RinchDocument {
 
         // Apply overflow-wrap from computed style
         root_text_style.overflow_wrap = root_computed.overflow_wrap.to_parley();
+        // `word-break` and `line-break` (#2388): the root's, and each span's
+        // below ([`Self::inline_style_props`]).
+        root_text_style.word_break = root_computed.word_break.to_parley();
+        root_text_style.line_break = root_computed.line_break.to_parley();
+        // `hyphens` (#2621): the root's, and each span's below.
+        root_text_style.hyphens = hyphens_to_parley(root_computed.hyphens_none);
 
         // Apply letter-/word-spacing from computed style (#698).
         //
@@ -4037,13 +12203,21 @@ impl RinchDocument {
         root_text_style.letter_spacing = root_computed.letter_spacing;
         root_text_style.word_spacing = root_computed.word_spacing;
 
-        let mut builder = layout_cx.tree_builder(font_cx, scale, true, &root_text_style);
+        // The root's own `nowrap`/`pre` forbids a soft wrap in its own text,
+        // while a descendant that allows wrapping still wraps (#1212). Parley
+        // takes a break opportunity's wrap mode from the cluster *before* it.
+        // That agrees with Chrome 153 at `pre` root text followed by a
+        // `normal` span (no break at the seam) and between two `normal` spans
+        // (a break, though their common ancestor is the root), and differs
+        // after a `normal` span followed by the root's preserved spaces,
+        // where Chrome breaks before the spaces and rinch does not.
+        root_text_style.text_wrap_mode = Self::text_wrap_mode(root_computed);
+        root_text_style.white_space_collapse = white_space_hanging(root_computed.white_space);
 
         // Apply white-space mode from computed style.
         // Contenteditable elements always use Preserve (pre-wrap) to prevent
         // Parley from collapsing trailing whitespace, which would cause cursor
         // position mismatches (the DOM text has the space but the layout doesn't).
-        use crate::computed_style::WhiteSpaceValue;
         let is_contenteditable = {
             let mut nid = Some(root_id);
             let mut found = false;
@@ -4056,189 +12230,734 @@ impl RinchDocument {
             }
             found
         };
-        let collapse = if is_contenteditable {
-            parley::style::WhiteSpaceCollapse::Preserve
-        } else {
-            match root_computed.white_space {
-                WhiteSpaceValue::Pre | WhiteSpaceValue::PreWrap | WhiteSpaceValue::PreLine => {
-                    parley::style::WhiteSpaceCollapse::Preserve
-                }
-                _ => parley::style::WhiteSpaceCollapse::Collapse,
-            }
-        };
-        builder.set_white_space_mode(collapse);
-
         let mut child_positions = Vec::new();
         let mut text_ranges = Vec::new();
         let mut background_spans = Vec::new();
         let mut decoration_spans = Vec::new();
+        let mut vertical_align_spans = Vec::new();
+        let mut relative_spans = Vec::new();
         let mut flat_pos = 0usize;
 
-        // Walk children and build the Parley tree
+        // Walk children into an `IfcText`, which collapses white space across
+        // the whole IFC (#1180), each text node by its own element's
+        // `white-space` (#1192), then replay it into the Parley tree.
+        //
+        // `font_family_resolves` counts `inline_style_props`'s actual
+        // `parley_font_family` calls (review of #1326's perf finding) — this
+        // function has no `&PerfCounters` of its own (only the node slab), so
+        // the three callers bump `Counter::InlineFontFamilyResolves` by the
+        // second element of the returned tuple.
+        let font_family_resolves = std::cell::Cell::new(0u64);
+        let mut ifc_text = IfcText::new(is_contenteditable);
+        let (base_direction, root_override) = block_bidi(nodes, root_id);
+        if let Some((before, _)) = root_override {
+            flat_pos += ifc_text.push_bidi_control(before, false);
+        }
         Self::walk_inline_children(
             nodes,
             root_id,
-            &mut builder,
+            &mut ifc_text,
             &mut child_positions,
             &mut text_ranges,
             &mut background_spans,
             &mut decoration_spans,
+            &mut vertical_align_spans,
+            &mut relative_spans,
             &mut flat_pos,
             scale,
-            collapse,
+            font_cx,
+            &font_family_resolves,
+            atomic,
         );
+        if let Some((_, after)) = root_override {
+            ifc_text.push_bidi_control(after, true);
+        }
+        // An emoji-presentation cluster is shaped with the root's stack, its
+        // generics replaced by their primary face (#1204), whatever family an
+        // enclosing inline element pushed for its own text (#677): emoji
+        // handling is root-wide, not per-span, so one emoji family serves the
+        // whole IFC even though a `<code>` or `<kbd>` span now shapes its own
+        // ordinary glyphs in its own family. Asked only when some text could
+        // hold one, after the walk and before the builder borrows the font
+        // context.
+        let emoji_family = if ifc_text.may_hold_emoji() {
+            crate::fonts::parley_emoji_font_family(font_cx, &root_computed.font_family)
+        } else {
+            None
+        };
+        ifc_text.finish();
+        let bidi_control_ranges = ifc_text.control_ranges();
+        // Every offset the walk recorded counted a held space `finish` has
+        // since removed; take them all to the final text.
+        for r in &mut text_ranges {
+            r.flat_start = ifc_text.remap(r.flat_start);
+            r.flat_end = ifc_text.remap(r.flat_end);
+        }
+        for b in &mut background_spans {
+            b.start = ifc_text.remap(b.start);
+            b.end = ifc_text.remap(b.end);
+        }
+        for d in &mut decoration_spans {
+            d.start = ifc_text.remap(d.start);
+            d.end = ifc_text.remap(d.end);
+        }
+        for v in &mut vertical_align_spans {
+            v.start = ifc_text.remap(v.start);
+            v.end = ifc_text.remap(v.end);
+        }
+        for r in &mut relative_spans {
+            r.start = ifc_text.remap(r.start);
+            r.end = ifc_text.remap(r.end);
+        }
+        let flat_len = ifc_text.final_len();
+        let mut out_of_flow = ifc_text.out_of_flow_marks();
+        let space_breaks = ifc_text.breaks_before_spaces();
 
         // The IFC root's own wavy underline covers everything the walk produced.
         // (An inline element's covers its own range and is pushed by the walk.)
-        if root_computed.text_decoration.is_wavy_underline() && flat_pos > 0 {
+        if root_computed.text_decoration.is_wavy_underline() && flat_len > 0 {
             decoration_spans.push(crate::node::InlineDecorationSpan {
+                owner: root_id,
                 start: 0,
-                end: flat_pos,
-                color: root_computed
-                    .text_decoration
-                    .color
-                    .or(root_computed.color)
-                    .unwrap_or(peniko::Color::BLACK),
+                end: flat_len,
+                color: wavy_underline_color(root_computed),
             });
         }
 
-        let (text_layout, text_content) = builder.build();
-        let mut text_layout = text_layout;
-        // white-space: nowrap/pre prevents line wrapping — use infinite width
-        let effective_max_width = match root_computed.white_space {
-            WhiteSpaceValue::NoWrap | WhiteSpaceValue::Pre => None,
-            _ => max_width,
-        };
-        text_layout.break_all_lines(effective_max_width);
-
-        // Apply text-align from computed style
-        let alignment = root_computed.text_align.to_parley();
-        text_layout.align(alignment, parley::layout::AlignmentOptions::default());
-
-        InlineLayout {
-            layout: text_layout,
-            text_content,
-            child_positions,
-            text_ranges,
-            background_spans,
-            decoration_spans,
-            max_width: max_width.unwrap_or(f32::INFINITY),
-        }
-    }
-
-    /// Build an IFC layout with ellipsis truncation.
-    ///
-    /// Binary-searches for the longest text prefix that fits within `container_width`
-    /// when combined with an ellipsis character, then rebuilds the layout.
-    #[allow(clippy::too_many_arguments)]
-    fn build_ellipsis_layout(
-        nodes: &slab::Slab<Node>,
-        root_id: usize,
-        full_text: &str,
-        container_width: f32,
-        scale: f32,
-        font_cx: &mut parley::FontContext,
-        layout_cx: &mut parley::LayoutContext<Brush>,
-    ) -> InlineLayout {
-        let root_computed = &nodes[root_id].computed_style;
-        let font_size = root_computed.font_size * scale;
-        let font_family: std::borrow::Cow<'static, str> = if root_computed.font_family.is_empty() {
-            "sans-serif".into()
+        // A paragraph none of whose text may wrap is broken unconstrained:
+        // only forced breaks end its lines. One that holds wrapping text — a
+        // wrapping root, or a `normal`/`pre-wrap`/`pre-line` element inside a
+        // `nowrap`/`pre` root (#1212) — is broken at the available width, and
+        // the per-cluster `TextWrapMode` keeps the rest of it on its lines.
+        let boxes: Vec<RawNodeId> = ifc_text.atomic_box_ids().collect();
+        // A space with an opportunity before it (#2238) wraps too, though
+        // all the text may not: `aa<span nowrap>hello</span><span
+        // normal></span> ccc` breaks before ` ccc` in Chrome.
+        let effective_max_width = if !space_breaks.is_empty()
+            || Self::wraps_anywhere(nodes, root_id, &text_ranges, &boxes)
+        {
+            max_width
         } else {
-            root_computed.font_family.clone().into()
+            None
         };
-        let font_weight = parley::style::FontWeight::new(root_computed.font_weight);
-        let color = root_computed.color.unwrap_or_else(|| {
-            peniko::color::AlphaColor::<peniko::color::Srgb>::from_rgba8(0, 0, 0, 255)
-        });
-        let line_height = root_computed.line_height.to_parley();
-        let letter_spacing = root_computed.letter_spacing;
-        let word_spacing = root_computed.word_spacing;
-        let alignment = root_computed.text_align.to_parley();
-
-        let ellipsis = "\u{2026}";
-
-        // Measure ellipsis width
-        let ellipsis_width = {
-            let mut b = layout_cx.ranged_builder(font_cx, ellipsis, scale, true);
-            b.push_default(parley::style::StyleProperty::FontSize(font_size));
-            b.push_default(parley::style::StyleProperty::FontWeight(font_weight));
-            b.push_default(parley::style::StyleProperty::FontFamily(
-                parley::style::FontFamily::Source(font_family.clone()),
-            ));
-            push_spacing(&mut b, letter_spacing, word_spacing);
-            let mut l = b.build(ellipsis);
-            l.break_all_lines(None);
-            l.width()
-        };
-
-        let target_width = container_width - ellipsis_width;
-        let chars: Vec<char> = full_text.chars().collect();
-        let mut best_len = 0;
-
-        if target_width > 0.0 {
-            let mut lo: usize = 0;
-            let mut hi: usize = chars.len();
-            while lo <= hi {
-                let mid = (lo + hi) / 2;
-                if mid == 0 {
-                    lo = 1;
-                    continue;
-                }
-                let prefix: String = chars[..mid].iter().collect();
-                let mut b = layout_cx.ranged_builder(font_cx, &prefix, scale, true);
-                b.push_default(parley::style::StyleProperty::FontSize(font_size));
-                b.push_default(parley::style::StyleProperty::FontWeight(font_weight));
-                b.push_default(parley::style::StyleProperty::FontFamily(
-                    parley::style::FontFamily::Source(font_family.clone()),
-                ));
-                push_spacing(&mut b, letter_spacing, word_spacing);
-                let mut l = b.build(&prefix);
-                l.break_all_lines(None);
-                if l.width() <= target_width {
-                    best_len = mid;
-                    lo = mid + 1;
-                } else {
-                    if mid == 0 {
-                        break;
+        // Only preserved spaces can hang past a soft wrap or end a line as
+        // content; collapsible ones are single, and gone at a forced break.
+        let preserves_spaces = ifc_text.preserved();
+        // The text of `pre` elements, whose preserved spaces must not hang
+        // (`LineUnit::unhung`; next to wrapping spaces, see `pre_seam`),
+        // and of `break-spaces` ones, whose spaces never hang (#1043).
+        let mut unhung = UnhungSpaces::default();
+        if preserves_spaces {
+            use crate::computed_style::WhiteSpaceValue;
+            for r in text_ranges
+                .iter()
+                .filter(|r| !r.is_br && r.flat_end > r.flat_start)
+            {
+                let white_space = nodes
+                    .get(r.node_id)
+                    .and_then(|t| t.parent)
+                    .and_then(|el| nodes.get(el))
+                    .map(|el| el.computed_style.white_space);
+                match white_space {
+                    Some(WhiteSpaceValue::Pre) => unhung.pre.push(r.flat_start..r.flat_end),
+                    Some(WhiteSpaceValue::BreakSpaces) => {
+                        unhung.breaking.push(r.flat_start..r.flat_end)
                     }
-                    hi = mid - 1;
+                    _ => {}
                 }
             }
         }
+        // #1238: a paragraph broken at a width that holds atomic inlines and
+        // some element that does not wrap is broken where CSS breaks next to
+        // its boxes ([`WrapSeams`]), not where parley does. #1243: so is one
+        // that holds a `pre` element's spaces (a wrapping paragraph does
+        // then): parley takes no break between a wrapping run of spaces and
+        // a `pre` one, and hangs a `pre` space that overflows, breaking the
+        // `pre` run.
+        // Whether it does is known once parley has broken it
+        // ([`pre_seams_needed`]); its ranges are filled now.
+        let pre_candidate =
+            effective_max_width.is_some() && Self::any_pre_space(nodes, &text_ranges, &unhung.pre);
+        unhung.pre_candidate = pre_candidate;
+        let needs_seams = effective_max_width.is_some()
+            && !boxes.is_empty()
+            && Self::any_nowrap_element(nodes, root_id, &text_ranges, &boxes);
+        unhung.box_seams = needs_seams;
+        // #2390: where text that does not wrap ends right before wrapping
+        // text, the characters there decide, once the text is known.
+        let text_seam_candidates = if effective_max_width.is_some() {
+            Self::nowrap_text_seams(nodes, root_id, &text_ranges)
+        } else {
+            Vec::new()
+        };
+        if pre_candidate {
+            unhung.collapsed = Self::collapsed_after_close(nodes, root_id, &text_ranges);
+            use crate::computed_style::WhiteSpaceValue;
+            for r in text_ranges
+                .iter()
+                .filter(|r| !r.is_br && r.flat_end > r.flat_start)
+            {
+                let collapses = nodes
+                    .get(r.node_id)
+                    .and_then(|t| t.parent)
+                    .and_then(|el| nodes.get(el))
+                    .is_some_and(|el| {
+                        matches!(
+                            el.computed_style.white_space,
+                            WhiteSpaceValue::Normal
+                                | WhiteSpaceValue::NoWrap
+                                | WhiteSpaceValue::PreLine
+                        )
+                    });
+                if collapses {
+                    unhung.collapsible.push(r.flat_start..r.flat_end);
+                }
+            }
+        }
+        // #1426: where an edge box's false break opportunities are undone,
+        // text that may not wrap offers no opportunity either; the same where
+        // a box's are (#1238).
+        if ifc_text.has_edge_boxes()
+            || needs_seams
+            || pre_candidate
+            || !text_seam_candidates.is_empty()
+        {
+            for r in text_ranges
+                .iter()
+                .filter(|r| !r.is_br && r.flat_end > r.flat_start)
+            {
+                let wraps = nodes
+                    .get(r.node_id)
+                    .and_then(|t| t.parent)
+                    .and_then(|el| nodes.get(el))
+                    .is_none_or(|el| {
+                        Self::text_wrap_mode(&el.computed_style)
+                            == parley::style::TextWrapMode::Wrap
+                    });
+                if !wraps {
+                    unhung.nowrap.push(r.flat_start..r.flat_end);
+                }
+            }
+            // A collapsible space with an opportunity before it is handed to
+            // parley as wrapping (`IfcText::replay`): it wraps here too.
+            for &(byte, collapsible) in &space_breaks {
+                if collapsible {
+                    remove_byte(&mut unhung.nowrap, byte);
+                }
+            }
+        }
+        unhung.space_breaks = space_breaks.iter().map(|&(byte, _)| byte).collect();
+        // Build and break; with preserved tabs, again until each tab ends at
+        // its stop (#1122): a tab's width depends on where its line puts it.
+        let tabs = ifc_text.tab_offsets();
+        let tab_sizes = ifc_text.tab_sizes();
+        let mut tab_spacing = vec![0.0f32; tabs.len()];
+        let stops = (!tabs.is_empty()).then(|| {
+            TabStops::of_block(
+                font_cx,
+                layout_cx,
+                &root_text_style,
+                root_computed.letter_spacing,
+                root_computed.word_spacing,
+                scale,
+            )
+        });
+        let alignment = root_computed.text_align.to_parley();
+        // A line aligned away from the left edge is aligned within the
+        // content width even when nothing wraps (#1237): parley aligns an
+        // unconstrained paragraph within its own widest line, which puts
+        // every line at the left. In a right-to-left block that is every
+        // alignment: a short `left`/`end` line still lands at the left, and
+        // a line wider than the box is start-aligned whatever its alignment
+        // (CSS Text 3 §7.1), so it overflows to the left (Chrome 157; an rtl
+        // scroll container scrolls to it, #2546). It overflowed to the
+        // right, past the inline start, before.
+        let ltr = css_direction_is_ltr(nodes, root_id);
+        let aligned_away = !ltr
+            || matches!(
+                alignment,
+                parley::layout::Alignment::Right
+                    | parley::layout::Alignment::Center
+                    | parley::layout::Alignment::End
+            );
+        let (indent, indent_options) =
+            text_indent_of(nodes, root_id, max_width, align_width, atomic);
+        let mut hang = HangStats::default();
+        let mut float_drop: f32;
+        let mut builds = 0u32;
+        let (text_layout, text_content) = loop {
+            let mut builder = layout_cx.tree_builder(font_cx, scale, true, &root_text_style);
+            builder.set_line_break_override(Some(CHROME_LINE_BREAKS));
+            // A block's paragraph runs in the block's `direction` whatever
+            // its text (parley 0.12 takes a base direction): an rtl one's
+            // trailing spaces are at its visual left, inside the box (Chrome
+            // 155, review of #1669), and a `ltr` one that starts with Hebrew
+            // is still left to right (#2594). `unicode-bidi: plaintext` alone
+            // takes it from the first strong character ([`block_bidi`]).
+            builder.set_base_direction(base_direction);
+            ifc_text.replay(&mut builder, emoji_family.as_ref(), &tab_spacing);
+            let (mut text_layout, text_content) = builder.build();
+            if indent != 0.0 {
+                text_layout.set_text_indent(indent, indent_options);
+            }
+            builds += 1;
+            if builds == 1 && !text_seam_candidates.is_empty() {
+                let breaks = TextBreaks::new(&text_content);
+                unhung.text_seams = text_seam_candidates.iter().any(|&byte| {
+                    !matches!(
+                        text_content[..byte].chars().next_back(),
+                        None | Some(' ' | '\t')
+                    ) && breaks.at(byte)
+                });
+            }
+            if (needs_seams || pre_candidate || unhung.text_seams) && unhung.seams.is_none() {
+                unhung.seams = Some(WrapSeams::of(nodes, root_id, &text_ranges, &text_layout));
+            }
+            let broken = break_lines_hanging_spaces(
+                &mut text_layout,
+                &text_content,
+                effective_max_width,
+                preserves_spaces,
+                &unhung,
+                align_width.filter(|_| aligned_away),
+                floats,
+                placer.as_deref_mut(),
+            );
+            hang.add(broken.hang);
+            float_drop = broken.float_drop;
+            let Some(stops) = &stops else {
+                break (text_layout, text_content);
+            };
+            let deltas = stops.deltas(&text_layout, &tabs, &tab_sizes);
+            if deltas.iter().all(|d| d.abs() < TAB_STOP_TOLERANCE) || builds >= MAX_TAB_BUILDS {
+                break (text_layout, text_content);
+            }
+            for (spacing, d) in tab_spacing.iter_mut().zip(&deltas) {
+                *spacing += d / scale;
+            }
+            hang.tab_rebuilds += 1;
+        };
+        let mut text_layout = text_layout;
 
-        // Build final layout: truncated text + ellipsis
-        let truncated: String = chars[..best_len]
+        // Apply text-align from computed style
+        text_layout.align(alignment, parley::layout::AlignmentOptions::default());
+        resolve_out_of_flow_marks(&text_layout, &text_content, scale, &mut out_of_flow);
+
+        let max_width = max_width.unwrap_or(f32::INFINITY);
+        let align_width = align_width.map_or(f32::INFINITY, |a| a.width);
+        let glyph_overflow = InlineLayout::glyph_overflow_of(&text_layout, max_width, align_width);
+        (
+            InlineLayout {
+                layout: text_layout,
+                text_content,
+                child_positions,
+                text_ranges,
+                root_color,
+                background_spans,
+                decoration_spans,
+                vertical_align_spans,
+                relative_spans,
+                relative_spans_resting: Vec::new(),
+                max_width,
+                align_width,
+                preserves_spaces,
+                break_spaces: unhung.breaking,
+                hang,
+                span_fragments: Default::default(),
+                out_of_flow,
+                ellipsis: None,
+                float_drop,
+                line_clamp: root_computed
+                    .line_clamp
+                    .map(|n| n as usize)
+                    .or(nodes[root_id].clamp_lines.map(|(n, _)| n)),
+                clamp_continues: nodes[root_id].clamp_lines.is_some_and(|(_, more)| more),
+                float_bands: floats.filter(|f| !f.is_empty()).cloned(),
+                glyph_overflow,
+                bidi_control_ranges,
+            },
+            font_family_resolves.get(),
+        )
+    }
+
+    /// Whether anything in an IFC may soft-wrap: the root itself (between its
+    /// own text and its atomic inlines alike), an element holding some text
+    /// run inside it (#1212), or one of its atomic inlines (`boxes`), however
+    /// deep (#1238: a `normal` span of
+    /// inline-blocks breaks between them, and a span that closes between
+    /// two boxes lends them its opportunity, [`WrapSeams`]). `false` only for
+    /// a `nowrap`/`pre` root none of whose content is in a wrapping element.
+    pub(crate) fn wraps_anywhere(
+        nodes: &crate::node_slab::NodeSlab,
+        root_id: RawNodeId,
+        text_ranges: &[crate::node::IfcTextRange],
+        boxes: &[RawNodeId],
+    ) -> bool {
+        let wraps = |id: RawNodeId| {
+            nodes.get(id).is_some_and(|n| {
+                Self::text_wrap_mode(&n.computed_style) == parley::style::TextWrapMode::Wrap
+            })
+        };
+        wraps(root_id)
+            || text_ranges
+                .iter()
+                .filter(|r| !r.is_br)
+                .any(|r| Self::ancestors_in_ifc(nodes, root_id, r.node_id).any(wraps))
+            || boxes
+                .iter()
+                .any(|&b| Self::ancestors_in_ifc(nodes, root_id, b).any(wraps))
+    }
+
+    /// Where a text node whose spaces collapsed away entirely stands right
+    /// after text whose element closes into the collapsed node's (#1243,
+    /// review of #1897): `<span>dd </span> <span pre>…` — the root's space
+    /// collapsed after the span's. Chrome 155 breaks before the `pre` spaces
+    /// there as it does after a run of spaces across two text nodes; not
+    /// when the collapsed space is in the same element as the text before
+    /// it (`dd ` and ` ` as two text nodes of one element), in a sibling
+    /// element that opens there (`dd <span> </span><span pre>`), or after a
+    /// comment. Sorted flat bytes.
+    fn collapsed_after_close(
+        nodes: &crate::node_slab::NodeSlab,
+        root_id: RawNodeId,
+        text_ranges: &[crate::node::IfcTextRange],
+    ) -> Vec<usize> {
+        let parent = |id: RawNodeId| nodes.get(id).and_then(|n| n.parent);
+        let mut out = Vec::new();
+        let mut prev: Option<&crate::node::IfcTextRange> = None;
+        for r in text_ranges.iter().filter(|r| !r.is_br) {
+            if r.flat_end > r.flat_start {
+                prev = Some(r);
+                continue;
+            }
+            let collapsed_space = nodes
+                .get(r.node_id)
+                .and_then(|n| n.text_content())
+                .is_some_and(|t| !t.is_empty());
+            let Some(before) = prev.filter(|p| p.flat_end == r.flat_start) else {
+                continue;
+            };
+            let (Some(into), Some(from)) = (parent(r.node_id), parent(before.node_id)) else {
+                continue;
+            };
+            // `into` is a proper ancestor of the element the text before it is
+            // in: that element closes there.
+            let closes = into != from
+                && std::iter::successors(parent(from), |&id| {
+                    (id != root_id).then(|| parent(id)).flatten()
+                })
+                .chain(std::iter::once(root_id))
+                .any(|id| id == into);
+            if collapsed_space && closes {
+                out.push(r.flat_start);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Whether some text of a `pre` element (`pre`, the `white-space` ranges
+    /// of [`UnhungSpaces::pre`]) holds a space or tab (#1243).
+    fn any_pre_space(
+        nodes: &crate::node_slab::NodeSlab,
+        text_ranges: &[crate::node::IfcTextRange],
+        pre: &[std::ops::Range<usize>],
+    ) -> bool {
+        !pre.is_empty()
+            && text_ranges
+                .iter()
+                .filter(|r| !r.is_br && r.flat_end > r.flat_start && in_ranges(pre, r.flat_start))
+                .any(|r| {
+                    nodes
+                        .get(r.node_id)
+                        .and_then(|n| n.text_content())
+                        .is_some_and(|t| t.contains([' ', '\t']))
+                })
+    }
+
+    /// The flat bytes where a text run whose element does not wrap (`nowrap`,
+    /// `pre`) ends right before another text run, and some element from the
+    /// first run's up to the nearest that holds both wraps ([`wraps_between`]):
+    /// the opportunity there is that element's, so the characters on either
+    /// side decide it (CSS Text 3 §5.1; #2390: `<span pre>abc-</span>123`
+    /// breaks after `-` in Chrome 156). parley takes a break's wrap mode from
+    /// the text before it, so it has none there.
+    fn nowrap_text_seams(
+        nodes: &crate::node_slab::NodeSlab,
+        root_id: RawNodeId,
+        text_ranges: &[crate::node::IfcTextRange],
+    ) -> Vec<usize> {
+        let nowrap = |text: RawNodeId| {
+            nodes
+                .get(text)
+                .and_then(|t| t.parent)
+                .and_then(|el| nodes.get(el))
+                .is_some_and(|el| {
+                    Self::text_wrap_mode(&el.computed_style) != parley::style::TextWrapMode::Wrap
+                })
+        };
+        let mut runs = text_ranges
             .iter()
-            .collect::<String>()
-            .trim_end()
-            .to_string()
-            + ellipsis;
-
-        let mut b = layout_cx.ranged_builder(font_cx, &truncated, scale, true);
-        b.push_default(parley::style::StyleProperty::FontSize(font_size));
-        b.push_default(parley::style::StyleProperty::Brush(Brush::Solid(color)));
-        b.push_default(parley::style::StyleProperty::FontWeight(font_weight));
-        b.push_default(parley::style::StyleProperty::FontFamily(
-            parley::style::FontFamily::Source(font_family),
-        ));
-        if let Some(lh) = line_height {
-            b.push_default(parley::style::StyleProperty::LineHeight(lh));
+            .filter(|r| !r.is_br && r.flat_end > r.flat_start);
+        let mut out = Vec::new();
+        let Some(mut prev) = runs.next() else {
+            return out;
+        };
+        for r in runs {
+            if prev.flat_end == r.flat_start
+                && nowrap(prev.node_id)
+                && wraps_between(nodes, root_id, prev.node_id, r.node_id)
+            {
+                out.push(prev.flat_end);
+            }
+            prev = r;
         }
-        push_spacing(&mut b, letter_spacing, word_spacing);
-        let mut layout = b.build(&truncated);
-        layout.break_all_lines(None);
-        layout.align(alignment, parley::layout::AlignmentOptions::default());
+        out
+    }
 
-        InlineLayout {
-            layout,
-            text_content: truncated,
-            child_positions: Vec::new(),
-            text_ranges: Vec::new(),
-            background_spans: Vec::new(),
-            decoration_spans: Vec::new(),
-            max_width: container_width,
+    /// Whether some element holding content of an IFC — its root, the
+    /// element of a text run, or an element holding one of its atomic
+    /// inlines (`boxes`) — does not wrap (#1238).
+    fn any_nowrap_element(
+        nodes: &crate::node_slab::NodeSlab,
+        root_id: RawNodeId,
+        text_ranges: &[crate::node::IfcTextRange],
+        boxes: &[RawNodeId],
+    ) -> bool {
+        let nowrap = |id: RawNodeId| {
+            nodes.get(id).is_some_and(|n| {
+                Self::text_wrap_mode(&n.computed_style) != parley::style::TextWrapMode::Wrap
+            })
+        };
+        nowrap(root_id)
+            || text_ranges
+                .iter()
+                .filter(|r| !r.is_br)
+                .any(|r| Self::ancestors_in_ifc(nodes, root_id, r.node_id).any(nowrap))
+            || boxes
+                .iter()
+                .any(|&b| Self::ancestors_in_ifc(nodes, root_id, b).any(nowrap))
+    }
+
+    /// The elements from `node`'s parent up to, not including, the IFC root.
+    fn ancestors_in_ifc(
+        nodes: &crate::node_slab::NodeSlab,
+        root_id: RawNodeId,
+        node: RawNodeId,
+    ) -> impl Iterator<Item = RawNodeId> + '_ {
+        std::iter::successors(nodes.get(node).and_then(|n| n.parent), |&id| {
+            nodes.get(id).and_then(|n| n.parent)
+        })
+        .take_while(move |&id| id != root_id)
+    }
+
+    /// Where `text-overflow: ellipsis` cuts `il`'s lines (#1100), or `None`
+    /// when no line overflows `container_width`.
+    ///
+    /// A line overflows when its content (its advance less its trailing white
+    /// space, as parley's own `Layout::width` measures it) is wider than the
+    /// box (#1091: the question is asked per line, after wrapping). On such a
+    /// line everything whose **visual** extent passes the point where the "…"
+    /// still fits before the line's end edge is hidden — each cluster, and
+    /// each atomic inline whole — and the "…" is placed right after what is
+    /// kept: the box's right edge less the "…" when the line leaves the box by
+    /// its right, its left edge plus the "…" when it leaves by its left (an
+    /// overflowing right-to-left line, which parley aligns to the left of the
+    /// box). That is Chrome 155's cut
+    /// (`ellipsis_paint_cut_1100_tests.rs`): it is made by position, so a
+    /// right-to-left run in a left-to-right line is cut where it is drawn,
+    /// not at its logical end. Edge boxes (#1426) draw nothing and are never
+    /// hidden; one that fits moves the "…" past it.
+    ///
+    /// With `text_overflow` every overflowing line is cut so. `clamp_line`
+    /// (#1703, `-webkit-line-clamp`) is the last line a clamp keeps: it ends
+    /// in "…" whether or not it overflows, placed after its content less its
+    /// trailing white space, and cut as above only where the "…" would not
+    /// fit (Chrome 155: `seven eight nine ten…`).
+    ///
+    /// Nothing but the "…" is shaped: the lines are the ones laid out, and
+    /// paint draws the cut ([`crate::node::EllipsisCut`]).
+    #[allow(clippy::too_many_arguments)]
+    fn ellipsis_cut(
+        nodes: &crate::node_slab::NodeSlab,
+        root_id: RawNodeId,
+        il: &InlineLayout,
+        container_width: f32,
+        text_overflow: bool,
+        clamp_line: Option<usize>,
+        font_cx: &mut parley::FontContext,
+        layout_cx: &mut parley::LayoutContext<Brush>,
+    ) -> Option<crate::node::EllipsisCut> {
+        use parley::layout::PositionedLayoutItem;
+        // A tolerance for the float sums: a cluster ending this close past
+        // the limit still fits.
+        const EPS: f32 = 0.01;
+        let overflowing = |line: &parley::layout::Line<'_, Brush>| {
+            let m = line.metrics();
+            text_overflow && m.advance - m.hanging_advance > container_width
+        };
+        if clamp_line.is_none() && !il.layout.lines().any(|l| overflowing(&l)) {
+            return None;
         }
+        // The "…" is the root's text, undecorated: Chrome 155 draws it in the
+        // block's font and colour, and draws no underline under it even where
+        // the block itself is underlined.
+        let mut style = EllipsisStyle::of(&nodes[root_id].computed_style, 1.0);
+        style.underline = false;
+        style.strikethrough = false;
+        let mut glyph = style.shape(layout_cx, font_cx, "\u{2026}", 1.0, true);
+        glyph.break_all_lines(None);
+        let ellipsis_width = glyph.width();
+        let glyph_baseline = glyph.lines().next().map_or(0.0, |l| l.metrics().baseline);
+        let rtl = il.layout.is_rtl();
+
+        let mut hidden: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut hidden_boxes = Vec::new();
+        let mut marks = Vec::new();
+        // One line's items: `(x0, x1, what)`. A cluster item is a unit that
+        // is kept or hidden whole: a grapheme, and a ligature with every
+        // cluster its glyph covers. Paint draws a glyph with the first
+        // cluster it belongs to, so hiding part of either drew the whole
+        // glyph under the "…" (review of #1860).
+        enum Item {
+            Cluster(Vec<std::ops::Range<usize>>, bool),
+            Edge,
+            Atomic(RawNodeId),
+        }
+        let mut items: Vec<(f32, f32, Item)> = Vec::new();
+        // `(range, x0, x1, space, starts a unit)` per cluster of a line.
+        let mut clusters: Vec<(std::ops::Range<usize>, f32, f32, bool, bool)> = Vec::new();
+        let text = il.text_content.as_str();
+        for (index, line) in il.layout.lines().enumerate() {
+            // The clamp's line ends in "…" after its content, its trailing
+            // white space not counted, unless it overflows as well.
+            let clamped = clamp_line == Some(index) && !overflowing(&line);
+            if !clamped && !overflowing(&line) {
+                continue;
+            }
+            let m = line.metrics();
+            items.clear();
+            clusters.clear();
+            for run in line.runs() {
+                let Some(mut x) = run
+                    .visual_clusters()
+                    .next()
+                    .and_then(|c| crate::float_wrap::cluster_x(&c))
+                else {
+                    continue;
+                };
+                for cluster in run.visual_clusters() {
+                    let x1 = x + cluster.advance();
+                    let r = cluster.text_range();
+                    let starts = !cluster.is_ligature_continuation()
+                        && rinch_words::is_grapheme_boundary(text, r.start);
+                    clusters.push((r, x, x1, cluster.is_space_or_nbsp(), starts));
+                    x = x1;
+                }
+            }
+            // Group the clusters into units in text order.
+            clusters.sort_by_key(|c| c.0.start);
+            for (r, x0, x1, space, starts) in clusters.drain(..) {
+                match items.last_mut() {
+                    Some((ux0, ux1, Item::Cluster(ranges, uspace))) if !starts => {
+                        *ux0 = ux0.min(x0);
+                        *ux1 = ux1.max(x1);
+                        *uspace &= space;
+                        ranges.push(r);
+                    }
+                    _ => items.push((x0, x1, Item::Cluster(vec![r], space))),
+                }
+            }
+            for item in line.items() {
+                if let PositionedLayoutItem::InlineBox(b) = item {
+                    let what = if is_edge_box(b.id) {
+                        Item::Edge
+                    } else {
+                        Item::Atomic(b.id as RawNodeId)
+                    };
+                    items.push((b.x, b.x + b.width, what));
+                }
+            }
+            // The side the line's content leaves the box by is its end
+            // edge: the right for a left-to-right paragraph, the left for a
+            // right-to-left one, whose overflowing lines parley moves left
+            // of the box when it aligns them against it. An unconstrained
+            // (`nowrap`/`pre`) right-to-left line is not so moved and leaves
+            // by the right, where the "…" then goes, inside the box.
+            let (lo, hi) = items
+                .iter()
+                .filter(|(_, _, w)| !matches!(w, Item::Cluster(_, true) | Item::Edge))
+                .fold(
+                    (f32::INFINITY, f32::NEG_INFINITY),
+                    |(lo, hi), &(a, b, _)| (lo.min(a), hi.max(b)),
+                );
+            let (over_left, over_right) = (lo < -EPS, hi > container_width + EPS);
+            let at_left = if over_left != over_right {
+                over_left
+            } else {
+                rtl
+            };
+            // Whether an extent `x0..x1` is past the point the "…" fits at.
+            let past = |x0: f32, x1: f32| {
+                if at_left {
+                    x0 < ellipsis_width - EPS
+                } else {
+                    x1 > container_width - ellipsis_width + EPS
+                }
+            };
+            // The kept content's extent at the end edge.
+            let mut kept: Option<f32> = None;
+            for (x0, x1, what) in items.drain(..) {
+                if past(x0, x1) {
+                    match what {
+                        Item::Cluster(ranges, _) => {
+                            hidden.extend(ranges.into_iter().filter(|r| !r.is_empty()))
+                        }
+                        Item::Atomic(id) => hidden_boxes.push(id),
+                        _ => {}
+                    }
+                } else if !(clamped && matches!(what, Item::Cluster(_, true))) {
+                    let edge = if at_left { x0 } else { x1 };
+                    kept = Some(match kept {
+                        None => edge,
+                        Some(k) if at_left => k.min(edge),
+                        Some(k) => k.max(edge),
+                    });
+                }
+            }
+            let x = match (kept, at_left) {
+                (Some(edge), false) => edge,
+                (Some(edge), true) => edge - ellipsis_width,
+                (None, false) => (m.inline_min_coord + m.offset).max(0.0),
+                (None, true) => {
+                    (m.inline_min_coord + m.offset + m.advance).min(container_width)
+                        - ellipsis_width
+                }
+            };
+            marks.push(crate::node::EllipsisMark {
+                line: index,
+                x,
+                y: m.baseline - glyph_baseline,
+                // Past this x, in the line's visual order, everything is
+                // hidden: paint stops walking the line there.
+                hidden_past: (!at_left).then_some(container_width - ellipsis_width + EPS),
+            });
+        }
+        hidden.sort_by_key(|r| r.start);
+        let mut merged: Vec<std::ops::Range<usize>> = Vec::with_capacity(hidden.len());
+        for r in hidden {
+            match merged.last_mut() {
+                Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+                _ => merged.push(r),
+            }
+        }
+        Some(crate::node::EllipsisCut {
+            hidden: merged,
+            hidden_boxes,
+            marks,
+            glyph,
+        })
     }
 
     /// Whether two computed styles agree on every property
@@ -4314,6 +13033,20 @@ impl RinchDocument {
         a: &crate::computed_style::ComputedStyle,
         b: &crate::computed_style::ComputedStyle,
     ) -> bool {
+        Self::same_inline_text_style_but_wrap(a, b)
+            && Self::text_wrap_mode(a) == Self::text_wrap_mode(b)
+            && a.word_break == b.word_break
+            && a.line_break == b.line_break
+            && a.hyphens_none == b.hyphens_none
+            && a.overflow_wrap == b.overflow_wrap
+    }
+
+    /// [`Self::same_inline_text_style`] less the wrap mode: every property
+    /// that decides how a span's glyphs look.
+    fn same_inline_text_style_but_wrap(
+        a: &crate::computed_style::ComputedStyle,
+        b: &crate::computed_style::ComputedStyle,
+    ) -> bool {
         use crate::computed_style::values::LineHeightValue;
         let same_line_height = match (a.line_height, b.line_height) {
             (LineHeightValue::Normal, LineHeightValue::Normal) => true,
@@ -4323,6 +13056,7 @@ impl RinchDocument {
         };
         a.font_size == b.font_size
             && a.font_weight == b.font_weight
+            && a.font_family == b.font_family
             && a.font_style == b.font_style
             && a.color == b.color
             && a.text_decoration == b.text_decoration
@@ -4330,6 +13064,50 @@ impl RinchDocument {
             && same_line_height
             && a.letter_spacing == b.letter_spacing
             && a.word_spacing == b.word_spacing
+    }
+
+    /// `id`, or its nearest ancestor that is not `display: contents`: the
+    /// element whose box an inline item of `id` sits in.
+    /// Whether an inline element's strut (CSS 2.1 §10.8.1) is the one of
+    /// `parent`, the box it sits in: the same font family at the same size
+    /// and `line-height`, on the parent's baseline. An empty such element
+    /// adds nothing to its line (#1463). Weight and style are not compared:
+    /// a family's faces share their vertical metrics in practice, and an
+    /// empty `<b>`/`<i>` is the common case this exists for.
+    fn same_strut(
+        el: &crate::computed_style::ComputedStyle,
+        parent: &crate::computed_style::ComputedStyle,
+    ) -> bool {
+        el.vertical_align == VerticalAlignValue::Baseline
+            && el.font_size == parent.font_size
+            && el.font_family == parent.font_family
+            && el.line_height_px() == parent.line_height_px()
+    }
+
+    fn box_ancestor(nodes: &crate::node_slab::NodeSlab, mut id: RawNodeId) -> RawNodeId {
+        while nodes[id].computed_style.display
+            == crate::computed_style::values::DisplayValue::Contents
+            && let Some(up) = nodes[id].parent.filter(|&up| nodes.get_live(up).is_some())
+        {
+            id = up;
+        }
+        id
+    }
+
+    /// Whether an element's text may wrap: `nowrap` and `pre` forbid it
+    /// (#1091). Pushed per inline element, so a `nowrap` span inside a
+    /// wrapping root keeps its text on one line — and overflows that line,
+    /// which is what draws its `text-overflow: ellipsis`. The IFC root's own
+    /// mode is its root text style's (#1212), so a wrapping span inside a
+    /// `nowrap`/`pre` root wraps while the root's own text does not.
+    fn text_wrap_mode(
+        computed: &crate::computed_style::ComputedStyle,
+    ) -> parley::style::TextWrapMode {
+        use crate::computed_style::WhiteSpaceValue;
+        match computed.white_space {
+            WhiteSpaceValue::NoWrap | WhiteSpaceValue::Pre => parley::style::TextWrapMode::NoWrap,
+            _ => parley::style::TextWrapMode::Wrap,
+        }
     }
 
     /// The Parley style span an element contributes to the inline formatting
@@ -4340,11 +13118,50 @@ impl RinchDocument {
     /// box but is still in the inheritance chain, so the two arms owe their
     /// children the same properties; only the *box*-shaped work (the background
     /// span) is the inline element's alone.
-    fn inline_style_props<'a>(
-        computed: &'a crate::computed_style::ComputedStyle,
+    ///
+    /// **Includes `font-family` (#677).** Without it a span inherited the IFC
+    /// root's family whatever its own computed style said — `<code>`'s
+    /// `font-family: monospace` inside a paragraph rendered in the paragraph's
+    /// proportional face. Resolved through [`crate::fonts::parley_font_family`],
+    /// the same generic/fallback resolution the root's own family goes through
+    /// in [`Self::build_inline_layout`], so a generic such as `monospace` on a
+    /// span is resolved identically to one on the root. One known gap stays
+    /// open: an emoji-presentation cluster inside such a span is still shaped
+    /// with the *root's* emoji family ([`Self::build_inline_layout`]'s
+    /// `emoji_family`, computed once from `root_computed.font_family`), not the
+    /// span's — out of scope for #677, which is about text glyphs, not emoji.
+    ///
+    /// **`parent_family` is the cheap skip (review of #1326).** `font-family`
+    /// is an inherited CSS property, so an element that does not declare its
+    /// own carries its parent's value already — `resolve_property`'s
+    /// `FontFamily` resolution is the expensive half of this push (a cache
+    /// lookup plus an owned `Cow` clone even on a hit), and calling it for
+    /// every one of a document's spans whether or not the family actually
+    /// changed cost 30-50% of wall time on an adversarial 3000-span document
+    /// (measured, review of #1326). `parent_family` is every call site's own
+    /// `nodes[parent_id].computed_style.font_family` — the enclosing IFC
+    /// context's family — so `computed.font_family == parent_family` means
+    /// Parley already has the right value from whichever ancestor last
+    /// changed it, and no span-level override is needed at all.
+    // The leading unconditional pushes (`FontSize` through `FontStyle`) read
+    // as a `vec![]` candidate in isolation, but the conditional pushes further
+    // down mean the whole function cannot be one literal.
+    #[allow(clippy::vec_init_then_push)]
+    fn inline_style_props(
+        computed: &crate::computed_style::ComputedStyle,
+        parent_family: &str,
+        vertical_align: parley::style::VerticalAlign,
         scale: f32,
-    ) -> Vec<parley::style::StyleProperty<'a, Brush>> {
-        let mut props: Vec<parley::style::StyleProperty<'a, Brush>> = Vec::new();
+        font_cx: &mut parley::FontContext,
+        font_family_resolves: &std::cell::Cell<u64>,
+    ) -> Vec<parley::style::StyleProperty<'static, Brush>> {
+        let mut props: Vec<parley::style::StyleProperty<'static, Brush>> = Vec::new();
+        if computed.font_family != parent_family {
+            props.push(parley::style::StyleProperty::FontFamily(
+                crate::fonts::parley_font_family(font_cx, &computed.font_family),
+            ));
+            font_family_resolves.set(font_family_resolves.get() + 1);
+        }
         props.push(parley::style::StyleProperty::FontSize(
             computed.font_size * scale,
         ));
@@ -4357,25 +13174,30 @@ impl RinchDocument {
         if let Some(color) = computed.color {
             props.push(parley::style::StyleProperty::Brush(Brush::Solid(color)));
         }
-        if computed.text_decoration.underline {
-            // A wavy underline is painted by `paint::text` from a decoration span
-            // (Parley has no wavy decoration), so the straight line is explicitly
-            // turned *off* rather than merely not turned on: the enclosing span
-            // may have switched it on, and a squiggle drawn over an inherited
-            // straight rule is two underlines.
-            props.push(parley::style::StyleProperty::Underline(
-                !computed.text_decoration.is_wavy_underline(),
-            ));
+        // A wavy underline is painted by `paint::text` from a decoration span
+        // (Parley has no wavy decoration), so a wavy element pushes no
+        // `Underline` at all — and in particular does not turn one *off*. CSS
+        // propagates an ancestor's decoration to every descendant's glyphs and a
+        // descendant cannot remove it, so a misspelled word inside `<u>` or an
+        // underlined link keeps its straight line and gains the squiggle, which
+        // is what a browser draws (review of #836, finding 4).
+        let wavy = computed.text_decoration.is_wavy_underline();
+        if computed.text_decoration.underline && !wavy {
+            props.push(parley::style::StyleProperty::Underline(true));
         }
         if computed.text_decoration.strikethrough {
             props.push(parley::style::StyleProperty::Strikethrough(true));
         }
         // `text-decoration-color`; see the sibling assignment in
-        // `build_inline_layout` for why `currentcolor` pushes nothing.
+        // `build_inline_layout` for why `currentcolor` pushes nothing. A wavy
+        // element's colour belongs to its squiggle (the decoration span carries
+        // it), not to an underline it inherited.
         if let Some(c) = computed.text_decoration.color {
-            props.push(parley::style::StyleProperty::UnderlineBrush(Some(
-                Brush::Solid(c),
-            )));
+            if !wavy {
+                props.push(parley::style::StyleProperty::UnderlineBrush(Some(
+                    Brush::Solid(c),
+                )));
+            }
             props.push(parley::style::StyleProperty::StrikethroughBrush(Some(
                 Brush::Solid(c),
             )));
@@ -4385,14 +13207,8 @@ impl RinchDocument {
         // away from the text), parley's is baseline-up.
         //
         // **Always `None` in production, because no CSS path sets the field
-        // today.** `text-underline-offset` is declared `engines="gecko"` at
-        // `stylo-0.11.0/properties/longhands/inherited_text.mako.rs:330`, and
-        // stylo's `build.rs` generates exactly one engine's property set — so
-        // the servo build emits no parser entry and Stylo discards the
-        // declaration as unknown. Measured in a generated `properties.rs`:
-        // `text_underline_offset` 0 hits, the documented gecko-only
-        // `scrollbar_color` 0 hits, and `text_decoration_line` 52 hits as the
-        // positive control that the grep fires at all (#580).
+        // today**: stylo parses `text-underline-offset` since 0.21, but
+        // `ComputedStyle::from_stylo` does not read it (#580).
         if let Some(css_offset) = computed.text_underline_offset {
             props.push(parley::style::StyleProperty::UnderlineOffset(Some(
                 -css_offset,
@@ -4423,7 +13239,194 @@ impl RinchDocument {
         props.push(parley::style::StyleProperty::WordSpacing(
             computed.word_spacing,
         ));
+        props.push(parley::style::StyleProperty::TextWrapMode(
+            Self::text_wrap_mode(computed),
+        ));
+        props.push(parley::style::StyleProperty::WhiteSpaceCollapse(
+            white_space_hanging(computed.white_space),
+        ));
+        // `word-break` and `line-break` inherit; pushed unconditionally for
+        // the spacings' reason (#2388).
+        props.push(parley::style::StyleProperty::WordBreak(
+            computed.word_break.to_parley(),
+        ));
+        props.push(parley::style::StyleProperty::LineBreak(
+            computed.line_break.to_parley(),
+        ));
+        // `hyphens` inherits too (#2621).
+        props.push(parley::style::StyleProperty::Hyphens(hyphens_to_parley(
+            computed.hyphens_none,
+        )));
+        // So does `overflow-wrap` (#2625): a span's own value, not only the
+        // paragraph's.
+        props.push(parley::style::StyleProperty::OverflowWrap(
+            computed.overflow_wrap.to_parley(),
+        ));
+        // Unconditional for the reason the spacings are: parley's span style
+        // inherits, and `vertical-align` does not (#1357).
+        props.push(parley::style::StyleProperty::VerticalAlign(vertical_align));
         props
+    }
+
+    /// The `vertical-align` shift (#724) a `vertical_align` value gives a text
+    /// run, as an unscaled layout-pixel offset in rinch's Y-down convention:
+    /// **positive moves the glyph down**, negative up.
+    ///
+    /// Three cases:
+    ///
+    /// - `Baseline` and the five keywords with no consumer yet
+    ///   (`Top`/`TextTop`/`Middle`/`Bottom`/`TextBottom` — see
+    ///   [`crate::computed_style::VerticalAlignValue`]'s doc) answer `0.0`.
+    /// - `Sub`/`Super` answer a fixed fraction of `parent_font_size` — CSS 2.1
+    ///   §10.8.1 says `sub`/`super` lower/raise the box "to the proper
+    ///   position for subscripts/superscripts **of the parent's box**",
+    ///   UA-defined, so there is no spec algorithm to match: Chrome instead
+    ///   reads the OS/2 table's actual sub/superscript metrics of the
+    ///   parent's font at its size, non-linearly (measured: at 24px Inter the
+    ///   ratio to font-size is ~8% off the 16px ratio, almost certainly
+    ///   device-pixel rounding inside Chrome's own layout, not a simpler
+    ///   closed form). `SUB_RATIO`/`SUPER_RATIO` below are that *ratio*,
+    ///   calibrated once against the one case this issue asks for — Chrome
+    ///   153, the bundled Inter, a 16px parent (`crates/rinch-dom/tests/vertical_align_tests.rs`
+    ///   has the measurement) — and applied linearly to any `parent_font_size`.
+    ///   Exact only at that calibration point; elsewhere it is a documented
+    ///   approximation, like the five keywords above.
+    /// - A `<length>`/`<percentage>` resolves through
+    ///   [`crate::computed_style::values::LengthPercentageValue::resolve`]
+    ///   against **this element's own** `line-height` (its own box, not the
+    ///   parent's — the one place `sub`/`super` and a length disagree about
+    ///   whose metrics apply, both measured against Chrome 153 with Inter).
+    ///   CSS's sign (positive raises) is the opposite of this function's, so
+    ///   the resolved value is negated on the way out.
+    pub(crate) fn vertical_align_shift_px(
+        computed: &crate::computed_style::ComputedStyle,
+        parent_font_size: f32,
+    ) -> f32 {
+        use crate::computed_style::VerticalAlignValue;
+        // Calibration: Chrome 153, bundled Inter, 16px parent `font-size`
+        // (line-height does not move it — verified at 16px/32px line-height,
+        // same 16px font-size, identical shift both times).
+        const SUB_RATIO: f32 = 67.0 / 256.0; // 4.1875px at a 16px parent
+        const SUPER_RATIO: f32 = 405.0 / 1024.0; // 6.328125px at a 16px parent
+        match computed.vertical_align {
+            VerticalAlignValue::Sub => SUB_RATIO * parent_font_size,
+            VerticalAlignValue::Super => -(SUPER_RATIO * parent_font_size),
+            VerticalAlignValue::LengthPercentage(lp) => -lp.resolve(computed.line_height_px()),
+            VerticalAlignValue::Baseline
+            | VerticalAlignValue::Top
+            | VerticalAlignValue::TextTop
+            | VerticalAlignValue::Middle
+            | VerticalAlignValue::Bottom
+            | VerticalAlignValue::TextBottom => 0.0,
+        }
+    }
+
+    /// Where parley puts `id`'s baseline (#1357): its offset from its line's
+    /// baseline, in rinch's Y-down sign, which is every inline element's own
+    /// [`Self::vertical_align_shift_px`] from `id` up to the IFC root, added
+    /// outermost first and rounded once, as parley adds and rounds a span's
+    /// baseline offset in a quantized layout (`style_metrics.rs`). A `display:
+    /// contents` element has no box and moves nothing; the walk stops at the
+    /// first element that is neither (the IFC root, an anonymous box's
+    /// container). The keywords parley would align by their font metrics are
+    /// `0.0` here, as they are in the parley style ([`Self::span_vertical_align`]).
+    pub(crate) fn composed_vertical_align_shift<'a>(
+        get: impl Fn(RawNodeId) -> Option<&'a Node>,
+        id: RawNodeId,
+    ) -> f32 {
+        Self::composed_vertical_align_exact(get, id).round()
+    }
+
+    /// Whether `id` or an inline element around it (up to the IFC root, as
+    /// [`Self::composed_vertical_align_shift`] walks) declares one of the
+    /// keywords parley places by font metrics or by the line
+    /// (`top`/`middle`/`bottom`/`text-top`/`text-bottom`, #1357): where its
+    /// baseline went is then read from the layout, not added up here.
+    fn vertical_align_from_metrics<'a>(
+        get: impl Fn(RawNodeId) -> Option<&'a Node>,
+        id: RawNodeId,
+    ) -> bool {
+        let mut cur = get(id);
+        for _ in 0..64 {
+            let Some(el) = cur.filter(|n| n.is_element()) else {
+                break;
+            };
+            let contents = el.inline_flow_role() == crate::node::InlineFlowRole::Contents;
+            if !contents && el.display_mode != crate::node::DisplayMode::Inline {
+                break;
+            }
+            if !contents && is_metrics_vertical_align(el.computed_style.vertical_align) {
+                return true;
+            }
+            cur = el.parent.and_then(&get);
+        }
+        false
+    }
+
+    /// [`Self::composed_vertical_align_shift`] before it is rounded: what a
+    /// span standing for `id`'s shift passes parley, which rounds it.
+    fn composed_vertical_align_exact<'a>(
+        get: impl Fn(RawNodeId) -> Option<&'a Node>,
+        id: RawNodeId,
+    ) -> f32 {
+        // Collected innermost first, added outermost first.
+        let mut own: [f32; 64] = [0.0; 64];
+        let mut n = 0;
+        let mut cur = get(id);
+        // Inline nesting is shallow; the bound only guards a cycle.
+        for _ in 0..64 {
+            let Some(el) = cur.filter(|n| n.is_element()) else {
+                break;
+            };
+            let parent = el.parent.and_then(&get);
+            if el.inline_flow_role() == crate::node::InlineFlowRole::Contents {
+                cur = parent;
+                continue;
+            }
+            if el.display_mode != crate::node::DisplayMode::Inline {
+                break;
+            }
+            if el.computed_style.vertical_align != VerticalAlignValue::Baseline {
+                let parent_font_size =
+                    parent.map_or(el.computed_style.font_size, |p| p.computed_style.font_size);
+                own[n] = Self::vertical_align_shift_px(&el.computed_style, parent_font_size);
+                n += 1;
+            }
+            cur = parent;
+        }
+        own[..n].iter().rev().fold(0.0f32, |acc, s| acc + s)
+    }
+
+    /// The parley `VerticalAlign` of an inline element's span (#1357): its
+    /// shift from its parent span, [`Self::vertical_align_shift_px`], as a
+    /// length raising it, so that parley places the span box by it and grows
+    /// the line to hold it (CSS 2.1 §10.8). `sub` and `super` stay rinch's
+    /// Chrome-calibrated amounts rather than parley's `font-size / 5` and `/ 3`.
+    /// The keywords placed against font metrics or the line
+    /// (`top`/`middle`/`bottom`/`text-top`/`text-bottom`) are parley's own
+    /// (#1357), as an atomic inline's are ([`atomic_vertical_align`]).
+    /// Parley's span style inherits, so a span that does not move pushes
+    /// `BASELINE` too.
+    /// Unscaled: parley scales a style's length itself.
+    pub(crate) fn span_vertical_align(
+        computed: &crate::computed_style::ComputedStyle,
+        parent_font_size: f32,
+    ) -> parley::style::VerticalAlign {
+        use parley::style::VerticalAlign as V;
+        match computed.vertical_align {
+            VerticalAlignValue::Top => return V::TOP,
+            VerticalAlignValue::Bottom => return V::BOTTOM,
+            VerticalAlignValue::Middle => return V::MIDDLE,
+            VerticalAlignValue::TextTop => return V::TEXT_TOP,
+            VerticalAlignValue::TextBottom => return V::TEXT_BOTTOM,
+            _ => {}
+        }
+        let shift = Self::vertical_align_shift_px(computed, parent_font_size);
+        if shift == 0.0 {
+            parley::style::VerticalAlign::BASELINE
+        } else {
+            parley::style::VerticalAlign::length(-shift)
+        }
     }
 
     /// Push the spans `owner` contributes over `start..end` — its background, if
@@ -4432,14 +13435,43 @@ impl RinchDocument {
     /// The one place an inline box becomes a span, so the ordinary `display:
     /// inline` arm and the split-inline bridge below cannot disagree about
     /// padding, radius, or which elements get a squiggle.
+    #[allow(clippy::too_many_arguments)]
     fn push_inline_spans(
+        nodes: &crate::node_slab::NodeSlab,
         owner: &Node,
         start: usize,
         end: usize,
+        has_edges: bool,
         background_spans: &mut Vec<crate::node::InlineBackgroundSpan>,
         decoration_spans: &mut Vec<crate::node::InlineDecorationSpan>,
+        vertical_align_spans: &mut Vec<crate::node::InlineVerticalAlignSpan>,
+        relative_spans: &mut Vec<crate::node::InlineRelativeSpan>,
     ) {
+        // #1425/#2346: a relatively positioned inline element moves its text
+        // and its atomic inlines, even when it holds no text of its own.
+        // Recorded with no offset: the offset is resolved against the
+        // containing block once the root's box is known
+        // (`resolve_relative_spans`), and a span left at zero is dropped then.
+        // #2869: so does a static one that is a stacking context (a
+        // `filter`, an `opacity`, a mask), whose range its own entry paints
+        // (`paint::paints_in_own_entry`); its offset resolves to zero.
+        if owner.computed_style.position == crate::computed_style::PositionValue::Relative
+            || is_static_inline_layer(&owner.computed_style)
+        {
+            relative_spans.push(crate::node::InlineRelativeSpan {
+                owner: owner.id,
+                start,
+                end: end.max(start),
+                dx: 0.0,
+                dy: 0.0,
+            });
+        }
         if end <= start {
+            // An element with no text still has its edge boxes (#1426), and
+            // draws its background and border over them.
+            if has_edges && let Some(span) = inline_background_span(owner, start, end) {
+                background_spans.push(span);
+            }
             return;
         }
         // A wavy underline is not a Parley style, so it is recorded as a span and
@@ -4447,34 +13479,41 @@ impl RinchDocument {
         // the straight `Underline` for the same element.
         if owner.computed_style.text_decoration.is_wavy_underline() {
             decoration_spans.push(crate::node::InlineDecorationSpan {
+                owner: owner.id,
                 start,
                 end,
-                color: owner
-                    .computed_style
-                    .text_decoration
-                    .color
-                    .or(owner.computed_style.color)
-                    .unwrap_or(peniko::Color::BLACK),
+                color: wavy_underline_color(&owner.computed_style),
             });
         }
-        let Some(color) = owner.computed_style.background_color() else {
-            return;
-        };
-        // Skip transparent backgrounds (alpha == 0).
-        if color.components[3] <= 0.0 {
-            return;
+        // `vertical-align` (#724). Parley places the glyphs by it and grows
+        // the line for it (#1357, [`Self::span_vertical_align`]); this span
+        // records where they went — the shifts of the elements around it
+        // added up as parley adds them — for what is still measured from the
+        // line box rather than from the glyphs: the caret, the glyph bounds,
+        // the element's background and border. The "parent's box" the spec
+        // shifts against (CSS 2.1 §10.8.1) is each element's own DOM parent,
+        // which may sit above whatever enclosing span called in once a split
+        // inline or a `display: contents` bridge is in the way.
+        if owner.computed_style.vertical_align != VerticalAlignValue::Baseline {
+            let from_layout = Self::vertical_align_from_metrics(|id| nodes.get_live(id), owner.id);
+            let shift = if from_layout {
+                0.0
+            } else {
+                Self::composed_vertical_align_shift(|id| nodes.get_live(id), owner.id)
+            };
+            if shift != 0.0 || from_layout {
+                vertical_align_spans.push(crate::node::InlineVerticalAlignSpan {
+                    owner: owner.id,
+                    start,
+                    end,
+                    shift_px: shift,
+                    from_layout,
+                });
+            }
         }
-        let cs = &owner.computed_style;
-        background_spans.push(crate::node::InlineBackgroundSpan {
-            start,
-            end,
-            color,
-            padding_left: cs.padding_left.to_px(),
-            padding_right: cs.padding_right.to_px(),
-            padding_top: cs.padding_top.to_px(),
-            padding_bottom: cs.padding_bottom.to_px(),
-            border_radius: cs.border_radius_top_left.to_px(),
-        });
+        if let Some(span) = inline_background_span(owner, start, end) {
+            background_spans.push(span);
+        }
     }
 
     /// The `is_split_inline` DOM ancestors of `node_id` below `stop_at`,
@@ -4485,10 +13524,10 @@ impl RinchDocument {
     /// walked — which is why anything it would have contributed to the line has to
     /// be reached from its descendants instead.
     fn split_inline_ancestors(
-        nodes: &slab::Slab<Node>,
-        node_id: usize,
-        stop_at: Option<usize>,
-    ) -> Vec<usize> {
+        nodes: &crate::node_slab::NodeSlab,
+        node_id: RawNodeId,
+        stop_at: Option<RawNodeId>,
+    ) -> Vec<RawNodeId> {
         let mut chain = Vec::new();
         let mut cur = nodes.get(node_id).and_then(|n| n.parent);
         let cap = nodes.len() + 1;
@@ -4510,23 +13549,27 @@ impl RinchDocument {
 
     /// Recursively walk inline children, pushing text and style spans into the TreeBuilder.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn walk_inline_children(
-        nodes: &slab::Slab<Node>,
-        parent_id: usize,
-        builder: &mut parley::TreeBuilder<'_, Brush>,
-        child_positions: &mut Vec<(usize, LayoutResult)>,
+    pub(crate) fn walk_inline_children<'a>(
+        nodes: &'a crate::node_slab::NodeSlab,
+        parent_id: RawNodeId,
+        builder: &mut IfcText<'a>,
+        child_positions: &mut Vec<(RawNodeId, LayoutResult)>,
         text_ranges: &mut Vec<crate::node::IfcTextRange>,
         background_spans: &mut Vec<crate::node::InlineBackgroundSpan>,
         decoration_spans: &mut Vec<crate::node::InlineDecorationSpan>,
+        vertical_align_spans: &mut Vec<crate::node::InlineVerticalAlignSpan>,
+        relative_spans: &mut Vec<crate::node::InlineRelativeSpan>,
         flat_pos: &mut usize,
         scale: f32,
-        collapse: parley::style::WhiteSpaceCollapse,
+        font_cx: &mut parley::FontContext,
+        font_family_resolves: &std::cell::Cell<u64>,
+        atomic: Option<&AtomicContributions<'_>>,
     ) {
         // As in `mark_inline_descendants`: an anonymous box's content is its
         // recorded run, not its (empty) `children` (#566). The two must walk
         // exactly the same set — that is [`Node::inline_flow_role`]'s contract
         // (#366) and it now includes where the set comes from.
-        let children: Vec<usize> = nodes[parent_id].ifc_children().to_vec();
+        let children: Vec<RawNodeId> = nodes[parent_id].ifc_children().to_vec();
 
         // **A split inline's own background has to be reached from its members**
         // (#513). The element is flattened out of the box tree, so the arm below
@@ -4548,10 +13591,22 @@ impl RinchDocument {
         // *borders* are still unimplemented. See `paint::drawn_by_its_ifc`.
         let container = nodes[parent_id].parent;
         let bridging = nodes[parent_id].is_anonymous_block_box;
-        let mut open: Vec<(usize, usize)> = Vec::new();
+        let mut open: Vec<(RawNodeId, usize)> = Vec::new();
+        // An out-of-flow box that is a child of the container itself joins
+        // no run (#406), so an anonymous box's member list does not hold it.
+        // The ones standing inside this run are met here, each before the
+        // member it precedes (`Node::run_out_of_flow`, #632).
+        let between: &[(usize, RawNodeId)] = if bridging {
+            &nodes[parent_id].run_out_of_flow
+        } else {
+            &[]
+        };
 
-        for child_id in children {
-            let child = match nodes.get(child_id) {
+        for (member_index, child_id) in children.into_iter().enumerate() {
+            for &(_, id) in between.iter().filter(|(at, _)| *at == member_index) {
+                builder.note_out_of_flow(id);
+            }
+            let child = match nodes.get_live(child_id) {
                 Some(c) => c,
                 None => continue,
             };
@@ -4559,8 +13614,16 @@ impl RinchDocument {
             // Diff this member's split-inline ancestor chain against the open
             // stretches: close the ones it has left (emitting their span), open
             // the ones it has entered. `flat_pos` is the seam in both directions.
+            // The split inlines this member stands in move it by their
+            // `vertical-align` (#1357). Their spans are not parley's parents
+            // of the member's, so one span carries their shift.
+            let mut split_shift = 0.0;
             if bridging {
                 let chain = Self::split_inline_ancestors(nodes, child_id, container);
+                if let Some(&inner) = chain.last() {
+                    split_shift =
+                        Self::composed_vertical_align_exact(|id| nodes.get_live(id), inner);
+                }
                 let keep = open
                     .iter()
                     .zip(chain.iter())
@@ -4569,11 +13632,15 @@ impl RinchDocument {
                 for (owner_id, start) in open.drain(keep..).rev() {
                     if let Some(owner) = nodes.get(owner_id) {
                         Self::push_inline_spans(
+                            nodes,
                             owner,
                             start,
                             *flat_pos,
+                            false,
                             background_spans,
                             decoration_spans,
+                            vertical_align_spans,
+                            relative_spans,
                         );
                     }
                 }
@@ -4614,7 +13681,7 @@ impl RinchDocument {
                 child
                     .parent
                     .filter(|&dom_parent| dom_parent != parent_id)
-                    .and_then(|dom_parent| nodes.get(dom_parent))
+                    .and_then(|dom_parent| nodes.get_live(dom_parent))
                     .filter(|owner| {
                         !Self::same_inline_text_style(
                             &owner.computed_style,
@@ -4625,33 +13692,74 @@ impl RinchDocument {
             } else {
                 None
             };
+            let split_span = split_shift != 0.0;
+            if split_span {
+                builder.push_span(vec![parley::style::StyleProperty::VerticalAlign(
+                    parley::style::VerticalAlign::length(-split_shift),
+                )]);
+            }
             let bridged = bridged_style.is_some();
             if let Some(owner_style) = bridged_style {
-                let props = Self::inline_style_props(owner_style, scale);
-                builder.push_style_modification_span(props.iter());
+                builder.push_span(Self::inline_style_props(
+                    owner_style,
+                    &nodes[parent_id].computed_style.font_family,
+                    // A split inline's shift is the run's own span, below.
+                    parley::style::VerticalAlign::BASELINE,
+                    scale,
+                    font_cx,
+                    font_family_resolves,
+                ));
             }
             match &child.kind {
                 NodeKind::Text(text_data) => {
-                    if !text_data.content.is_empty() {
+                    if !text_data.content.is_empty() && !is_blank_after_inline_cell(nodes, child_id)
+                    {
                         let start = *flat_pos;
                         // Apply text-transform from parent's computed style
                         let parent_transform = &nodes[parent_id].computed_style.text_transform;
-                        let raw =
-                            if let Some(transformed) = parent_transform.apply(&text_data.content) {
-                                transformed
-                            } else {
-                                text_data.content.clone()
+                        let raw: std::borrow::Cow<'a, str> =
+                            match parent_transform.apply(&text_data.content) {
+                                Some(transformed) => transformed.into(),
+                                None => text_data.content.as_str().into(),
                             };
                         let dom_text_len = raw.len();
-                        // Expand tabs to 4 spaces for Parley (which has no tab stop support)
-                        let has_tabs = raw.contains('\t');
-                        let display = if has_tabs {
-                            raw.replace('\t', "    ")
-                        } else {
-                            raw
-                        };
-                        builder.push_text(&display);
-                        *flat_pos += display.len();
+                        // Collapsed (#1180), or verbatim with a tab as a
+                        // space widened to its stop (#1122), by the
+                        // `white-space` of the element the text is in: its
+                        // DOM parent, which inside an anonymous box is not
+                        // `parent_id` (#1192).
+                        let own = &child
+                            .parent
+                            .and_then(|dom_parent| nodes.get_live(dom_parent))
+                            .unwrap_or(&nodes[parent_id])
+                            .computed_style;
+                        let mode = SpaceCollapse::of(own.white_space);
+                        let own_wraps =
+                            Self::text_wrap_mode(own) == parley::style::TextWrapMode::Wrap;
+                        builder.set_wraps(own_wraps);
+                        builder.set_tab_size(own.tab_size);
+                        // Text that does not wrap, in a `display: contents`
+                        // element whose nearest boxed ancestor wraps, takes
+                        // the opportunity before its spaces away (Chrome 156,
+                        // review of #2258: `aa<span contents nowrap><span
+                        // normal>hello</span> ccc</span>` in a `normal` root
+                        // does not break after `hello`).
+                        if !own_wraps
+                            && let Some(dom_parent) = child.parent.filter(|&p| {
+                                nodes.get_live(p).is_some_and(|n| {
+                                    n.computed_style.display
+                                        == crate::computed_style::values::DisplayValue::Contents
+                                })
+                            })
+                            && Self::text_wrap_mode(
+                                &nodes[Self::box_ancestor(nodes, dom_parent)].computed_style,
+                            ) == parley::style::TextWrapMode::Wrap
+                        {
+                            builder.nowrap_text_in_wrapping_box();
+                        }
+                        let (flat_len, offset_map) = builder.push_text_node(raw, mode);
+                        *flat_pos += flat_len;
+                        debug_assert_eq!(*flat_pos, builder.len());
                         text_ranges.push(crate::node::IfcTextRange {
                             flat_start: start,
                             flat_end: *flat_pos,
@@ -4659,11 +13767,8 @@ impl RinchDocument {
                             node_offset: 0,
                             is_br: false,
                             dom_text_len,
-                            dom_text: if has_tabs {
-                                text_data.content.clone()
-                            } else {
-                                String::new()
-                            },
+                            offset_map,
+                            color: text_color(nodes, child_id),
                         });
                         // Record position placeholder — actual position comes from layout
                         child_positions.push((child_id, LayoutResult::default()));
@@ -4676,13 +13781,8 @@ impl RinchDocument {
                 {
                     // <br> elements insert a hard line break.
                     let start = *flat_pos;
-                    builder.set_white_space_mode(parley::style::WhiteSpaceCollapse::Preserve);
-                    builder.push_text("\n");
+                    builder.push_forced_break();
                     *flat_pos += 1;
-                    let no_props: [parley::style::StyleProperty<'_, Brush>; 0] = [];
-                    builder.push_style_modification_span(no_props.iter());
-                    builder.pop_style_span();
-                    builder.set_white_space_mode(collapse);
                     text_ranges.push(crate::node::IfcTextRange {
                         flat_start: start,
                         flat_end: *flat_pos,
@@ -4690,7 +13790,8 @@ impl RinchDocument {
                         node_offset: 0,
                         is_br: true,
                         dom_text_len: 1,
-                        dom_text: String::new(),
+                        offset_map: Vec::new(),
+                        color: peniko::Color::BLACK,
                     });
                     child_positions.push((child_id, LayoutResult::default()));
                 }
@@ -4700,14 +13801,61 @@ impl RinchDocument {
                 {
                     // Push style span for inline element using typed ComputedStyle
                     let child_computed = &child.computed_style;
-                    let props = Self::inline_style_props(child_computed, scale);
 
                     // Record background span start position
                     let bg_start = *flat_pos;
-                    let has_bg = child_computed.background_color().is_some();
+                    let has_bg = child_computed.background_color().is_some()
+                        || has_inline_image(child_computed);
+                    // #724: whether this element needs its own vertical-align
+                    // span over the stretch it owns.
+                    let has_valign = child_computed.vertical_align != VerticalAlignValue::Baseline;
 
-                    builder.push_style_modification_span(props.iter());
+                    let parent_font_size = child
+                        .parent
+                        .and_then(|p| nodes.get_live(p))
+                        .map_or(child_computed.font_size, |p| p.computed_style.font_size);
+                    builder.push_span(Self::inline_style_props(
+                        child_computed,
+                        &nodes[parent_id].computed_style.font_family,
+                        Self::span_vertical_align(child_computed, parent_font_size),
+                        scale,
+                        font_cx,
+                        font_family_resolves,
+                    ));
+                    // #2238: where a run of spaces that does not wrap may
+                    // break before it, item by item ([`IfcText::last_wraps`]).
+                    let wraps = |style: &crate::computed_style::ComputedStyle| {
+                        Self::text_wrap_mode(style) == parley::style::TextWrapMode::Wrap
+                    };
+                    let wbr = child.tag() == Some("wbr");
+                    if wbr {
+                        builder.push_wbr();
+                        *flat_pos += WBR_TEXT.len();
+                    } else {
+                        builder.open_element(wraps(child_computed));
+                    }
+                    // #2588: its `unicode-bidi`'s controls, around its edges
+                    // and content.
+                    let bidi_controls = inline_bidi_controls(child);
+                    if let Some((before, _)) = bidi_controls {
+                        *flat_pos += builder.push_bidi_control(before, false);
+                    }
                     child_positions.push((child_id, LayoutResult::default()));
+
+                    // #1426: the room its inline-start margin, border and
+                    // padding take before its content, and the end ones after
+                    // it — as zero-height boxes, which hold no text.
+                    // The direction is read only when the two sides differ.
+                    let (left, right) = inline_edge_widths(child_computed, true);
+                    let (edge_start, edge_end) = if left != right && !element_is_ltr(child) {
+                        (right, left)
+                    } else {
+                        (left, right)
+                    };
+                    if let Some(edge_start) = edge_start {
+                        builder.push_edge_box(child_id, false, edge_start * scale);
+                    }
+                    let content_from = builder.op_count();
 
                     // Recurse into inline element's children
                     Self::walk_inline_children(
@@ -4718,24 +13866,87 @@ impl RinchDocument {
                         text_ranges,
                         background_spans,
                         decoration_spans,
+                        vertical_align_spans,
+                        relative_spans,
                         flat_pos,
                         scale,
-                        collapse,
+                        font_cx,
+                        font_family_resolves,
+                        atomic,
                     );
 
-                    builder.pop_style_span();
+                    if let Some(edge_end) = edge_end {
+                        builder.push_edge_box(child_id, true, edge_end * scale);
+                    }
+                    if let Some((_, after)) = bidi_controls {
+                        *flat_pos += builder.push_bidi_control(after, true);
+                    }
+                    // #1463: its strut is on the line though it holds
+                    // nothing (an edge box already holds it there) — unless
+                    // it is its parent's strut again, which is on the line
+                    // already, and empty `<b>`/`<a name>` in a paragraph's
+                    // font are common. The box does not cut shaping unless
+                    // the element's `vertical-align` does (#2470).
+                    if !wbr
+                        && !Self::same_strut(
+                            child_computed,
+                            &nodes[Self::box_ancestor(nodes, parent_id)].computed_style,
+                        )
+                    {
+                        builder.push_empty_inline_box(
+                            content_from,
+                            child_computed.vertical_align != VerticalAlignValue::Baseline,
+                        );
+                    }
+                    builder.pop_span();
+                    // It closes into its nearest ancestor with a box: a
+                    // `display: contents` parent has none, and its
+                    // `white-space` is not the one in effect after the end
+                    // (Chrome 156, review of #2258: `aa<span contents
+                    // normal><span nowrap>hello</span></span> ccc` in a
+                    // `nowrap` root does not break after `hello`, and
+                    // `aa<span normal><span contents nowrap><span
+                    // nowrap>hello</span></span></span> ccc` does).
+                    let into = Self::box_ancestor(nodes, parent_id);
+                    if !wbr {
+                        builder.close_element(
+                            wraps(child_computed),
+                            wraps(&nodes[into].computed_style),
+                        );
+                    }
 
-                    // Record background span if the inline element has a visible
-                    // background. Through the shared helper, so this and the
-                    // split-inline bridge below cannot drift about padding or
-                    // radius.
-                    if has_bg {
+                    // Record background and/or vertical-align span if the
+                    // inline element has one. Through the shared helper, so
+                    // this and the split-inline bridge below cannot drift
+                    // about padding, radius, or the vertical shift. An empty
+                    // element with edge boxes still draws its background and
+                    // border over them (#1426).
+                    // So does one that holds an atomic inline and no text
+                    // (#2597): its box is around the atomic inline.
+                    let has_edges = edge_start.is_some()
+                        || edge_end.is_some()
+                        || (*flat_pos <= bg_start && builder.holds_inline_box_since(content_from));
+                    // #1425/#2346: a relative element moves what it holds.
+                    let is_relative =
+                        child_computed.position == crate::computed_style::PositionValue::Relative;
+                    // #2869: a static one that is a stacking context has its
+                    // range painted by its own entry.
+                    if has_bg
+                        || has_valign
+                        || is_relative
+                        || is_static_inline_layer(child_computed)
+                        || has_inline_border(child_computed)
+                    {
                         Self::push_inline_spans(
+                            nodes,
                             child,
                             bg_start,
                             *flat_pos,
+                            has_edges,
                             background_spans,
                             decoration_spans,
+                            vertical_align_spans,
+                            relative_spans,
                         );
                     }
                 }
@@ -4746,14 +13957,75 @@ impl RinchDocument {
                     // context its interior gets is `DisplayValue::to_taffy`'s
                     // business, not this arm's, so `inline-grid` needed nothing
                     // here (#607).
-                    let child_layout = &child.layout;
-                    builder.push_inline_box(parley::InlineBox {
-                        id: child_id as u64,
-                        index: 0, // will be set by builder
-                        width: child_layout.width * scale,
-                        height: child_layout.height * scale,
-                        kind: parley::InlineBoxKind::InFlow,
+                    //
+                    // The paint layout lines the box up at the size it has.
+                    // A *measure* lines an `auto`-width one up at what it
+                    // contributes to the width being asked about (#1476).
+                    let (width, height) = match atomic {
+                        Some(atomic) => atomic.size(child_id, child),
+                        None => (child.layout.width, child.layout.height),
+                    };
+                    // Lined up by its margin box on the block axis
+                    // ([`atomic_vertical_margins`]); `write_inline_positions`
+                    // puts the border box back inside it.
+                    let (margin_top, margin_bottom) =
+                        atomic_vertical_margins(&child.computed_style);
+                    // Its baseline (#663), as its compute last laid it out.
+                    // Lined up at another height than that one (a measure's
+                    // contribution), a last-line baseline keeps its distance
+                    // from the bottom and a first-line one from the top.
+                    let baseline = child.atomic_baseline.map(|b| {
+                        let first = matches!(
+                            child.computed_style.display,
+                            crate::computed_style::DisplayValue::InlineFlex
+                                | crate::computed_style::DisplayValue::InlineGrid
+                        );
+                        if first {
+                            b
+                        } else {
+                            b + (height - child.layout.height)
+                        }
                     });
+                    // The `white-space` of the element the box is in (its
+                    // own styles its contents); inside a `display: contents`
+                    // element, that of its nearest boxed ancestor (Chrome
+                    // 156, review of #2258).
+                    let box_parent = child
+                        .parent
+                        .filter(|&dom_parent| nodes.get_live(dom_parent).is_some())
+                        .map_or(parent_id, |dom_parent| {
+                            Self::box_ancestor(nodes, dom_parent)
+                        });
+                    builder.set_wraps(
+                        Self::text_wrap_mode(&nodes[box_parent].computed_style)
+                            == parley::style::TextWrapMode::Wrap,
+                    );
+                    // A cell standing in an anonymous inline-table has the
+                    // table's spacing beside it, before it when it opens the
+                    // table, glued to it as an inline element's edges are
+                    // (`table_layout::wrap_cell_in_inline_table`).
+                    let spacing = child
+                        .computed_style
+                        .anonymous_inline_table
+                        .map(|_| crate::table_layout::inline_table_spacing(&child.computed_style).0)
+                        .filter(|&h| h != 0.0);
+                    if let Some(h) = spacing
+                        && !crate::table_layout::follows_inline_cell_in(nodes, child_id)
+                    {
+                        builder.push_edge_box(child_id, false, h * scale);
+                    }
+                    builder.push_inline_box(parley::InlineBox {
+                        id: child_id,
+                        index: 0, // will be set by builder
+                        width: width * scale,
+                        height: (height + margin_top + margin_bottom) * scale,
+                        kind: parley::InlineBoxKind::InFlow,
+                        baseline: baseline.map(|b| (b + margin_top) * scale),
+                        vertical_align: atomic_vertical_align(&child.computed_style, scale),
+                    });
+                    if let Some(h) = spacing {
+                        builder.push_edge_box(child_id, true, h * scale);
+                    }
                     child_positions.push((child_id, LayoutResult::default()));
                 }
                 NodeKind::Element(_)
@@ -4779,8 +14051,15 @@ impl RinchDocument {
                         &nodes[parent_id].computed_style,
                     );
                     if styled {
-                        let props = Self::inline_style_props(&child.computed_style, scale);
-                        builder.push_style_modification_span(props.iter());
+                        builder.push_span(Self::inline_style_props(
+                            &child.computed_style,
+                            &nodes[parent_id].computed_style.font_family,
+                            // No box, so nothing to move.
+                            parley::style::VerticalAlign::BASELINE,
+                            scale,
+                            font_cx,
+                            font_family_resolves,
+                        ));
                     }
                     Self::walk_inline_children(
                         nodes,
@@ -4790,12 +14069,16 @@ impl RinchDocument {
                         text_ranges,
                         background_spans,
                         decoration_spans,
+                        vertical_align_spans,
+                        relative_spans,
                         flat_pos,
                         scale,
-                        collapse,
+                        font_cx,
+                        font_family_resolves,
+                        atomic,
                     );
                     if styled {
-                        builder.pop_style_span();
+                        builder.pop_span();
                     }
                 }
                 NodeKind::Element(_)
@@ -4827,6 +14110,17 @@ impl RinchDocument {
                     // position — and it `break`s below, matching where the
                     // marking pass stops. Walking past it instead would flow
                     // text the mark left attached — a double draw.
+                    //
+                    // Its place in the content is remembered, though: that
+                    // is its static position (#632).
+                    if role == InlineFlowRole::OutOfFlow {
+                        builder.note_out_of_flow(child_id);
+                        // A float is placed where it stands, at the top of
+                        // its line, when the line breaker reaches it.
+                        if child.computed_style.float.is_floated() {
+                            builder.push_float_box(child_id);
+                        }
+                    }
                 }
                 NodeKind::Comment(_) => {
                     // Skip comments in inline layout
@@ -4845,6 +14139,12 @@ impl RinchDocument {
                     // block. Neither is caught by the other's assertion, which is
                     // why both are asserted.
                     //
+                    // Since #1069 the layout pass no longer shapes a detached
+                    // root, so the marking arm is still reached by the layout
+                    // pass and this one only through
+                    // `RinchDocument::shape_ifc_root_for_tests`, which the
+                    // witnesses call after checking the pass declined.
+                    //
                     // An in-flow block-level child — or the opaque
                     // `display: contents` wrapper standing for one — breaks
                     // the inline flow: stop here, exactly where
@@ -4853,21 +14153,660 @@ impl RinchDocument {
                 }
             }
             if bridged {
-                builder.pop_style_span();
+                builder.pop_span();
             }
+            if split_span {
+                builder.pop_span();
+            }
+        }
+
+        // (Not reached when the walk stopped at a block above; a run holds
+        // none.)
+        let members = nodes[parent_id].ifc_children().len();
+        for &(_, id) in between.iter().filter(|(at, _)| *at >= members) {
+            builder.note_out_of_flow(id);
         }
 
         // Close whatever is still open at the end of the run.
         for (owner_id, start) in open.drain(..).rev() {
             if let Some(owner) = nodes.get(owner_id) {
                 Self::push_inline_spans(
+                    nodes,
                     owner,
                     start,
                     *flat_pos,
+                    false,
                     background_spans,
                     decoration_spans,
+                    vertical_align_spans,
+                    relative_spans,
                 );
             }
         }
+    }
+}
+
+// ── IFC content signatures ──────────────────────────────────────────────────
+
+/// FxHash's mixing step: fast, not cryptographic, and good enough to tell one
+/// IFC's content from another's. Collisions would cost a stale measure, so
+/// each member's hash is finished with a full avalanche (`finish_member`)
+/// before the members are summed.
+#[derive(Default)]
+struct SigHasher(u64);
+
+impl SigHasher {
+    #[inline]
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl std::hash::Hasher for SigHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        for c in chunks {
+            self.add(u64::from_le_bytes(*c));
+        }
+        if !rest.is_empty() {
+            let mut b = [0u8; 8];
+            b[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(b));
+        }
+    }
+    fn write_u8(&mut self, i: u8) {
+        self.add(i as u64);
+    }
+    fn write_u32(&mut self, i: u32) {
+        self.add(i as u64);
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+    fn write_isize(&mut self, i: isize) {
+        self.add(i as u64);
+    }
+}
+
+/// splitmix64's finaliser, so that summing member hashes (which makes the
+/// signature independent of slab order) cannot cancel structured inputs out.
+#[inline]
+fn finish_member(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+impl RinchDocument {
+    /// The content signature of every IFC root in the document, keyed by root.
+    ///
+    /// A root's signature hashes everything its measure and its paint layout
+    /// are built from **other than typography and the available width**:
+    /// which nodes are its members (`ifc_root == Some(root)`), under which
+    /// parent and at which index (so a reorder moves it), what each one is —
+    /// its text, its tag, its `display` mode, its `position`, whether it is
+    /// generated content — and, for an atomic inline, the size
+    /// `compute_inline_block_layouts` just gave it, which the line breaks
+    /// around. An **out-of-flow box** among those children is hashed the
+    /// same way though it is no member: the lines keep its static position
+    /// (#632), so they are built again when one comes, goes or moves. The root's own `estimated_height` (a virtualized, collapsed
+    /// block) is folded in too.
+    ///
+    /// Typography is deliberately **not** in it: the cascade compares each
+    /// re-cascaded node's text inputs and drops the IFC of the one that
+    /// changed (`ComputedStyle::same_text_layout_inputs`), so hashing styles
+    /// here would only repeat that at the cost of a style hash per member per
+    /// structural pass. The width is the key of each cached size.
+    ///
+    /// O(document): one pass over the slab and a hash of every member's text.
+    /// That is what the structural pass costs anyway; what this replaces was
+    /// a Parley shape of every root.
+    ///
+    /// With a `scope`, only the roots of the scope's containers — each
+    /// container and the anonymous boxes it now holds — are signed, from the
+    /// parents their members can have: those same nodes and the transparent
+    /// nodes of the containers' regions. A root's members are all in its
+    /// container's region, so each signature is the one the whole-document
+    /// walk computes.
+    pub(crate) fn ifc_signatures(
+        &self,
+        scope: Option<&crate::ifc_scope::IfcScope>,
+    ) -> HashMap<RawNodeId, u64> {
+        use std::hash::{Hash, Hasher};
+        let nodes = &self.tree.nodes;
+        let mut sigs: HashMap<RawNodeId, u64> = HashMap::new();
+        let (parents, roots): (Vec<RawNodeId>, Option<std::collections::HashSet<RawNodeId>>) =
+            match scope {
+                None => (nodes.iter().map(|(id, _)| id).collect(), None),
+                Some(scope) => {
+                    let mut roots = std::collections::HashSet::new();
+                    let mut parents = Vec::new();
+                    for &c in &scope.containers {
+                        roots.insert(c);
+                        parents.push(c);
+                        if let Some(cn) = nodes.get_live(c) {
+                            roots.extend(cn.run_boxes.iter().copied());
+                            parents.extend(cn.run_boxes.iter().copied());
+                        }
+                    }
+                    parents.extend(scope.transparent_region());
+                    (parents, Some(roots))
+                }
+            };
+        for parent_id in parents {
+            let Some(parent) = nodes.get_live(parent_id) else {
+                continue;
+            };
+            let children = parent.ifc_children();
+            // The root of the nearest member before the child at hand, and
+            // (found once, when asked) of the first member at all.
+            let mut near: Option<RawNodeId> = None;
+            let mut first: Option<Option<RawNodeId>> = None;
+            for (index, &child_id) in children.iter().enumerate() {
+                let Some(child) = nodes.get_live(child_id) else {
+                    continue;
+                };
+                let root = match child.ifc_root {
+                    Some(root) => {
+                        near = Some(root);
+                        root
+                    }
+                    // An out-of-flow box is no member, but the lines hold
+                    // its static position (#632): one that appears among a
+                    // root's content, leaves it or moves in it changes what
+                    // those lines must remember. Signed with the root of
+                    // the member before it (the first one, when none is).
+                    // (`is_out_of_flow` first: it is one compare, and this
+                    // arm is asked of every block child of every parent.)
+                    None if (child.is_out_of_flow() || child.computed_style.float.is_floated())
+                        && child.inline_flow_role() == InlineFlowRole::OutOfFlow =>
+                    {
+                        let found = near.or_else(|| {
+                            *first.get_or_insert_with(|| {
+                                children
+                                    .iter()
+                                    .find_map(|&c| nodes.get_live(c).and_then(|n| n.ifc_root))
+                            })
+                        });
+                        match found {
+                            Some(root) => root,
+                            None => continue,
+                        }
+                    }
+                    None => continue,
+                };
+                if roots.as_ref().is_some_and(|r| !r.contains(&root)) {
+                    continue;
+                }
+                let mut h = SigHasher::default();
+                child_id.hash(&mut h);
+                parent_id.hash(&mut h);
+                index.hash(&mut h);
+                match &child.kind {
+                    NodeKind::Text(t) => {
+                        0u8.hash(&mut h);
+                        t.content.hash(&mut h);
+                    }
+                    NodeKind::Element(_) => {
+                        1u8.hash(&mut h);
+                        child.tag().unwrap_or("").hash(&mut h);
+                    }
+                    _ => 2u8.hash(&mut h),
+                }
+                std::mem::discriminant(&child.display_mode).hash(&mut h);
+                std::mem::discriminant(&child.computed_style.position).hash(&mut h);
+                child.is_pseudo_element.hash(&mut h);
+                if child.display_mode.is_atomic_inline() {
+                    child.layout.width.to_bits().hash(&mut h);
+                    child.layout.height.to_bits().hash(&mut h);
+                    // And where it lines up (#896): a box can keep its size
+                    // and move its baseline.
+                    child.atomic_baseline.map(f32::to_bits).hash(&mut h);
+                    // Its line lines up its margin box on the block axis.
+                    let (top, bottom) = atomic_vertical_margins(&child.computed_style);
+                    top.to_bits().hash(&mut h);
+                    bottom.to_bits().hash(&mut h);
+                    // And an anonymous inline-table's spacing beside it.
+                    if child.computed_style.anonymous_inline_table.is_some() {
+                        child.computed_style.border_spacing.0.to_bits().hash(&mut h);
+                        child.computed_style.border_collapse.hash(&mut h);
+                    }
+                }
+                let member = finish_member(h.finish());
+                let sig = sigs.entry(root).or_insert(0);
+                *sig = sig.wrapping_add(member);
+            }
+        }
+        for (&root, sig) in sigs.iter_mut() {
+            let collapsed = nodes.get(root).and_then(|n| n.estimated_height);
+            let mut h = SigHasher::default();
+            collapsed.map(f32::to_bits).hash(&mut h);
+            // Whether an indented anonymous block box holds its container's
+            // first formatted line (#2628) moves with its siblings, which
+            // are no members: a block before it leaving the flow indents it.
+            if let Some(n) = nodes.get(root)
+                && n.is_anonymous_block_box
+                && !n.computed_style.text_indent.is_zero()
+            {
+                holds_first_formatted_line(nodes, root).hash(&mut h);
+            }
+            *sig = sig.wrapping_add(finish_member(h.finish() ^ 0x9e37_79b9_7f4a_7c15));
+        }
+        sigs
+    }
+
+    /// Decide, after a structural pass, which IFC roots the change reached.
+    ///
+    /// A root whose content signature ([`Self::ifc_signatures`]) is the one it
+    /// had at the previous structural pass keeps its cached measures and its
+    /// paint layout: nothing it is built from moved. A root whose signature
+    /// moved — a child appended, removed or reordered anywhere inside it, a
+    /// member's text or `display` changed, an atomic inline in it resized —
+    /// or that is new, loses both, and is marked dirty in Taffy so the next
+    /// compute measures it at all. A node that has stopped being a root loses
+    /// its entry.
+    ///
+    /// This is what lets the structural pass stop clearing the whole measure
+    /// cache, which re-shaped every paragraph in a document to measure one
+    /// appended row. It is also a second, independent net under the mutation
+    /// verbs' own invalidations (`invalidate_parent_ifc` and friends), which
+    /// only reach the *parent* of a change: text appended to a `<span>` inside
+    /// a paragraph invalidated the span, not the paragraph, and the paragraph
+    /// kept painting its old line.
+    ///
+    /// With a `scope`, only the scope's roots are signed and only the scope's
+    /// nodes can lose an entry or a layout: a root outside it was not reached
+    /// by the change, keeps its signature and so keeps both.
+    pub(crate) fn refresh_ifc_signatures(&mut self, scope: Option<&crate::ifc_scope::IfcScope>) {
+        let sigs = self.ifc_signatures(scope);
+        // Roots signed at an earlier pass that are roots no longer. Their
+        // `text_layout` alone cannot say so: a move verb has usually dropped
+        // it already (`invalidate_ifc_left_by`, on the IFC its node left), so
+        // a block whose only span moved to another parent held no layout by
+        // now, and its glyphs stayed on screen (#1064). The signature is what
+        // survives every invalidation until this pass.
+        let mut unrooted: Vec<RawNodeId> = Vec::new();
+        match scope {
+            None => self.tree.ifc_measure_cache.retain(|root, entry| {
+                let keep = sigs.contains_key(root);
+                if !keep && entry.signature.is_some() {
+                    unrooted.push(*root);
+                }
+                keep
+            }),
+            Some(scope) => {
+                for &id in &scope.rootable {
+                    if !sigs.contains_key(&id)
+                        && let Some(entry) = self.tree.ifc_measure_cache.remove(&id)
+                        && entry.signature.is_some()
+                    {
+                        unrooted.push(id);
+                    }
+                }
+            }
+        }
+        // One still holding a layout is pushed below, with the layout.
+        for id in unrooted {
+            if self
+                .tree
+                .nodes
+                .get(id)
+                .is_some_and(|n| n.text_layout.is_none())
+            {
+                self.tree.paint_dirty_nodes.push(id);
+            }
+        }
+        // A node that is no longer an IFC root keeps no layout from when it
+        // was one. `text_layout` is written for IFC roots only (a text leaf's
+        // shaped text lives in `cached_text_parley`), and several readers take
+        // its presence to mean "this is a root" — caret and selection rects,
+        // layer bounds, and the ancestor walk in `invalidate_ifc_for_node`,
+        // which would stop at the stale node instead of the real root.
+        //
+        // Its glyphs leave the screen with it (a paragraph whose only span
+        // became `display: none`), so it is paint-dirty too — in both arms:
+        // the scoped one is the path a `display` flip takes now.
+        match scope {
+            None => {
+                for (id, node) in self.tree.nodes.iter_mut() {
+                    if node.text_layout.is_some() && !sigs.contains_key(&id) {
+                        node.text_layout = None;
+                        self.tree.paint_dirty_nodes.push(id);
+                    }
+                }
+            }
+            Some(scope) => {
+                for &id in &scope.rootable {
+                    if let Some(node) = self.tree.nodes.get_mut(id)
+                        && node.text_layout.is_some()
+                        && !sigs.contains_key(&id)
+                    {
+                        node.text_layout = None;
+                        self.tree.paint_dirty_nodes.push(id);
+                    }
+                }
+            }
+        }
+        let mut changed: u64 = 0;
+        let mut atomic_changed = false;
+        for (root, sig) in sigs {
+            let entry = self.tree.ifc_measure_cache.entry(root).or_default();
+            if entry.signature == Some(sig) && !entry.stale {
+                continue;
+            }
+            let seen_before = entry.signature.is_some();
+            entry.signature = Some(sig);
+            entry.stale = false;
+            entry.sizes.clear();
+            self.tree.forget_line_baselines(root);
+            changed += 1;
+            let Some(node) = self.tree.nodes.get_mut(root) else {
+                continue;
+            };
+            node.text_layout = None;
+            // An atomic inline is sized by its own detached compute, which
+            // `compute_inline_block_layouts` ran *earlier in this pass* —
+            // against the cached measures this loop is only now dropping, and
+            // with no signal that its content had changed. So it is queued
+            // for the same re-measure a text edit inside it gets, which runs
+            // below once every changed root has been seen. A root seen for
+            // the first time is not: it has no earlier measure to be stale
+            // against, and re-measuring every new chip would size each one
+            // twice on a first layout.
+            if node.display_mode.is_atomic_inline() {
+                if seen_before {
+                    self.tree.dirty_atomic_inlines.insert(root);
+                    atomic_changed = true;
+                }
+                continue;
+            }
+            if let Some(taffy_id) = node.taffy_id {
+                let _ = self.tree.taffy.mark_dirty(taffy_id);
+            }
+            self.mark_ifc_measure_dirty(root);
+            // The same holds one level out: an atomic inline that *contains*
+            // this root — a paragraph in an `inline-block`, a flex item's IFC in
+            // an `inline-flex` — was sized earlier in the pass, against the
+            // measure this root had cached in Taffy before its content moved.
+            // Queue every one above it. (Found by the scoped pass's random
+            // differential, on the whole-document pass: a chip turned
+            // `inline-block` inside a flex item of an `inline-flex` left the
+            // `inline-flex` at the width it had without the chip.)
+            if seen_before {
+                let mut cur = self.tree.nodes.get(root).and_then(|n| n.parent);
+                while let Some(a) = cur {
+                    let Some(an) = self.tree.nodes.get(a) else {
+                        break;
+                    };
+                    if an.display_mode.is_atomic_inline() {
+                        self.tree.dirty_atomic_inlines.insert(a);
+                        atomic_changed = true;
+                    }
+                    cur = an.parent;
+                }
+            }
+        }
+        self.tree
+            .perf
+            .add(crate::perf::Counter::IfcSignatureChanges, changed);
+        if atomic_changed {
+            self.remeasure_dirty_atomic_inlines();
+        }
+    }
+}
+
+/// How close a tab's end has to be to its stop to count as there.
+const TAB_STOP_TOLERANCE: f32 = 0.01;
+
+/// The most builds [`RinchDocument::build_inline_layout`] makes of a
+/// paragraph to put its tabs at their stops. A tab's width moves what follows
+/// it on its line, and on a wrapping line can move the line break, which
+/// moves the tabs after it; a line of tabs that does not wrap is settled by
+/// the second build. Each build settles one more moved soft wrap, so a long
+/// soft-wrapped `pre-wrap` paragraph can stop here with some tabs off their
+/// stops, 3.8–5px from Chrome's, from about its fifth line on: it keeps the
+/// last build (Refs #1593).
+const MAX_TAB_BUILDS: u32 = 4;
+
+/// The tab stops of one block container (css-text-3 §4.2), and how far each
+/// preserved tab of a laid-out paragraph is from ending at its stop.
+///
+/// Measured in Chrome 155 (`tests/tab_stop_1122_tests.rs`): a tab's stops
+/// are its own text's `tab-size` apart (#1584) — a number counts spaces of
+/// the **block's** own font, its `letter-spacing` and `word-spacing`
+/// included, not the font or spacing of the element the tab is in; a length
+/// is the interval as it is — from the line's start edge, the tab's start
+/// measured in logical order before `text-align` moves the line; the tab's
+/// end is the first stop strictly past its start, or the one after it when
+/// that is less than half a space (the block font's own, unspaced) away.
+pub(crate) struct TabStops {
+    /// The advance of a space of the block, spacing included, in layout px.
+    space: f32,
+    /// CSS px to layout px.
+    scale: f32,
+    min_width: f32,
+}
+
+impl TabStops {
+    /// The stops of a block of `style` (its `letter_spacing` and
+    /// `word_spacing` in CSS px; `style` resolves them at `scale`).
+    pub(crate) fn of_block(
+        font_cx: &mut parley::FontContext,
+        layout_cx: &mut parley::LayoutContext<Brush>,
+        style: &parley::style::TextStyle<'_, '_, Brush>,
+        letter_spacing: f32,
+        word_spacing: f32,
+        scale: f32,
+    ) -> Self {
+        let mut builder = layout_cx.tree_builder(font_cx, scale, true, style);
+        // parley 0.12 made `white-space-collapse` a style (`TextStyle::white_space_collapse`),
+        // `Preserve` by default and set by nothing in rinch: the builder collapses nothing.
+        builder.push_text(" ");
+        let (mut layout, _) = builder.build();
+        layout.break_all_lines(None);
+        let space: f32 = layout
+            .lines()
+            .flat_map(|line| line.runs().collect::<Vec<_>>())
+            .flat_map(|run| run.clusters().map(|c| c.advance()).collect::<Vec<_>>())
+            .sum();
+        Self {
+            space,
+            scale,
+            min_width: ((space - (letter_spacing + word_spacing) * scale) / 2.0).max(0.0),
+        }
+    }
+
+    /// The distance between the stops of a tab of `tab_size`, in layout px.
+    fn interval(&self, tab_size: crate::computed_style::TabSizeValue) -> f32 {
+        use crate::computed_style::TabSizeValue;
+        match tab_size {
+            TabSizeValue::Spaces(n) => n * self.space,
+            TabSizeValue::Length(px) => px * self.scale,
+        }
+    }
+
+    /// How wide a tab of `tab_size` starting `x` from its line's start edge
+    /// is.
+    pub(crate) fn width_at(&self, x: f32, tab_size: crate::computed_style::TabSizeValue) -> f32 {
+        let interval = self.interval(tab_size);
+        if !interval.is_finite() || interval <= 0.0 {
+            return 0.0;
+        }
+        let mut w = interval - x.rem_euclid(interval);
+        if w < self.min_width {
+            w += interval;
+        }
+        w
+    }
+
+    /// For each tab of `layout` (`tabs`: their flat offsets, ascending;
+    /// `sizes`: each one's `tab-size`), how much wider it must be to end at
+    /// its stop. A tab's start counts the widths the tabs before it on its
+    /// line are to take.
+    pub(crate) fn deltas(
+        &self,
+        layout: &parley::Layout<Brush>,
+        tabs: &[usize],
+        sizes: &[crate::computed_style::TabSizeValue],
+    ) -> Vec<f32> {
+        use parley::PositionedLayoutItem;
+        let mut deltas = vec![0.0f32; tabs.len()];
+        /// (byte, 0 = inline box / 1 = cluster, order), advance, tab index.
+        type Unit = ((usize, u8, usize), f32, Option<usize>);
+        let mut units: Vec<Unit> = Vec::new();
+        for line in layout.lines() {
+            units.clear();
+            for run in line.runs() {
+                for c in run.clusters() {
+                    let start = c.text_range().start;
+                    let n = units.len();
+                    units.push(((start, 1, n), c.advance(), tabs.binary_search(&start).ok()));
+                }
+            }
+            for item in line.items() {
+                if let PositionedLayoutItem::InlineBox(b) = item {
+                    let Some(ib) = layout.inline_boxes().find(|ib| ib.id == b.id) else {
+                        continue;
+                    };
+                    let advance = if matches!(ib.kind, parley::InlineBoxKind::InFlow) {
+                        ib.width
+                    } else {
+                        0.0
+                    };
+                    let n = units.len();
+                    units.push(((ib.index, 0, n), advance, None));
+                }
+            }
+            // A box at byte `i` comes before the text at `i`.
+            units.sort_unstable_by_key(|u| u.0);
+            let mut x = 0.0f32;
+            for &(_, advance, tab) in &units {
+                if let Some(t) = tab {
+                    let delta =
+                        self.width_at(x, sizes.get(t).copied().unwrap_or_default()) - advance;
+                    deltas[t] = delta;
+                    x += delta;
+                }
+                x += advance;
+            }
+        }
+        deltas
+    }
+}
+
+#[cfg(test)]
+mod atomic_leaf_layout_tests {
+    use crate::RinchDocument;
+    use rinch_core::dom::DomDocument;
+
+    /// The keying rule of `NodeTree::atomic_leaf_layouts` (#904): each layout
+    /// the atomic compute's text measure builds is filed under the width it
+    /// was wrapped at, as the root compute files its own. Nothing behavioural
+    /// pins it — `copy_cached_text_layouts` falls back to the `u32::MAX` entry,
+    /// and the last measure Taffy makes is usually the final one — so filing
+    /// every layout under `u32::MAX` left every other fixture green (#904's
+    /// review, M6). Here the final width is a min-content grid column, 45.3px
+    /// and not a whole pixel, which the box's unrounded width must name.
+    #[test]
+    fn a_leaf_layout_is_filed_under_the_width_it_was_wrapped_at() {
+        let mut doc = RinchDocument::new();
+        doc.load_css(
+            "body { font-family: sans-serif; font-size: 16px; line-height: 20px; }
+             .c { display: inline-grid; grid-template-columns: min-content; }",
+        );
+        let body = doc.body();
+        let c = doc.create_element("span");
+        doc.set_attribute(c, "class", "c");
+        let t = doc.create_text("a long chip label text that wraps");
+        doc.append_child(c, t);
+        doc.append_child(body, c);
+        doc.resolve_layout(800.0, 600.0);
+        doc.resolve_layout(800.0, 600.0);
+
+        let leaf_taffy = doc.tree.nodes[t.0]
+            .taffy_id
+            .expect("the leaf has a Taffy node");
+        let final_width = doc.tree.taffy.unrounded_layout(leaf_taffy).size.width;
+        assert!(
+            final_width.fract() != 0.0,
+            "counter-oracle: the column is not a whole pixel ({final_width})"
+        );
+
+        // Measure the atomic inline again, and read what it filed before a
+        // layout pass hands it on.
+        let _ = doc.tree.taffy.mark_dirty(leaf_taffy);
+        doc.compute_inline_block_layouts();
+        let keys: Vec<u32> = doc
+            .tree
+            .atomic_leaf_layouts
+            .keys()
+            .filter(|(id, _)| *id == t.0)
+            .map(|&(_, bits)| bits)
+            .collect();
+        assert!(
+            keys.contains(&final_width.to_bits()),
+            "a layout filed under the final width {final_width}; keys were {:?}",
+            keys.iter().map(|&b| f32::from_bits(b)).collect::<Vec<_>>()
+        );
+        let n = doc.tree.nodes[t.0].layout.height;
+        let cached = doc.tree.nodes[t.0].cached_text_parley.as_ref().unwrap();
+        assert_eq!(
+            cached.height(),
+            n,
+            "the painted layout is the one laid out for the box, not the unwrapped line"
+        );
+    }
+}
+
+#[cfg(test)]
+mod chrome_break_tests {
+    use super::{chrome_break, chrome_break_at};
+
+    /// The table has the opportunity after a hyphen before `>`, which the
+    /// bundled Inter shapes into one arrow ligature with it: a line breaks
+    /// inside the ligature there, as in Chrome 156 (#2381,
+    /// `tests/ligature_break_2381_tests.rs`).
+    #[test]
+    fn a_hyphen_before_a_greater_than_sign_is_an_opportunity() {
+        assert_eq!(chrome_break(Some('a'), '-', '>'), Some(true));
+        assert_eq!(chrome_break_at("a->b", 2), Some(true));
+    }
+
+    /// Spaces, tabs and non-ASCII characters are UAX #14's, except the
+    /// opportunity after a space run; a hyphen before a digit is Blink's
+    /// minus-sign rule, which reads the character before the hyphen.
+    #[test]
+    fn what_the_table_leaves_to_uax_14() {
+        assert_eq!(chrome_break(Some('a'), ' ', ')'), Some(true));
+        assert_eq!(chrome_break(Some('a'), ' ', ' '), None);
+        assert_eq!(chrome_break(Some('a'), ' ', '\t'), None);
+        assert_eq!(chrome_break(Some('a'), 'b', 'é'), None);
+        assert_eq!(chrome_break(Some('a'), '/', '日'), None);
+        assert_eq!(chrome_break(Some('c'), '-', '1'), Some(true));
+        assert_eq!(chrome_break(Some(' '), '-', '1'), Some(false));
+        assert_eq!(chrome_break(None, '-', '1'), Some(false));
+        assert_eq!(chrome_break_at("-1", 1), Some(false));
+        assert_eq!(chrome_break_at("x", 0), None);
+    }
+}
+
+#[cfg(test)]
+mod hebrew_hyphen_tests {
+    /// #2622: `HL (HY | BA) × [^HL]` (Unicode 15.1): a break after a hyphen
+    /// or a soft hyphen between Hebrew letters, none after one before a
+    /// Latin letter or between Latin letters.
+    #[test]
+    fn a_hyphen_between_hebrew_letters_breaks() {
+        assert_eq!(super::chrome_break(Some('ם'), '\u{ad}', 'ע'), Some(true));
+        assert_eq!(super::chrome_break(Some('ם'), '-', 'ע'), Some(true));
+        assert!(!super::hebrew_hyphen_break(Some('ם'), '\u{ad}', 'a'));
+        assert!(!super::hebrew_hyphen_break(Some('a'), '\u{ad}', 'ע'));
+        assert!(!super::hebrew_hyphen_break(Some('ם'), 'ל', 'ע'));
     }
 }

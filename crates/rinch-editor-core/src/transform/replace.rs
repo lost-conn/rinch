@@ -8,7 +8,7 @@
 //! the content on the right of `to`, and any ancestors that the cut passes
 //! through reconstructed. This is a faithful port of ProseMirror's
 //! `transform/src/replace.ts`; **schema enforcement** (decision G) lives in
-//! [`close`], which rejects any reconstructed node whose children violate its
+//! `close`, which rejects any reconstructed node whose children violate its
 //! content expression — so an invalid step never produces a document.
 
 use crate::Slice;
@@ -89,7 +89,7 @@ fn replace_outer(
 /// Reconstruct `node`'s content as `content`, **enforcing the schema**: the child
 /// sequence must satisfy `node`'s content expression and each child's marks must
 /// be allowed. Returns `Err` otherwise — the schema gate for every replace.
-fn close(node: &Node, content: Fragment) -> Result<Node, StepError> {
+pub(crate) fn close(node: &Node, content: Fragment) -> Result<Node, StepError> {
     let names: Vec<&str> = content.children().iter().map(Node::type_name).collect();
     if !node.node_type().content_match().matches(&names) {
         return Err(StepError::new(format!(

@@ -3,11 +3,11 @@
 use super::{ClipboardError, ClipboardResult, ImageData};
 
 pub fn copy_text(text: impl AsRef<str>) -> ClipboardResult<()> {
-    rinch_android::clipboard::copy_text(text.as_ref()).map_err(|e| ClipboardError::AccessFailed(e))
+    rinch_android::clipboard::copy_text(text.as_ref()).map_err(ClipboardError::AccessFailed)
 }
 
 pub fn paste_text() -> ClipboardResult<String> {
-    rinch_android::clipboard::paste_text().map_err(|e| ClipboardError::AccessFailed(e))
+    rinch_android::clipboard::paste_text().map_err(ClipboardError::AccessFailed)
 }
 
 pub fn has_text() -> bool {
@@ -60,6 +60,13 @@ pub fn copy_text_async(text: impl AsRef<str>) {
     let _ = copy_text(text);
 }
 
+pub fn copy_text_then(
+    text: impl AsRef<str>,
+    on_done: impl FnOnce(ClipboardResult<()>) + Send + 'static,
+) {
+    on_done(copy_text(text));
+}
+
 pub fn paste_text_timeout(_timeout: Duration) -> ClipboardResult<String> {
     paste_text()
 }
@@ -80,6 +87,14 @@ pub fn paste_image_async(
 
 pub fn copy_html_async(html: impl AsRef<str>, alt_text: Option<&str>) {
     let _ = copy_html(html, alt_text);
+}
+
+pub fn copy_html_then(
+    html: impl AsRef<str>,
+    alt_text: Option<&str>,
+    on_done: impl FnOnce(ClipboardResult<()>) + Send + 'static,
+) {
+    on_done(copy_html(html, alt_text));
 }
 
 pub fn paste_html_timeout(_timeout: Duration) -> ClipboardResult<String> {
@@ -106,4 +121,22 @@ pub fn paste_rich_timeout(_timeout: Duration) -> ClipboardResult<RichPaste> {
 
 pub fn paste_rich_async(on_done: impl FnOnce(ClipboardResult<RichPaste>) + Send + 'static) {
     on_done(paste_rich());
+}
+
+/// [`paste_rich`] and no text beside it: Android's bridge offers text only, so
+/// the answer is always a [`RichPaste::Text`], which carries its own text.
+pub fn paste_rich_with_text() -> ClipboardResult<(RichPaste, Option<String>)> {
+    paste_rich().map(|rich| (rich, None))
+}
+
+pub fn paste_rich_with_text_timeout(
+    _timeout: Duration,
+) -> ClipboardResult<(RichPaste, Option<String>)> {
+    paste_rich_with_text()
+}
+
+pub fn paste_rich_with_text_async(
+    on_done: impl FnOnce(ClipboardResult<(RichPaste, Option<String>)>) + Send + 'static,
+) {
+    on_done(paste_rich_with_text());
 }

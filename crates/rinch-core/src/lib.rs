@@ -22,21 +22,35 @@
 #![cfg_attr(target_os = "android", allow(clippy::missing_const_for_thread_local))]
 
 pub mod component_prop;
+pub mod content_sizing;
 pub mod context;
+pub mod doc_keyed;
 pub mod dom;
 pub mod element;
 pub mod event;
 pub mod events;
+pub mod file;
+pub mod font_defaults;
 pub mod for_loop;
+pub mod html_entities;
 pub mod image;
 pub mod main_thread;
 pub mod match_dom;
+pub mod popup_placement;
 pub mod reactive;
 pub mod reconcile;
 pub mod show;
+pub mod task;
 pub mod timer;
+pub mod video_sink;
 pub mod virtual_list;
 
+#[cfg(test)]
+mod batch_dom_order_tests;
+#[cfg(test)]
+mod cache_scope_733_tests;
+#[cfg(test)]
+mod node_lifetime_tests;
 /// The post-condition of `remove` vs `discard` across the reactive helpers
 /// (issue #719). Needs `MockDomDocument`, which is `cfg(test)` here.
 #[cfg(test)]
@@ -44,6 +58,7 @@ mod reinsertion_tests;
 
 // Re-export image loading types
 pub use component_prop::DefaultProp;
+pub use doc_keyed::{DocKeyed, DocList, DocMap, ForgetDoc, Removed, doc_entries, forget_doc};
 pub use image::{ImageLoadResult, ImageLoader};
 
 // Re-export element types for convenience
@@ -58,8 +73,8 @@ pub use for_loop::{
     FineForBuilder, KeySource, for_each_dom, for_each_dom_typed,
     for_each_dom_typed_with_key_source, for_each_dom_with_key_source, to_for_items,
 };
-pub use match_dom::match_dom;
-pub use show::{FineShowBuilder, show_dom};
+pub use match_dom::{match_dom, match_dom_rebinding};
+pub use show::{FineShowBuilder, show_dom, show_dom_rebinding};
 pub use virtual_list::virtual_list;
 
 // Re-export reconciliation types
@@ -70,54 +85,74 @@ pub use main_thread::{
     MainCallbackId, cancel_main_callback, park_main_callback, resume_main_callback,
 };
 
+// Futures on the UI thread (issue #1767)
+pub use task::{Sleep, TaskHandle, sleep, spawn_local};
+
 // Re-export cross-platform timers
-pub use timer::{TimeoutHandle, clear_timeout, fire_timeout, set_timeout, set_timer_backend};
+pub use timer::{
+    IntervalHandle, TimeoutHandle, clear_interval, clear_timeout, fire_timeout, set_interval,
+    set_timeout, set_timer_backend, set_timer_backend_with_cancel,
+};
 
 // Re-export reactive types for convenience
 pub use reactive::{
     Effect, ElementBounds, Memo, OwnedCounts, Owner, PollRate, Scope, Signal,
-    SignalChangeSubscription, batch, clear_main_callbacks, clear_on_signal_change,
-    clear_signals_changed, current_owner, derived, drain_main_callbacks, drain_polls, poll_signal,
-    queue_main_callback, register_bounds_signal, register_main_thread, run_on_main_thread,
-    set_cross_thread_dispatcher, set_cross_thread_dispatcher_if_unset, set_on_signal_change,
-    signals_changed, subscribe_signal_change, unowned, untracked, update_bounds_signals,
+    SignalChangeSubscription, TrackingSuspended, batch, clear_main_callbacks,
+    clear_on_signal_change, clear_signals_changed, current_owner, derived, dispatch_main_callback,
+    drain_main_callbacks, drain_polls, flush_pending_effects, is_main_thread,
+    main_callbacks_pending, mark_host_thread, note_host_change, poll_signal, queue_main_callback,
+    register_bounds_signal, register_main_thread, run_on_main_thread, set_cross_thread_dispatcher,
+    set_cross_thread_dispatcher_if_unset, set_on_signal_change, signals_changed,
+    subscribe_signal_change, suppress_effect_flush, suspend_tracking, unowned, untracked,
+    untracked_handler, update_bounds_signals,
 };
 
 // Re-export context for sharing state across components
 pub use context::{
-    ContextRootGuard, DispatchDocGuard, clear_context, clear_context_for_root, create_context,
-    create_store, current_context_root, current_dispatching_doc, doc_identity, doc_matches,
-    push_context_root, push_dispatching_doc, try_use_context, try_use_store, use_context,
-    use_store,
+    CallbackFrame, CallbackFrameGuard, ContextRootGuard, DispatchDocGuard, DisposingDocGuard,
+    clear_context, clear_context_for_root, create_context, create_store, current_context_root,
+    current_dispatching_doc, doc_identity, doc_matches, push_context_root, push_dispatching_doc,
+    push_disposing_doc, try_use_context, try_use_store, use_context, use_store,
 };
 
 // Re-export event handling types
 pub use events::{
-    AncestorBounds, ClickContext, ConfigurationChangeHandler, DismissHandle, Drag, DragContext,
-    EventCallback, EventHandlerId, FileDropCallback, FocusRequest, InputCallback, InputContext,
-    KeyEventData, KeyEventKind, ModifierState, MouseButton, PasteEventData, PasteInterceptor,
-    PrimaryButton, ScrollEvent, SelectionAction, TextHitInfo, check_and_clear_input_handled,
-    clear_configuration_change_handler, clear_handlers, clear_keyboard_interceptor,
-    clear_paste_interceptor, clear_selection_callback, clear_selection_snapshot,
-    clear_selection_sync_callback, click_ancestors, dispatch_configuration_change,
-    dispatch_dismiss, dispatch_event, dispatch_file_drop_event, dispatch_input_event,
-    dispatch_keyboard_event, dispatch_paste_event, dispatch_selection, find_click_ancestor,
-    finish_drag, fire_selection_sync, get_click_context, get_input_context, get_modifier_state,
-    get_saved_selection, has_paste_interceptor, is_drag_ghost_visible, post_focus_request,
-    push_dismiss_handler, query_selection_ranges, register_file_drop_handler, register_handler,
-    register_input_handler, request_focus, reset_drag_ghost_visibility, restore_drag_ghost,
-    save_selection_snapshot, set_click_ancestors, set_click_context,
-    set_configuration_change_handler, set_input_context, set_keyboard_interceptor,
-    set_modifier_state, set_paste_interceptor, set_selection_callback, set_selection_sync_callback,
-    suppress_drag_ghost, take_pending_focus_request, update_drag, update_drag_with_button,
+    AncestorBounds, AppKeyListener, ClickContext, ConfigurationChangeHandler, DismissHandle, Drag,
+    DragContext, EventCallback, EventHandlerId, FileDropCallback, FocusRequest, FocusStep,
+    InputCallback, InputContext, KeyCallback, KeyEventData, KeyEventKind, ModifierState,
+    MouseButton, PasteEventData, PasteInterceptor, PrimaryButton, ScrollEvent, SelectionAction,
+    TextHitInfo, WheelCallback, WheelEvent, cancel_pending_text_selection_request,
+    check_and_clear_input_handled, clear_configuration_change_handler, clear_handlers,
+    clear_keyboard_interceptor, clear_paste_interceptor, clear_selection_callback,
+    clear_selection_snapshot, clear_selection_sync_callback, click_ancestors, click_link,
+    dispatch_app_key, dispatch_configuration_change, dispatch_dismiss, dispatch_event,
+    dispatch_file_drop_event, dispatch_files_drop_event, dispatch_input_event,
+    dispatch_key_handler, dispatch_key_handler_chain, dispatch_keyboard_event,
+    dispatch_paste_event, dispatch_selection, dispatch_wheel_handler, dispatch_wheel_handler_chain,
+    find_click_ancestor, finish_drag, finish_drag_for_button, fire_selection_sync,
+    get_click_context, get_input_context, get_modifier_state, get_saved_selection,
+    has_files_drop_handler, has_key_handler, has_paste_interceptor, has_wheel_handler,
+    heal_missed_release, is_drag_ghost_visible, note_pointer_press, notify_element_drag_ended,
+    notify_focus_moved, notify_window_blurred, on_app_key, on_element_drag_end,
+    peek_pending_text_selection_request, pending_focus_request_needs_layout, post_focus_request,
+    post_release_request, post_text_selection_request, push_dismiss_handler,
+    push_dismiss_handler_within, push_key_handler, query_selection_ranges,
+    register_file_drop_handler, register_files_drop_handler, register_handler,
+    register_input_handler, register_key_handler, register_wheel_handler, request_focus,
+    reset_drag_ghost_visibility, restore_drag_ghost, save_selection_snapshot, set_click_ancestors,
+    set_click_context, set_click_link, set_configuration_change_handler, set_input_context,
+    set_keyboard_interceptor, set_modifier_state, set_paste_interceptor, set_selection_callback,
+    set_selection_sync_callback, suppress_drag_ghost, take_pending_focus_request,
+    take_pending_focus_steps, take_pending_text_selection_requests, update_drag,
+    update_drag_with_button, withhold_app_key_release,
 };
 
 // Re-export DOM types for fine-grained rendering
 pub use dom::{
-    DomDocument, DomUpdate, IntoNode, NodeHandle, NodeId, RenderScope, StyleProp, UpdateBatch,
-    clear_render_scope, has_render_scope, normalize_property_name, reactive_component_dom,
-    serialize_declarations, set_render_scope, split_declarations, try_with_render_scope,
-    with_render_scope,
+    Cached, DomDocument, DomUpdate, IntoNode, NodeHandle, NodeId, RenderScope, ScopeId,
+    SelectionDirection, StyleProp, UpdateBatch, clear_render_scope, has_render_scope,
+    normalize_property_name, reactive_component_dom, serialize_declarations, set_render_scope,
+    split_declarations, try_with_render_scope, with_render_scope,
 };
 
 use std::cell::RefCell;
@@ -178,14 +213,42 @@ pub fn stored_effect_count() -> usize {
 #[cfg(feature = "theme")]
 thread_local! {
     static CURRENT_THEME_CSS: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Bumped every time [`set_current_theme_css`] actually changes the slot.
+    static CURRENT_THEME_CSS_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Set the current theme CSS for snapshot creation.
+///
+/// Setting the same CSS again changes nothing, including the
+/// [generation](current_theme_css_generation).
 #[cfg(feature = "theme")]
 pub fn set_current_theme_css(css: Option<String>) {
-    CURRENT_THEME_CSS.with(|theme_css| {
-        *theme_css.borrow_mut() = css;
+    let changed = CURRENT_THEME_CSS.with(|theme_css| {
+        let mut slot = theme_css.borrow_mut();
+        if *slot == css {
+            false
+        } else {
+            *slot = css;
+            true
+        }
     });
+    if changed {
+        CURRENT_THEME_CSS_GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
+        // The hosts read this slot only when a signal-change callback tells
+        // them to, and a batch that wrote no signal calls none (issue #234).
+        crate::reactive::note_host_change();
+    }
+}
+
+/// A counter that moves whenever the current theme CSS changes.
+///
+/// The cheap way to ask "has the theme changed since I last looked?": the CSS
+/// itself is tens of kilobytes (every palette in ten shades), and a host that
+/// cloned and compared it on every signal flush paid for that on every
+/// re-render.
+#[cfg(feature = "theme")]
+pub fn current_theme_css_generation() -> u64 {
+    CURRENT_THEME_CSS_GENERATION.with(|g| g.get())
 }
 
 /// Get the current theme CSS for snapshot creation.

@@ -1,14 +1,177 @@
 // ── Free functions (platform-agnostic hit testing) ───────────────────────────
 
 use super::ScrollAxis;
-use rinch_dom::stacking::{paints_at_stacking_root, stacking_paint_order};
+use rinch_dom::paint::scrollbar::ScrollbarAxis;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
+use rinch_dom::stacking::{
+    DeferredBars, PaintOrder, paints_at_stacking_root, stacking_hit_order, stacking_paint_order,
+};
 
 /// Simple hit testing: find the deepest node whose layout rect contains (x, y).
 /// Respects CSS stacking contexts so that elements with higher z-index
 /// are tested before visually-behind siblings, and CSS transforms so that a
 /// transformed subtree is hit where it is *painted* (#199).
-pub(crate) fn hit_test(tree: &rinch_dom::NodeTree, x: f32, y: f32) -> Option<usize> {
-    hit_test_node(tree, tree.body_id, 0.0, 0.0, x, y, x, y)
+pub(crate) fn hit_test(tree: &rinch_dom::NodeTree, x: f32, y: f32) -> Option<u64> {
+    tree.perf.bump(rinch_dom::perf::Counter::HitTests);
+    hit_test_node(&PlainHit, tree, tree.body_id, 0.0, 0.0, x, y, x, y, None)
+}
+
+/// What a walk of [`hit_test_node`] looks for. The plain hit test is one;
+/// the scrollbar search a press runs ([`find_scrollbar_hit`]) and the wheel's
+/// geometric fallback ([`find_scroll_container_at_point`]) are the others.
+/// All three are the same walk, so they agree on everything that decides
+/// what reaches a point: paint order, the clip chain each entry was hoisted
+/// past, `mask-image`, `visibility` and `pointer-events` (#1727, #2684).
+/// Monomorphised, so the plain hit test carries none of the others' checks.
+trait Probe {
+    /// Whether the walk tries scroll containers' overlay bars, each where
+    /// paint draws it (#1727).
+    const BARS: bool = false;
+    /// The counter each visited node bumps.
+    const VISITS: rinch_dom::perf::Counter;
+
+    /// Whether a node the walk finds under the point is the answer. One that
+    /// is not is passed over, and the walk goes on to what is painted below
+    /// it.
+    #[inline]
+    fn accepts(&self, _tree: &rinch_dom::NodeTree, _node_id: u64) -> bool {
+        true
+    }
+
+    /// The scrollbar search's state, when [`Self::BARS`].
+    #[inline]
+    fn bars(&self) -> Option<&BarSearch> {
+        None
+    }
+}
+
+/// The plain hit test: the topmost node painted under the point.
+struct PlainHit;
+
+impl Probe for PlainHit {
+    const VISITS: rinch_dom::perf::Counter = rinch_dom::perf::Counter::HitTestNodesVisited;
+}
+
+/// The scrollbar search: the walk ends at the topmost thing painted under
+/// the point, and when that is a scroll container's bar, [`Self::found`]
+/// names it.
+#[derive(Default)]
+struct BarSearch {
+    /// The scrollers whose bars the stacking sequences being walked draw
+    /// themselves, after their last contained entry (#1717): their own node
+    /// does not offer them. A stack, as paint's `DEFERRED_BARS` is.
+    deferred: RefCell<Vec<u64>>,
+    /// The bar the walk ended on.
+    found: Cell<Option<(u64, ScrollAxis)>>,
+}
+
+impl Probe for BarSearch {
+    const BARS: bool = true;
+    const VISITS: rinch_dom::perf::Counter = rinch_dom::perf::Counter::ScrollProbeNodesVisited;
+
+    #[inline]
+    fn bars(&self) -> Option<&BarSearch> {
+        Some(self)
+    }
+}
+
+impl BarSearch {
+    /// End the walk on `node_id`'s bar on `axis`.
+    fn found(&self, node_id: u64, axis: ScrollAxis) -> Option<u64> {
+        self.found.set(Some((node_id, axis)));
+        Some(node_id)
+    }
+}
+
+/// Pushes a sequence's deferred scrollers onto [`BarSearch::deferred`] and
+/// takes them back off on drop.
+struct DeferredScope<'a>(&'a BarSearch, usize);
+
+impl<'a> DeferredScope<'a> {
+    fn enter(search: &'a BarSearch, bars: &[DeferredBars]) -> Self {
+        let mut d = search.deferred.borrow_mut();
+        let len = d.len();
+        d.extend(bars.iter().map(|b| b.node_id));
+        Self(search, len)
+    }
+}
+
+impl Drop for DeferredScope<'_> {
+    fn drop(&mut self) {
+        self.0.deferred.borrow_mut().truncate(self.1);
+    }
+}
+
+/// The wheel's fallback: the topmost scroll container painted under the
+/// point that overflows on the axis, past whatever is painted over it.
+struct ScrollerSearch(ScrollbarAxis);
+
+impl Probe for ScrollerSearch {
+    const VISITS: rinch_dom::perf::Counter = rinch_dom::perf::Counter::ScrollProbeNodesVisited;
+
+    #[inline]
+    fn accepts(&self, tree: &rinch_dom::NodeTree, node_id: u64) -> bool {
+        rinch_dom::paint::scrollbar::overflows(tree, node_id, self.0)
+    }
+}
+
+/// The bar of scroll container `node` under `(lx, ly)`, a point relative to
+/// its border-box origin in its own space: the hit strips are the paint
+/// pass's own geometry (#400, #444). None for a container that takes no
+/// pointer events or is hidden, nor for a bar a scroll lock shuts out (#474).
+fn bar_under(
+    tree: &rinch_dom::NodeTree,
+    node: &rinch_dom::Node,
+    node_id: u64,
+    lx: f32,
+    ly: f32,
+) -> Option<ScrollAxis> {
+    if !takes_pointer(node) {
+        return None;
+    }
+    let bars = rinch_dom::paint::scrollbar::scrollbars(tree, node_id, 1.0);
+    let (lx, ly) = (lx as f64, ly as f64);
+    let axis = [
+        (ScrollbarAxis::Vertical, ScrollAxis::Vertical),
+        (ScrollbarAxis::Horizontal, ScrollAxis::Horizontal),
+    ]
+    .into_iter()
+    .find_map(|(axis, scroll_axis)| {
+        bars.axis(axis)?;
+        let (x0, y0, x1, y1) = bars.hit_strip(axis)?;
+        (lx >= x0 && lx <= x1 && ly >= y0 && ly <= y1).then_some(scroll_axis)
+    })?;
+    (!tree.scroll_locked_out(node_id)).then_some(axis)
+}
+
+/// The deferred bar `bar` of `order` under `(x, y)`, a point in the
+/// sequence's own space: drawn under the clips its scroller is drawn under,
+/// at the scroller's border-box origin (#1717).
+fn deferred_bar_under(
+    tree: &rinch_dom::NodeTree,
+    order: &PaintOrder,
+    bar: &DeferredBars,
+    x: f32,
+    y: f32,
+) -> Option<ScrollAxis> {
+    let owner = tree.get_live(bar.node_id)?;
+    if hides_own_hit(tree, owner)
+        || !order
+            .clips_for_span(bar.clips)
+            .iter()
+            .all(|c| c.contains(x as f64, y as f64))
+    {
+        return None;
+    }
+    bar_under(
+        tree,
+        owner,
+        bar.node_id,
+        x - bar.origin_x as f32,
+        y - bar.origin_y as f32,
+    )
 }
 
 /// Map `(px, py)` — a point in the coordinate space the node's layout box lives
@@ -33,7 +196,9 @@ pub(crate) fn hit_test(tree: &rinch_dom::NodeTree, x: f32, y: f32) -> Option<usi
 fn local_point(node: &rinch_dom::Node, nx: f32, ny: f32, px: f32, py: f32) -> Option<(f32, f32)> {
     use peniko::kurbo::{Affine, Point};
 
-    if node.computed_style.transform.is_identity {
+    // A plain inline span's transform does not apply (#1080), and paint's
+    // composition skips it, so the inverse must too.
+    if !node.has_applied_transform() {
         return Some((px, py));
     }
     // A display:contents node has no box, so paint gives it no transform box
@@ -105,7 +270,7 @@ struct Frame {
 fn descend(
     tree: &rinch_dom::NodeTree,
     node: &rinch_dom::Node,
-    node_id: usize,
+    node_id: u64,
     offset_x: f32,
     offset_y: f32,
     x: f32,
@@ -113,7 +278,7 @@ fn descend(
     vx: f32,
     vy: f32,
 ) -> Option<Frame> {
-    let is_fixed = node.computed_style.position == rinch_dom::computed_style::PositionValue::Fixed;
+    let is_fixed = node.box_position() == rinch_dom::computed_style::PositionValue::Fixed;
     let (x, y) = if is_fixed { (vx, vy) } else { (x, y) };
     let (nx, ny) = if is_fixed {
         (node.layout.x, node.layout.y)
@@ -150,18 +315,31 @@ fn descend(
 /// probe point in viewport space, kept for `position: fixed` subtrees, which
 /// paint places with zeroed offsets and the body's transform however deep the
 /// stacking context that owns them (#545).
+///
+/// `clipped` names the outermost clip on the way here that the probe point
+/// is outside of, by its clipping box: one that a `position: fixed`
+/// descendant escapes (#549) — a clip between this node and the nearest
+/// ancestor that contains fixed descendants
+/// ([`rinch_dom::paint::contains_fixed_descendants`]), or the viewport — or
+/// that an absolute descendant whose containing block is above it does
+/// (#2815). Paint lifts exactly those clips around such an entry, so the walk
+/// goes on looking for one — through stacking contexts that hold one, and
+/// nowhere else — and hits nothing else on the way.
 #[allow(clippy::too_many_arguments)]
-fn hit_test_node(
+fn hit_test_node<P: Probe>(
+    probe: &P,
     tree: &rinch_dom::NodeTree,
-    node_id: usize,
+    node_id: u64,
     offset_x: f32,
     offset_y: f32,
     x: f32,
     y: f32,
     vx: f32,
     vy: f32,
-) -> Option<usize> {
-    let node = tree.get(node_id)?;
+    clipped: Option<u64>,
+) -> Option<u64> {
+    tree.perf.bump(P::VISITS);
+    let node = tree.get_live(node_id)?;
 
     // The `position: fixed` hoist, the IFC content-box offset, the transform
     // inverse and the body's viewport re-seed all live in `descend`, which every
@@ -175,26 +353,93 @@ fn hit_test_node(
         vy,
     } = descend(tree, node, node_id, offset_x, offset_y, x, y, vx, vy)?;
 
+    // A box that contains its fixed descendants keeps every clip above it
+    // around them, as paint does (#549): a probe already clipped away from it
+    // reaches nothing under it.
+    if clipped.is_some() && rinch_dom::paint::contains_fixed_descendants(node) {
+        return None;
+    }
+
+    // A stacking context whose subtree hoists nothing paints exactly its flow
+    // walk, so a point outside its flow extent hits nothing in it: answered
+    // before its sequence is built (#1719). The loop below prunes such an
+    // entry before entering it; this is the transformed one, which only its
+    // own inverse — `descend`, above — can place.
+    if stacking_context_misses(tree, node, node_id, nx, ny, x, y) {
+        return None;
+    }
+
     let nw = node.layout.width;
     let nh = node.layout.height;
 
-    // Skip entire subtree when visibility: hidden — per CSS spec, hidden elements
-    // and their descendants don't receive pointer events. This also guards against
-    // Stylo not cascading visibility to children when a parent's class changes.
-    if matches!(
-        node.computed_style.visibility,
-        rinch_dom::computed_style::VisibilityValue::Hidden
-            | rinch_dom::computed_style::VisibilityValue::Collapse
-    ) {
+    // A hidden box is not hit itself, but `visibility` is inherited and a
+    // descendant may set it back to `visible`: that descendant is painted
+    // (#829) and hit, as in Chrome (#843). So a hidden node's subtree is
+    // skipped only when nothing below it is visible — the common case, which
+    // keeps the old whole-subtree skip — and otherwise walked for the visible
+    // boxes alone.
+    let hidden = hides_own_hit(tree, node);
+    if hidden && !shows_below(tree, node_id) {
         return None;
     }
 
     let point_in_bounds = x >= nx && x <= nx + nw && y >= ny && y <= ny + nh;
 
+    // A `mask-image` clips everything the box paints to its border box
+    // (`mask-clip`), and Chrome 155 hit-tests the same way: nothing of a
+    // masked box is hit outside it (the mask's own alpha is not consulted
+    // inside it). #1798.
+    if !point_in_bounds
+        && !node.computed_style.mask_image.is_empty()
+        && node.computed_style.display != rinch_dom::computed_style::DisplayValue::Contents
+    {
+        return None;
+    }
+
+    // The scrollbar search: this node's own bars, which paint draws over
+    // everything it draws itself — after its in-flow content, and for a
+    // stacking context after its whole sequence — unless the sequence it is
+    // in draws them later, after its last contained entry (below, #1717).
+    // So they are tried before its children, and whatever is drawn over them
+    // has already been tried before this node (#1727).
+    if let Some(search) = probe.bars()
+        && !hidden
+        && clipped.is_none()
+        && (node.scrolls_y() || node.scrolls_x())
+        && !search.deferred.borrow().contains(&node_id)
+        && let Some(axis) = bar_under(tree, node, node_id, x - nx, y - ny)
+    {
+        return search.found(node_id, axis);
+    }
+
     // Nodes with overflow clipping must restrict child hit testing to within
-    // bounds — the same predicate paint clips pixels with (#324), so a box
-    // cannot be drawn somewhere it cannot be tapped.
-    let check_children = !node.clips_overflow() || point_in_bounds;
+    // the same box paint clips pixels to (#324) — the **padding** box, not
+    // the border box (#536): `rinch_dom::paint::padding_box_insets` is the
+    // one function that measures it, the same one `clip_shape` scales for
+    // paint, so a click on the container's own border resolves to the
+    // container (`point_in_bounds`, below, is unaffected and stays the border
+    // box — the border itself is still part of the element's own hit target)
+    // rather than falling through to content that cannot be drawn there.
+    //
+    // Per axis (#535), matching `clip_shape`: an axis whose own `overflow`
+    // computes to `visible` does not bound children at all, so
+    // `overflow-x: clip; overflow-y: visible` only restricts `x`.
+    //
+    // `clip_axes()` (not the two single-axis predicates) runs the shared
+    // display/contents guards once per node instead of twice, and the common
+    // "neither axis clips" case skips `padding_box_insets` entirely — this is
+    // the hottest node-visit site in the pointer-move path (every visited
+    // node, every probe), and both cost a measured +12% on
+    // `pointer_move_warm` in CI's Callgrind before this (#535 Perf CI).
+    let (clip_x, clip_y) = node.clip_axes();
+    let check_children = if !clip_x && !clip_y {
+        true
+    } else {
+        let (left, top, right, bottom) = rinch_dom::paint::padding_box_insets(node);
+        let x_ok = !clip_x || (x >= nx + left && x <= nx + nw - right);
+        let y_ok = !clip_y || (y >= ny + top && y <= ny + nh - bottom);
+        x_ok && y_ok
+    };
 
     let sx = node.scroll_offset.0 as f32;
     let sy = node.scroll_offset.1 as f32;
@@ -222,48 +467,212 @@ fn hit_test_node(
         let is_stretched_ifc_text =
             |child: &rinch_dom::Node| child.is_text() && child.ifc_root.is_some();
 
-        if node_id == tree.body_id || node.creates_stacking_context() {
+        if (node_id == tree.body_id || node.creates_stacking_context())
+            && rinch_dom::RinchDocument::box_tree_children(&tree.nodes, node.id).is_empty()
+        {
+            // No sequence to build for a stacking context with nothing in its
+            // box tree: there is nothing below it to probe (#1719).
+        } else if !check_children && rinch_dom::paint::clips_fixed_descendants(node) {
+            // A transformed or filtered root is the containing block of its
+            // fixed descendants, so its own clip is the one none of them
+            // escapes (#549): paint takes the fixed floor after this root's
+            // bracket. A probe outside it hits nothing in its sequence.
+        } else if node_id == tree.body_id || node.creates_stacking_context() {
             // A stacking-context root probes exactly the sequence paint draws,
             // read backwards — the last box painted is the first one tapped.
             // Same function, same offsets, opposite direction: the two cannot
             // drift apart the way two hand-written phase walks did.
-            let order =
-                stacking_paint_order(tree, node_id, 1.0, (nx - sx) as f64, (ny - sy) as f64);
-            for entry in order.iter().rev() {
-                let Some(child) = tree.get(entry.node_id) else {
+            let order = cached_paint_order::<P>(tree, node_id, (nx - sx) as f64, (ny - sy) as f64);
+            let _deferred = probe.bars().map(|s| DeferredScope::enter(s, &order.bars));
+            let mut next_bar = order.bars.len();
+            // The boxes in a relative split inline first (`lifted`).
+            for (lifted, (index, entry)) in [true, false]
+                .into_iter()
+                .flat_map(|pass| order.iter().enumerate().rev().map(move |e| (pass, e)))
+            {
+                // The scrollbar search: the bars paint draws right after this
+                // entry, over it and below everything after it (#1717), the
+                // outer scroller's over the inner's. Under this root's own
+                // clip, as paint draws them inside its bracket.
+                if let Some(search) = probe.bars()
+                    && !lifted
+                {
+                    while let Some(bar) = next_bar
+                        .checked_sub(1)
+                        .map(|b| &order.bars[b])
+                        .filter(|b| b.after == index)
+                    {
+                        next_bar -= 1;
+                        if check_children
+                            && clipped.is_none()
+                            && let Some(axis) = deferred_bar_under(tree, &order, bar, x, y)
+                        {
+                            return search.found(bar.node_id, axis);
+                        }
+                    }
+                }
+                // The cached order is dropped by every mutation that can move or
+                // free a node (`hit_cache.invalidate()`), so its ids are as live
+                // as the walk that built it (#723). Unchecked on purpose: this
+                // runs per entry per probe. PR 2: every route that frees a slot
+                // (free-on-discard included) must drop the hit cache before the
+                // slot can be reused — `NodeTree::remove_subtree` does, so a
+                // free that goes through it is covered; a new one must too.
+                let Some(child) = tree.get_live(entry.node_id) else {
                     continue;
                 };
-                // This root's own bounds gate. A `position: fixed` entry is
-                // exempt: this root is not its containing block, so its clip
-                // does not apply — paint lifts the same bracket around it
-                // (`paint_children_with_stacking`, #545). Without the exemption
-                // a fixed modal inside an `overflow: hidden; z-index: 1` panel
-                // would be painted and never tappable.
-                let escapes_root_clip = child.computed_style.position
-                    == rinch_dom::computed_style::PositionValue::Fixed;
-                if !check_children && !escapes_root_clip {
+                if in_relative_split_inline(tree, child) != lifted {
+                    continue;
+                }
+                // A `position: relative` inline element is painted here, in
+                // its place among the positioned boxes (#2819), so its text is
+                // tapped here too: the hit is its IFC root's, as for any text
+                // in its lines, and the target is found from there. It has no
+                // box, so nothing below would find it.
+                if rinch_dom::paint::paints_in_own_entry(child) {
+                    let inside = check_children
+                        && clipped.is_none()
+                        && order
+                            .clips_for(entry)
+                            .iter()
+                            .all(|c| c.contains(x as f64, y as f64));
+                    let over = inside
+                        .then(|| {
+                            rinch_dom::text_query::layered_span_at(
+                                tree,
+                                child,
+                                entry.offset_x as f32,
+                                entry.offset_y as f32,
+                                x,
+                                y,
+                            )
+                        })
+                        .flatten();
+                    // Its atomic inlines first, drawn over its text; placed
+                    // from the root's scrolled origin, as the root's own walk
+                    // places them. Wherever the point is, not only over its
+                    // text: an inline-block beside the span's text is off
+                    // that text, and only this entry draws it (#2869).
+                    if inside {
+                        for id in rinch_dom::text_query::layered_span_boxes(tree, child)
+                            .into_iter()
+                            .rev()
+                        {
+                            if let Some(hit) = hit_test_node(
+                                probe,
+                                tree,
+                                id,
+                                entry.offset_x as f32,
+                                entry.offset_y as f32,
+                                x,
+                                y,
+                                vx,
+                                vy,
+                                None,
+                            ) {
+                                return Some(hit);
+                            }
+                        }
+                    }
+                    if over == Some(true)
+                        && !hides_own_hit(tree, child)
+                        && !matches!(
+                            child.computed_style.pointer_events,
+                            rinch_dom::computed_style::PointerEventsValue::None
+                        )
+                        && let Some(root) = child.ifc_root
+                        && probe.accepts(tree, root)
+                    {
+                        return Some(root);
+                    }
+                    continue;
+                }
+                // A box entered as an ordinary node — in flow, or positioned
+                // with `z-index: auto` — can be skipped outright when its
+                // flow subtree reaches nowhere near the point. A stacking
+                // context can when nothing under it is hoisted (#1719): its
+                // sequence is then its flow walk. One that hoists cannot: its
+                // own hoisted descendants may be anywhere.
+                if (entry.kind != rinch_dom::stacking::PaintKind::StackingContext
+                    || !flow_hoists(tree, entry.node_id))
+                    && !flow_subtree_may_contain(
+                        tree,
+                        child,
+                        entry.offset_x as f32,
+                        entry.offset_y as f32,
+                        x,
+                        y,
+                    )
+                {
                     continue;
                 }
                 if is_stretched_ifc_text(child) {
                     continue;
                 }
-                // The clipping ancestors this entry was hoisted past. Since
-                // #324 an `overflow` box is not a stacking context, so the
-                // walk went straight through them and the `check_children`
-                // gate below never saw them — the chain is what keeps a
-                // hoisted box unreachable exactly where it is unpainted.
+                // This root's own bounds gate, and the clipping ancestors this
+                // entry was hoisted past. Since #324 an `overflow` box is not
+                // a stacking context, so the walk went straight through them
+                // and the `check_children` gate never saw them — the chain is
+                // what keeps a hoisted box unreachable exactly where it is
+                // unpainted.
                 //
                 // The clips are in this root's own space, which is the space
                 // `x`/`y` are in here, and at scale 1.0 because that is what
                 // this walk asked `stacking_paint_order` for.
-                if !order
-                    .clips_for(entry)
-                    .iter()
-                    .all(|c| c.contains(x as f64, y as f64))
+                let chain_out = if check_children {
+                    order
+                        .clips_for(entry)
+                        .iter()
+                        .find(|c| !c.contains(x as f64, y as f64))
+                        .map(|c| c.owner)
+                } else {
+                    None
+                };
+                let inside_clips = check_children && chain_out.is_none();
+                // A `position: fixed` entry escapes all of those, and every
+                // clip `clipped` stands for: its containing block is the
+                // viewport, and paint lifts each of them around it
+                // (`paint_sequence_entry`, #545, #549). Without that a fixed
+                // modal inside an `overflow: hidden; z-index: 1` panel — or
+                // under one inside a plain `overflow: hidden` shell — would be
+                // painted and never tappable.
+                // One whose containing block is a transformed ancestor
+                // (`box_position` reads `absolute`, #1372) is clipped by it.
+                // Asked only of an entry clipped away: the common probe is
+                // inside every clip and pays nothing for it.
+                //
+                // An absolute entry whose containing block is above this root
+                // escapes the clips of that block's descendants (#2815), so it
+                // is entered unclipped when the outermost clip the probe is
+                // outside of is one of them: this root's own, or a link of the
+                // chain, or one above (`clipped`), outermost first.
+                let child_clipped = if (inside_clips && clipped.is_none())
+                    || child.box_position() == rinch_dom::computed_style::PositionValue::Fixed
+                {
+                    None
+                } else {
+                    clipped
+                        .or((!check_children).then_some(node_id))
+                        .or(chain_out)
+                        .filter(|&c| {
+                            !rinch_dom::paint::absolute_escapes_clip(tree, node_id, child, c)
+                        })
+                };
+                // Clipped away, the entry can still hold a fixed or absolute
+                // box that is not: only a stacking context can (one that is
+                // not hoists such descendants into this sequence), and only
+                // one with such a box under it — a cached bit, so a probe
+                // outside a scroller full of stacking-context rows walks none
+                // of them.
+                if child_clipped.is_some()
+                    && !(entry.kind == rinch_dom::stacking::PaintKind::StackingContext
+                        && (rinch_dom::paint::holds_escaping_fixed(tree, entry.node_id)
+                            || rinch_dom::paint::holds_escaping_absolute(tree, entry.node_id)))
                 {
                     continue;
                 }
                 if let Some(hit) = hit_test_node(
+                    probe,
                     tree,
                     entry.node_id,
                     entry.offset_x as f32,
@@ -272,35 +681,56 @@ fn hit_test_node(
                     y,
                     vx,
                     vy,
+                    child_clipped,
                 ) {
                     return Some(hit);
                 }
             }
-        } else if check_children {
+        } else if check_children && clipped.is_none() {
             // Not a stacking-context root — test only the children that were
             // not hoisted to an ancestor's sequence, in reverse tree order.
             // Nothing here can be a fixed box: one creates a stacking context
             // unconditionally, so `paints_at_stacking_root` skips it and it is
             // an entry of some ancestor's sequence instead. So this branch keeps
             // the plain bounds gate.
-            for &child_id in rinch_dom::RinchDocument::box_tree_children(&tree.nodes, node.id)
-                .iter()
-                .rev()
+            //
+            // The boxes in a relative split inline first (`lifted`).
+            let kids = rinch_dom::RinchDocument::box_tree_children(&tree.nodes, node.id);
+            for (lifted, &child_id) in [true, false]
+                .into_iter()
+                .flat_map(|pass| kids.iter().rev().map(move |c| (pass, c)))
             {
-                let Some(child) = tree.get(child_id) else {
+                let Some(child) = tree.get_live(child_id) else {
                     continue;
                 };
-                if paints_at_stacking_root(child) || is_stretched_ifc_text(child) {
+                if paints_at_stacking_root(child)
+                    || is_stretched_ifc_text(child)
+                    || in_relative_split_inline(tree, child) != lifted
+                {
                     continue;
                 }
-                if let Some(hit) = hit_test_node(tree, child_id, nx - sx, ny - sy, x, y, vx, vy) {
+                if !flow_subtree_may_contain(tree, child, nx - sx, ny - sy, x, y) {
+                    continue;
+                }
+                if let Some(hit) =
+                    hit_test_node(probe, tree, child_id, nx - sx, ny - sy, x, y, vx, vy, None)
+                {
                     return Some(hit);
                 }
             }
         }
     }
 
-    if !point_in_bounds {
+    // An inline element's padding or border past the root's box (#2647).
+    let in_inline_box = !point_in_bounds
+        && !hidden
+        && !clip_x
+        && !clip_y
+        && inline_box_outside(tree, node, x - nx, y - ny);
+    if clipped.is_some()
+        || !(point_in_bounds || in_inline_box)
+        || (hidden && !visible_text_at(tree, node, x - nx, y - ny))
+    {
         return None;
     }
 
@@ -312,7 +742,454 @@ fn hit_test_node(
         return None;
     }
 
-    Some(node_id)
+    probe.accepts(tree, node_id).then_some(node_id)
+}
+
+/// Whether box `child` stands inside a `position: relative` split inline
+/// (#513, #2408): the inline is positioned, so it and what it holds are above
+/// the in-flow boxes around it in Chrome — the **unmoved** anonymous box of
+/// the run after the block among them, which its offset can move the block
+/// over (review of #2497). Hit testing tries such boxes before their
+/// siblings. One parent check for nearly every box.
+fn in_relative_split_inline(tree: &rinch_dom::NodeTree, child: &rinch_dom::Node) -> bool {
+    use rinch_dom::computed_style::{DisplayValue, PositionValue};
+    let mut cur = child.parent;
+    while let Some(p) = cur.and_then(|p| tree.get_live(p)) {
+        if p.is_split_inline() {
+            if p.computed_style.position == PositionValue::Relative {
+                return true;
+            }
+        } else if p.computed_style.display != DisplayValue::Contents {
+            return false;
+        }
+        cur = p.parent;
+    }
+    false
+}
+
+/// `root`'s stacking sequence at base `(ox, oy)`, from the tree's hit cache
+/// when nothing has invalidated it since it was built (see
+/// [`rinch_dom::hit_cache`]). Paint builds its own at the DPI scale; this one
+/// is at `scale = 1.0`, the unit hit testing works in, so it is cached apart.
+///
+/// The scrollbar search ([`Probe::BARS`]) walks the sequence with
+/// [`PaintOrder::bars`] (`stacking_paint_order`), cached apart from the plain
+/// one: it tries each deferred bar where paint draws it.
+fn cached_paint_order<P: Probe>(
+    tree: &rinch_dom::NodeTree,
+    root: u64,
+    ox: f64,
+    oy: f64,
+) -> Rc<PaintOrder> {
+    if let Some(order) = tree.hit_cache.order(root, ox, oy, P::BARS) {
+        return order;
+    }
+    let order = Rc::new(if P::BARS {
+        stacking_paint_order(tree, root, 1.0, ox, oy)
+    } else {
+        stacking_hit_order(tree, root, 1.0, ox, oy)
+    });
+    tree.hit_cache
+        .store_order(root, ox, oy, P::BARS, order.clone());
+    order
+}
+
+/// `root`'s stacking sequence for the plain hit test, from the hit cache: the
+/// one an input-region walk ([`super::input_region`]) follows, so it agrees
+/// with the hit test on which clips each hoisted box is under.
+#[cfg(feature = "windowing")]
+pub(super) fn plain_paint_order(
+    tree: &rinch_dom::NodeTree,
+    root: u64,
+    ox: f64,
+    oy: f64,
+) -> Rc<PaintOrder> {
+    cached_paint_order::<PlainHit>(tree, root, ox, oy)
+}
+
+/// Slack added around a subtree extent before it is allowed to prune. The
+/// extent is summed relative to each box while `hit_test_node` sums absolute
+/// offsets down the tree, and the two roundings can differ by an ulp at an
+/// edge; a pixel of slack keeps the prune strictly conservative.
+const EXTENT_SLACK: f32 = 1.0;
+
+/// [`flow_extent`]'s cache hit, inlined where the warm pointer move's 500-row
+/// loop asks it ([`flow_subtree_may_contain`]); a miss computes it out of line.
+/// `flow_extent` itself stays one function, cache check included, for its own
+/// recursion: inlining the check there cost the cold move about 4% (review of
+/// #1720, which also measured +18% on `shell::pointer_move_warm` while
+/// nothing inlined the hit).
+#[inline]
+fn cached_flow_extent(tree: &rinch_dom::NodeTree, id: u64) -> rinch_dom::hit_cache::Extent {
+    match tree.hit_cache.extent(id) {
+        Some(e) => e,
+        None => flow_extent(tree, id),
+    }
+}
+
+/// Whether `hit_test_node(child)` — entered at parent offset `(ox, oy)` as an
+/// ordinary node, i.e. not as a stacking-context root — could possibly return
+/// a hit for the point `(x, y)`.
+///
+/// `false` is a proof, not a guess: the point lies outside the union of every
+/// box the child's flow walk can test (see [`flow_extent`]), so the walk would
+/// visit the whole subtree and find nothing. `true` means "walk it".
+fn flow_subtree_may_contain(
+    tree: &rinch_dom::NodeTree,
+    child: &rinch_dom::Node,
+    ox: f32,
+    oy: f32,
+    x: f32,
+    y: f32,
+) -> bool {
+    // Mirror `descend` for a non-fixed, untransformed box. Only a stacking
+    // context can be either, and callers never hand one in — but a box that
+    // is one anyway is simply walked.
+    if child.box_position() == rinch_dom::computed_style::PositionValue::Fixed
+        || child.has_applied_transform()
+    {
+        return true;
+    }
+    let (dx, dy) = rinch_dom::paint::ifc_content_box_offset(tree, child);
+    let cx = ox + child.layout.x + dx;
+    let cy = oy + child.layout.y + dy;
+    let [x0, y0, x1, y1] = cached_flow_extent(tree, child.id);
+    x >= cx + x0 - EXTENT_SLACK
+        && x <= cx + x1 + EXTENT_SLACK
+        && y >= cy + y0 - EXTENT_SLACK
+        && y <= cy + y1 + EXTENT_SLACK
+}
+
+/// The rectangle, relative to `id`'s own border-box origin, that contains
+/// every box `hit_test_node` can test when it enters `id` as an ordinary node:
+/// the node's own box, and — unless the node clips, which confines every child
+/// hit to its own box — the extents of the children that walk recurses into
+/// (the same enumeration: box-tree children, minus those hoisted to a stacking
+/// root and the stretched IFC text it never tests), placed where the walk
+/// places them, scroll offset included.
+///
+/// Hoisted descendants are deliberately absent: they are entries of an
+/// ancestor stacking root's sequence, and that root tests them itself.
+///
+/// A NaN component (a box with no finite layout) is dropped by `min`/`max`,
+/// which is conservative: a subtree placed at NaN cannot be hit anyway.
+///
+/// Memoised in the tree's hit cache until something invalidates it. The one
+/// input that is not relative to `id`'s own origin is its **own** scroll offset
+/// — a descendant's extent never reads an ancestor's — and only when `id` does
+/// not clip, which is what lets a scroll of a box that clips keep every extent
+/// (`HitCache::invalidate_scroll`, #911).
+///
+/// Per axis (#535): a box clipping on only one axis still folds its children
+/// into the *open* axis — `overflow-x: clip; overflow-y: visible` confines `x`
+/// to the box but lets `y` grow with whatever a child reaches, which is what a
+/// sibling's `flow_subtree_may_contain` has to see to still walk into a child
+/// overflowing *this* node vertically.
+fn flow_extent(tree: &rinch_dom::NodeTree, id: u64) -> rinch_dom::hit_cache::Extent {
+    if let Some(e) = tree.hit_cache.extent(id) {
+        return e;
+    }
+    tree.perf.bump(rinch_dom::perf::Counter::HitExtentsComputed);
+    let Some(node) = tree.get_live(id) else {
+        return [0.0; 4];
+    };
+    let mut e = [0.0, 0.0, node.layout.width, node.layout.height];
+    let (clip_x, clip_y) = node.clip_axes();
+    // An IFC root's inline elements' padding and border, which can reach
+    // past its box and are hit there (#2647; `inline_box_outside`). Not a
+    // hidden root's, which `hit_test_node` does not grow.
+    if !clip_x
+        && !clip_y
+        && let Some(inline) = node.text_layout.as_ref()
+        && !hides_own_hit(tree, node)
+        && let Some([r0, r1, r2, r3]) =
+            rinch_dom::paint::inline_box_reach(|id| tree.get(id), inline)
+    {
+        let (ox, oy) = rinch_dom::paint::ifc_root_content_origin(node);
+        let (sx, sy) = (node.scroll_offset.0 as f32, node.scroll_offset.1 as f32);
+        e[0] = e[0].min(r0 + ox - sx);
+        e[1] = e[1].min(r1 + oy - sy);
+        e[2] = e[2].max(r2 + ox - sx);
+        e[3] = e[3].max(r3 + oy - sy);
+    }
+    if !clip_x || !clip_y {
+        let sx = node.scroll_offset.0 as f32;
+        let sy = node.scroll_offset.1 as f32;
+        for &child_id in rinch_dom::RinchDocument::box_tree_children(&tree.nodes, id).iter() {
+            let Some(child) = tree.get_live(child_id) else {
+                continue;
+            };
+            if paints_at_stacking_root(child) || (child.is_text() && child.ifc_root.is_some()) {
+                continue;
+            }
+            let (dx, dy) = rinch_dom::paint::ifc_content_box_offset(tree, child);
+            let cx = child.layout.x + dx - sx;
+            let cy = child.layout.y + dy - sy;
+            let [c0, c1, c2, c3] = flow_extent(tree, child_id);
+            if !clip_x {
+                e[0] = e[0].min(cx + c0);
+                e[2] = e[2].max(cx + c2);
+            }
+            if !clip_y {
+                e[1] = e[1].min(cy + c1);
+                e[3] = e[3].max(cy + c3);
+            }
+        }
+    }
+    tree.hit_cache.store_extent(id, e);
+    e
+}
+
+/// Whether `node` is a stacking context (not the body) whose subtree hoists
+/// nothing and whose flow extent misses `(x, y)` — in its own space, after
+/// `descend`'s inverse — so its hit test can answer `None` without building
+/// its sequence (#1719). Kept out of line: `hit_test_node` runs it for every
+/// node it visits, and inlining it pushed `flow_subtree_may_contain` out of
+/// `hit_test_node` (+4% on `shell::pointer_move_cold`, review of #1720).
+#[inline(never)]
+fn stacking_context_misses(
+    tree: &rinch_dom::NodeTree,
+    node: &rinch_dom::Node,
+    node_id: u64,
+    nx: f32,
+    ny: f32,
+    x: f32,
+    y: f32,
+) -> bool {
+    if node_id == tree.body_id || !node.creates_stacking_context() || flow_hoists(tree, node_id) {
+        return false;
+    }
+    let [x0, y0, x1, y1] = flow_extent(tree, node_id);
+    !(x >= nx + x0 - EXTENT_SLACK
+        && x <= nx + x1 + EXTENT_SLACK
+        && y >= ny + y0 - EXTENT_SLACK
+        && y <= ny + y1 + EXTENT_SLACK)
+}
+
+/// Whether the flow walk under `id` passes over a box painted at a stacking
+/// root (positioned, or a stacking context). A stacking context with no such
+/// box has a sequence holding only its in-flow children — the flow walk,
+/// exactly — so its flow extent bounds every box its own hit test can reach,
+/// and it can be pruned like an in-flow box (#1719). A box that clips on both
+/// axes answers conservatively ("hoists", if it has children) without walking.
+/// Kept apart from [`flow_extent`] so a document with no stacking context
+/// below the body pays nothing for it.
+fn flow_hoists(tree: &rinch_dom::NodeTree, id: u64) -> bool {
+    if let Some(h) = tree.hit_cache.hoists(id) {
+        return h;
+    }
+    let Some(node) = tree.get_live(id) else {
+        return false;
+    };
+    let (clip_x, clip_y) = node.clip_axes();
+    let hoists = if clip_x && clip_y {
+        !node.children.is_empty()
+    } else {
+        rinch_dom::RinchDocument::box_tree_children(&tree.nodes, id)
+            .iter()
+            .any(|&child_id| {
+                tree.get_live(child_id).is_some_and(|child| {
+                    paints_at_stacking_root(child)
+                        || (!(child.is_text() && child.ifc_root.is_some())
+                            && flow_hoists(tree, child_id))
+                })
+            })
+    };
+    tree.hit_cache.store_hoists(id, hoists);
+    hoists
+}
+
+/// Whether `node` is not hit itself (#843): `visibility: hidden`/`collapse`,
+/// a text node answering from its parent. Paint's answer too
+/// (`rinch_dom::visibility::hides_own`).
+#[inline]
+fn hides_own_hit(tree: &rinch_dom::NodeTree, node: &rinch_dom::Node) -> bool {
+    rinch_dom::visibility::hides_own(tree, node)
+}
+
+/// Whether the glyph under `(lx, ly)` — relative to `node`'s border-box
+/// origin — is text a `visibility: visible` element of `node`'s IFC draws.
+///
+/// An IFC's text is hit as its root (the stretched text nodes are skipped), so
+/// a hidden root still answers for the text of a visible inline element in it,
+/// which paint draws (#829's per-element mask) and Chrome hits (#843). Asked
+/// only of a hidden node under the point whose subtree shows something.
+fn visible_text_at(tree: &rinch_dom::NodeTree, node: &rinch_dom::Node, lx: f32, ly: f32) -> bool {
+    let Some(inline) = node.text_layout.as_ref() else {
+        return false;
+    };
+    let (ox, oy) = rinch_dom::paint::ifc_root_content_origin(node);
+    let rel_x = lx - ox + node.scroll_offset.0 as f32;
+    let rel_y = ly - oy + node.scroll_offset.1 as f32;
+    let Some(cluster) = rinch_dom::text_query::cluster_range_in_inline(inline, rel_x, rel_y) else {
+        return false;
+    };
+    inline
+        .text_ranges
+        .iter()
+        .find(|r| !r.is_br && (r.flat_start..r.flat_end).contains(&cluster.start))
+        .and_then(|r| tree.get(r.node_id))
+        .and_then(|t| t.parent)
+        .and_then(|p| tree.get(p))
+        .is_some_and(|el| !hides_own_hit(tree, el))
+}
+
+/// The point `(x, y)` in IFC root `node`'s glyph space: relative to its
+/// content origin, its own scroll offset added. `(lx, ly)` is the point
+/// relative to its border-box origin.
+fn ifc_point(node: &rinch_dom::Node, lx: f32, ly: f32) -> (f32, f32) {
+    let (ox, oy) = rinch_dom::paint::ifc_root_content_origin(node);
+    (
+        lx - ox + node.scroll_offset.0 as f32,
+        ly - oy + node.scroll_offset.1 as f32,
+    )
+}
+
+/// The text node whose glyph is drawn at `(rel_x, rel_y)` ([`ifc_point`])
+/// in `inline` (#2404).
+fn glyph_text_node(
+    inline: &rinch_dom::node::InlineLayout,
+    rel_x: f32,
+    rel_y: f32,
+) -> Option<Option<u64>> {
+    let cluster = rinch_dom::text_query::glyph_cluster_in_inline(inline, rel_x, rel_y)?;
+    Some(
+        inline
+            .text_ranges
+            .iter()
+            .find(|r| !r.is_br && (r.flat_start..r.flat_end).contains(&cluster.start))
+            .map(|r| r.node_id),
+    )
+}
+
+/// Whether `node` takes pointer events: not `pointer-events: none`, and
+/// `visibility: visible`.
+fn takes_pointer(node: &rinch_dom::Node) -> bool {
+    use rinch_dom::computed_style::{PointerEventsValue, VisibilityValue};
+    node.computed_style.pointer_events != PointerEventsValue::None
+        && node.computed_style.visibility == VisibilityValue::Visible
+}
+
+/// Whether the point `(lx, ly)`, relative to IFC root `node`'s border-box
+/// origin and outside its box, is in the padding or border of one of its
+/// inline elements that takes pointer events (#2647). Chrome 157 hits such
+/// an element there: a padded span on a line near its block's edge reaches
+/// past the block. Not a box that clips: its overflow is not drawn.
+fn inline_box_outside(
+    tree: &rinch_dom::NodeTree,
+    node: &rinch_dom::Node,
+    lx: f32,
+    ly: f32,
+) -> bool {
+    let Some(inline) = node.text_layout.as_ref() else {
+        return false;
+    };
+    let (rel_x, rel_y) = ifc_point(node, lx, ly);
+    rinch_dom::paint::inline_element_at_where(
+        |id| tree.get(id),
+        inline,
+        rel_x,
+        rel_y,
+        takes_pointer,
+    )
+    .is_some()
+}
+
+/// The text node whose glyph is under the window point `(x, y)` in the IFC
+/// root `root_id`, if any: an IFC's text is hit as its root (its text nodes
+/// stretch over the whole line box and are skipped), and this says which of
+/// its inline elements the point is in. Where no glyph is, the inline
+/// element whose padding or border is under the point (#2618; its box where
+/// paint draws it, `rinch_dom::paint::inline_element_at`), as Chrome 157's
+/// `elementFromPoint` finds it.
+pub(crate) fn text_node_at(
+    tree: &rinch_dom::NodeTree,
+    root_id: u64,
+    x: f32,
+    y: f32,
+) -> Option<u64> {
+    let node = tree.get(root_id)?;
+    let inline = node.text_layout.as_ref()?;
+    let (lx, ly) = pointer_in_node(tree, root_id, x, y);
+    let (rel_x, rel_y) = ifc_point(node, lx, ly);
+    match glyph_text_node(inline, rel_x, rel_y) {
+        Some(text) => text,
+        // An inline element's padding or border (#2618).
+        None => rinch_dom::paint::inline_element_at(|id| tree.get(id), inline, rel_x, rel_y),
+    }
+}
+
+/// Where a press at `(x, y)` in IFC root `root_id` is delivered, as in
+/// Chrome 157: the text node under the glyphs, or, when the element around
+/// it takes no pointer events (`pointer-events: none`, or not visible), the
+/// nearest element above it that does; off the glyphs, the last inline
+/// element in document order that takes pointer events and whose padding or
+/// border is under the point (#2618). An element that takes none passes the
+/// point to one around it only where that one's box holds the point
+/// (#2647). `None` past the glyphs and those boxes (the root's own, then).
+pub(crate) fn event_target_at(
+    tree: &rinch_dom::NodeTree,
+    root_id: u64,
+    x: f32,
+    y: f32,
+) -> Option<u64> {
+    let node = tree.get(root_id)?;
+    let inline = node.text_layout.as_ref()?;
+    let (lx, ly) = pointer_in_node(tree, root_id, x, y);
+    let (rel_x, rel_y) = ifc_point(node, lx, ly);
+    let Some(text) = glyph_text_node(inline, rel_x, rel_y) else {
+        return rinch_dom::paint::inline_element_at_where(
+            |id| tree.get(id),
+            inline,
+            rel_x,
+            rel_y,
+            takes_pointer,
+        );
+    };
+    let target = text?;
+    let takes = |id: u64| tree.get(id).is_some_and(takes_pointer);
+    let mut element = tree.get(target)?.parent?;
+    if takes(element) {
+        return Some(target);
+    }
+    loop {
+        if element == root_id {
+            return Some(root_id);
+        }
+        element = tree.get(element)?.parent?;
+        if takes(element) {
+            return Some(element);
+        }
+    }
+}
+
+/// The element a pointer event targets, given `hit_test`'s answer `hit`
+/// and `target`, [`event_target_at`]'s refinement of it (else `hit`): the
+/// inline element under the point when `hit` is an IFC root (its glyphs or
+/// its padding and border, or the nearest element above it that takes
+/// pointer events), else `hit` itself. Never a text node: its parent
+/// element, as the DOM's `event.target` and `:hover` are an element (#2648).
+///
+/// `:hover`, `:active`, the cursor, `mouseenter`/`mouseleave`, the
+/// `data-onmouse*` handlers, `oncontextmenu`, `onwheel`, the `title`
+/// tooltip and the focus a press takes all start here
+/// (`RinchApp::shared_target`), where Chrome starts them; the click and drag
+/// walks start at `target` (`RinchApp::shared_event_target`).
+pub(crate) fn element_of_target(tree: &rinch_dom::NodeTree, hit: u64, target: u64) -> u64 {
+    match tree.get(target) {
+        Some(n) if n.is_text() => n.parent.unwrap_or(hit),
+        Some(_) => target,
+        None => hit,
+    }
+}
+
+/// Whether some element below `id` computes to `visibility: visible` (#843),
+/// i.e. whether a hidden `id`'s subtree can hold anything to hit. One memo with
+/// paint and the stacking collector, which skip the same subtrees (#2137):
+/// `rinch_dom::visibility::shows_below`.
+#[inline]
+fn shows_below(tree: &rinch_dom::NodeTree, id: rinch_dom::node::RawNodeId) -> bool {
+    rinch_dom::visibility::shows_below(tree, id)
 }
 
 /// The box a node is *painted* in, in layout pixels, shaped as the four
@@ -326,7 +1203,7 @@ fn hit_test_node(
 /// behave the same on both backends (#203).
 pub(crate) fn painted_element_box(
     tree: &rinch_dom::NodeTree,
-    node_id: usize,
+    node_id: u64,
 ) -> (f32, f32, f32, f32) {
     let r = rinch_dom::paint::painted_border_box(tree, node_id, 1.0);
     (
@@ -351,7 +1228,7 @@ pub(crate) fn painted_element_box(
 /// position and the caller's clamp is as good an answer as any).
 pub(crate) fn pointer_in_node(
     tree: &rinch_dom::NodeTree,
-    node_id: usize,
+    node_id: u64,
     x: f32,
     y: f32,
 ) -> (f32, f32) {
@@ -473,9 +1350,8 @@ pub(crate) fn pointer_on_scrollbar_thumb(tree: &rinch_dom::NodeTree, x: f32, y: 
     // same space the pointer is mapped into, so a scroller under a
     // `transform: scale()` answers about the thumb you can see (#203).
     let local = pointer_in_node(tree, hit.node_id, x, y);
-    let along = hit.axis.along(local.0, local.1) as f64;
-    let start = hit.track.thumb_start(scroll);
-    along >= start && along <= start + hit.track.thumb_len
+    hit.track
+        .thumb_contains(scroll, hit.axis.along(local.0, local.1) as f64)
 }
 
 /// Map a resize direction to the appropriate cursor style.
@@ -538,235 +1414,181 @@ pub(super) fn cursor_value_to_style(
 /// Only `overflow: scroll` and `overflow: auto` are considered scrollable.
 /// `overflow: hidden` clips content but should NOT consume mousewheel events —
 /// the wheel should bubble up to the nearest actual scroll container.
-pub(crate) fn find_scroll_container(tree: &rinch_dom::NodeTree, start: usize) -> Option<usize> {
-    use rinch_dom::computed_style::OverflowValue;
-
+///
+/// Test-only since the review of #2084: the wheel picks its container with
+/// [`wheel_scroll_target`] (the nearest that can still move toward it, not the
+/// nearest that overflows). The `overflows` tests (#769, #474) still ask this.
+#[cfg(test)]
+pub(crate) fn find_scroll_container(tree: &rinch_dom::NodeTree, start: u64) -> Option<u64> {
     let mut current = Some(start);
     while let Some(node_id) = current {
         let node = tree.get(node_id)?;
-        let overflow_y = &node.computed_style.overflow_y;
-        match overflow_y {
-            OverflowValue::Scroll | OverflowValue::Auto => {
-                let content_h = compute_content_height(tree, node_id);
-                if content_h > node.layout.height as f64 {
-                    return Some(node_id);
-                }
-            }
-            _ => {}
+        if rinch_dom::paint::scrollbar::overflows(tree, node_id, ScrollbarAxis::Vertical) {
+            return Some(node_id);
         }
         current = node.parent;
     }
     // Fall back to body if content overflows
-    let body = tree.get(tree.body_id)?;
-    let content_h = compute_content_height(tree, tree.body_id);
-    if content_h > body.layout.height as f64 {
+    tree.get(tree.body_id)?;
+    if rinch_dom::paint::scrollbar::overflows(tree, tree.body_id, ScrollbarAxis::Vertical) {
         return Some(tree.body_id);
     }
     None
 }
 
-/// Compute the total content height of a node from its children's layout bounds.
+/// The scroller a Page Up / Page Down in an editor moves (#2020): the nearest
+/// ancestor of `start` (or `start`) that overflows vertically and that no
+/// `lock_scroll` overlay locks out ([`rinch_dom::NodeTree::scroll_locked_out`],
+/// the wheel's and drag auto-scroll's rule) — else the body, on the same
+/// terms.
 ///
-/// Delegates to [`rinch_dom::paint::scrollbar::content_extents`] so this and
-/// the paint pass cannot disagree about what "content" means (#400).
-pub(crate) fn compute_content_height(tree: &rinch_dom::NodeTree, node_id: usize) -> f64 {
-    rinch_dom::paint::scrollbar::content_extents(tree, node_id).1
+/// The walk stops at a `position: fixed` box (checked itself first): the
+/// viewport holds it, so no scroller outside it moves it, and paging one would
+/// scroll the page behind a modal and leave the caret where it was. Then
+/// nothing scrolls (`None`).
+#[cfg(feature = "windowing")]
+pub(crate) fn page_scroller(tree: &rinch_dom::NodeTree, start: u64) -> Option<u64> {
+    let usable = |id: u64| {
+        rinch_dom::paint::scrollbar::overflows(tree, id, ScrollbarAxis::Vertical)
+            && !tree.scroll_locked_out(id)
+    };
+    let mut current = Some(start);
+    while let Some(node_id) = current {
+        let node = tree.get(node_id)?;
+        if usable(node_id) {
+            return Some(node_id);
+        }
+        if node.box_position() == rinch_dom::computed_style::PositionValue::Fixed {
+            return None;
+        }
+        current = node.parent;
+    }
+    tree.get(tree.body_id)?;
+    usable(tree.body_id).then_some(tree.body_id)
 }
 
 /// Find the nearest ancestor (or self) that is a horizontal scroll container.
+///
+/// Test-only since the review of #2084, like [`find_scroll_container`].
+#[cfg(test)]
 pub(crate) fn find_horizontal_scroll_container(
     tree: &rinch_dom::NodeTree,
-    start: usize,
-) -> Option<usize> {
-    use rinch_dom::computed_style::OverflowValue;
-
+    start: u64,
+) -> Option<u64> {
     let mut current = Some(start);
     while let Some(node_id) = current {
         let node = tree.get(node_id)?;
-        let overflow_x = &node.computed_style.overflow_x;
-        match overflow_x {
-            OverflowValue::Scroll | OverflowValue::Auto => {
-                let content_w = compute_content_width(tree, node_id);
-                if content_w > node.layout.width as f64 {
-                    return Some(node_id);
-                }
-            }
-            _ => {}
+        if rinch_dom::paint::scrollbar::overflows(tree, node_id, ScrollbarAxis::Horizontal) {
+            return Some(node_id);
         }
         current = node.parent;
     }
     // Fall back to body if content overflows
-    let body = tree.get(tree.body_id)?;
-    let content_w = compute_content_width(tree, tree.body_id);
-    if content_w > body.layout.width as f64 {
+    tree.get(tree.body_id)?;
+    if rinch_dom::paint::scrollbar::overflows(tree, tree.body_id, ScrollbarAxis::Horizontal) {
         return Some(tree.body_id);
     }
     None
+}
+
+/// The one container a wheel of `(dx, dy)` (the DOM's signs) at `(x, y)` over
+/// `hit` scrolls: the nearest of `hit` and its ancestors, then the body, that
+/// can still move toward the wheel
+/// ([`rinch_dom::paint::scrollbar::can_scroll_toward`], which takes in
+/// `lock_scroll`). The whole wheel goes to it: a diagonal wheel over a strip
+/// that scrolls only sideways moves the strip and drops the rest, as Chrome
+/// and Firefox do — it is not split into one container per axis.
+///
+/// A container at its end in that direction is passed over, so the wheel
+/// chains to the one around it, as a browser does for a new gesture.
+///
+/// Only when nothing on that walk **overflows** on an axis the wheel moves on
+/// (the hit is in another branch than its scroller: an absolutely positioned
+/// overlay, a `position: fixed` modal's backdrop) is the container found
+/// geometrically at the point (`find_scroll_container_at_point` and its
+/// horizontal twin). A walk that met a container which could not move —
+/// at its end, or locked out — does not fall back, so a locked page behind a
+/// modal is not reached around the lock.
+pub(crate) fn wheel_scroll_target(
+    tree: &rinch_dom::NodeTree,
+    hit: u64,
+    x: f32,
+    y: f32,
+    dx: f64,
+    dy: f64,
+) -> Option<u64> {
+    use rinch_dom::paint::scrollbar::{can_scroll_toward, overflows};
+    let overflows_on_wheel = |id: u64| {
+        (dy != 0.0 && overflows(tree, id, ScrollbarAxis::Vertical))
+            || (dx != 0.0 && overflows(tree, id, ScrollbarAxis::Horizontal))
+    };
+    let mut met = false;
+    let chain = std::iter::successors(Some(hit), |&id| tree.get(id).and_then(|n| n.parent))
+        .chain(tree.get(tree.body_id).map(|_| tree.body_id));
+    for id in chain {
+        if tree.get(id).is_none() {
+            continue;
+        }
+        if can_scroll_toward(tree, id, dx, dy) {
+            return Some(id);
+        }
+        met |= overflows_on_wheel(id);
+    }
+    if met {
+        return None;
+    }
+    let vertical = (dy != 0.0)
+        .then(|| find_scroll_container_at_point(tree, x, y))
+        .flatten();
+    let horizontal = (dx != 0.0)
+        .then(|| find_horizontal_scroll_container_at_point(tree, x, y))
+        .flatten();
+    [vertical, horizontal]
+        .into_iter()
+        .flatten()
+        .find(|&id| can_scroll_toward(tree, id, dx, dy))
 }
 
 /// Find a vertical scroll container at (x, y) by geometric search.
 ///
 /// When the hit-tested node lives in a different DOM branch from the scroll
 /// container (e.g., an absolutely-positioned overlay sibling), the parent-chain
-/// walk in `find_scroll_container` fails. This function walks the tree from the
-/// body, looking for the deepest scroll container whose *painted* bounds
-/// contain the point — the same descent `hit_test` makes, via [`descend`], so a
-/// scroller under a CSS transform or inside a `position: fixed` overlay is
-/// found where the wheel pointer actually is (#203). Picking the wrong
-/// container here is silent: the wheel scrolls something else.
+/// walk in `find_scroll_container` fails. This asks for the topmost scroll
+/// container painted under the point that overflows vertically, passing over
+/// whatever is painted above it: the hit test's own walk ([`ScrollerSearch`]),
+/// so a scroller under a CSS transform or inside a `position: fixed` overlay is
+/// found where the wheel pointer actually is (#203), and one that paint clips,
+/// masks or hides there, or that takes no pointer events, is not (#2684).
+/// Picking the wrong container here is silent: the wheel scrolls something
+/// else.
 pub(crate) fn find_scroll_container_at_point(
     tree: &rinch_dom::NodeTree,
     x: f32,
     y: f32,
-) -> Option<usize> {
-    find_scroll_container_at_point_recursive(tree, tree.body_id, 0.0, 0.0, x, y, x, y)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn find_scroll_container_at_point_recursive(
-    tree: &rinch_dom::NodeTree,
-    node_id: usize,
-    offset_x: f32,
-    offset_y: f32,
-    x: f32,
-    y: f32,
-    vx: f32,
-    vy: f32,
-) -> Option<usize> {
-    use rinch_dom::computed_style::OverflowValue;
-
-    let node = tree.get(node_id)?;
-    let Frame {
-        nx,
-        ny,
-        x,
-        y,
-        vx,
-        vy,
-    } = descend(tree, node, node_id, offset_x, offset_y, x, y, vx, vy)?;
-    let nw = node.layout.width;
-    let nh = node.layout.height;
-
-    let in_bounds = x >= nx && x <= nx + nw && y >= ny && y <= ny + nh;
-    if !in_bounds {
-        return None;
-    }
-
-    let sx = node.scroll_offset.0 as f32;
-    let sy = node.scroll_offset.1 as f32;
-
-    // Check children first (deepest match wins)
-    for &child_id in rinch_dom::RinchDocument::box_tree_children(&tree.nodes, node.id)
-        .iter()
-        .rev()
-    {
-        if let Some(found) =
-            find_scroll_container_at_point_recursive(tree, child_id, nx - sx, ny - sy, x, y, vx, vy)
-        {
-            return Some(found);
-        }
-    }
-
-    // Check this node
-    let overflow_y = &node.computed_style.overflow_y;
-    if matches!(overflow_y, OverflowValue::Scroll | OverflowValue::Auto) {
-        let content_h = compute_content_height(tree, node_id);
-        if content_h > node.layout.height as f64 {
-            return Some(node_id);
-        }
-    }
-
-    None
+) -> Option<u64> {
+    let probe = ScrollerSearch(ScrollbarAxis::Vertical);
+    hit_test_node(&probe, tree, tree.body_id, 0.0, 0.0, x, y, x, y, None)
 }
 
 /// Find a horizontal scroll container at (x, y) by geometric search.
 ///
-/// The horizontal twin of [`find_scroll_container_at_point`], sharing its
-/// [`descend`] geometry.
+/// The horizontal twin of [`find_scroll_container_at_point`].
 pub(crate) fn find_horizontal_scroll_container_at_point(
     tree: &rinch_dom::NodeTree,
     x: f32,
     y: f32,
-) -> Option<usize> {
-    find_hscroll_container_at_point_recursive(tree, tree.body_id, 0.0, 0.0, x, y, x, y)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn find_hscroll_container_at_point_recursive(
-    tree: &rinch_dom::NodeTree,
-    node_id: usize,
-    offset_x: f32,
-    offset_y: f32,
-    x: f32,
-    y: f32,
-    vx: f32,
-    vy: f32,
-) -> Option<usize> {
-    use rinch_dom::computed_style::OverflowValue;
-
-    let node = tree.get(node_id)?;
-    let Frame {
-        nx,
-        ny,
-        x,
-        y,
-        vx,
-        vy,
-    } = descend(tree, node, node_id, offset_x, offset_y, x, y, vx, vy)?;
-    let nw = node.layout.width;
-    let nh = node.layout.height;
-
-    let in_bounds = x >= nx && x <= nx + nw && y >= ny && y <= ny + nh;
-    if !in_bounds {
-        return None;
-    }
-
-    let sx = node.scroll_offset.0 as f32;
-    let sy = node.scroll_offset.1 as f32;
-
-    for &child_id in rinch_dom::RinchDocument::box_tree_children(&tree.nodes, node.id)
-        .iter()
-        .rev()
-    {
-        if let Some(found) = find_hscroll_container_at_point_recursive(
-            tree,
-            child_id,
-            nx - sx,
-            ny - sy,
-            x,
-            y,
-            vx,
-            vy,
-        ) {
-            return Some(found);
-        }
-    }
-
-    let overflow_x = &node.computed_style.overflow_x;
-    if matches!(overflow_x, OverflowValue::Scroll | OverflowValue::Auto) {
-        let content_w = compute_content_width(tree, node_id);
-        if content_w > node.layout.width as f64 {
-            return Some(node_id);
-        }
-    }
-
-    None
-}
-
-/// Compute the total content width of a node from its children's layout bounds.
-///
-/// The horizontal twin of [`compute_content_height`], and the same delegation:
-/// one definition, so a padded container cannot decide it overflows when paint
-/// says it does not.
-pub(crate) fn compute_content_width(tree: &rinch_dom::NodeTree, node_id: usize) -> f64 {
-    rinch_dom::paint::scrollbar::content_extents(tree, node_id).0
+) -> Option<u64> {
+    let probe = ScrollerSearch(ScrollbarAxis::Horizontal);
+    hit_test_node(&probe, tree, tree.body_id, 0.0, 0.0, x, y, x, y, None)
 }
 
 /// The width of the invisible strip along a container's edge that counts as
-/// its scrollbar for hit-testing — deliberately wider than the 6px thumb the
-/// paint pass draws, so the bar is easy to grab. Both axes use it, so the
-/// corner the two strips would share is a square of this side.
-pub(crate) const SCROLLBAR_HIT_THICKNESS: f32 = 16.0;
+/// its scrollbar for hit-testing — [`rinch_dom::paint::scrollbar::HIT_THICKNESS`],
+/// which is where it is defined, beside the painted geometry it has to agree
+/// with (#444). Only tests name it; the strips come from
+/// [`rinch_dom::paint::scrollbar::Scrollbars::hit_strip`].
+#[cfg(test)]
+pub(crate) const SCROLLBAR_HIT_THICKNESS: f32 = rinch_dom::paint::scrollbar::HIT_THICKNESS as f32;
 
 /// A scrollbar the pointer is over.
 ///
@@ -783,7 +1605,7 @@ pub(crate) const SCROLLBAR_HIT_THICKNESS: f32 = 16.0;
 /// works in device pixels.
 pub(crate) struct ScrollbarHit {
     /// The scroll container whose bar was hit.
-    pub node_id: usize,
+    pub node_id: u64,
     /// Which of its two bars.
     pub axis: ScrollAxis,
     /// That bar's geometry, in the container's own space — the *paint pass's*
@@ -794,6 +1616,20 @@ pub(crate) struct ScrollbarHit {
 
 /// Check if a point (x, y) hits a scrollbar.
 ///
+/// **Only a bar that is the topmost thing painted at the point** (#1727), as
+/// in Chrome: the search is the hit test's own walk ([`BarSearch`]), which
+/// tries each scroll container's bars where paint draws them — a container's
+/// own after everything it draws itself, a deferred one right after its last
+/// contained entry in the enclosing sequence (#1717). So a modal backdrop, a
+/// popover, a fixed header or a later positioned sibling drawn over a bar
+/// takes the press, while a positioned or `z-index` child under the bar (an
+/// `Editor`, whose sheet makes it `relative; z-index: 0`) does not. Being that
+/// walk, it agrees with `hit_test` on what reaches the point: a scroller
+/// standing past an ancestor's box that does not clip is reached (#2678,
+/// #1441), and one past a clip on its containing-block chain, a masked
+/// ancestor's box, or hidden or `pointer-events: none` is not (#2684); and it
+/// costs what a hit test costs, pruned by the same extents.
+///
 /// The strips are tested in the container's **own** space, which is where the
 /// paint pass draws the thumbs — it composes `node_transform` before stroking
 /// them — so a scroller inside a `transform: scale()` or `translate()` is
@@ -803,7 +1639,7 @@ pub(crate) struct ScrollbarHit {
 /// the same mapping.
 ///
 /// **A bar a scroll lock has shut out is not here** (#474): while a `lock_scroll`
-/// overlay is open, the page's own bar answers `None` and the overlay's answers
+/// overlay is open, the page's own bar is passed over and the overlay's answers
 /// normally. Gating in this one function rather than at the press site keeps the
 /// two readers agreeing — [`pointer_on_scrollbar_thumb`] arbitrates the
 /// borderless-window resize edge against this answer, so a bar that cannot be
@@ -813,116 +1649,68 @@ pub(crate) struct ScrollbarHit {
 /// page's thumb is visible and inert. That is the deliberate half of the
 /// divergence the guide documents — desktop suppresses the scroll, web
 /// suppresses the scrollbar.
+///
+/// The strips, and the corner neither claims, come from the same module as
+/// the painted tracks (#444): where both bars are present their strips would
+/// overlap in a square at the far end and one would silently win the click,
+/// so each stops at it and the corner falls through to ordinary click
+/// handling on the container.
 pub(crate) fn find_scrollbar_hit(
     tree: &rinch_dom::NodeTree,
     x: f32,
     y: f32,
 ) -> Option<ScrollbarHit> {
-    let hit = find_scrollbar_hit_node(tree, tree.body_id, 0.0, 0.0, x, y, x, y)?;
-    (!tree.scroll_locked_out(hit.node_id)).then_some(hit)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn find_scrollbar_hit_node(
-    tree: &rinch_dom::NodeTree,
-    node_id: usize,
-    offset_x: f32,
-    offset_y: f32,
-    x: f32,
-    y: f32,
-    vx: f32,
-    vy: f32,
-) -> Option<ScrollbarHit> {
-    let node = tree.get(node_id)?;
-
-    // Skip hidden subtrees
-    if matches!(
-        node.computed_style.visibility,
-        rinch_dom::computed_style::VisibilityValue::Hidden
-            | rinch_dom::computed_style::VisibilityValue::Collapse
-    ) {
-        return None;
-    }
-
-    let Frame {
-        nx,
-        ny,
-        x,
-        y,
-        vx,
-        vy,
-    } = descend(tree, node, node_id, offset_x, offset_y, x, y, vx, vy)?;
-    let nw = node.layout.width;
-    let nh = node.layout.height;
-
-    let point_in_bounds = x >= nx && x <= nx + nw && y >= ny && y <= ny + nh;
-    if !point_in_bounds {
-        return None;
-    }
-
-    let sx = node.scroll_offset.0 as f32;
-    let sy = node.scroll_offset.1 as f32;
-    let children: Vec<_> =
-        rinch_dom::RinchDocument::box_tree_children(&tree.nodes, node.id).into_owned();
-    for &child_id in children.iter().rev() {
-        if let Some(hit) = find_scrollbar_hit_node(tree, child_id, nx - sx, ny - sy, x, y, vx, vy) {
-            return Some(hit);
-        }
-    }
-
-    // Which bars exist, and where they are: the paint pass's own computation,
-    // asked for at scale 1 because these coordinates are logical (#400). Cheap
-    // for an ordinary node in the recursion — `scrollbars` returns after two
-    // enum checks when neither axis scrolls, without walking children.
+    let search = BarSearch::default();
+    hit_test_node(&search, tree, tree.body_id, 0.0, 0.0, x, y, x, y, None);
+    let (node_id, axis) = search.found.get()?;
+    // The track the walk found the strip of, as paint computes it (#400).
     let bars = rinch_dom::paint::scrollbar::scrollbars(tree, node_id, 1.0);
-    let (vertical, horizontal) = (bars.vertical, bars.horizontal);
-
-    // The corner. Where both bars are present their strips would overlap in a
-    // square at the far end, and one of them would silently win the click.
-    // Neither claims it: each strip stops short by the other's thickness, so
-    // the corner falls through to ordinary click handling on the container.
-    // The paint pass shortens both tracks the same way, so no thumb is ever
-    // drawn in a square that cannot be grabbed.
-    let t = SCROLLBAR_HIT_THICKNESS;
-    let v_end = if horizontal.is_some() {
-        ny + nh - t
-    } else {
-        ny + nh
-    };
-    let h_end = if vertical.is_some() {
-        nx + nw - t
-    } else {
-        nx + nw
-    };
-
-    if let Some(track) = vertical {
-        let scrollbar_left = nx + nw - t;
-        if x >= scrollbar_left && x <= nx + nw && y >= ny && y <= v_end {
-            return Some(ScrollbarHit {
-                node_id,
-                axis: ScrollAxis::Vertical,
-                track,
-            });
-        }
-    }
-
-    if let Some(track) = horizontal {
-        let scrollbar_top = ny + nh - t;
-        if y >= scrollbar_top && y <= ny + nh && x >= nx && x <= h_end {
-            return Some(ScrollbarHit {
-                node_id,
-                axis: ScrollAxis::Horizontal,
-                track,
-            });
-        }
-    }
-
-    None
+    let track = bars.axis(match axis {
+        ScrollAxis::Vertical => ScrollbarAxis::Vertical,
+        ScrollAxis::Horizontal => ScrollbarAxis::Horizontal,
+    })?;
+    Some(ScrollbarHit {
+        node_id,
+        axis,
+        track,
+    })
 }
 
 #[cfg(test)]
+#[path = "hit_test_prune_tests.rs"]
+mod prune_tests;
+
+#[cfg(test)]
+#[path = "scrollbar_paint_order_1727_tests.rs"]
+mod scrollbar_paint_order_1727_tests;
+
+#[cfg(test)]
+#[path = "hidden_ancestor_hit_843_tests.rs"]
+mod hidden_ancestor_hit_843_tests;
+
+#[cfg(test)]
+#[path = "relative_inline_hit_2346_tests.rs"]
+mod relative_inline_hit_2346_tests;
+
+#[cfg(test)]
+#[path = "inline_box_hit_2618_tests.rs"]
+mod inline_box_hit_2618_tests;
+
+#[cfg(test)]
+#[path = "inline_box_hit_2647_tests.rs"]
+mod inline_box_hit_2647_tests;
+
+#[cfg(test)]
+#[path = "fixed_escape_hit_549_tests.rs"]
+mod fixed_escape_hit_549_tests;
+
+#[cfg(test)]
+#[path = "absolute_escape_hit_2815_tests.rs"]
+mod absolute_escape_hit_2815_tests;
+
+#[cfg(test)]
 mod tests {
-    use super::hit_test;
+    use super::{flow_extent, hit_test};
     use rinch_core::dom::{DomDocument, NodeId};
     use rinch_dom::RinchDocument;
 
@@ -936,7 +1724,7 @@ mod tests {
     /// the answer. Do not "fix" it to call `painted_element_box`: it exists
     /// precisely to disagree with it. (`paint::tests::untransformed_origin`
     /// serves the same purpose in rinch-dom.)
-    fn abs_origin(doc: &RinchDocument, node_id: usize) -> (f32, f32) {
+    fn abs_origin(doc: &RinchDocument, node_id: u64) -> (f32, f32) {
         let (mut x, mut y) = (0.0f32, 0.0f32);
         let body = doc.body().0;
         let mut cur = Some(node_id);
@@ -950,6 +1738,161 @@ mod tests {
             cur = n.parent;
         }
         (x, y)
+    }
+
+    /// #536: paint and hit testing must agree on which box a clipping
+    /// container clips to. The container's own border strip is drawn, never
+    /// clipped, and (since this fix) never reachable by an overflowing
+    /// child's content either — so a click there must resolve to the
+    /// container, not fall through to clipped content that happens to still
+    /// be geometrically under the border-box point.
+    ///
+    /// The mutant this kills: reverting `check_children`'s bounds test from
+    /// the padding box back to the plain border box (`hit_test_node`'s
+    /// pre-#536 shape) makes this click descend into the overflowing child —
+    /// whose own border box covers the whole container including the border
+    /// strip — and return the child's id instead of the container's.
+    #[test]
+    fn a_click_on_a_clipping_containers_own_border_hits_the_container_not_overflowing_content() {
+        let mut doc = RinchDocument::new();
+        let body = doc.body();
+        let container = doc.create_element("div");
+        doc.set_attribute(
+            container,
+            "style",
+            "box-sizing: border-box; width: 100px; height: 100px; border: 10px solid blue; overflow: hidden",
+        );
+        doc.append_child(body, container);
+        let child = doc.create_element("div");
+        doc.set_attribute(child, "style", "width: 300px; height: 300px");
+        doc.append_child(container, child);
+        doc.resolve_layout(800.0, 600.0);
+
+        // (95, 60): inside the border box, inside the right border strip,
+        // outside the padding box — the point #536's issue measured as
+        // visually red (the child) against a browser's blue (the border).
+        assert_eq!(
+            hit_test(&doc.tree, 95.0, 60.0),
+            Some(container.0),
+            "a click on the right border strip must hit the container"
+        );
+        assert_eq!(
+            hit_test(&doc.tree, 60.0, 95.0),
+            Some(container.0),
+            "...and the bottom border strip"
+        );
+        // Sanity: well inside the padding box, the child is still what's hit.
+        assert_eq!(
+            hit_test(&doc.tree, 50.0, 50.0),
+            Some(child.0),
+            "content area is unaffected — the child is still reachable there"
+        );
+    }
+
+    /// #1798 review: a masked box's overflowing child is not hit outside the
+    /// box's border box, as in Chrome 155 (`elementFromPoint` answers the
+    /// page there), but is hit inside it even where the mask is transparent.
+    #[test]
+    fn a_masked_boxs_overflow_is_not_hit_outside_its_border_box() {
+        let mut doc = RinchDocument::new();
+        let body = doc.body();
+        let m = doc.create_element("div");
+        doc.set_attribute(
+            m,
+            "style",
+            "position: absolute; left: 20px; top: 20px; width: 100px; height: 50px; \
+             mask-image: linear-gradient(90deg, #000 50%, transparent 50%)",
+        );
+        doc.append_child(body, m);
+        let child = doc.create_element("div");
+        doc.set_attribute(child, "style", "width: 300px; height: 100px");
+        doc.append_child(m, child);
+        doc.resolve_layout(400.0, 400.0);
+        assert_eq!(hit_test(&doc.tree, 30.0, 30.0), Some(child.0));
+        assert_eq!(hit_test(&doc.tree, 100.0, 30.0), Some(child.0));
+        assert_ne!(hit_test(&doc.tree, 200.0, 30.0), Some(child.0));
+        assert_ne!(hit_test(&doc.tree, 30.0, 90.0), Some(child.0));
+    }
+
+    /// #535: `check_children`'s bounds test is per axis. A container holding
+    /// `overflow-x: clip; overflow-y: visible` must still let a click reach an
+    /// overflowing child **below** it (the open axis), while a click to its
+    /// **right** (the clipping axis) still falls through to the body — paint
+    /// and hit testing have to agree on both halves of that, not just the one
+    /// #536 already covers (clipping on both axes at once).
+    ///
+    /// The mutant this kills: reverting `check_children` to the pre-#535 `!
+    /// node.clips_overflow() || <border-box-both-axes test>` shape makes the
+    /// vertical probe miss (it tests `y` against the container's own height
+    /// even though `overflow-y: visible` says not to) and return the body
+    /// instead of the child.
+    #[test]
+    fn a_click_past_an_open_axis_still_reaches_overflowing_content_but_the_clipped_axis_does_not() {
+        let mut doc = RinchDocument::new();
+        let body = doc.body();
+        let container = doc.create_element("div");
+        doc.set_attribute(
+            container,
+            "style",
+            "width: 100px; height: 100px; overflow-x: clip; overflow-y: visible",
+        );
+        doc.append_child(body, container);
+        let child = doc.create_element("div");
+        doc.set_attribute(child, "style", "width: 200px; height: 200px");
+        doc.append_child(container, child);
+        doc.resolve_layout(800.0, 600.0);
+
+        // (50, 150): inside the container's columns, below its rows — the
+        // open (y) axis's overhang. `overflow-y: visible` says this is
+        // reachable, as CSS paints it.
+        assert_eq!(
+            hit_test(&doc.tree, 50.0, 150.0),
+            Some(child.0),
+            "overflow-y: visible lets a click reach the vertical overhang"
+        );
+        // (150, 50): right of the container's columns — the clipping (x)
+        // axis's overhang. `overflow-x: clip` still cuts this, whatever y
+        // says, so the click falls through to the body.
+        assert_eq!(
+            hit_test(&doc.tree, 150.0, 50.0),
+            Some(body.0),
+            "overflow-x: clip still cuts the horizontal overhang"
+        );
+        // Sanity: inside the container's own box either way.
+        assert_eq!(hit_test(&doc.tree, 50.0, 50.0), Some(child.0));
+    }
+
+    /// [`a_click_past_an_open_axis_still_reaches_overflowing_content_but_the_clipped_axis_does_not`],
+    /// mirrored: `overflow-y: clip; overflow-x: visible` reaches its
+    /// *horizontal* overhang and still cuts its vertical one. Pins that the
+    /// per-axis fix is symmetric and not an `x`-only special case.
+    #[test]
+    fn a_click_past_an_open_x_axis_still_reaches_overflowing_content_but_clipped_y_does_not() {
+        let mut doc = RinchDocument::new();
+        let body = doc.body();
+        let container = doc.create_element("div");
+        doc.set_attribute(
+            container,
+            "style",
+            "width: 100px; height: 100px; overflow-y: clip; overflow-x: visible",
+        );
+        doc.append_child(body, container);
+        let child = doc.create_element("div");
+        doc.set_attribute(child, "style", "width: 200px; height: 200px");
+        doc.append_child(container, child);
+        doc.resolve_layout(800.0, 600.0);
+
+        assert_eq!(
+            hit_test(&doc.tree, 150.0, 50.0),
+            Some(child.0),
+            "overflow-x: visible lets a click reach the horizontal overhang"
+        );
+        assert_eq!(
+            hit_test(&doc.tree, 50.0, 150.0),
+            Some(body.0),
+            "overflow-y: clip still cuts the vertical overhang"
+        );
+        assert_eq!(hit_test(&doc.tree, 50.0, 50.0), Some(child.0));
     }
 
     /// Regression (found while fixing #61): an inline-block button laid out in a
@@ -1396,14 +2339,46 @@ mod tests {
         );
     }
 
-    /// `position: fixed` inside a transformed ancestor. Per CSS a transform
-    /// makes a containing block for fixed descendants, but rinch models no
-    /// containment: `out_of_flow` answers "the viewport" for every fixed box and
-    /// `paint_children_with_stacking` paints a fixed entry with zeroed offsets
-    /// and the *body's* transform, whichever stacking context now owns it
-    /// (#545). So they render at their viewport box with no ancestor transform.
-    /// Hit testing mirrors paint — consistency beats spec here, and diverging is
-    /// the bug we are fixing. Containment is tracked with #386 and #415.
+    /// `backface-visibility: hidden` on a box whose own transform turns its
+    /// back to the viewer (#997): Chrome 153's `elementFromPoint` finds neither
+    /// it nor anything in it. The same box turned only 80° is hit.
+    #[test]
+    fn a_hidden_backface_subtree_is_unhittable() {
+        let (mut doc, container) = container_doc();
+        let turned = child_of(
+            &mut doc,
+            container,
+            "position: absolute; left: 100px; top: 100px; width: 100px; height: 40px; \
+             transform: rotateY(180deg); backface-visibility: hidden",
+        );
+        let inside = child_of(
+            &mut doc,
+            turned,
+            "width: 100px; height: 40px; transform: rotateY(180deg)",
+        );
+        let edge_on = child_of(
+            &mut doc,
+            container,
+            "position: absolute; left: 300px; top: 100px; width: 100px; height: 40px; \
+             transform: rotateY(80deg); backface-visibility: hidden",
+        );
+        doc.resolve_layout(800.0, 600.0);
+
+        for (x, y) in [(150.0, 120.0), (110.0, 105.0), (190.0, 135.0)] {
+            let hit = hit_test(&doc.tree, x, y);
+            assert_eq!(hit, Some(container.0), "({x}, {y}) falls through");
+            assert_ne!(hit, Some(inside.0));
+        }
+        assert_eq!(hit_test(&doc.tree, 350.0, 120.0), Some(edge_on.0));
+    }
+
+    /// `position: fixed` inside a transformed ancestor: the transform makes
+    /// the ancestor its containing block (#1372), so it is placed against the
+    /// ancestor and painted under its transform — and hit there, where paint
+    /// puts it. Chrome 151 (`elementFromPoint`): `(60, 70)` is the body,
+    /// `(260, 170)` the fixed box, whose box is `250,160,100,40`. (Before
+    /// #1372 rinch placed it at its viewport box, untransformed, in paint and
+    /// hit testing alike.)
     #[test]
     fn fixed_in_transformed_ancestor_is_hit_where_paint_puts_it() {
         let mut doc = RinchDocument::new();
@@ -1423,21 +2398,25 @@ mod tests {
         doc.resolve_layout(800.0, 600.0);
 
         assert_eq!(
-            hit_test(&doc.tree, 60.0, 70.0),
-            Some(fixed.0),
-            "the fixed box is hit at its viewport position, as paint draws it"
-        );
-        assert_ne!(
             hit_test(&doc.tree, 260.0, 170.0),
             Some(fixed.0),
-            "the ancestor's transform must not displace the fixed box's hit area"
+            "the fixed box is hit where the ancestor's transform carries it"
         );
+        assert_ne!(
+            hit_test(&doc.tree, 60.0, 70.0),
+            Some(fixed.0),
+            "and not at its insets in the viewport"
+        );
+        let r = rinch_dom::paint::painted_border_box(&doc.tree, fixed.0, 1.0);
+        assert_eq!((r.x0, r.y0, r.x1, r.y1), (250.0, 160.0, 350.0, 200.0));
     }
 
-    /// Pins the viewport-point re-seed at the body level. A transform on `body`
-    /// itself is the only thing that makes it do work: paint paints the hoisted
-    /// fixed entries with *body's* `node_transform`, so viewport space for a
-    /// fixed box is body's post-transform space, not the raw input point.
+    /// A transform on `body` and on an ancestor between: the ancestor contains
+    /// the fixed box (#1372), and both transforms carry it. Chrome 151, with
+    /// `body { margin: 0; transform: translate(40px, 30px) }`: the box is
+    /// `290,190,100,40`; `(140, 110)` — its inset box under the body's
+    /// translate alone, where rinch drew it before #1372 — and `(100, 80)` are
+    /// the body.
     #[test]
     fn body_transform_applies_to_a_hoisted_fixed_descendant() {
         let mut doc = RinchDocument::new();
@@ -1448,8 +2427,6 @@ mod tests {
             body,
             "position: relative; width: 400px; height: 300px; transform: translate(200px, 100px)",
         );
-        // Viewport box (50,60)-(150,100); painted at body's translate →
-        // (90,90)-(190,130). `outer`'s translate must not reach it.
         let fixed = child_of(
             &mut doc,
             outer,
@@ -1458,20 +2435,13 @@ mod tests {
         doc.resolve_layout(800.0, 600.0);
 
         assert_eq!(
-            hit_test(&doc.tree, 140.0, 110.0),
+            hit_test(&doc.tree, 300.0, 200.0),
             Some(fixed.0),
-            "the fixed box is hit at its viewport box shifted by body's transform"
+            "the fixed box is hit under both transforms"
         );
-        assert_ne!(
-            hit_test(&doc.tree, 100.0, 80.0),
-            Some(fixed.0),
-            "the un-shifted viewport box must not hit — body's transform does apply"
-        );
-        assert_ne!(
-            hit_test(&doc.tree, 290.0, 190.0),
-            Some(fixed.0),
-            "the transformed ancestor's own translate must still not reach the fixed box"
-        );
+        for (x, y) in [(140.0, 110.0), (100.0, 80.0)] {
+            assert_ne!(hit_test(&doc.tree, x, y), Some(fixed.0), "({x}, {y})");
+        }
     }
 
     /// Pins the `display: contents` half of the zero-size guard in `local_point`.
@@ -1548,6 +2518,86 @@ mod tests {
             Some(container.0),
             "where that transform would have put the child must miss"
         );
+    }
+
+    /// A `transform` on a plain inline span does not apply (#1080, CSS
+    /// Transforms 1 §1): Chrome 153 puts an `inline-block` inside
+    /// `span { transform: translateX(30px) }` exactly where it is with no
+    /// transform, so paint draws it there and hit testing must find it there.
+    /// Fails before #1080: the probe at the untranslated box missed and the
+    /// one 30px right of it hit.
+    #[test]
+    fn an_inline_spans_transform_does_not_move_its_inline_block_child() {
+        let (mut doc, container) = container_doc();
+        doc.set_attribute(
+            container,
+            "style",
+            "position: relative; width: 400px; height: 300px; font-size: 16px; line-height: 20px",
+        );
+        let span = doc.create_element("span");
+        doc.set_attribute(span, "style", "transform: translateX(30px)");
+        doc.append_child(container, span);
+        let ib = doc.create_element("span");
+        doc.set_attribute(
+            ib,
+            "style",
+            "display: inline-block; width: 20px; height: 10px",
+        );
+        doc.append_child(span, ib);
+        doc.resolve_layout(800.0, 600.0);
+        let (x, y) = rinch_dom::paint::compute_absolute_position(&doc.tree, ib.0, 1.0);
+        let (x, y) = (x as f32, y as f32);
+        assert!(
+            !doc.tree
+                .get(span.0)
+                .unwrap()
+                .computed_style
+                .transform
+                .is_identity,
+            "the test needs a real transform declared on the span"
+        );
+        assert_eq!(
+            hit_test(&doc.tree, x + 10.0, y + 5.0),
+            Some(ib.0),
+            "the inline-block is hit at its laid-out box"
+        );
+        assert_ne!(
+            hit_test(&doc.tree, x + 40.0, y + 5.0),
+            Some(ib.0),
+            "where the span's transform would have put it must miss"
+        );
+    }
+
+    /// The split-inline twin (#513: a block inside the transformed span, which
+    /// keeps a box of its own). Chrome 153: `elementFromPoint(10, 25)` is the
+    /// block and `(40, 25)` is the span — the transform moves nothing.
+    #[test]
+    fn a_split_inlines_transform_does_not_move_its_block_child() {
+        let mut doc = RinchDocument::new();
+        let body = doc.body();
+        doc.set_attribute(body, "style", "margin: 0");
+        let d = child_of(
+            &mut doc,
+            body,
+            "height: 80px; font-size: 16px; line-height: 20px",
+        );
+        let ab = doc.create_text("ab");
+        doc.append_child(d, ab);
+        let span = doc.create_element("span");
+        doc.set_attribute(span, "style", "transform: translateX(30px)");
+        doc.append_child(d, span);
+        let xy = doc.create_text("xy");
+        doc.append_child(span, xy);
+        let b = child_of(&mut doc, span, "width: 20px; height: 10px");
+        let zz = doc.create_text("zz");
+        doc.append_child(span, zz);
+        doc.resolve_layout(800.0, 600.0);
+        assert_eq!(
+            hit_test(&doc.tree, 10.0, 25.0),
+            Some(b.0),
+            "the block, in place"
+        );
+        assert_ne!(hit_test(&doc.tree, 40.0, 25.0), Some(b.0), "not 30px right");
     }
     // ── CSS 2.1 Appendix E step 8: positioned descendants with `z-index: auto`
     //
@@ -2088,6 +3138,143 @@ mod tests {
         );
     }
 
+    // ── #769: the wheel and the painted bar must agree about a padded or
+    // bordered container's overflow ──────────────────────────────────────
+    //
+    // `scrollbars()` compares the content extent against the container's
+    // **content** box (border box less its own padding and border);
+    // `find_scroll_container`/`find_horizontal_scroll_container` and their
+    // `_at_point` twins used to compare against the **border** box instead —
+    // strictly larger whenever there is padding or a border — so a container
+    // whose content overflowed the content box but not the border box got a
+    // painted, draggable bar the wheel routed straight past.
+
+    /// The exact #769 repro. `width: 200px; height: 100px; padding: 20px` has
+    /// a content box of 160x60; a 160x80 child overflows that content box
+    /// (80 > 60) but not the 100px border box (80 < 100) — the window the
+    /// border-box comparison missed entirely.
+    #[test]
+    fn a_padded_containers_overflow_matches_its_own_painted_bar() {
+        let mut doc = RinchDocument::new();
+        let body = doc.body();
+        let container = child_of(
+            &mut doc,
+            body,
+            "box-sizing: border-box; width: 200px; height: 100px; padding: 20px; overflow: auto",
+        );
+        let child = child_of(&mut doc, container, "width: 160px; height: 80px");
+        doc.resolve_layout(800.0, 600.0);
+
+        assert!(
+            rinch_dom::paint::scrollbar::scrollbars(&doc.tree, container.0, 1.0)
+                .vertical
+                .is_some(),
+            "positive control: the bar paints (content box 160x60, child 160x80)"
+        );
+        assert_eq!(
+            super::find_scroll_container(&doc.tree, child.0),
+            Some(container.0),
+            "the wheel must claim the container the bar is painted on, not \
+             fall through past it to the body"
+        );
+        assert_eq!(
+            super::find_scroll_container_at_point(&doc.tree, 10.0, 50.0),
+            Some(container.0),
+            "the geometric search must agree too"
+        );
+    }
+
+    /// The horizontal twin, same shape: `width: 100px; height: 200px;
+    /// padding: 20px` has a content box of 60x160; an 80px-wide child
+    /// overflows it (80 > 60) but not the 100px border box (80 < 100).
+    #[test]
+    fn a_padded_containers_horizontal_overflow_matches_its_own_painted_bar() {
+        let mut doc = RinchDocument::new();
+        let body = doc.body();
+        let container = child_of(
+            &mut doc,
+            body,
+            "box-sizing: border-box; width: 100px; height: 200px; padding: 20px; overflow-x: auto",
+        );
+        let child = child_of(&mut doc, container, "width: 80px; height: 160px");
+        doc.resolve_layout(800.0, 600.0);
+
+        assert!(
+            rinch_dom::paint::scrollbar::scrollbars(&doc.tree, container.0, 1.0)
+                .horizontal
+                .is_some(),
+            "positive control: the bar paints (content box 60x160, child 80px wide)"
+        );
+        assert_eq!(
+            super::find_horizontal_scroll_container(&doc.tree, child.0),
+            Some(container.0),
+            "the wheel must claim the container the bar is painted on"
+        );
+        assert_eq!(
+            super::find_horizontal_scroll_container_at_point(&doc.tree, 50.0, 10.0),
+            Some(container.0),
+            "the geometric search must agree too"
+        );
+    }
+
+    /// The reverse fixed point, off the mutant's blind spot: content that
+    /// fits **both** boxes must not scroll and must not paint a bar either —
+    /// a padded container is not a scroller just because it has padding.
+    #[test]
+    fn a_padded_container_whose_content_fits_both_boxes_does_not_scroll() {
+        let mut doc = RinchDocument::new();
+        let body = doc.body();
+        let container = child_of(
+            &mut doc,
+            body,
+            "box-sizing: border-box; width: 200px; height: 100px; padding: 20px; overflow: auto",
+        );
+        let child = child_of(&mut doc, container, "width: 160px; height: 60px");
+        doc.resolve_layout(800.0, 600.0);
+
+        assert!(
+            rinch_dom::paint::scrollbar::scrollbars(&doc.tree, container.0, 1.0)
+                .vertical
+                .is_none(),
+            "positive control: content fits the content box exactly, no bar"
+        );
+        assert_eq!(
+            super::find_scroll_container(&doc.tree, child.0),
+            None,
+            "nothing above the body scrolls, and this fixture's body does not overflow"
+        );
+    }
+
+    /// A padded `<body>` whose content overflows its content box but not the
+    /// viewport (its border box) must be the container the wheel scrolls,
+    /// exactly as `scrollbars()` paints its bar. The walk from a body child
+    /// meets the body as an ancestor, so this does **not** reach the
+    /// fallback onto `tree.body_id`; `padded_scroll_overflow_769_tests`'
+    /// `the_body_fallback_uses_the_content_box` (and its horizontal twin)
+    /// start at `<html>` for that.
+    #[test]
+    fn a_padded_bodys_overflow_matches_its_own_painted_bar() {
+        let mut doc = RinchDocument::new();
+        let body = doc.body();
+        doc.set_attribute(body, "style", "padding: 20px; overflow: auto");
+        // Viewport 800x600 -> content box 760x560. A 580px-tall child
+        // overflows that (580 > 560) but not the 600px border box (580 < 600).
+        let child = child_of(&mut doc, body, "width: 100%; height: 580px");
+        doc.resolve_layout(800.0, 600.0);
+
+        assert!(
+            rinch_dom::paint::scrollbar::scrollbars(&doc.tree, body.0, 1.0)
+                .vertical
+                .is_some(),
+            "positive control: the bar paints (content box 560px tall, child 580px)"
+        );
+        assert_eq!(
+            super::find_scroll_container(&doc.tree, child.0),
+            Some(body.0),
+            "the wheel must find the body the bar is painted on"
+        );
+    }
+
     /// A hoisted inline-block — `position: relative` in a padded IFC — is
     /// tapped where its IFC **paints** it: the root's content origin plus the
     /// parley position. Not one padding+border up-left at the plain border-box
@@ -2539,4 +3726,83 @@ mod tests {
             "a point outside the box does not tap it, got {off:?}"
         );
     }
+
+    /// #535 review, white-box: directly inspects the cached `flow_extent` for
+    /// a box clipping x alone (open y) before and after it is scrolled, to
+    /// prove `NodeTree::mark_scrolled`'s per-axis `extent_reads_scroll`
+    /// (`!clips_overflow_x() || !clips_overflow_y()`) actually drops the stale
+    /// cached extent rather than merely being plausible. Reading `hit_test`'s
+    /// final answer instead of `flow_extent` directly would not discriminate
+    /// here — the production hit-test walk has another, uncached route to the
+    /// right answer, so a caching bug can hide behind a correct final result.
+    ///
+    /// An ordinary (non-positioned) sibling spacer pushes the target child
+    /// down in normal flow, avoiding both margin-collapse-with-parent and the
+    /// absolute-hoist path (which `flow_extent` folds in through a different
+    /// route and never reaches here).
+    ///
+    /// The mutant this kills: reverting `mark_scrolled`'s
+    /// `extent_reads_scroll` to the pre-#535 `!node.clips_overflow()` (both
+    /// axes) leaves the cache believing this box's extent cannot depend on
+    /// its own scroll offset, so after scrolling back to 0 the second
+    /// `flow_extent` call returns the stale scrolled-to-300 value instead of
+    /// recomputing — `after` comes back `[0.0, -300.0, 100.0, 100.0]` instead
+    /// of `[0.0, 0.0, 100.0, 350.0]`.
+    #[test]
+    fn mark_scrolled_invalidates_flow_extent_for_a_box_clipping_only_one_axis() {
+        let mut doc = RinchDocument::new();
+        let body = doc.body();
+        let container = doc.create_element("div");
+        doc.set_attribute(
+            container,
+            "style",
+            "width: 100px; height: 100px; overflow-x: clip; overflow-y: visible;",
+        );
+        doc.append_child(body, container);
+        let spacer = doc.create_element("div");
+        doc.set_attribute(spacer, "style", "width: 1px; height: 300px;");
+        doc.append_child(container, spacer);
+        let child = doc.create_element("div");
+        doc.set_attribute(child, "style", "width: 50px; height: 50px;");
+        doc.append_child(container, child);
+        doc.resolve_layout(800.0, 600.0);
+
+        doc.set_scroll_top(container, 300.0);
+        let fits = flow_extent(&doc.tree, container.0);
+        assert_eq!(
+            fits,
+            [0.0, -300.0, 100.0, 100.0],
+            "max-y stays at the container's own 100 while scrolled to 300 \
+             (the child's bottom at 50 doesn't exceed it): {fits:?}"
+        );
+
+        doc.set_scroll_top(container, 0.0);
+        let after = flow_extent(&doc.tree, container.0);
+        assert_eq!(
+            after,
+            [0.0, 0.0, 100.0, 350.0],
+            "scrolling back must recompute the extent (open y axis), not \
+             reuse the stale scroll=300 value — if this fails, \
+             mark_scrolled did not invalidate the cache for this \
+             partially-clipping box: {after:?}"
+        );
+    }
 }
+
+#[cfg(test)]
+#[path = "hidden_ancestor_hit_review_2008_tests.rs"]
+mod review_2008_probe_tests;
+
+// Paints with the software painter, which `embed` alone does not build.
+#[cfg(all(test, software_shell))]
+#[path = "fixed_over_scroller_2038_tests.rs"]
+mod fixed_over_scroller_2038_tests;
+
+// Paints with the software painter, which `embed` alone does not build.
+#[cfg(all(test, software_shell))]
+#[path = "fixed_in_transform_1372_tests.rs"]
+mod fixed_in_transform_1372_tests;
+
+#[cfg(test)]
+#[path = "filter_hit_2719_tests.rs"]
+mod filter_hit_2719_tests;

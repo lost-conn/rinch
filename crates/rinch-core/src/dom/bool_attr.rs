@@ -40,11 +40,13 @@
 ///   `hidden="false"` hides. It fails exactly the way a boolean attribute
 ///   fails, so it is written the same way. (rinch honours it through
 ///   `.rinch-tabs__panel[hidden]`, a presence selector, so desktop agrees.)
-/// - **`data-disabled`**, **`data-nofocus`** and **`data-trap-focus`** are
-///   rinch's own boolean attributes, documented as "present unless the value is
-///   `false`" — desktop reads all three that way, and the web reads
-///   `data-nofocus` and `data-trap-focus` that way (it has no `data-disabled`
-///   reader at all). Writing them by presence makes a reactive binding correct
+/// - **`data-disabled`**, **`data-nofocus`**, **`data-trap-focus`**,
+///   **`data-backdrop`** and **`data-scroll-lock-exempt`** (issue #701) are
+///   rinch's own boolean attributes, documented as
+///   "present unless the value is `false`" — desktop reads all five that way,
+///   and the web reads `data-nofocus`, `data-trap-focus` and `data-backdrop`
+///   that way (it has no reader for the other two: the browser does not know
+///   `data-disabled`, and its scroll lock stops no inner scroller to exempt). Writing them by presence makes a reactive binding correct
 ///   by construction instead of correct by that tolerance.
 ///
 ///   `data-trap-focus` (issue #474) is the one that most needs it: it is
@@ -114,37 +116,49 @@ fn is_lowercase_boolean_attribute(name: &str) -> bool {
             | "data-disabled"
             | "data-nofocus"
             | "data-trap-focus"
+            | "data-backdrop"
+            | "data-scroll-lock-exempt"
     )
 }
 
 /// Whether `name` is a boolean attribute whose state the **browser** can move
 /// behind the app's back, so that the content attribute stops describing it.
 ///
-/// `checked` and `selected` are the whole set, and they are the two the web
-/// backend mirrors onto a live IDL property (`sync_presence_property`, issue
-/// #100). A browser sets a *dirty checkedness* / *dirty selectedness* flag on
-/// the first user toggle and from then on the content attribute is only the
-/// control's **default**: the box can read checked with no `checked` attribute
-/// anywhere, and `getAttribute` cannot tell.
+/// `checked` and `selected` are the original two, and with `muted` (issue
+/// #754) they are the three the web backend mirrors onto a live IDL property
+/// (`sync_presence_property`, issues #100 and #754). A browser sets a *dirty
+/// checkedness* / *dirty selectedness* flag on the first user toggle and from
+/// then on the content attribute is only the control's **default**: the box
+/// can read checked with no `checked` attribute anywhere, and `getAttribute`
+/// cannot tell. `muted` is the same shape from the very first frame rather
+/// than after a toggle — HTML gives its content attribute no dynamic effect at
+/// all, reading it only once at the media element's load algorithm to seed
+/// `defaultMuted` — and native media controls (a `<video controls>`'s own mute
+/// button) move `.muted` with no attribute write at all, same as a user's
+/// checkbox click.
 ///
 /// That is what [`super::NodeHandle::write_attribute`] consults. Its removal is
 /// otherwise guarded by "is the attribute already absent", which is a sound
 /// proxy for "is it already off" for every attribute whose whole state *is* the
-/// attribute — and a false one for these two on the web, where a user click
-/// left the property on and the attribute off, so a binding writing `false`
-/// wrote nothing and the control stayed checked (issue #687).
+/// attribute — and a false one for these three on the web, where a user click
+/// (or, for `muted`, the native controls) left the property on and the
+/// attribute off, so a binding writing `false` wrote nothing and the control
+/// stayed checked / muted (issue #687, and #754 for `muted`).
 ///
 /// Desktop has no such divergence: `:checked` (`stylo_impl.rs`) and `<option>`
-/// selectedness (`select.rs`) read the attribute and nothing else, and no
-/// desktop input path writes a raw `<input>`'s `checked`. The unguarded
-/// removal costs it nothing anyway — `RinchDocument::remove_attribute` returns
-/// early for an attribute the node does not carry.
+/// selectedness (`select.rs`) read the attribute and nothing else, no desktop
+/// input path writes a raw `<input>`'s `checked`, and desktop has no media
+/// element that reads `muted` at all. The unguarded removal costs it nothing
+/// anyway — `RinchDocument::remove_attribute` returns early for an attribute
+/// the node does not carry.
 ///
 /// `indeterminate` is deliberately **not** here: it is a property-only IDL flag
 /// with no content attribute at all, so it is not a boolean attribute either
 /// and `write_attribute` never maps it.
 pub fn is_presence_reflected_attribute(name: &str) -> bool {
-    name.eq_ignore_ascii_case("checked") || name.eq_ignore_ascii_case("selected")
+    name.eq_ignore_ascii_case("checked")
+        || name.eq_ignore_ascii_case("selected")
+        || name.eq_ignore_ascii_case("muted")
 }
 
 /// Truthiness for a value **being written into** a boolean attribute.
@@ -182,14 +196,17 @@ pub fn attr_is_truthy(value: &str) -> bool {
 
 /// Whether one of **rinch's own** `data-` boolean attributes is on.
 ///
-/// `data-disabled`, `data-nofocus` and `data-trap-focus` are rinch inventions,
+/// `data-disabled`, `data-nofocus`, `data-trap-focus`, `data-backdrop`
+/// (issue #1093) and `data-scroll-lock-exempt` (issue #701) are rinch inventions,
 /// not HTML, and rinch gives them an escape HTML has no equivalent of: present
 /// means on *unless* the value is the literal `false`, ASCII-case-insensitively.
-/// It is a rinch convention rather than a desktop quirk, and the latter two are
-/// what show that: desktop reads them through this function and the web through
+/// It is a rinch convention rather than a desktop quirk, and `data-nofocus`,
+/// `data-trap-focus` and `data-backdrop` are what show that: desktop reads them through this function and the web through
 /// `event_delegation.rs`'s `[data-nofocus]:not([data-nofocus="false" i])` and
-/// `[data-trap-focus]:not([data-trap-focus="false" i])`. (`data-disabled` has no
-/// web reader, so there is nothing on that side to agree or disagree with.)
+/// `[data-trap-focus]:not([data-trap-focus="false" i])`, and `data-backdrop`
+/// through this very function on both. (`data-disabled` and
+/// `data-scroll-lock-exempt` have no web reader, so there is nothing on that
+/// side to agree or disagree with.)
 ///
 /// The plain HTML `disabled` / `readonly` deliberately do **not** go through
 /// here: they are read by presence alone, the way a browser reads them (issue
@@ -258,11 +275,18 @@ mod tests {
         }
     }
 
-    /// The four deliberate additions, so removing one is a test failure rather
+    /// The six deliberate additions, so removing one is a test failure rather
     /// than a silent narrowing.
     #[test]
-    fn the_non_spec_additions_are_the_documented_four() {
-        for name in ["hidden", "data-disabled", "data-nofocus", "data-trap-focus"] {
+    fn the_non_spec_additions_are_the_documented_six() {
+        for name in [
+            "hidden",
+            "data-disabled",
+            "data-nofocus",
+            "data-trap-focus",
+            "data-backdrop",
+            "data-scroll-lock-exempt",
+        ] {
             assert!(
                 is_boolean_attribute(name),
                 "{name} must be written by presence"
@@ -300,18 +324,20 @@ mod tests {
         }
     }
 
-    /// The pair whose live state the browser can move on its own, and which
-    /// therefore cannot have its falsey write skipped (#687).
+    /// The trio whose live state the browser can move on its own, and which
+    /// therefore cannot have its falsey write skipped (#687, #754).
     ///
     /// Case-folded like every HTML attribute name (#688), and sampled off the
     /// fixed point: each accepted name is checked in a spelling that needs the
     /// fold, and beside a rejected neighbour. `indeterminate` is the pointed
-    /// rejection — it is the third member of the web backend's *reflected*
+    /// rejection — it is a fourth member of the web backend's *reflected*
     /// family, and the one with no content attribute at all, so it is not a
     /// boolean attribute and `write_attribute` never maps it.
     #[test]
-    fn the_presence_reflected_pair_is_checked_and_selected_in_any_case() {
-        for name in ["checked", "CHECKED", "Selected", "selected"] {
+    fn the_presence_reflected_trio_is_checked_selected_and_muted_in_any_case() {
+        for name in [
+            "checked", "CHECKED", "Selected", "selected", "muted", "MUTED",
+        ] {
             assert!(
                 is_presence_reflected_attribute(name),
                 "{name}'s live state can move without its attribute"

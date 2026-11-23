@@ -63,8 +63,33 @@ pub fn is_mark_active(state: &EditorState, mark_type: &MarkType) -> bool {
             .unwrap_or_else(|| marks_at(state, sel.from().0));
         marks.iter().any(|m| &m.typ == mark_type)
     } else {
-        range_has_mark(&state.doc, sel.from().0, sel.to().0, mark_type)
+        ranges_have_mark(state, mark_type)
     }
+}
+
+/// The selection's content ranges ([`Selection::ranges`](crate::Selection::ranges)):
+/// each selected cell's for a cell selection.
+fn sel_ranges(state: &EditorState) -> Vec<(usize, usize)> {
+    state
+        .selection
+        .ranges(&state.doc)
+        .into_iter()
+        .map(|(a, b)| (a.0, b.0))
+        .collect()
+}
+
+/// Whether any of the selection's ranges carries `mark_type`. Over a cell
+/// selection each selected cell is read as its own node, so asking costs in
+/// the selected cells, not the table (a toolbar asks for every mark).
+fn ranges_have_mark(state: &EditorState, mark_type: &MarkType) -> bool {
+    if let crate::selection::Selection::Cell(c) = &state.selection {
+        return crate::tables::selected_cells(&state.doc, c.anchor_cell.0, c.head_cell.0)
+            .iter()
+            .any(|(_, cell)| range_has_mark(cell, 0, cell.content_size(), mark_type));
+    }
+    sel_ranges(state)
+        .into_iter()
+        .any(|(from, to)| range_has_mark(&state.doc, from, to, mark_type))
 }
 
 /// The node type of the textblock at the selection head — drives the block-style
@@ -143,12 +168,15 @@ pub fn toggle_mark(mark_type: &'static str) -> Command {
                 tr.add_stored_mark(mark);
             }
         } else {
-            let (from, to) = (sel.from().0, sel.to().0);
+            // Mark steps move no position, so every range stays valid.
             let mark = Mark::simple(mt.clone());
-            if range_has_mark(&state.doc, from, to, &mt) {
-                tr.remove_mark(from, to, mark).ok()?;
-            } else {
-                tr.add_mark(from, to, mark).ok()?;
+            let remove = ranges_have_mark(state, &mt);
+            for (from, to) in sel_ranges(state) {
+                if remove {
+                    tr.remove_mark(from, to, mark.clone()).ok()?;
+                } else {
+                    tr.add_mark(from, to, mark.clone()).ok()?;
+                }
             }
         }
         Some(tr)
@@ -164,14 +192,16 @@ pub fn toggle_link(href: String) -> Command {
         if sel.is_empty() {
             return None;
         }
-        let (from, to) = (sel.from().0, sel.to().0);
         let mut tr = state.tr();
-        if range_has_mark(&state.doc, from, to, &mt) {
-            // Remove every link in the range, regardless of href.
-            remove_marks_of_type(&mut tr, &state.doc, from, to, &mt).ok()?;
-        } else {
-            let attrs = Attrs::from_iter([("href", crate::AttrValue::from(href.clone()))]);
-            tr.add_mark(from, to, Mark::new(mt.clone(), attrs)).ok()?;
+        let remove = ranges_have_mark(state, &mt);
+        for (from, to) in sel_ranges(state) {
+            if remove {
+                // Remove every link in the range, regardless of href.
+                remove_marks_of_type(&mut tr, &state.doc, from, to, &mt).ok()?;
+            } else {
+                let attrs = Attrs::from_iter([("href", crate::AttrValue::from(href.clone()))]);
+                tr.add_mark(from, to, Mark::new(mt.clone(), attrs)).ok()?;
+            }
         }
         Some(tr)
     })
@@ -181,13 +211,13 @@ pub fn toggle_link(href: String) -> Command {
 pub fn remove_link() -> Command {
     command_tr(|state| {
         let mt = state.schema().mark_type("link")?.clone();
-        let sel = &state.selection;
-        let (from, to) = (sel.from().0, sel.to().0);
-        if to <= from || !range_has_mark(&state.doc, from, to, &mt) {
+        if state.selection.is_empty() || !ranges_have_mark(state, &mt) {
             return None;
         }
         let mut tr = state.tr();
-        remove_marks_of_type(&mut tr, &state.doc, from, to, &mt).ok()?;
+        for (from, to) in sel_ranges(state) {
+            remove_marks_of_type(&mut tr, &state.doc, from, to, &mt).ok()?;
+        }
         Some(tr)
     })
 }
@@ -241,21 +271,27 @@ pub fn set_block_type(node_type: &'static str, attrs: Attrs) -> Command {
         if !ty.is_textblock() {
             return None;
         }
-        let (from, to) = (state.selection.from().0, state.selection.to().0);
+        let ranges = sel_ranges(state);
         let mut applies = false;
-        state
-            .doc
-            .nodes_between(from, to, &mut |node, _pos, _parent| {
-                if node.is_textblock() && !node.has_markup(&ty, &attrs) {
-                    applies = true;
-                }
-                true
-            });
+        for &(from, to) in &ranges {
+            state
+                .doc
+                .nodes_between(from, to, &mut |node, _pos, _parent| {
+                    if node.is_textblock() && !node.has_markup(&ty, &attrs) {
+                        applies = true;
+                    }
+                    true
+                });
+        }
         if !applies {
             return None;
         }
+        // A block-type change keeps every block's size, so the ranges hold.
         let mut tr = state.tr();
-        tr.set_block_type(from, to, ty, attrs.clone()).ok()?;
+        for (from, to) in ranges {
+            tr.set_block_type(from, to, ty.clone(), attrs.clone())
+                .ok()?;
+        }
         tr.doc_changed().then_some(tr)
     })
 }
@@ -655,22 +691,23 @@ fn build_set_text_align(state: &EditorState, align: &str) -> Option<Transaction>
     if !TEXT_ALIGN_VALUES.contains(&align) {
         return None;
     }
-    let (from, to) = (state.selection.from().0, state.selection.to().0);
     // `(position-before-block, current alignment)` for each alignable textblock.
     let mut targets: Vec<(usize, String)> = Vec::new();
-    state
-        .doc
-        .nodes_between(from, to, &mut |node, pos, _parent| {
-            if matches!(node.type_name(), "paragraph" | "heading") {
-                let cur = node
-                    .attrs()
-                    .get_str("text_align")
-                    .unwrap_or("left")
-                    .to_string();
-                targets.push((pos, cur));
-            }
-            true
-        });
+    for (from, to) in sel_ranges(state) {
+        state
+            .doc
+            .nodes_between(from, to, &mut |node, pos, _parent| {
+                if matches!(node.type_name(), "paragraph" | "heading") {
+                    let cur = node
+                        .attrs()
+                        .get_str("text_align")
+                        .unwrap_or("left")
+                        .to_string();
+                    targets.push((pos, cur));
+                }
+                true
+            });
+    }
     if targets.is_empty() {
         return None;
     }
@@ -699,7 +736,9 @@ fn build_set_text_align(state: &EditorState, align: &str) -> Option<Transaction>
 pub fn set_paragraph() -> Command {
     command_tr(|state| {
         let para_ty = state.schema().node_type("paragraph")?.clone();
-        let (from, to) = (state.selection.from().0, state.selection.to().0);
+        // Each selected cell's content for a cell selection. Every step below
+        // keeps positions (marks, block types and attrs change no size).
+        let ranges = sel_ranges(state);
         let mut tr = state.tr();
 
         // 1. Strip every inline mark over the selection. Mark steps don't shift
@@ -709,32 +748,38 @@ pub fn set_paragraph() -> Command {
         mark_names.sort();
         for name in &mark_names {
             if let Some(mt) = state.schema().mark_type(name) {
-                remove_marks_of_type(&mut tr, &state.doc, from, to, mt).ok()?;
+                for &(from, to) in &ranges {
+                    remove_marks_of_type(&mut tr, &state.doc, from, to, mt).ok()?;
+                }
             }
         }
 
         // 2. Convert the selected textblock(s) to plain paragraphs. `set_block_type`
         //    preserves block-boundary positions (same open/close token count).
-        let _ = tr.set_block_type(from, to, para_ty, Attrs::new());
+        for &(from, to) in &ranges {
+            let _ = tr.set_block_type(from, to, para_ty.clone(), Attrs::new());
+        }
 
         // 3. Reset the indent attribute to 0 and the alignment back to left on the
         //    (now-)paragraphs in range — but only where they aren't already at their
         //    defaults, so a plain paragraph stays a true no-op.
         let mut indent_targets: Vec<usize> = Vec::new();
         let mut align_targets: Vec<usize> = Vec::new();
-        state
-            .doc
-            .nodes_between(from, to, &mut |node, pos, _parent| {
-                if matches!(node.type_name(), "paragraph" | "heading") {
-                    if node.attrs().get_int("indent").unwrap_or(0) != 0 {
-                        indent_targets.push(pos);
+        for &(from, to) in &ranges {
+            state
+                .doc
+                .nodes_between(from, to, &mut |node, pos, _parent| {
+                    if matches!(node.type_name(), "paragraph" | "heading") {
+                        if node.attrs().get_int("indent").unwrap_or(0) != 0 {
+                            indent_targets.push(pos);
+                        }
+                        if node.attrs().get_str("text_align").unwrap_or("left") != "left" {
+                            align_targets.push(pos);
+                        }
                     }
-                    if node.attrs().get_str("text_align").unwrap_or("left") != "left" {
-                        align_targets.push(pos);
-                    }
-                }
-                true
-            });
+                    true
+                });
+        }
         for pos in indent_targets {
             let _ = tr.set_node_attr(pos, "indent", crate::AttrValue::Int(0));
         }
@@ -812,6 +857,13 @@ fn lift_blocks_to_top(tr: &mut Transaction) {
 
 /// Split the current textblock at the cursor (Enter). Deletes a non-empty
 /// selection first; at the end of a heading, the new block becomes a paragraph.
+///
+/// Refuses (`None`) when the cursor, after that delete, is not in a textblock:
+/// a caret at a gap between blocks (between a rule and a paragraph in a table
+/// cell, #1232; inside a table row) would otherwise split the node around the
+/// gap — the cell, leaving a ragged row. Enter puts a paragraph at such a gap
+/// instead ([`create_paragraph_near`]). A split never cuts an isolating node in
+/// any case ([`Transform::split`](crate::transform::Transform::split)).
 pub fn split_block() -> Command {
     command_tr(|state| {
         let mut tr = state.tr();
@@ -820,7 +872,7 @@ pub fn split_block() -> Command {
         }
         let pos = tr.selection().from().0;
         let r = tr.doc().resolve(Pos(pos)).ok()?;
-        if r.depth() < 1 {
+        if r.depth() < 1 || !r.parent().is_textblock() {
             return None;
         }
         let parent = r.parent();
@@ -895,10 +947,12 @@ pub fn lift_empty_block() -> Command {
             return None;
         }
         let r = state.doc.resolve(state.selection.from()).ok()?;
-        if r.parent().content().size() != 0 {
+        if !r.parent().is_textblock() || r.parent().content().size() != 0 {
             return None;
         }
         // Not the last child of its grandparent → split the grandparent before it.
+        // A table cell is never split (`Transform::split` refuses an isolating
+        // cut, #1232): the empty block is then split as any other, below.
         if r.depth() >= 2
             && r.after(r.depth()) != Some(r.end(r.depth() - 1))
             && let Some(before) = r.before(r.depth())
@@ -913,16 +967,57 @@ pub fn lift_empty_block() -> Command {
     })
 }
 
+/// Put an empty paragraph at a caret that is not in a textblock — a gap between
+/// two blocks, such as between a horizontal rule and a paragraph in a table cell —
+/// and move the caret into it. Port of ProseMirror's `createParagraphNear` for a
+/// collapsed text selection (a node selection is left to the rest of the Enter
+/// chain, which replaces the node). `None` when the caret is in a textblock, or
+/// when a paragraph is not valid content at the gap (inside a table row).
+pub fn create_paragraph_near() -> Command {
+    command_tr(|state| {
+        if !state.selection.is_text_cursor() {
+            return None;
+        }
+        let pos = state.selection.from().0;
+        let r = state.doc.resolve(Pos(pos)).ok()?;
+        if r.parent().is_textblock() {
+            return None;
+        }
+        let para = state
+            .schema()
+            .create_node("paragraph", Attrs::new(), Fragment::empty())
+            .ok()?;
+        let mut tr = state.tr();
+        tr.replace_with(pos, pos, Fragment::from_node(para)).ok()?;
+        tr.set_selection(crate::selection::Selection::cursor(Pos(pos + 1)));
+        Some(tr)
+    })
+}
+
 /// The Enter handler (`splitBlock` is the toolbar/programmatic name; Enter binds
-/// here): split a list item into a new item, else lift an empty block out of its
-/// wrapper, else split the current block.
+/// here): split a list item into a new item, else put a paragraph at a caret
+/// between blocks, else lift an empty block out of its wrapper, else split the
+/// current block. ProseMirror's base Enter chain, `newlineInCode` aside.
 pub fn split_block_or_list_item() -> Command {
     chain(vec![
         split_list_item("list_item"),
         split_list_item("task_item"),
+        create_paragraph_near(),
         lift_empty_block(),
         split_block(),
     ])
+}
+
+/// The transaction an insert starts from: over a cell selection, the
+/// selected cells cleared and the caret in the first of them, where the
+/// inserted node goes (prosemirror-tables' `CellSelection.replace`, as typing
+/// and paste over one do, #1847); otherwise a fresh transaction.
+fn insertion_tr(state: &EditorState) -> Option<Transaction> {
+    if matches!(state.selection, crate::selection::Selection::Cell(_)) {
+        table_ops::clear_cells(state)
+    } else {
+        Some(state.tr())
+    }
 }
 
 /// Insert a hard break at the cursor (Shift+Enter).
@@ -932,7 +1027,7 @@ pub fn insert_hard_break() -> Command {
             .schema()
             .create_node("hard_break", Attrs::new(), Fragment::empty())
             .ok()?;
-        let mut tr = state.tr();
+        let mut tr = insertion_tr(state)?;
         tr.replace_selection_with(hb).ok()?;
         Some(tr)
     })
@@ -945,7 +1040,7 @@ pub fn insert_horizontal_rule() -> Command {
             .schema()
             .create_node("horizontal_rule", Attrs::new(), Fragment::empty())
             .ok()?;
-        let mut tr = state.tr();
+        let mut tr = insertion_tr(state)?;
         tr.insert_block(hr).ok()?;
         Some(tr)
     })
@@ -987,7 +1082,7 @@ pub fn build_table(schema: &crate::Schema, rows: usize, cols: usize) -> Option<N
 pub fn insert_table(rows: usize, cols: usize) -> Command {
     command_tr(move |state| {
         let table = build_table(state.schema(), rows, cols)?;
-        let mut tr = state.tr();
+        let mut tr = insertion_tr(state)?;
         tr.insert_block(table).ok()?;
         Some(tr)
     })
@@ -1004,7 +1099,7 @@ pub fn insert_image(src: String, alt: String) -> Command {
             .schema()
             .create_node("image", attrs, Fragment::empty())
             .ok()?;
-        let mut tr = state.tr();
+        let mut tr = insertion_tr(state)?;
         tr.replace_selection_with(img).ok()?;
         Some(tr)
     })
@@ -1072,6 +1167,97 @@ fn find_cut_after(r: &ResolvedPos) -> Option<usize> {
     None
 }
 
+/// Whether a join across `cut` must not touch the node before it: an isolating
+/// node (a table cell), a table or a table row. ProseMirror's `deleteBarrier`
+/// neither joins nor wraps across an `isolating` node, and prosemirror-tables
+/// makes the table isolating; rinch's table is not (that would change paste and
+/// lift), so the table parts are named here. Joining two tables, or wrapping the
+/// block after a table into a new row of it, left a row with another cell count
+/// than the table's (#1232).
+///
+/// Only the node *before* the cut is asked. The node after it is the caret's
+/// own block for Backspace; for Delete a table after a block other than a table
+/// cannot be joined (its rows are not that block's content, so the step fails)
+/// and the lift that follows stops at the cell (`build_lift_after`'s floor).
+fn table_barrier(doc: &Node, cut: usize) -> bool {
+    let Ok(r) = doc.resolve(Pos(cut)) else {
+        return true;
+    };
+    r.node_before().is_some_and(|n| {
+        n.node_type().is_isolating() || crate::tables::is_table(&n) || crate::tables::is_row(&n)
+    })
+}
+
+/// Whether `node`'s last descendant down its last children is a textblock (PM
+/// `textblockAt(node, "end")`).
+fn ends_in_textblock(node: &Node) -> bool {
+    let mut n = node.clone();
+    loop {
+        if n.is_textblock() {
+            return true;
+        }
+        if n.is_leaf() || n.child_count() == 0 {
+            return false;
+        }
+        n = n.child(n.child_count() - 1).clone();
+    }
+}
+
+/// Backspace at the start of a block right after a table (`cut` from
+/// [`find_cut_before`]), ProseMirror's base keymap there (`joinBackward`'s
+/// empty-block branch, then `selectNodeBackward`): an empty block is deleted
+/// (with each ancestor it is the only child of, while that is not valid) and
+/// the caret goes to the end of the table's last textblock (the table is
+/// node-selected when it ends in no textblock); any other block leaves the
+/// document as it is and **selects the table**, so a second Backspace deletes it
+/// — the select-first rule rinch keeps next to an atom ([`select_atom_across`]).
+/// Nothing is joined into, wrapped into or lifted out past the table (#1232).
+/// `None` when the node before the cut is a row or a cell.
+fn backspace_after_table(state: &EditorState, r: &ResolvedPos, cut: usize) -> Option<Transaction> {
+    use crate::selection::{NodeSelection, Selection};
+    let table = state.doc.resolve(Pos(cut)).ok()?.node_before()?;
+    if !crate::tables::is_table(&table) {
+        return None;
+    }
+    let table_pos = cut - table.node_size();
+    let table_sel = || {
+        Selection::Node(NodeSelection {
+            anchor: Pos(table_pos),
+            head: Pos(cut),
+        })
+    };
+    if r.parent().is_textblock() && r.parent().content().size() == 0 {
+        let mut d = r.depth();
+        while d >= 1 {
+            let (Some(from), Some(to)) = (r.before(d), r.after(d)) else {
+                break;
+            };
+            let mut tr = state.tr();
+            if tr
+                .step(Box::new(ReplaceStep::new(from, to, crate::Slice::empty())))
+                .is_ok()
+                && tr.doc_changed()
+            {
+                // The deletion is after the table: `cut` and `table_pos` hold.
+                let sel = if ends_in_textblock(&table) {
+                    Selection::near(tr.doc(), Pos(cut), -1)
+                } else {
+                    table_sel()
+                };
+                tr.set_selection(sel);
+                return Some(tr);
+            }
+            if d == 1 || r.node(d - 1).child_count() > 1 {
+                break;
+            }
+            d -= 1;
+        }
+    }
+    let mut tr = state.tr();
+    tr.set_selection(table_sel());
+    Some(tr)
+}
+
 /// Lift the block that begins just after `cut` out of its wrapper (PM
 /// `deleteBarrier`'s lift path, used when a forward-Delete can't directly join
 /// across the barrier). Returns `None` if there is no liftable block there.
@@ -1083,7 +1269,13 @@ fn build_lift_after(state: &EditorState, cut: usize) -> Option<Transaction> {
     if range.depth == 0 {
         return None;
     }
-    for target in (0..range.depth).rev() {
+    // The isolating floor of [`build_lift`]: a block lifted out of a table cell
+    // split the table around it (#1232).
+    let floor = (1..=range.depth)
+        .filter(|&d| r_from.node(d).node_type().is_isolating())
+        .max()
+        .unwrap_or(0);
+    for target in (floor..range.depth).rev() {
         let mut tr = state.tr();
         if tr.lift(&range, target).is_ok() && tr.doc_changed() {
             return Some(tr);
@@ -1177,6 +1369,60 @@ fn wrap_into_before(state: &EditorState, cut: usize) -> Option<Transaction> {
     tr.doc_changed().then_some(tr)
 }
 
+/// Whether `node` is what Backspace or Delete beside it node-selects rather than
+/// joins with: a selectable leaf atom that is not text (an image, a horizontal
+/// rule, an `embed`).
+fn selectable_atom(node: &Node) -> bool {
+    !node.is_text() && node.is_leaf() && node.node_type().spec().selectable
+}
+
+/// Backspace at the start of the block after an atom (`backward`), or Delete at
+/// the end of the block before one, across `cut` (from [`find_cut_before`] /
+/// [`find_cut_after`]): **select** the atom, so the next press removes it. When the
+/// caret's block is empty and sits right beside the atom, that block is removed
+/// first. `None` when the node across the cut is not a [`selectable_atom`].
+///
+/// A decision, and deliberately **unlike ProseMirror**, whose base keymap runs
+/// `joinBackward` / `joinForward` before `selectNodeBackward` /
+/// `selectNodeForward`: those delete the atom in one press when the caret's block
+/// is not empty (and `joinForward` from an empty one too). An atom can be an
+/// `embed` holding an app's component and its state, so rinch selects it first —
+/// for every selectable atom alike (`tests/backspace_selects_atom.rs`).
+fn select_atom_across(
+    state: &EditorState,
+    r: &ResolvedPos,
+    cut: usize,
+    backward: bool,
+) -> Option<Transaction> {
+    let r_cut = state.doc.resolve(Pos(cut)).ok()?;
+    let atom = if backward {
+        r_cut.node_before()?
+    } else {
+        r_cut.node_after()?
+    };
+    if !selectable_atom(&atom) {
+        return None;
+    }
+    let atom_pos = if backward {
+        cut - atom.node_size()
+    } else {
+        cut
+    };
+    let mut tr = state.tr();
+    let depth = r.depth();
+    let beside = depth >= 1 && r_cut.depth() + 1 == depth;
+    if beside
+        && r.parent().content().size() == 0
+        && let (Some(from), Some(to)) = (r.before(depth), r.after(depth))
+    {
+        tr.delete(from, to).ok()?;
+    }
+    let atom_pos = tr.mapping().map(atom_pos, 1);
+    let sel = crate::selection::Selection::node_at(tr.doc(), Pos(atom_pos))?;
+    tr.set_selection(sel);
+    Some(tr)
+}
+
 /// Backspace: delete the selection, else the char before the cursor, else — at the
 /// start of a textblock — join onto the previous block, move into a preceding
 /// container, or lift this block out of its wrapper.
@@ -1186,13 +1432,17 @@ fn wrap_into_before(state: &EditorState, cut: usize) -> Option<Transaction> {
 /// undo group, never coalesced into typing); when it cannot join directly but the
 /// block before the cut is a **container** that can take this block (wrapped) — a
 /// paragraph after a list — it **moves the block in** as a new item
-/// ([`wrap_into_before`], the find-wrapping branch); and when it crosses a wrapper
+/// (`wrap_into_before`, the find-wrapping branch); and when it crosses a wrapper
 /// boundary from *inside* — a block at the start of a blockquote / list item — it
 /// **lifts** this block out of the wrapper, so a second Backspace then joins.
 ///
-/// Not ported (rare `deleteBarrier` tails): the content-move `ReplaceAround` (merge
-/// into the before-container's last textblock) and select-node-backward (atom
-/// delete) branches.
+/// An atom before the cut (a horizontal rule, an image, an `embed`) is
+/// **selected** instead (`select_atom_across`), so a second Backspace removes
+/// it; an empty block right after it goes in the same step. After a table,
+/// `backspace_after_table`: nothing is joined, wrapped or lifted.
+///
+/// Not ported (a rare `deleteBarrier` tail): the content-move `ReplaceAround`
+/// (merge into the before-container's last textblock).
 pub fn delete_char_backward() -> Command {
     command_tr(|state| {
         let sel = &state.selection;
@@ -1210,30 +1460,45 @@ pub fn delete_char_backward() -> Command {
         }
         let r = state.doc.resolve(Pos(pos)).ok()?;
         if r.parent_offset() > 0 {
-            // Mid-text: delete the char before the cursor.
+            // Mid-text: delete the char before the cursor — or the whole emoji
+            // sequence it ends (#1684).
+            let from = crate::motion::backspace_start(&state.doc, Pos(pos)).unwrap_or(pos - 1);
             let mut tr = state.tr();
-            tr.delete(pos - 1, pos).ok()?;
+            tr.delete(from, pos).ok()?;
             return tr.doc_changed().then_some(tr);
         }
         // At block start: join across the nearest cut, else move into the preceding
         // container, else lift out of the wrapper.
         if let Some(cut) = find_cut_before(&r) {
-            let mut tr = state.tr();
-            if tr
-                .step(Box::new(ReplaceStep::structural(
-                    cut - 1,
-                    cut + 1,
-                    crate::Slice::empty(),
-                )))
-                .is_ok()
-                && tr.doc_changed()
-            {
+            // An atom before the cut is selected, not joined with (it has no
+            // content to join).
+            if let Some(tr) = select_atom_across(state, &r, cut, true) {
                 return Some(tr);
             }
-            // Could not join directly across the cut — try moving this block into
-            // the container before it (a paragraph after a list → a new list item).
-            if let Some(tr) = wrap_into_before(state, cut) {
-                return Some(tr);
+            // After a table (or at a row or cell boundary) nothing is joined,
+            // wrapped or lifted: see [`backspace_after_table`].
+            if table_barrier(&state.doc, cut) {
+                return backspace_after_table(state, &r, cut);
+            }
+            {
+                let mut tr = state.tr();
+                if tr
+                    .step(Box::new(ReplaceStep::structural(
+                        cut - 1,
+                        cut + 1,
+                        crate::Slice::empty(),
+                    )))
+                    .is_ok()
+                    && tr.doc_changed()
+                {
+                    return Some(tr);
+                }
+                // Could not join directly across the cut — try moving this block
+                // into the container before it (a paragraph after a list → a new
+                // list item).
+                if let Some(tr) = wrap_into_before(state, cut) {
+                    return Some(tr);
+                }
             }
         }
         build_lift(state)
@@ -1259,27 +1524,83 @@ pub fn delete_char_forward() -> Command {
         let pos = sel.from().0;
         let r = state.doc.resolve(Pos(pos)).ok()?;
         if r.parent_offset() < r.parent().content().size() {
-            // Mid-text: delete the char after the cursor.
+            // Mid-text: delete the grapheme cluster after the cursor (#1684).
+            let to = crate::motion::grapheme_step(&state.doc, Pos(pos), true).unwrap_or(pos + 1);
             let mut tr = state.tr();
-            tr.delete(pos, pos + 1).ok()?;
+            tr.delete(pos, to).ok()?;
             return tr.doc_changed().then_some(tr);
         }
         // At block end: join across the nearest cut, else lift the next block out.
         let cut = find_cut_after(&r)?;
-        let mut tr = state.tr();
-        if tr
-            .step(Box::new(ReplaceStep::structural(
-                cut - 1,
-                cut + 1,
-                crate::Slice::empty(),
-            )))
-            .is_ok()
-            && tr.doc_changed()
-        {
+        if let Some(tr) = select_atom_across(state, &r, cut, false) {
             return Some(tr);
+        }
+        if !table_barrier(&state.doc, cut) {
+            let mut tr = state.tr();
+            if tr
+                .step(Box::new(ReplaceStep::structural(
+                    cut - 1,
+                    cut + 1,
+                    crate::Slice::empty(),
+                )))
+                .is_ok()
+                && tr.doc_changed()
+            {
+                return Some(tr);
+            }
         }
         build_lift_after(state, cut)
     })
+}
+
+/// The range a word delete removes from a collapsed caret: from the caret to
+/// the previous (`forward = false`) or next word boundary of
+/// [`word_boundary`](crate::motion::word_boundary) — exactly what the word
+/// motion (Ctrl+Left / Right) moves over, so the two cannot disagree. An inline
+/// atom is a word of its own there (#938): beside the caret it goes alone,
+/// with any whitespace between them, and a word beyond it stays. `None` when
+/// the selection is not a collapsed text caret, or when the range is empty (at
+/// a textblock edge).
+fn word_delete_range(state: &EditorState, forward: bool) -> Option<(usize, usize)> {
+    let sel = &state.selection;
+    if matches!(sel, crate::selection::Selection::Cell(_)) || !sel.is_empty() {
+        return None;
+    }
+    let head = sel.head();
+    let target = crate::motion::word_boundary(&state.doc, head, forward)?;
+    (target != head).then(|| (target.0.min(head.0), target.0.max(head.0)))
+}
+
+/// Delete from the caret to a word boundary (see [`word_delete_range`]), when
+/// that range is not empty.
+fn delete_word_range(forward: bool) -> Command {
+    command_tr(move |state| {
+        let (from, to) = word_delete_range(state, forward)?;
+        let mut tr = state.tr();
+        tr.delete(from, to).ok()?;
+        tr.doc_changed().then_some(tr)
+    })
+}
+
+/// Delete the word before the caret (Ctrl+Backspace; Alt+Backspace on macOS):
+/// from the caret back to the boundary the word motion (Ctrl+Left) lands on,
+/// taking any whitespace between them. A mark boundary is not a word boundary.
+///
+/// A word is what [`word_segments`](crate::motion::word_segments) says: a run
+/// of punctuation is one apart from the letters beside it, and an inline atom
+/// is one of its own, so a word delete never takes an atom along with text.
+///
+/// Where that range is empty it is [`delete_char_backward`]: with a non-empty
+/// selection (deleted as it stands) and at a textblock's start (join / lift, as
+/// Backspace does there).
+pub fn delete_word_backward() -> Command {
+    chain(vec![delete_word_range(false), delete_char_backward()])
+}
+
+/// Delete the word after the caret (Ctrl+Delete; Alt+Delete on macOS) — the
+/// mirror of [`delete_word_backward`], falling back to [`delete_char_forward`].
+pub fn delete_word_forward() -> Command {
+    chain(vec![delete_word_range(true), delete_char_forward()])
 }
 
 // ===================================================================
@@ -1341,6 +1662,8 @@ impl Plugin for BaseCommandsPlugin {
             ("deleteSelection", delete_selection()),
             ("deleteCharBackward", delete_char_backward()),
             ("deleteCharForward", delete_char_forward()),
+            ("deleteWordBackward", delete_word_backward()),
+            ("deleteWordForward", delete_word_forward()),
         ];
         for level in 1..=6i64 {
             let name: &'static str = match level {
@@ -1355,6 +1678,10 @@ impl Plugin for BaseCommandsPlugin {
             cmds.push((name, set_block_type("heading", attrs)));
         }
         cmds
+    }
+
+    fn selection_commands(&self) -> Vec<&'static str> {
+        vec!["selectAll"]
     }
 
     fn keymap(&self) -> Vec<(KeyBinding, &'static str)> {
@@ -1392,8 +1719,37 @@ impl Plugin for BaseCommandsPlugin {
             ("Mod-Alt-6", "setHeading6"),
         ]
         .into_iter()
+        .chain(word_delete_bindings())
         .filter_map(|(b, cmd)| KeyBinding::parse(b).map(|kb| (kb, cmd)))
         .collect()
+    }
+}
+
+/// The word-delete chords: Ctrl+Backspace / Ctrl+Delete on Windows and Linux,
+/// Alt(Option)+Backspace / Alt+Delete on macOS, where Cmd+Backspace is the
+/// line delete. `Mod` is the primary accelerator, which is Cmd on macOS — hence
+/// the platform split, decided at compile time like the desktop shell's own
+/// `cfg!(target_os = "macos")` checks.
+///
+/// **None on wasm.** A browser build cannot know the OS at compile time, and
+/// the browser already resolves the platform's chord into a `beforeinput`
+/// `deleteWordBackward` / `deleteWordForward`, which `rinch-web` maps onto these
+/// commands by name. Binding `Mod-Backspace` there would take Cmd+Backspace on a
+/// Mac (the web glue's `primary` is Ctrl *or* Meta) away from the browser's line
+/// delete.
+fn word_delete_bindings() -> Vec<(&'static str, &'static str)> {
+    if cfg!(target_arch = "wasm32") {
+        Vec::new()
+    } else if cfg!(target_os = "macos") {
+        vec![
+            ("Alt-Backspace", "deleteWordBackward"),
+            ("Alt-Delete", "deleteWordForward"),
+        ]
+    } else {
+        vec![
+            ("Mod-Backspace", "deleteWordBackward"),
+            ("Mod-Delete", "deleteWordForward"),
+        ]
     }
 }
 
@@ -2906,5 +3262,254 @@ mod tests {
             current_block_type(&listed).map(|t| t.name().to_string()),
             Some("paragraph".to_string())
         );
+    }
+
+    // ── word delete (issue #303) ─────────────────────────────────────────────
+
+    /// An editor over `html`, its nodes minted by the state's own schema (node
+    /// and mark types compare by identity, #217), with a caret at `caret`.
+    fn html_editor(html: &str, caret: usize) -> EditorState {
+        let s = Rc::new(Schema::starter_kit());
+        let slice = crate::serialize::slice_from_html(&s, html).expect("parses");
+        let doc = s.branch("doc", slice.content).expect("a document");
+        let mut state = EditorState::create(s, doc, vec![Rc::new(BaseCommandsPlugin)]);
+        state.selection = Selection::cursor(Pos(caret));
+        state
+    }
+
+    /// The document as `html`, for comparing a whole result at once.
+    fn html_of(state: &EditorState) -> String {
+        crate::serialize::node_to_html(&state.doc)
+    }
+
+    /// Inside a word the delete stops at the word's start / end — off the
+    /// word's own edge, so a delete-to-the-block-edge would be told apart.
+    /// "hello world": "hello" 1..6, " " 6..7, "world" 7..12; the caret sits
+    /// in "wor|ld" at 10.
+    #[test]
+    fn word_delete_mid_word_stops_at_the_words_edge() {
+        let back = html_editor("<p>hello world</p>", 10)
+            .run("deleteWordBackward")
+            .expect("applies");
+        assert_eq!(all_text(&back.doc), "hello ld");
+        assert_eq!(back.selection, Selection::cursor(Pos(7)));
+        let fwd = html_editor("<p>hello world</p>", 10)
+            .run("deleteWordForward")
+            .expect("applies");
+        assert_eq!(all_text(&fwd.doc), "hello wor");
+        assert_eq!(fwd.selection, Selection::cursor(Pos(10)));
+    }
+
+    /// The whitespace between the caret and the word goes with the word, as
+    /// the word motion skips it (Ctrl+Left/Right land on the same boundaries).
+    #[test]
+    fn word_delete_takes_the_whitespace_before_the_word() {
+        // "hello  world": caret after the two spaces, at 8.
+        let back = html_editor("<p>hello  world</p>", 8)
+            .run("deleteWordBackward")
+            .unwrap();
+        assert_eq!(all_text(&back.doc), "world");
+        // Caret right after "hello", at 6: forward eats the spaces and "world".
+        let fwd = html_editor("<p>hello  world</p>", 6)
+            .run("deleteWordForward")
+            .unwrap();
+        assert_eq!(all_text(&fwd.doc), "hello");
+    }
+
+    /// The deleted range is exactly the word motion's: whatever
+    /// `resolve_cursor_motion(WordLeft/WordRight)` selects is what goes.
+    #[test]
+    fn word_delete_deletes_what_the_word_motion_selects() {
+        use crate::motion::{CursorMotion, resolve_cursor_motion};
+        let text = "one two  three four";
+        for caret in 1..=(text.chars().count() + 1) {
+            for (name, motion) in [
+                ("deleteWordBackward", CursorMotion::WordLeft),
+                ("deleteWordForward", CursorMotion::WordRight),
+            ] {
+                let state = html_editor(&format!("<p>{text}</p>"), caret);
+                let sel = resolve_cursor_motion(&state.doc, Pos(caret), Pos(caret), motion, true)
+                    .expect("a textblock");
+                let Some(after) = state.run(name) else {
+                    assert!(sel.is_empty(), "{name} at {caret}: the motion moved");
+                    continue;
+                };
+                let (from, to) = (sel.from().0, sel.to().0);
+                let chars: Vec<char> = text.chars().collect();
+                let expect: String = chars[..from - 1]
+                    .iter()
+                    .chain(chars[to - 1..].iter())
+                    .collect();
+                assert_eq!(all_text(&after.doc), expect, "{name} at {caret}");
+            }
+        }
+    }
+
+    /// At a textblock's start / end the word motion has nowhere to go, and a
+    /// word delete means what Backspace / Delete mean there: join the blocks.
+    #[test]
+    fn word_delete_at_a_block_edge_joins_like_backspace_and_delete() {
+        // "ab" 1..3, second paragraph's content opens at 5.
+        let back = html_editor("<p>ab</p><p>cd</p>", 5)
+            .run("deleteWordBackward")
+            .expect("joins backward");
+        assert_eq!(back.doc.child_count(), 1);
+        assert_eq!(all_text(&back.doc), "abcd");
+        assert_eq!(
+            html_of(&back),
+            html_of(
+                &html_editor("<p>ab</p><p>cd</p>", 5)
+                    .run("deleteCharBackward")
+                    .unwrap()
+            )
+        );
+        let fwd = html_editor("<p>ab</p><p>cd</p>", 3)
+            .run("deleteWordForward")
+            .expect("joins forward");
+        assert_eq!(fwd.doc.child_count(), 1);
+        assert_eq!(all_text(&fwd.doc), "abcd");
+        // A list item's start lifts, as Backspace does there.
+        let li = html_editor("<p>x</p><ul><li><p>item</p></li></ul>", 6);
+        assert_eq!(
+            li.run("deleteWordBackward").map(|s| html_of(&s)),
+            li.run("deleteCharBackward").map(|s| html_of(&s)),
+        );
+        // At the very start / end of the document both are inapplicable alike.
+        let start = html_editor("<p>ab</p>", 1);
+        assert!(!start.can_run("deleteWordBackward"));
+        assert_eq!(
+            start.can_run("deleteWordBackward"),
+            start.can_run("deleteCharBackward")
+        );
+        let end = html_editor("<p>ab</p>", 3);
+        assert!(!end.can_run("deleteWordForward"));
+    }
+
+    /// A non-empty selection is deleted as it stands, not widened to words.
+    #[test]
+    fn word_delete_with_a_selection_deletes_the_selection() {
+        for name in ["deleteWordBackward", "deleteWordForward"] {
+            let mut state = html_editor("<p>hello world</p>", 1);
+            state.selection = Selection::text(Pos(3), Pos(5)); // "ll"
+            let after = state.run(name).expect("applies");
+            assert_eq!(all_text(&after.doc), "heo world", "{name}");
+        }
+    }
+
+    /// A mark boundary is not a word boundary: the word runs straight across
+    /// it. "foo " 1..5, bold "bar" 5..8, "baz" 8..11.
+    #[test]
+    fn word_delete_runs_across_a_mark_boundary() {
+        let html = "<p>foo <strong>bar</strong>baz</p>";
+        let back = html_editor(html, 11).run("deleteWordBackward").unwrap();
+        assert_eq!(all_text(&back.doc), "foo ");
+        assert!(!doc_has_mark(&back.doc, "bold"));
+        let fwd = html_editor(html, 5).run("deleteWordForward").unwrap();
+        assert_eq!(all_text(&fwd.doc), "foo ");
+        // From the seam itself (8), backward takes the bold part only.
+        let seam = html_editor(html, 8).run("deleteWordBackward").unwrap();
+        assert_eq!(all_text(&seam.doc), "foo baz");
+        assert!(!doc_has_mark(&seam.doc, "bold"));
+    }
+
+    fn count_type(doc: &Node, name: &str) -> usize {
+        let mut n = 0;
+        doc.nodes_between(0, doc.content_size(), &mut |node, _, _| {
+            if node.type_name() == name {
+                n += 1;
+            }
+            true
+        });
+        n
+    }
+
+    /// An inline atom (an image, a hard break) is a word of its own (#938): an
+    /// adjacent atom goes on its own, like Backspace / Delete would take it, and
+    /// a word beyond one stays.
+    /// `foo<img>bar`: "foo" 1..4, the image 4..5, "bar" 5..8.
+    #[test]
+    fn word_delete_stops_at_an_inline_atom() {
+        for (atom, html) in [
+            ("image", r#"<p>foo<img src="x.png">bar</p>"#),
+            ("hard_break", "<p>foo<br>bar</p>"),
+        ] {
+            // Right after the atom: the atom alone.
+            let back = html_editor(html, 5).run("deleteWordBackward").unwrap();
+            assert_eq!(count_type(&back.doc, atom), 0, "{atom}: backward");
+            assert_eq!(all_text(&back.doc), "foobar", "{atom}: backward");
+            // Right before it, forward: the atom alone.
+            let fwd = html_editor(html, 4).run("deleteWordForward").unwrap();
+            assert_eq!(count_type(&fwd.doc, atom), 0, "{atom}: forward");
+            assert_eq!(all_text(&fwd.doc), "foobar", "{atom}: forward");
+            // Past the atom by a word: the word only, the atom stays.
+            let word = html_editor(html, 8).run("deleteWordBackward").unwrap();
+            assert_eq!(count_type(&word.doc, atom), 1, "{atom}: word before");
+            assert_eq!(all_text(&word.doc), "foo", "{atom}: word before");
+            let word = html_editor(html, 1).run("deleteWordForward").unwrap();
+            assert_eq!(count_type(&word.doc, atom), 1, "{atom}: word after");
+            assert_eq!(all_text(&word.doc), "bar", "{atom}: word after");
+        }
+        // Whitespace between the caret and an atom goes with the atom, as it
+        // goes with a word (#938, Chrome 153): "foo" 1..4, the image 4..5,
+        // "  " 5..7, caret at 7.
+        let gap = html_editor(r#"<p>foo<img src="x.png">  </p>"#, 7)
+            .run("deleteWordBackward")
+            .unwrap();
+        assert_eq!(count_type(&gap.doc, "image"), 0);
+        assert_eq!(all_text(&gap.doc), "foo");
+    }
+
+    /// An atom further away than the word boundary does not move the delete:
+    /// only one *between* the caret and the boundary clamps it. Off the fixed
+    /// point where the atom sits exactly at the boundary (review of #930).
+    #[test]
+    fn word_delete_ignores_an_atom_beyond_the_word() {
+        // "a<img>b c": "a" 1, the image 2, "b" 3, " " 4, "c" 5, end 6.
+        let back = html_editor(r#"<p>a<img src="x.png">b c</p>"#, 6)
+            .run("deleteWordBackward")
+            .unwrap();
+        assert_eq!(
+            html_of(&back),
+            html_of(&html_editor(r#"<p>a<img src="x.png">b </p>"#, 1))
+        );
+        // "foo bar baz<img>": caret after "foo" (4); forward takes " bar" only.
+        let fwd = html_editor(r#"<p>foo bar baz<img src="x.png"></p>"#, 4)
+            .run("deleteWordForward")
+            .unwrap();
+        assert_eq!(
+            html_of(&fwd),
+            html_of(&html_editor(r#"<p>foo baz<img src="x.png"></p>"#, 1))
+        );
+    }
+
+    /// The default keymap binds the word deletes to the platform's chord:
+    /// Ctrl on Windows / Linux, Alt (Option) on macOS; plain Backspace /
+    /// Delete stay the char deletes.
+    #[test]
+    fn word_delete_is_bound_to_the_platforms_chord() {
+        let state = editor("x");
+        let bound = |k: &str| {
+            state
+                .keymap()
+                .command_for(&KeyBinding::parse(k).unwrap())
+                .map(str::to_string)
+        };
+        let (word, other) = if cfg!(target_os = "macos") {
+            ("Alt", "Mod")
+        } else {
+            ("Mod", "Alt")
+        };
+        assert_eq!(
+            bound(&format!("{word}-Backspace")).as_deref(),
+            Some("deleteWordBackward")
+        );
+        assert_eq!(
+            bound(&format!("{word}-Delete")).as_deref(),
+            Some("deleteWordForward")
+        );
+        assert_eq!(bound(&format!("{other}-Backspace")), None);
+        assert_eq!(bound(&format!("{other}-Delete")), None);
+        assert_eq!(bound("Backspace").as_deref(), Some("deleteCharBackward"));
+        assert_eq!(bound("Delete").as_deref(), Some("deleteCharForward"));
     }
 }

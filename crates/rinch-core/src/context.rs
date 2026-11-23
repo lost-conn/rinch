@@ -35,6 +35,7 @@
 //! To opt out and keep an entry for the life of the thread, create it under
 //! [`unowned`](crate::reactive::unowned).
 
+use crate::reactive::restore::{RestoreCell, Slot, restore_slot};
 use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -59,16 +60,42 @@ thread_local! {
     // which has no `const fn` constructor.
     static CONTEXT_STORE: RefCell<HashMap<(u64, TypeId), ContextEntry>> =
         RefCell::new(HashMap::new());
-    /// The root whose namespace create/use_context resolve right now.
-    static CURRENT_ROOT: Cell<u64> = const { Cell::new(GLOBAL_ROOT) };
-    /// The document whose event stream is being dispatched right now, if any
-    /// (issue #139). Deliberately separate from `CURRENT_ROOT`: that is a store
-    /// *namespace*, and desktop shells leave it at the thread-global `0`.
-    static DISPATCHING_DOC: Cell<Option<u64>> = const { Cell::new(None) };
+    /// The ambient root and document — see [`Ambient`].
+    static AMBIENT: Ambient = const {
+        Ambient {
+            root: Cell::new(GLOBAL_ROOT),
+            doc: Cell::new(0),
+            disposing: Cell::new(0),
+        }
+    };
     /// Monotonic insertion counter. Never reused, and deliberately **not** reset
     /// by `clear_context`/`clear_context_for_root` — resetting it would recreate
     /// the exact ABA the epoch exists to prevent.
     static NEXT_EPOCH: Cell<u64> = const { Cell::new(1) };
+}
+
+/// The two ambient identities every effect and memo run re-enters.
+///
+/// One thread-local rather than two so that re-entering both costs one TLS
+/// access each way, not two: [`enter_reactive_frame`] runs around every effect
+/// run and every memo recompute (issue #295), and reaching a thread-local of
+/// this crate from another crate is a call, not a load. Measured on the
+/// `rinch-bench` `memo_flush` bench, a second, separate guard for the
+/// document cost +1.4% instructions; this shape costs nothing measurable.
+struct Ambient {
+    /// The root whose namespace create/use_context resolve right now.
+    root: Cell<u64>,
+    /// The document whose code is running right now, if any (issues #139,
+    /// #295), as a raw `doc_key` — `0` for none, read through
+    /// [`doc_identity`]. Raw rather than `Option<u64>` so the reactive frame
+    /// saves and restores one word, not two. Deliberately separate from
+    /// `root`: that is a store *namespace*, and desktop shells leave it at the
+    /// thread-global `0`.
+    doc: Cell<u64>,
+    /// The document being disposed right now, if any, raw (`0` for none):
+    /// see [`push_disposing_doc`]. While `doc` is this one, its code reads
+    /// it as the dispatching document but records no document for later.
+    disposing: Cell<u64>,
 }
 
 fn next_epoch() -> u64 {
@@ -114,20 +141,16 @@ fn clear_roots(doomed: impl Fn(u64) -> bool) {
 /// The context root currently in effect on this thread (`0` = the
 /// thread-global fallback root).
 pub fn current_context_root() -> u64 {
-    CURRENT_ROOT.with(|r| r.get())
+    AMBIENT.with(|a| a.root.get())
 }
 
 /// RAII guard returned by [`push_context_root`]; restores the previous root
 /// when dropped.
 pub struct ContextRootGuard {
-    prev: u64,
+    _restore: RestoreCell<AmbientRoot>,
 }
 
-impl Drop for ContextRootGuard {
-    fn drop(&mut self) {
-        CURRENT_ROOT.with(|r| r.set(self.prev));
-    }
-}
+restore_slot!(AmbientRoot: u64 = AMBIENT.root);
 
 /// Make `root` the current context root until the returned guard drops.
 ///
@@ -136,12 +159,21 @@ impl Drop for ContextRootGuard {
 /// resolve that root's namespace. Closures that run with no root pushed
 /// resolve the thread-global root `0`.
 pub fn push_context_root(root: u64) -> ContextRootGuard {
-    let prev = CURRENT_ROOT.with(|r| r.replace(root));
-    ContextRootGuard { prev }
+    ContextRootGuard {
+        _restore: RestoreCell::replace(root),
+    }
 }
 
 /// The document whose events are being dispatched on this thread right now, or
 /// `None` outside any dispatch (issue #139).
+///
+/// "Dispatched" is wider than the name (issue #295): the marker names the
+/// document whose code is running, and a document's code also runs at its
+/// **mount** (`RinchApp::mount_component` pushes it) and in every **effect or
+/// memo** it owns. Those record the marker current at their creation and
+/// re-enter it around each run, because the effect queue is thread-global — an
+/// effect of document B woken by a write in document A's handler is flushed
+/// inside A's dispatch, and must still answer B here.
 ///
 /// Input state that lives in a process-lifetime thread-local — the pointer-capture
 /// drag, and anything else a future arbiter parks there — reads this to answer
@@ -156,12 +188,27 @@ pub fn push_context_root(root: u64) -> ContextRootGuard {
 /// window, so it cannot tell two windows apart.
 ///
 /// `None` means "no document is dispatching" and must be read as *permissive*:
-/// state armed or queried outside any dispatch (a timer, a menu callback, a
-/// backend with a single page-wide event stream like rinch-web) belongs to
-/// nobody in particular and stays drivable by anybody. Only two **`Some`** keys
-/// that differ mean "not yours".
+/// state armed or queried outside any dispatch (a timer armed from `main`, a
+/// menu callback, rinch-web's pointer stream after a press, which may cross
+/// roots) belongs to nobody in particular and stays drivable by anybody.
+/// Only two **`Some`** keys that differ mean "not yours".
+///
+/// A **timer, a parked continuation (an http completion), a closure queued
+/// with `run_on_main_thread` and a `rinch-ws` callback** are their creator's
+/// code too (issue #963): each records the marker current where it was armed,
+/// queued or registered, and runs under it — so one armed inside a document's
+/// dispatch, mount or effect answers that document here, however it is later
+/// delivered, and one armed outside any document (or queued from a worker
+/// thread) answers `None`.
 pub fn current_dispatching_doc() -> Option<u64> {
-    DISPATCHING_DOC.with(|d| d.get())
+    doc_identity(AMBIENT.with(|a| a.doc.get()))
+}
+
+/// The raw key of the document current right now (`0` for none): what a
+/// signal write is counted against (#2798).
+#[inline]
+pub(crate) fn current_doc_raw() -> u64 {
+    AMBIENT.try_with(|a| a.doc.get()).unwrap_or(0)
 }
 
 /// Read a raw `doc_key` as a document *identity*, or `None` when there is no
@@ -187,9 +234,9 @@ pub fn doc_identity(doc_key: u64) -> Option<u64> {
 /// or ended by the document `caller` (issue #139).
 ///
 /// Permissive by construction: `None` on either side means "no document in
-/// particular" — state armed or queried outside any dispatch (a timer, a menu
-/// callback, a backend with one page-wide event stream like rinch-web) belongs
-/// to nobody and stays usable by anybody. **Only two `Some` keys that differ**
+/// particular" — state armed or queried outside any dispatch (a timer armed
+/// from `main`, a menu callback, rinch-web's pointer stream after a press)
+/// belongs to nobody and stays usable by anybody. **Only two `Some` keys that differ**
 /// are refused; anything stricter would wedge the state in its *own* document.
 ///
 /// The single home for that rule, shared by the pointer-capture drag
@@ -208,14 +255,10 @@ pub fn doc_matches(owner: Option<u64>, caller: Option<u64>) -> bool {
 /// mis-attribution is invisible until two documents share a thread.
 #[must_use = "the marker is only live while the guard is held — bind it, e.g. `let _d = …`"]
 pub struct DispatchDocGuard {
-    prev: Option<u64>,
+    _restore: RestoreCell<AmbientDoc>,
 }
 
-impl Drop for DispatchDocGuard {
-    fn drop(&mut self) {
-        DISPATCHING_DOC.with(|d| d.set(self.prev));
-    }
-}
+restore_slot!(AmbientDoc: u64 = AMBIENT.doc);
 
 /// Mark `doc_key` as the document being dispatched until the returned guard
 /// drops (issue #139).
@@ -227,8 +270,199 @@ impl Drop for DispatchDocGuard {
 ///
 /// A `doc_key` of `0` pushes `None`, not `Some(0)` — see [`doc_identity`].
 pub fn push_dispatching_doc(doc_key: u64) -> DispatchDocGuard {
-    let prev = DISPATCHING_DOC.with(|d| d.replace(doc_identity(doc_key)));
-    DispatchDocGuard { prev }
+    // Stored raw: `0` reads back as `None` through `doc_identity`.
+    DispatchDocGuard {
+        _restore: RestoreCell::replace(doc_key),
+    }
+}
+
+/// RAII guard returned by [`enter_reactive_frame`]; restores both the root and
+/// the document it displaced.
+pub(crate) struct ReactiveFrameGuard {
+    _restore: RestoreCell<AmbientFrame>,
+}
+
+/// The root and the document together: one TLS access each way, on the path
+/// every effect run and memo recompute takes.
+struct AmbientFrame;
+
+impl Slot for AmbientFrame {
+    type Value = (u64, u64);
+    #[inline]
+    fn swap((root, doc): (u64, u64)) -> (u64, u64) {
+        AMBIENT.with(|a| (a.root.replace(root), a.doc.replace(doc)))
+    }
+    #[inline]
+    fn put_back((root, doc): (u64, u64)) {
+        let _ = AMBIENT.try_with(|a| {
+            a.root.set(root);
+            a.doc.set(doc);
+        });
+    }
+}
+
+/// The context root and the document current right now, read together in one
+/// TLS access — what an effect or memo records at creation and later hands to
+/// [`enter_reactive_frame`]. The document is the raw `doc_key` (`0` = none).
+pub(crate) fn current_reactive_frame() -> (u64, u64) {
+    AMBIENT.with(|a| {
+        let doc = a.doc.get();
+        // A document being disposed is no document to come back to: what
+        // its disposal makes for later records none (`push_disposing_doc`).
+        let doc = if doc == a.disposing.get() { 0 } else { doc };
+        (a.root.get(), doc)
+    })
+}
+
+/// RAII guard returned by [`push_disposing_doc`]; restores the dispatching
+/// and disposing documents it displaced.
+#[must_use = "the marker is only live while the guard is held — bind it, e.g. `let _d = …`"]
+pub struct DisposingDocGuard {
+    _restore: RestoreCell<AmbientDisposing>,
+}
+
+/// The dispatching and disposing documents together, swapped in one TLS
+/// access.
+struct AmbientDisposing;
+
+impl Slot for AmbientDisposing {
+    type Value = (u64, u64);
+    #[inline]
+    fn swap((doc, disposing): (u64, u64)) -> (u64, u64) {
+        AMBIENT.with(|a| (a.doc.replace(doc), a.disposing.replace(disposing)))
+    }
+    #[inline]
+    fn put_back((doc, disposing): (u64, u64)) {
+        let _ = AMBIENT.try_with(|a| {
+            a.doc.set(doc);
+            a.disposing.set(disposing);
+        });
+    }
+}
+
+/// Mark `doc_key` as the document whose code runs **while it is disposed**,
+/// until the guard drops (#2789, its review in #2794).
+///
+/// Code the disposal runs (an `on_cleanup`, a scope's last cleanup) is the
+/// document's own code, so [`current_dispatching_doc`] answers it: a reader
+/// of that document's window facts reads its own window's. But the document
+/// is going, so nothing made then records it ([`CallbackFrame::current`]
+/// answers none):
+///
+/// - An effect or a memo made inside the disposal records no document, and
+///   its first run, which happens at once, already runs under none: a memo
+///   over a window fact made in a cleanup and read there reads the thread's
+///   facts (the main window's), not the closing window's.
+/// - A timer or a parked callback made inside the disposal is owned by the
+///   scope being disposed, so it is dropped with it and never runs. Only
+///   work no scope owns, such as a [`queue_main_callback`] closure, runs
+///   later, and it runs under no document, as it did before the disposal ran
+///   as the document's code.
+/// - So a registration made by code that runs later is nobody's. One the
+///   cleanup makes directly, during the disposal (an app key, a dismiss
+///   handler), is keyed to the dying document, as anything that reads
+///   [`current_dispatching_doc`] there is; the document's sweep
+///   ([`forget_doc`](crate::forget_doc)), which follows the disposal, takes
+///   it out of a registry declared with [`doc_keyed!`](crate::doc_keyed!).
+///
+/// [`queue_main_callback`]: crate::reactive::queue_main_callback
+pub fn push_disposing_doc(doc_key: u64) -> DisposingDocGuard {
+    DisposingDocGuard {
+        _restore: RestoreCell::replace((doc_key, doc_key)),
+    }
+}
+
+/// Re-enter the context root and the document an effect or memo was created
+/// under, until the guard drops — one TLS access each way.
+///
+/// The root is issue #136: `use_context`/`use_store` must resolve the same
+/// namespace as at build time. The document is issue #295: the effect queue
+/// is thread-global and drains under whichever document happens to be
+/// dispatching, so an effect of document B woken by a write in document A's
+/// handler must still answer B to [`current_dispatching_doc`]. `doc` is the
+/// raw key [`current_reactive_frame`] captured at creation; `0` (no document)
+/// is re-entered as `0` — "nobody's", never a borrowed document.
+pub(crate) fn enter_reactive_frame(root: u64, doc: u64) -> ReactiveFrameGuard {
+    ReactiveFrameGuard {
+        _restore: RestoreCell::replace((root, doc)),
+    }
+}
+
+/// The context root and the document a callback was registered under, to be
+/// re-entered when it runs (issue #1032).
+///
+/// An effect or memo records both at creation and re-enters them around every
+/// run. A callback the platform or the host fires later — a timer, a parked
+/// continuation, a main-thread queue entry, a `rinch-ws` socket event, a menu,
+/// tray or hotkey item, a notification, a registered focus target, an Android
+/// sensor or activity result — is just as much its registrant's code, and is
+/// fired from outside any dispatch, or from inside another document's (an
+/// embedded `RinchContext`'s `update()` runs whatever is due). So such a
+/// registry records `CallbackFrame::current()` beside the callback's owner and
+/// runs the callback inside [`enter`](Self::enter):
+///
+/// - the **document** answers [`current_dispatching_doc`], so an interceptor
+///   the callback registers or clears is that document's (#963's rule);
+/// - the **root** is the store namespace [`use_store`]/[`use_context`]
+///   resolve (#136), so a timer armed in an embedded context reads that
+///   context's stores.
+///
+/// Recorded outside any document and root it re-enters none — the
+/// thread-global root and no document — wherever it is fired. It is two
+/// integers, `Copy` and `Send`, so a closure queued from a worker thread can
+/// carry one (that thread's, which is none).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct CallbackFrame {
+    root: u64,
+    /// Raw `doc_key`; `0` is no document (see [`doc_identity`]).
+    doc: u64,
+}
+
+impl CallbackFrame {
+    /// The context root and the document current on this thread right now.
+    #[must_use]
+    pub fn current() -> Self {
+        let (root, doc) = current_reactive_frame();
+        Self { root, doc }
+    }
+
+    /// This frame with its document replaced by `doc_key` — for a registry
+    /// that knows the document its callback belongs to better than the
+    /// ambient marker does (a focus target is registered on a node of a known
+    /// document, possibly at a mount no dispatch marks).
+    #[must_use]
+    pub fn with_doc(self, doc_key: u64) -> Self {
+        Self {
+            doc: doc_key,
+            ..self
+        }
+    }
+
+    /// The recorded context root (`0` = the thread-global root).
+    #[must_use]
+    pub fn root(self) -> u64 {
+        self.root
+    }
+
+    /// The recorded document, or `None` for none.
+    #[must_use]
+    pub fn doc(self) -> Option<u64> {
+        doc_identity(self.doc)
+    }
+
+    /// Make this frame's root and document current until the guard drops.
+    pub fn enter(self) -> CallbackFrameGuard {
+        CallbackFrameGuard {
+            _frame: enter_reactive_frame(self.root, self.doc),
+        }
+    }
+}
+
+/// RAII guard returned by [`CallbackFrame::enter`]; restores the root and the
+/// document it displaced.
+#[must_use = "the frame is only current while the guard is held — bind it, e.g. `let _f = …`"]
+pub struct CallbackFrameGuard {
+    _frame: ReactiveFrameGuard,
 }
 
 /// Create a context value accessible by any component.
@@ -604,7 +838,7 @@ mod tests {
             scope.run(|| create_store(S("root-seven")));
         }
 
-        // Dispose with CURRENT_ROOT back at 0.
+        // Dispose with the ambient root back at 0.
         scope.dispose();
 
         assert_eq!(
@@ -861,5 +1095,148 @@ mod tests {
             !doc_matches(Some(1), Some(2)),
             "only two known-and-different keys are refused"
         );
+    }
+
+    // ── effects run under the document that created them (issue #295) ────────
+
+    /// An effect created while document 1 was the current document re-runs
+    /// under document 1, whichever document happens to be dispatching when the
+    /// thread-global effect queue drains. Before #295 it ran under the flusher's
+    /// marker, so a `Drag::start()` or an interceptor registration made from it
+    /// was attributed to the wrong document.
+    #[test]
+    fn an_effect_reruns_under_the_document_it_was_created_in() {
+        use crate::reactive::{Effect, Signal};
+        let go = Signal::new(0u32);
+        let seen: Rc<RefCell<Vec<Option<u64>>>> = Rc::default();
+        let effect = {
+            let _creator = push_dispatching_doc(1);
+            let seen = seen.clone();
+            Effect::new(move || {
+                go.get();
+                seen.borrow_mut().push(current_dispatching_doc());
+            })
+        };
+        {
+            // Document 2 writes the signal; the effect flushes inside its
+            // dispatch.
+            let _flusher = push_dispatching_doc(2);
+            go.set(1);
+            assert_eq!(
+                current_dispatching_doc(),
+                Some(2),
+                "the flusher's own marker is restored after the effect ran"
+            );
+        }
+        // …and once more with nobody dispatching.
+        go.set(2);
+        assert_eq!(*seen.borrow(), vec![Some(1), Some(1), Some(1)]);
+        effect.dispose();
+    }
+
+    /// An effect created outside any document belongs to none, and says so
+    /// even when it is flushed inside some document's dispatch — "nobody's" is
+    /// permissive everywhere, where a borrowed document is a wrong answer.
+    #[test]
+    fn an_effect_created_outside_any_document_reruns_under_none() {
+        use crate::reactive::{Effect, Signal};
+        let go = Signal::new(0u32);
+        let seen: Rc<RefCell<Vec<Option<u64>>>> = Rc::default();
+        let effect = {
+            let seen = seen.clone();
+            Effect::new(move || {
+                go.get();
+                seen.borrow_mut().push(current_dispatching_doc());
+            })
+        };
+        {
+            let _flusher = push_dispatching_doc(3);
+            go.set(1);
+        }
+        assert_eq!(*seen.borrow(), vec![None, None]);
+        effect.dispose();
+    }
+
+    /// A memo's computation runs in its *reader's* frame, so it re-enters its
+    /// creation document there, as it re-enters its creation root (#136).
+    #[test]
+    fn a_memo_recomputes_under_the_document_it_was_created_in() {
+        use crate::reactive::{Memo, Signal};
+        let src = Signal::new(0u32);
+        let seen: Rc<RefCell<Vec<Option<u64>>>> = Rc::default();
+        let memo = {
+            let _creator = push_dispatching_doc(4);
+            let seen = seen.clone();
+            Memo::new(move || {
+                seen.borrow_mut().push(current_dispatching_doc());
+                src.get()
+            })
+        };
+        {
+            let _reader = push_dispatching_doc(5);
+            assert_eq!(memo.get(), 0);
+            src.set(1);
+            assert_eq!(memo.get(), 1);
+        }
+        assert_eq!(*seen.borrow(), vec![Some(4), Some(4)]);
+    }
+
+    #[test]
+    fn rv960_nested_and_panic_restore() {
+        use crate::reactive::{Effect, Signal};
+        let go = Signal::new(0u32);
+        let seen: Rc<RefCell<Vec<Option<u64>>>> = Rc::default();
+        let effect = {
+            let _creator = push_dispatching_doc(11);
+            let seen = seen.clone();
+            Effect::new(move || {
+                let v = go.get();
+                if v == 1 {
+                    // nested dispatch into another doc inside B's effect
+                    let _n = push_dispatching_doc(12);
+                    seen.borrow_mut().push(current_dispatching_doc());
+                }
+                seen.borrow_mut().push(current_dispatching_doc());
+                if v == 2 {
+                    panic!("boom");
+                }
+            })
+        };
+        {
+            let _a = push_dispatching_doc(10);
+            go.set(1);
+            assert_eq!(current_dispatching_doc(), Some(10));
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| go.set(2)));
+            assert!(r.is_err());
+            assert_eq!(current_dispatching_doc(), Some(10), "restored after panic");
+            assert_eq!(current_context_root(), 0);
+        }
+        assert_eq!(current_dispatching_doc(), None);
+        assert_eq!(*seen.borrow(), vec![Some(11), Some(12), Some(11), Some(11)]);
+        effect.dispose();
+    }
+}
+
+#[cfg(test)]
+mod disposing_tests {
+    use super::*;
+
+    /// While a document is disposed its code reads it as the dispatching
+    /// document, but what it makes for later records none; once the guard
+    /// drops, both are as before.
+    #[test]
+    fn a_disposing_document_is_read_but_not_recorded() {
+        let _outer = push_dispatching_doc(3);
+        {
+            let _disposing = push_disposing_doc(9);
+            assert_eq!(current_dispatching_doc(), Some(9));
+            assert_eq!(CallbackFrame::current().doc(), None);
+            // An effect of another document run inside the disposal records
+            // its own.
+            let _other = push_dispatching_doc(4);
+            assert_eq!(CallbackFrame::current().doc(), Some(4));
+        }
+        assert_eq!(current_dispatching_doc(), Some(3));
+        assert_eq!(CallbackFrame::current().doc(), Some(3));
     }
 }

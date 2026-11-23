@@ -2,11 +2,181 @@
 
 use peniko::Fill;
 use peniko::color::{AlphaColor, Srgb};
-use peniko::kurbo::{Affine, BezPath, Cap, Point, Rect, RoundedRectRadii, Shape, Stroke};
+use peniko::kurbo::{Affine, BezPath, Cap, Join, Point, Rect, Shape, Stroke, Vec2};
 
-use super::painter::Painter;
+use super::blur::Blur1d;
+use super::border_dashes::{self, Dash};
+use super::painter::{BlendMode, PaintShape, Painter};
+use super::radii::BorderRadii;
 use crate::computed_style::BorderStyleValue;
 use crate::node::Node;
+
+/// Shading math for the four "3D" border styles (`inset`/`outset`/`groove`/
+/// `ridge`, #731).
+///
+/// This is Chromium's own `CalculateInsetOutsetColor` /
+/// `Color::Light`/`Color::Dark` (the `TableDefaultBorderColorCurrentColorEnabled`
+/// path, which has shipped at `status: "stable"` since before Chrome 153 —
+/// read from `box_border_painter.cc` and `color.cc` directly rather than
+/// re-derived, because the two colour functions are not CSS-spec text: they
+/// are Chromium's own tuned constants). Measuring a 1px border against this
+/// is unreliable (antialiasing blends the computed shade with whatever is
+/// behind it — the #731 issue's own measured `(154, 238)` for a 1px `<hr>` is
+/// such a blend of this module's `(44, 212)` with the white page behind it,
+/// not a different formula), which is exactly why the fixtures in
+/// `border_bevel_tests.rs` use a several-px-wide border.
+mod bevel {
+    use peniko::color::{AlphaColor, Srgb};
+
+    /// Which of the four sides is being painted. `top_left()` is the one bit
+    /// every formula below keys on: CSS always darkens top/left and lightens
+    /// bottom/right for `inset` (the reverse for `outset`), regardless of box
+    /// size or which side physically touches the content box.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Side {
+        Top,
+        Right,
+        Bottom,
+        Left,
+    }
+
+    impl Side {
+        fn top_left(self) -> bool {
+            matches!(self, Side::Top | Side::Left)
+        }
+    }
+
+    /// `nextafterf(256.0f, 0.0f)` — the largest `f32` strictly below 256,
+    /// used by Chromium's `QuantizeTo8Bit` so that a component of exactly
+    /// 1.0 quantizes to 255 rather than overflowing to 256.
+    fn quantize_scale() -> f32 {
+        f32::from_bits(256.0f32.to_bits() - 1)
+    }
+
+    /// Chromium's `QuantizeTo8Bit`: round a `[0, 1]` component to the nearest
+    /// representable 8-bit sRGB value, expressed back as a `[0, 1]` float.
+    fn quantize_to_8bit(v: f32) -> f32 {
+        ((v * quantize_scale()) as i32) as f32 / 255.0
+    }
+
+    /// `color_utils::Linearize` (sRGB -> linear), the IEC 61966-2-1 transfer
+    /// function with the 0.04045 breakpoint color_utils.cc uses (not the
+    /// 0.03928 the W3C formula's text uses — see that file's own comment).
+    fn linearize(c: f32) -> f32 {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    /// `color_utils::GetRelativeLuminance4f`.
+    fn relative_luminance(c: AlphaColor<Srgb>) -> f32 {
+        let [r, g, b, _] = c.components;
+        0.2126 * linearize(r) + 0.7152 * linearize(g) + 0.0722 * linearize(b)
+    }
+
+    /// `blink::Color::Light()`.
+    fn light(c: AlphaColor<Srgb>) -> AlphaColor<Srgb> {
+        let [r, g, b, a] = c.components;
+        // Hardcoded fast path for opaque black, matching Chromium exactly.
+        if r == 0.0 && g == 0.0 && b == 0.0 && a == 1.0 {
+            return AlphaColor::new([84.0 / 255.0, 84.0 / 255.0, 84.0 / 255.0, 1.0]);
+        }
+        let v = r.max(g).max(b);
+        if v == 0.0 {
+            // Lightened black, alpha preserved.
+            return AlphaColor::new([84.0 / 255.0, 84.0 / 255.0, 84.0 / 255.0, a]);
+        }
+        let multiplier = (v + 0.33).min(1.0) / v;
+        AlphaColor::new([
+            quantize_to_8bit(r * multiplier),
+            quantize_to_8bit(g * multiplier),
+            quantize_to_8bit(b * multiplier),
+            a,
+        ])
+    }
+
+    /// `blink::Color::Dark()`.
+    fn dark(c: AlphaColor<Srgb>) -> AlphaColor<Srgb> {
+        let [r, g, b, a] = c.components;
+        if r == 1.0 && g == 1.0 && b == 1.0 && a == 1.0 {
+            return AlphaColor::new([171.0 / 255.0, 171.0 / 255.0, 171.0 / 255.0, 1.0]);
+        }
+        let v = r.max(g).max(b);
+        let multiplier = if v == 0.0 {
+            0.0
+        } else {
+            (v - 0.33).max(0.0) / v
+        };
+        AlphaColor::new([
+            quantize_to_8bit(r * multiplier),
+            quantize_to_8bit(g * multiplier),
+            quantize_to_8bit(b * multiplier),
+            a,
+        ])
+    }
+
+    /// Luminance of `rgb(32, 32, 32)` — very dark colours get extra contrast
+    /// instead of darkening further into near-invisibility.
+    const BASE_DARK_LUMINANCE: f32 = 0.014443844;
+    /// Luminance of `rgb(235, 235, 235)` — very light colours are left alone
+    /// on their light side rather than clipped to white.
+    const BASE_LIGHT_LUMINANCE: f32 = 0.83077;
+
+    /// `blink::CalculateInsetOutsetColor`. `is_darken` is this side/half's own
+    /// `DarkenBoxSide` bit — true for the shadow side, false for the
+    /// highlight side.
+    fn inset_outset_color(is_darken: bool, color: AlphaColor<Srgb>) -> AlphaColor<Srgb> {
+        let luminance = relative_luminance(color);
+        if luminance <= BASE_DARK_LUMINANCE {
+            return if is_darken {
+                light(color)
+            } else {
+                light(light(color))
+            };
+        }
+        if is_darken {
+            return dark(color);
+        }
+        if luminance > BASE_LIGHT_LUMINANCE {
+            color
+        } else {
+            light(color)
+        }
+    }
+
+    /// The whole-edge colour for `border-style: inset` or `outset`.
+    pub(super) fn inset_or_outset(
+        inset: bool,
+        side: Side,
+        color: AlphaColor<Srgb>,
+    ) -> AlphaColor<Srgb> {
+        // `DarkenBoxSide`: top/left darkens under `inset`, and the opposite
+        // sides darken under `outset`.
+        let darken = side.top_left() == inset;
+        inset_outset_color(darken, color)
+    }
+
+    /// The `(outer, inner)` half-colours for `border-style: groove` or
+    /// `ridge`, where "outer" is the half nearer the box's own outer edge
+    /// and "inner" is the half nearer the padding/content box.
+    ///
+    /// `groove`'s outer half takes `inset`'s shading and its inner half
+    /// takes `outset`'s (the reverse for `ridge`) — Chromium's
+    /// `DrawRidgeOrGrooveBoxSide` does this by literally recursing into the
+    /// solid-edge painter with `style` swapped to `Inset`/`Outset` per half;
+    /// this is that recursion collapsed to the two colours it produces.
+    pub(super) fn groove_or_ridge(
+        groove: bool,
+        side: Side,
+        color: AlphaColor<Srgb>,
+    ) -> (AlphaColor<Srgb>, AlphaColor<Srgb>) {
+        let outer = inset_or_outset(groove, side, color);
+        let inner = inset_or_outset(!groove, side, color);
+        (outer, inner)
+    }
+}
 
 /// Paint a CSS box-shadow effect.
 ///
@@ -20,11 +190,10 @@ pub(super) fn paint_borders(
     y: f64,
     w: f64,
     h: f64,
-    radii: RoundedRectRadii,
+    radii: BorderRadii,
     transform: Affine,
 ) {
     let cs = &node.computed_style;
-
     let sides = [
         // (width, color, style) for each side
         (
@@ -48,11 +217,40 @@ pub(super) fn paint_borders(
             cs.border_left_style,
         ),
     ];
+    paint_border_sides(painter, &sides, scale, x, y, w, h, radii, transform);
+}
 
-    // Fast path: if all sides have the same width, color, and style, use single stroke
+/// A border's four sides, `(width in CSS px, colour, style)` each, top,
+/// right, bottom, left, around the border box `x, y, w, h` (device px) with
+/// `radii`: [`paint_borders`] for a box, and each fragment of an inline
+/// element (#2396), whose open ends are sides of width 0.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn paint_border_sides(
+    painter: &mut dyn Painter,
+    sides: &[(f32, Option<AlphaColor<Srgb>>, BorderStyleValue); 4],
+    scale: f64,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    radii: BorderRadii,
+    transform: Affine,
+) {
+    // Fast path: if all sides have the same width, color, and style, use single stroke.
+    // Excluded for the four "3D" styles even when every side's (width, color,
+    // style) tuple is literally equal: the PAINTED colour still differs per
+    // side (and per half, for groove/ridge), so a single stroke in one colour
+    // would be #731 all over again.
     let all_same = sides
         .windows(2)
-        .all(|pair| pair[0].0 == pair[1].0 && pair[0].1 == pair[1].1 && pair[0].2 == pair[1].2);
+        .all(|pair| pair[0].0 == pair[1].0 && pair[0].1 == pair[1].1 && pair[0].2 == pair[1].2)
+        && !matches!(
+            sides[0].2,
+            BorderStyleValue::Inset
+                | BorderStyleValue::Outset
+                | BorderStyleValue::Groove
+                | BorderStyleValue::Ridge
+        );
 
     if all_same {
         let (bw, color, style) = sides[0];
@@ -60,19 +258,105 @@ pub(super) fn paint_borders(
             return;
         }
         if let Some(bc) = color {
-            let stroke = make_border_stroke(bw as f64 * scale, style);
-            let half = bw as f64 * scale * 0.5;
+            let bw = bw as f64 * scale;
+            let stroke = make_border_stroke(bw, style);
+            let half = bw * 0.5;
             let border_rect = Rect::new(x + half, y + half, x + w - half, y + h - half);
-            let has_radius = radii.top_left > 0.0
-                || radii.top_right > 0.0
-                || radii.bottom_right > 0.0
-                || radii.bottom_left > 0.0;
 
-            if has_radius {
-                let rrect = border_rect.to_rounded_rect(radii);
-                painter.stroke_color(&stroke, transform, bc, &rrect.into());
-            } else {
+            if let Some(dash) = Dash::of(style) {
+                // Chrome's dash layout (#2371, #2372): `border_dashes`.
+                let outer = Rect::new(x, y, x + w, y + h);
+                if radii.is_square() {
+                    border_dashes::paint_square_uniform(painter, transform, bc, outer, bw, dash);
+                } else {
+                    let centre = border_dashes::centre_line(
+                        border_rect,
+                        radii.inner(half, half, half, half),
+                    );
+                    let ring = border_ring(outer, radii, [bw; 4]);
+                    let curved = inner_edge_arcs(radii, [bw; 4]);
+                    if curved.iter().all(|&c| c) {
+                        border_dashes::paint_rounded(
+                            painter, transform, bc, &centre, &ring, None, bw, bw, dash,
+                        );
+                    } else {
+                        // Blink draws a side whose inner edge has no arc as a
+                        // straight side under the outer clip (its dashes
+                        // fitted to the side), and the others as the whole
+                        // dashed path clipped to their part.
+                        //
+                        // The two kinds of side overlap where they meet, so
+                        // a translucent border paints them opaque into one
+                        // layer of its alpha (Blink's opacity group), or
+                        // that corner darkens twice.
+                        let alpha = bc.components[3];
+                        let layered = alpha < 1.0;
+                        let bc = if layered {
+                            painter.push_layer(BlendMode::Normal, alpha, transform, &outer.into());
+                            bc.with_alpha(1.0)
+                        } else {
+                            bc
+                        };
+                        let edges = border_dashes::BoxEdges {
+                            rect: outer,
+                            widths: [bw; 4],
+                        };
+                        let mut straight = BezPath::new();
+                        for i in (0..4).filter(|&i| !curved[i]) {
+                            border_dashes::straight_side(
+                                &mut straight,
+                                &edges,
+                                DASH_SIDES[i],
+                                dash,
+                                &[],
+                            );
+                        }
+                        painter.push_clip(Fill::NonZero, transform, &ring.clone().into());
+                        painter.fill_color(Fill::NonZero, transform, bc, &straight.into());
+                        painter.pop_layer();
+                        for i in (0..4).filter(|&i| curved[i]) {
+                            let clip = side_quad(outer, ARC_SIDES[i]);
+                            border_dashes::paint_rounded(
+                                painter,
+                                transform,
+                                bc,
+                                &centre,
+                                &ring,
+                                Some(&clip),
+                                bw,
+                                bw,
+                                dash,
+                            );
+                        }
+                        if layered {
+                            painter.pop_layer();
+                        }
+                    }
+                }
+            } else if radii.is_square() {
                 painter.stroke_color(&stroke, transform, bc, &border_rect.into());
+            } else if matches!(style, BorderStyleValue::Solid) {
+                // A solid rounded border is exactly the ring between the
+                // border box's shape and the padding box's (css-backgrounds-3
+                // §5.5, #977), elliptical corners included — one even-odd
+                // fill, which a stroke of an ellipse cannot draw (an offset
+                // ellipse is no ellipse). Non-zero, the hole wound against
+                // the outline (`punched`).
+                let outer = Rect::new(x, y, x + w, y + h);
+                let mut ring = radii.path(outer);
+                let inner = outer.inset(-bw);
+                if inner.width() > 0.0 && inner.height() > 0.0 {
+                    ring = punched(ring, &radii.inner(bw, bw, bw, bw).path(inner));
+                }
+                painter.fill_color(Fill::NonZero, transform, bc, &ring.into());
+            } else {
+                // The double stroke runs along the border's centre line,
+                // whose radii are the outer ones less half the width — the
+                // stroke's outer edge then has the border box's radius. (It
+                // used to stroke the centre line with the outer radii, half
+                // a width too round, #977.)
+                let centre = radii.inner(half, half, half, half);
+                painter.stroke_color(&stroke, transform, bc, &centre.shape(border_rect));
             }
         }
         return;
@@ -87,75 +371,422 @@ pub(super) fn paint_borders(
     // When widths are uniform and border-radius is present, draw arc paths per side
     // instead of straight lines. This is needed for spinners (border-radius: 50%
     // with only one side colored).
-    let has_radius = radii.top_left > 0.0
-        || radii.top_right > 0.0
-        || radii.bottom_right > 0.0
-        || radii.bottom_left > 0.0;
+    let has_radius = !radii.is_square();
     let widths_uniform = (top_w - right_w).abs() < 0.01
         && (top_w - bottom_w).abs() < 0.01
         && (top_w - left_w).abs() < 0.01;
 
-    if widths_uniform && has_radius && top_w > 0.0 {
-        paint_borders_arc_per_side(painter, &sides, scale, x, y, w, h, radii, top_w, transform);
+    // groove/ridge split each edge into two differently-coloured halves along
+    // its own thickness, which the arc path below has no way to express (it
+    // strokes one whole-edge colour per side) — so a radius combined with
+    // groove/ridge falls through to the straight-line path instead, which
+    // loses the rounding at the corners but keeps the two-tone split. That is
+    // a narrower version of the pre-existing limitation just above (per-side
+    // rendering already ignores `border-radius` whenever widths aren't
+    // uniform); not covered by this issue.
+    let has_split_style = sides
+        .iter()
+        .any(|s| matches!(s.2, BorderStyleValue::Groove | BorderStyleValue::Ridge));
+
+    if widths_uniform && has_radius && top_w > 0.0 && !has_split_style {
+        paint_borders_arc_per_side(painter, sides, scale, x, y, w, h, radii, top_w, transform);
         return;
     }
 
-    // Fallback: straight lines per side (no border-radius)
+    // Fallback: straight lines per side (no border-radius).
+    let widths = [top_w, right_w, bottom_w, left_w];
+    paint_straight_sides(
+        painter,
+        sides,
+        widths,
+        Rect::new(x, y, x + w, y + h),
+        None,
+        transform,
+    );
+}
 
-    // Top border
-    if top_w > 0.0
-        && !matches!(
-            sides[0].2,
-            BorderStyleValue::None | BorderStyleValue::Hidden
-        )
-        && let Some(bc) = sides[0].1
-    {
-        let stroke = make_border_stroke(top_w, sides[0].2);
-        let half = top_w * 0.5;
-        let path = peniko::kurbo::Line::new((x, y + half), (x + w, y + half));
-        painter.stroke_color(&stroke, transform, bc, &path.into());
+/// Blink's `kStylePriority`: dashed, dotted and double sides paint first,
+/// then the 3D styles, then solid, so a side painted later and filling its
+/// whole band covers the corner the earlier one left whole.
+fn style_priority(style: BorderStyleValue) -> u8 {
+    match style {
+        BorderStyleValue::Dashed | BorderStyleValue::Dotted | BorderStyleValue::Double => 1,
+        BorderStyleValue::Inset
+        | BorderStyleValue::Outset
+        | BorderStyleValue::Groove
+        | BorderStyleValue::Ridge => 2,
+        BorderStyleValue::Solid => 3,
+        _ => 0,
     }
+}
 
-    // Right border
-    if right_w > 0.0
-        && !matches!(
-            sides[1].2,
-            BorderStyleValue::None | BorderStyleValue::Hidden
-        )
-        && let Some(bc) = sides[1].1
-    {
-        let stroke = make_border_stroke(right_w, sides[1].2);
-        let half = right_w * 0.5;
-        let path = peniko::kurbo::Line::new((x + w - half, y), (x + w - half, y + h));
-        painter.stroke_color(&stroke, transform, bc, &path.into());
+/// The straight sides of a border whose sides differ, in Blink's order
+/// ([`style_priority`]). A dashed or dotted side is cut on a corner's
+/// diagonal where Blink mitres it ([`blink_cuts`]), and so is a solid side
+/// beside a dashed or dotted one (Blink mitres it there, so the dashed
+/// side's dot or dash keeps its half of the corner). With `ring`, the sides
+/// are drawn under that clip (a rounded border whose inner edge has no arc).
+///
+/// When a side is dashed or dotted, the sides of each alpha below 1 are drawn
+/// opaque into one layer of that opacity, lowest first, as Blink's opacity
+/// groups are, so the corners they share do not darken twice.
+fn paint_straight_sides(
+    painter: &mut dyn Painter,
+    sides: &[(f32, Option<AlphaColor<Srgb>>, BorderStyleValue); 4],
+    widths: [f64; 4],
+    outer: Rect,
+    ring: Option<&BezPath>,
+    transform: Affine,
+) {
+    const SIDES: [bevel::Side; 4] = [
+        bevel::Side::Top,
+        bevel::Side::Right,
+        bevel::Side::Bottom,
+        bevel::Side::Left,
+    ];
+    let mut order = [0usize, 1, 2, 3];
+    order.sort_by_key(|&i| style_priority(sides[i].2));
+    let edges = border_dashes::BoxEdges {
+        rect: outer,
+        widths,
+    };
+    let painted = |i: usize| {
+        widths[i] > 0.0
+            && sides[i].1.is_some()
+            && !matches!(
+                sides[i].2,
+                BorderStyleValue::None | BorderStyleValue::Hidden
+            )
+    };
+    let any_dash = (0..4).any(|i| painted(i) && Dash::of(sides[i].2).is_some());
+    let alpha = |i: usize| sides[i].1.map_or(1.0, |c| c.components[3]);
+    // Blink's opacity groups: the sides of one alpha below 1 paint opaque
+    // into one layer of it, the lowest opacity first, so two of them meeting
+    // in a corner do not darken it twice. Only where a side is dashed or
+    // dotted: elsewhere this painter keeps its own solid-side corners.
+    let mut groups: Vec<f32> = Vec::new();
+    if any_dash {
+        for i in (0..4).filter(|&i| painted(i)) {
+            let a = alpha(i);
+            if a < 1.0 && !groups.contains(&a) {
+                groups.push(a);
+            }
+        }
+        groups.sort_by(f32::total_cmp);
     }
-
-    // Bottom border
-    if bottom_w > 0.0
-        && !matches!(
-            sides[2].2,
-            BorderStyleValue::None | BorderStyleValue::Hidden
-        )
-        && let Some(bc) = sides[2].1
-    {
-        let stroke = make_border_stroke(bottom_w, sides[2].2);
-        let half = bottom_w * 0.5;
-        let path = peniko::kurbo::Line::new((x, y + h - half), (x + w, y + h - half));
-        painter.stroke_color(&stroke, transform, bc, &path.into());
+    // The opaque sides last, with no layer.
+    let layers: Vec<Option<f32>> = groups.iter().map(|&a| Some(a)).chain([None]).collect();
+    if let Some(r) = ring {
+        painter.push_clip(Fill::NonZero, transform, &r.clone().into());
     }
+    let (x, y, w, h) = (outer.x0, outer.y0, outer.width(), outer.height());
+    let mut done = [false; 4];
+    for layer in layers {
+        let in_layer = |i: usize| match layer {
+            Some(a) => alpha(i) == a,
+            None => !groups.contains(&alpha(i)),
+        };
+        if let Some(a) = layer {
+            painter.push_layer(BlendMode::Normal, a, transform, &outer.into());
+        }
+        for &i in order.iter().filter(|&&i| in_layer(i)) {
+            let (_, color, style) = sides[i];
+            let Some(mut bc) = color else {
+                done[i] = true;
+                continue;
+            };
+            if layer.is_some() {
+                bc = bc.with_alpha(1.0);
+            }
+            if let Some(dash) = Dash::of(style) {
+                let cuts = blink_cuts(sides, &widths, &done, &edges, i);
+                let mut path = BezPath::new();
+                border_dashes::straight_side(&mut path, &edges, DASH_SIDES[i], dash, &cuts);
+                if !path.is_empty() {
+                    painter.fill_color(Fill::NonZero, transform, bc, &path.into());
+                }
+            } else if matches!(style, BorderStyleValue::Solid)
+                && widths[i] > 0.0
+                && let cuts = solid_cuts(sides, &widths, &done, &edges, i)
+                && !cuts.is_empty()
+            {
+                let mut path = BezPath::new();
+                border_dashes::solid_side(&mut path, &edges, DASH_SIDES[i], &cuts);
+                painter.fill_color(Fill::NonZero, transform, bc, &path.into());
+            } else {
+                paint_border_side(
+                    painter, SIDES[i], widths[i], style, bc, x, y, w, h, transform,
+                );
+            }
+            done[i] = true;
+        }
+        if layer.is_some() {
+            painter.pop_layer();
+        }
+    }
+    if ring.is_some() {
+        painter.pop_layer();
+    }
+}
 
-    // Left border
-    if left_w > 0.0
+/// Whether side `a` is drawn at all.
+fn side_present(
+    sides: &[(f32, Option<AlphaColor<Srgb>>, BorderStyleValue); 4],
+    widths: &[f64; 4],
+    a: usize,
+) -> bool {
+    widths[a] > 0.0
         && !matches!(
-            sides[3].2,
+            sides[a].2,
             BorderStyleValue::None | BorderStyleValue::Hidden
         )
-        && let Some(bc) = sides[3].1
-    {
-        let stroke = make_border_stroke(left_w, sides[3].2);
-        let half = left_w * 0.5;
-        let path = peniko::kurbo::Line::new((x + half, y), (x + half, y + h));
-        painter.stroke_color(&stroke, transform, bc, &path.into());
+}
+
+/// Blink's `ComputeMiter` for side `i` at each of its corners: no cut where
+/// the neighbour is absent, or is still to be painted and fills its whole
+/// band (it will cover the corner); otherwise a cut where the colours differ
+/// or the styles need one (`BorderStylesRequireMiter`: any two different
+/// styles, or a double, groove or ridge neighbour). `done` says which sides
+/// are painted already.
+fn blink_cuts(
+    sides: &[(f32, Option<AlphaColor<Srgb>>, BorderStyleValue); 4],
+    widths: &[f64; 4],
+    done: &[bool; 4],
+    edges: &border_dashes::BoxEdges,
+    i: usize,
+) -> Vec<border_dashes::Cut> {
+    let (_, color, style) = sides[i];
+    let mut cuts = Vec::new();
+    for a in [(i + 3) % 4, (i + 1) % 4] {
+        if !side_present(sides, widths, a) {
+            continue;
+        }
+        let (_, a_color, a_style) = sides[a];
+        let fills = !matches!(
+            a_style,
+            BorderStyleValue::Dashed | BorderStyleValue::Dotted | BorderStyleValue::Double
+        );
+        if !done[a] && fills {
+            continue;
+        }
+        let styles_need = style != a_style
+            || matches!(
+                a_style,
+                BorderStyleValue::Double | BorderStyleValue::Groove | BorderStyleValue::Ridge
+            )
+            || matches!(style, BorderStyleValue::Double);
+        if a_color != color || styles_need {
+            cuts.push(edges.miter(DASH_SIDES[i], DASH_SIDES[a]));
+        }
+    }
+    cuts
+}
+
+/// [`blink_cuts`] for a solid side, kept to the corners it shares with a
+/// dashed or dotted side: elsewhere a solid side keeps its whole-band stroke.
+fn solid_cuts(
+    sides: &[(f32, Option<AlphaColor<Srgb>>, BorderStyleValue); 4],
+    widths: &[f64; 4],
+    done: &[bool; 4],
+    edges: &border_dashes::BoxEdges,
+    i: usize,
+) -> Vec<border_dashes::Cut> {
+    // A neighbour that is not dashed or dotted is not a corner this concerns:
+    // treat it as absent.
+    let mut masked = *sides;
+    for (a, side) in masked.iter_mut().enumerate() {
+        if a != i && Dash::of(side.2).is_none() {
+            side.2 = BorderStyleValue::None;
+        }
+    }
+    blink_cuts(&masked, widths, done, edges, i)
+}
+
+/// [`bevel::Side`]'s order, as `border_dashes` names it.
+const DASH_SIDES: [border_dashes::Side; 4] = [
+    border_dashes::Side::Top,
+    border_dashes::Side::Right,
+    border_dashes::Side::Bottom,
+    border_dashes::Side::Left,
+];
+
+/// [`bevel::Side`] in `[top, right, bottom, left]` order.
+const ARC_SIDES: [bevel::Side; 4] = [
+    bevel::Side::Top,
+    bevel::Side::Right,
+    bevel::Side::Bottom,
+    bevel::Side::Left,
+];
+
+/// Per side, top, right, bottom, left: whether the padding box is rounded at
+/// either of that side's corners (Blink's `BorderWillArcInnerEdge`). A
+/// dashed or dotted side whose inner edge has no arc is drawn straight, as
+/// Blink draws it, even when its outer corners are rounded (a radius no
+/// larger than the border width).
+fn inner_edge_arcs(radii: BorderRadii, widths: [f64; 4]) -> [bool; 4] {
+    let [t, r, b, l] = widths;
+    let inner = radii.inner(t, r, b, l);
+    let arcs = |c: Vec2| c.x > 0.0 && c.y > 0.0;
+    let (tl, tr, br, bl) = (
+        arcs(inner.top_left),
+        arcs(inner.top_right),
+        arcs(inner.bottom_right),
+        arcs(inner.bottom_left),
+    );
+    [tl || tr, tr || br, br || bl, bl || tl]
+}
+
+/// The ring a border covers, the border box less the padding box, for a
+/// clip: `widths` top, right, bottom, left.
+fn border_ring(outer: Rect, radii: BorderRadii, widths: [f64; 4]) -> BezPath {
+    let [t, r, b, l] = widths;
+    let ring = radii.path(outer);
+    let inner = Rect::new(outer.x0 + l, outer.y0 + t, outer.x1 - r, outer.y1 - b);
+    if inner.width() > 0.0 && inner.height() > 0.0 {
+        punched(ring, &radii.inner(t, r, b, l).path(inner))
+    } else {
+        ring
+    }
+}
+
+/// The straight-line path of one border side at `(x, y, w, h)`, offset
+/// `offset_from_outer` logical units in from that side's own outer edge
+/// (toward the box's content), perpendicular to the edge.
+fn side_perpendicular_line(
+    side: bevel::Side,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    offset_from_outer: f64,
+) -> peniko::kurbo::Line {
+    use peniko::kurbo::Line;
+    match side {
+        bevel::Side::Top => Line::new((x, y + offset_from_outer), (x + w, y + offset_from_outer)),
+        bevel::Side::Bottom => Line::new(
+            (x, y + h - offset_from_outer),
+            (x + w, y + h - offset_from_outer),
+        ),
+        bevel::Side::Left => Line::new((x + offset_from_outer, y), (x + offset_from_outer, y + h)),
+        bevel::Side::Right => Line::new(
+            (x + w - offset_from_outer, y),
+            (x + w - offset_from_outer, y + h),
+        ),
+    }
+}
+
+/// Paint one straight (non-rounded) border side, splitting it into two
+/// differently-shaded halves for `groove`/`ridge` and resolving the
+/// whole-edge shade for `inset`/`outset` (#731). `width` is already scaled.
+#[allow(clippy::too_many_arguments)]
+fn paint_border_side(
+    painter: &mut dyn Painter,
+    side: bevel::Side,
+    width: f64,
+    style: BorderStyleValue,
+    color: AlphaColor<Srgb>,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    transform: Affine,
+) {
+    if width <= 0.0 || matches!(style, BorderStyleValue::None | BorderStyleValue::Hidden) {
+        return;
+    }
+    // Chromium's `BorderEdge::EffectiveStyle`: a groove/ridge edge one
+    // (device) pixel thick has no room for two visible halves and paints
+    // solid, in its own undarkened colour.
+    let style =
+        if width <= 1.0 && matches!(style, BorderStyleValue::Groove | BorderStyleValue::Ridge) {
+            BorderStyleValue::Solid
+        } else {
+            style
+        };
+    match style {
+        BorderStyleValue::Groove | BorderStyleValue::Ridge => {
+            let groove = matches!(style, BorderStyleValue::Groove);
+            let (outer_color, inner_color) = bevel::groove_or_ridge(groove, side, color);
+            // The outer half gets the extra pixel on an odd width, matching
+            // Chromium's `(y1 + y2 + 1) / 2` midpoint rounding.
+            let outer_w = (width * 0.5).ceil();
+            let inner_w = width - outer_w;
+            // `Stroke::new`'s default cap is `Round`, which bleeds a
+            // half-width half-disc beyond each open line's endpoint. The
+            // `all_same` fast path strokes a closed rect/rrect instead
+            // (where "cap" doesn't apply), so this round bleed was never
+            // visible for a uniform border until this per-side path — which
+            // every bevel style now always takes (see the comment on
+            // `all_same` above) — started drawing open line segments for
+            // what used to be a single rect stroke. `Butt` reaches exactly
+            // to each line's own endpoint, which is already the box's own
+            // corner, so the perpendicular side fills in the rest with no
+            // gap and no bleed, the same "reach exactly the corner" result
+            // `make_border_stroke`'s doc comment already relies on `Miter`
+            // for on a closed path.
+            let outer_line = side_perpendicular_line(side, x, y, w, h, outer_w * 0.5);
+            painter.stroke_color(
+                &Stroke::new(outer_w)
+                    .with_join(Join::Miter)
+                    .with_caps(Cap::Butt),
+                transform,
+                outer_color,
+                &outer_line.into(),
+            );
+            if inner_w > 0.0 {
+                let inner_line = side_perpendicular_line(side, x, y, w, h, outer_w + inner_w * 0.5);
+                painter.stroke_color(
+                    &Stroke::new(inner_w)
+                        .with_join(Join::Miter)
+                        .with_caps(Cap::Butt),
+                    transform,
+                    inner_color,
+                    &inner_line.into(),
+                );
+            }
+        }
+        BorderStyleValue::Inset | BorderStyleValue::Outset => {
+            let resolved =
+                bevel::inset_or_outset(matches!(style, BorderStyleValue::Inset), side, color);
+            // `Butt`, not whatever `make_border_stroke` returns (`Round`):
+            // see the long comment on the groove/ridge case above.
+            let stroke = make_border_stroke(width, style).with_caps(Cap::Butt);
+            let line = side_perpendicular_line(side, x, y, w, h, width * 0.5);
+            painter.stroke_color(&stroke, transform, resolved, &line.into());
+        }
+        _ => {
+            // `Butt`: a round cap reached half the width past each end, so a
+            // side beside an absent one (an inline fragment's open end, a
+            // box with only a `border-top`) drew past the box (#2607). Its
+            // ends are on whole device pixels, as Chrome snaps a box's
+            // edges: two boxes meeting at a fractional pixel (the cells of a
+            // collapsed table, `flex: 1` siblings) share the pixel their
+            // sides end and start in, where two partly covered ends left a
+            // lighter seam (review of #2623; the round caps overlapped it).
+            let stroke = make_border_stroke(width, style).with_caps(Cap::Butt);
+            let mut line = side_perpendicular_line(side, x, y, w, h, width * 0.5);
+            snap_side_ends(&mut line, side, transform);
+            painter.stroke_color(&stroke, transform, color, &line.into());
+        }
+    }
+}
+
+/// Move a straight side's two ends along it to whole device pixels, when
+/// `transform` maps the side's axis straight onto the device's (no rotation
+/// or skew); otherwise leave them.
+fn snap_side_ends(line: &mut peniko::kurbo::Line, side: bevel::Side, transform: Affine) {
+    let [a, b, c, d, e, f] = transform.as_coeffs();
+    if b != 0.0 || c != 0.0 || a == 0.0 || d == 0.0 {
+        return;
+    }
+    let horizontal = matches!(side, bevel::Side::Top | bevel::Side::Bottom);
+    let snap = |v: f64, k: f64, t: f64| ((k * v + t).round() - t) / k;
+    for p in [&mut line.p0, &mut line.p1] {
+        if horizontal {
+            p.x = snap(p.x, a, e);
+        } else {
+            p.y = snap(p.y, d, f);
+        }
     }
 }
 
@@ -172,7 +803,7 @@ fn paint_borders_arc_per_side(
     y: f64,
     w: f64,
     h: f64,
-    radii: RoundedRectRadii,
+    radii: BorderRadii,
     bw: f64,
     transform: Affine,
 ) {
@@ -183,71 +814,685 @@ fn paint_borders_arc_per_side(
     let iw = w - bw;
     let ih = h - bw;
 
-    // Inset radii for stroke centerline (can't go negative)
-    let tl = (radii.top_left - half).max(0.0);
-    let tr = (radii.top_right - half).max(0.0);
-    let br = (radii.bottom_right - half).max(0.0);
-    let bl = (radii.bottom_left - half).max(0.0);
+    // Inset radii for stroke centerline (can't go negative), per axis (#977).
+    let centre = radii.inner(half, half, half, half);
 
     // Build arc paths for each side
-    let paths = build_per_side_arc_paths(ix, iy, iw, ih, tl, tr, br, bl);
+    let paths = build_per_side_arc_paths(
+        ix,
+        iy,
+        iw,
+        ih,
+        centre.top_left,
+        centre.top_right,
+        centre.bottom_right,
+        centre.bottom_left,
+    );
 
-    // sides: [top, right, bottom, left]
+    // sides: [top, right, bottom, left]. The caller never routes a
+    // groove/ridge side here (it falls back to the straight-line path, which
+    // can express a two-tone split and this arc path cannot); inset/outset
+    // resolve to their one whole-side shade.
+    const SIDE_ORDER: [bevel::Side; 4] = [
+        bevel::Side::Top,
+        bevel::Side::Right,
+        bevel::Side::Bottom,
+        bevel::Side::Left,
+    ];
+    // Where the transform only translates, the solid and 3D sides fill the
+    // border ring, each under the part of the box that is its side (#2375),
+    // one clip per colour. The parts tile the box and meet on each corner's
+    // diagonal, a staircase on the device grid as Blink's aliased side clip
+    // is: each pixel there is one side's whole, so its coverage is the
+    // ring's and the side's colour. Under any other transform (a spinning
+    // loader, every frame) no staircase can follow the device grid, so those
+    // sides are the cheaper butt-capped strokes of their half-arcs below,
+    // which meet on the diagonal with a light anti-aliased seam. Round caps
+    // there covered the diagonal's edge pixels twice.
+    let [ta, tb, tc, td, ..] = transform.as_coeffs();
+    let translates = (ta, tb, tc, td) == (1.0, 0.0, 0.0, 1.0);
+    let filled = |style| {
+        translates
+            && matches!(
+                style,
+                BorderStyleValue::Solid | BorderStyleValue::Inset | BorderStyleValue::Outset
+            )
+    };
+    let outer = Rect::new(x, y, x + w, y + h);
+    // Each filled side's colour, `None` for a side drawn below, absent, or
+    // fully transparent (which paints nothing, so costs nothing).
+    let colours: [Option<AlphaColor<Srgb>>; 4] = std::array::from_fn(|i| {
+        let (_, color, style) = sides[i];
+        let bc = color.filter(|c| filled(style) && c.components[3] > 0.0)?;
+        Some(match style {
+            BorderStyleValue::Inset | BorderStyleValue::Outset => {
+                bevel::inset_or_outset(matches!(style, BorderStyleValue::Inset), SIDE_ORDER[i], bc)
+            }
+            _ => bc,
+        })
+    });
+    if colours.iter().any(Option::is_some)
+        && !paint_ring_by_corners(painter, colours, outer, radii, bw, transform)
+    {
+        // The corners overlap (a circle, a pill): each colour fills the ring
+        // under its sides' whole parts of the box.
+        let mut fills: Vec<(AlphaColor<Srgb>, BezPath, usize)> = Vec::new();
+        for (i, colour) in colours.iter().enumerate() {
+            let Some(resolved) = *colour else { continue };
+            let part = side_region(outer, SIDE_ORDER[i], radii, bw, transform);
+            match fills.iter_mut().find(|f| f.0 == resolved) {
+                Some(f) => {
+                    f.1.extend(part);
+                    f.2 += 1;
+                }
+                None => fills.push((resolved, part, 1)),
+            }
+        }
+        let ring = border_ring(outer, radii, [bw; 4]);
+        for (color, part, count) in fills {
+            // A colour on all four sides needs no clip.
+            let clipped = count < 4;
+            if clipped {
+                painter.push_clip(Fill::NonZero, transform, &part.into());
+            }
+            painter.fill_color(Fill::NonZero, transform, color, &ring.clone().into());
+            if clipped {
+                painter.pop_layer();
+            }
+        }
+    }
+
     for (i, path) in paths.iter().enumerate() {
         let (_, color, style) = sides[i];
-        if matches!(style, BorderStyleValue::None | BorderStyleValue::Hidden) {
+        if matches!(style, BorderStyleValue::None | BorderStyleValue::Hidden) || filled(style) {
             continue;
         }
         if let Some(bc) = color {
-            let stroke = make_border_stroke(bw, style);
-            painter.stroke_color(&stroke, transform, bc, &path.clone().into());
+            let resolved = match style {
+                BorderStyleValue::Inset | BorderStyleValue::Outset => bevel::inset_or_outset(
+                    matches!(style, BorderStyleValue::Inset),
+                    SIDE_ORDER[i],
+                    bc,
+                ),
+                _ => bc,
+            };
+            if let Some(dash) = Dash::of(style) {
+                // Chrome strokes the whole dashed centre line for each such
+                // side, clipped to that side's part of the ring.
+                let outer = Rect::new(x, y, x + w, y + h);
+                let centre_line =
+                    border_dashes::centre_line(Rect::new(ix, iy, ix + iw, iy + ih), centre);
+                let ring = border_ring(outer, radii, [bw; 4]);
+                if !inner_edge_arcs(radii, [bw; 4])[i] {
+                    // No arc on this side's inner edge: straight, under the
+                    // outer clip, cut where its neighbours differ.
+                    let edges = border_dashes::BoxEdges {
+                        rect: outer,
+                        widths: [bw; 4],
+                    };
+                    let cuts = blink_cuts(sides, &[bw; 4], &[true; 4], &edges, i);
+                    let mut path = BezPath::new();
+                    border_dashes::straight_side(&mut path, &edges, DASH_SIDES[i], dash, &cuts);
+                    painter.push_clip(Fill::NonZero, transform, &ring.into());
+                    painter.fill_color(Fill::NonZero, transform, resolved, &path.into());
+                    painter.pop_layer();
+                    continue;
+                }
+                let clip = side_quad(outer, SIDE_ORDER[i]);
+                border_dashes::paint_rounded(
+                    painter,
+                    transform,
+                    resolved,
+                    &centre_line,
+                    &ring,
+                    Some(&clip),
+                    bw,
+                    bw,
+                    dash,
+                );
+                continue;
+            }
+            let stroke = make_border_stroke(bw, style).with_caps(Cap::Butt);
+            painter.stroke_color(&stroke, transform, resolved, &path.clone().into());
         }
     }
+}
+
+/// The ring of a rounded border whose sides share a width `bw`, in each
+/// side's colour (`colours`, top, right, bottom, left; `None` paints
+/// nothing), where `transform` only translates (#2375, review of #2606).
+///
+/// Each corner gets a square on the device grid, the corner's larger radius
+/// or the width plus 2 px: inside it is the corner's piece of the ring (the
+/// border box's corner less the padding box's), outside it the ring is four
+/// straight bands. A corner whose two sides share a colour is its piece; one
+/// where they differ is split on the diagonal by a staircase on the device
+/// grid ([`stairs`]), so each pixel there is one side's whole, as Blink's
+/// aliased side clip splits it. The split is geometry, not a clip: each half
+/// is one path of the piece's two outlines, their curves split where the
+/// staircase crosses them ([`split_ring`]). Every cut is on the device grid,
+/// so the pieces and bands tile the ring, and each colour is one fill. Clipping each colour by its sides' whole parts of the box cost
+/// 400 clips and 0.9M mask px a frame for 200 cards with one coloured side
+/// (review of #2606).
+///
+/// `false`, painting nothing, when the squares of two corners would overlap
+/// (a circle or a pill).
+fn paint_ring_by_corners(
+    painter: &mut dyn Painter,
+    colours: [Option<AlphaColor<Srgb>>; 4],
+    outer: Rect,
+    radii: BorderRadii,
+    bw: f64,
+    transform: Affine,
+) -> bool {
+    let [.., tx, ty] = transform.as_coeffs();
+    let Rect { x0, y0, x1, y1 } = outer;
+    let inner_radii = radii.inner(bw, bw, bw, bw);
+    // top-left, top-right, bottom-right, bottom-left: the box's corner, the
+    // way in on each axis, the outer and inner radii, and the two sides
+    // (the horizontal one, the vertical one).
+    let corners = [
+        (
+            Point::new(x0, y0),
+            (1.0, 1.0),
+            radii.top_left,
+            inner_radii.top_left,
+            (0, 3),
+        ),
+        (
+            Point::new(x1, y0),
+            (-1.0, 1.0),
+            radii.top_right,
+            inner_radii.top_right,
+            (0, 1),
+        ),
+        (
+            Point::new(x1, y1),
+            (-1.0, -1.0),
+            radii.bottom_right,
+            inner_radii.bottom_right,
+            (2, 1),
+        ),
+        (
+            Point::new(x0, y1),
+            (1.0, -1.0),
+            radii.bottom_left,
+            inner_radii.bottom_left,
+            (2, 3),
+        ),
+    ];
+    // Each square's inner corner, on the device grid.
+    let ends: [Point; 4] = std::array::from_fn(|k| {
+        let (p, (sx, sy), r, ..) = corners[k];
+        let c = r.x.max(r.y).max(bw) + 2.0;
+        let snap = |v: f64, t: f64, s: f64| {
+            if s > 0.0 {
+                (v + t + c).ceil() - t
+            } else {
+                (v + t - c).floor() - t
+            }
+        };
+        Point::new(snap(p.x, tx, sx), snap(p.y, ty, sy))
+    });
+    let [tl, tr, br, bl] = ends;
+    if tl.x > tr.x || bl.x > br.x || tl.y > bl.y || tr.y > br.y {
+        return false;
+    }
+    // One path per colour.
+    let mut paths: Vec<(AlphaColor<Srgb>, BezPath)> = Vec::new();
+    let mut add = |side: usize, els: &mut dyn Iterator<Item = peniko::kurbo::PathEl>| {
+        let Some(c) = colours[side] else { return };
+        let i = match paths.iter().position(|p| p.0 == c) {
+            Some(i) => i,
+            None => {
+                paths.push((c, BezPath::new()));
+                paths.len() - 1
+            }
+        };
+        paths[i].1.extend(els);
+    };
+    // The straight runs.
+    let bands = [
+        Rect::new(tl.x, y0, tr.x, y0 + bw),
+        Rect::new(x1 - bw, tr.y, x1, br.y),
+        Rect::new(bl.x, y1 - bw, br.x, y1),
+        Rect::new(x0, tl.y, x0 + bw, bl.y),
+    ];
+    for (side, band) in bands.into_iter().enumerate() {
+        if band.width() > 0.0 && band.height() > 0.0 {
+            add(side, &mut band.path_elements(0.1));
+        }
+    }
+    let offset = Vec2::new(tx, ty);
+    for (k, &(p, (sx, sy), r, ir, (hs, vs))) in corners.iter().enumerate() {
+        let (h, v) = (colours[hs], colours[vs]);
+        if h.is_none() && v.is_none() {
+            continue;
+        }
+        let end = ends[k];
+        // The corner's piece of the ring: the square with the corner's outer
+        // radius, less its part inside the padding box.
+        let only = |c: Vec2| {
+            let mut z = [Vec2::ZERO; 4];
+            z[k] = c;
+            BorderRadii::new(z[0], z[1], z[2], z[3])
+        };
+        let square = Rect::from_points(p, end);
+        let outline = only(r).path(square);
+        let hole = Rect::from_points(p + Vec2::new(sx * bw, sy * bw), end);
+        let hole = (hole.width() > 0.0 && hole.height() > 0.0).then(|| only(ir).path(hole));
+        if h == v {
+            let piece = match &hole {
+                Some(hole) => punched(outline, hole),
+                None => outline,
+            };
+            add(hs, &mut piece.into_iter());
+            continue;
+        }
+        // The square split on its diagonal, in the corner's own frame
+        // (`u` across, `v` down, from the corner): the horizontal side is
+        // above the staircase, the vertical side below it.
+        let (du, dv) = ((end.x - p.x).abs(), (end.y - p.y).abs());
+        let d = du.min(dv);
+        let at = |u: f64, v: f64| Point::new(p.x + sx * u, p.y + sy * v);
+        // Past the padding box's corner (its radius in from the width) the
+        // diagonal is inside the hole, so the staircase stops there: its
+        // steps cost the scan converter two edges each.
+        let deep = if hole.is_some() {
+            d.min((bw + ir.x.max(ir.y)).ceil() + 1.0)
+        } else {
+            d
+        };
+        let mut steps = stairs(p + offset, at(deep, deep) + offset);
+        for q in &mut steps {
+            *q -= offset;
+        }
+        // The divider: the staircase, then straight on to the square's far
+        // edge. It crosses each convex outline once on the way in and ends
+        // on its edge.
+        let mut divider = steps;
+        divider.push(at(d, dv));
+        // Whether `q` is inside the outline whose corner is `inset` in and
+        // rounded by `rad`: past the inset, and inside the corner's ellipse
+        // where it is round.
+        let inside = |inset: f64, rad: Vec2| {
+            move |q: Point| {
+                let (u, v) = (sx * (q.x - p.x) - inset, sy * (q.y - p.y) - inset);
+                if u < 0.0 || v < 0.0 {
+                    return false;
+                }
+                if rad.x <= 0.0 || rad.y <= 0.0 || u >= rad.x || v >= rad.y {
+                    return true;
+                }
+                let (a, b) = ((u - rad.x) / rad.x, (v - rad.y) / rad.y);
+                a * a + b * b <= 1.0
+            }
+        };
+        let keep = at(du - 0.5, if hole.is_some() { bw * 0.5 } else { 0.5 });
+        if let Some((upper, lower)) = split_ring(
+            (&outline, inside(0.0, r)),
+            hole.as_ref().map(|h| (h, inside(bw, ir))),
+            &divider,
+            keep,
+        ) {
+            add(hs, &mut upper.into_iter());
+            add(vs, &mut lower.into_iter());
+        }
+    }
+    for (c, path) in paths {
+        painter.fill_color(Fill::NonZero, transform, c, &path.into());
+    }
+    true
+}
+
+/// A crossing of a divider with an outline: (position along the divider,
+/// the outline's segment, the segment's t).
+type Crossing = (f64, usize, f64);
+
+/// One convex outline (one closed subpath) prepared for [`split_ring`]: its
+/// segments, and where the divider comes into it and leaves it.
+struct Cut {
+    segs: Vec<peniko::kurbo::PathSeg>,
+    enter: Crossing,
+    leave: Crossing,
+}
+
+impl Cut {
+    /// `outline` crossed by the polyline `divider`, which starts outside (or
+    /// on) it, comes in once and ends on its edge; `inside` says whether a
+    /// point is in it. `None` when it does not cross twice.
+    fn new(outline: &BezPath, divider: &[Point], inside: impl Fn(Point) -> bool) -> Option<Self> {
+        use peniko::kurbo::{Line, PathSeg};
+        let segs: Vec<PathSeg> = outline.segments().collect();
+        let n = divider.len();
+        if n < 2 {
+            return None;
+        }
+        // The divider stays inside once in (the outline is convex and the
+        // staircase monotone), so its first vertex inside is found by
+        // bisection, and only the divider segments around it are tried
+        // against the outline's curves, which take a cubic solve each. The
+        // straight edges are cheap and tried against every segment (a
+        // square inner corner can sit on the staircase).
+        let (mut lo, mut hi) = (0, n - 1);
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2;
+            if inside(divider[mid]) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        let near = lo.saturating_sub(1)..=hi;
+        let boxes: Vec<Rect> = segs
+            .iter()
+            .map(|s| s.bounding_box().inflate(1e-6, 1e-6))
+            .collect();
+        let (mut enter, mut leave): (Option<Crossing>, Option<Crossing>) = (None, None);
+        for (i, w) in divider.windows(2).enumerate() {
+            let line = Line::new(w[0], w[1]);
+            let span = Rect::from_points(w[0], w[1]);
+            for (j, seg) in segs.iter().enumerate() {
+                let b = boxes[j];
+                if span.x1 < b.x0 || span.x0 > b.x1 || span.y1 < b.y0 || span.y0 > b.y1 {
+                    continue;
+                }
+                if !matches!(seg, PathSeg::Line(_)) && !near.contains(&i) {
+                    continue;
+                }
+                for x in seg.intersect_line(line) {
+                    let hit = (i as f64 + x.line_t, j, x.segment_t);
+                    if enter.is_none_or(|e| hit.0 < e.0) {
+                        enter = Some(hit);
+                    }
+                    if leave.is_none_or(|l| hit.0 > l.0) {
+                        leave = Some(hit);
+                    }
+                }
+            }
+        }
+        let (enter, leave) = (enter?, leave?);
+        (leave.0 - enter.0 > 1e-9).then_some(Self { segs, enter, leave })
+    }
+
+    fn point(&self, (_, j, t): Crossing) -> Point {
+        use peniko::kurbo::ParamCurve;
+        self.segs[j].eval(t)
+    }
+
+    /// The outline forward from `from` to `to`, appended to `path` (which is
+    /// at `from` already).
+    fn walk(&self, from: Crossing, to: Crossing, path: &mut BezPath) {
+        use peniko::kurbo::ParamCurve;
+        let n = self.segs.len();
+        let (mut j, mut t) = (from.1, from.2);
+        for _ in 0..=n {
+            if j == to.1 && to.2 >= t {
+                path.push(self.segs[j].subsegment(t..to.2).as_path_el());
+                return;
+            }
+            path.push(self.segs[j].subsegment(t..1.0).as_path_el());
+            j = (j + 1) % n;
+            t = 0.0;
+        }
+    }
+
+    /// The outline backward from `from` to `to`, appended to `path` (which
+    /// is at `from` already).
+    fn walk_back(&self, from: Crossing, to: Crossing, path: &mut BezPath) {
+        let mut forward = BezPath::new();
+        forward.move_to(self.point(to));
+        self.walk(to, from, &mut forward);
+        // Reversed, it starts with a move to `from`, where `path` is.
+        path.extend(
+            forward
+                .reverse_subpaths()
+                .into_iter()
+                .skip(1)
+                .filter(|el| !matches!(el, peniko::kurbo::PathEl::ClosePath)),
+        );
+    }
+}
+
+/// A corner's piece of the ring, the convex `outline` less the convex
+/// `hole` (each with its inside test), cut in two by the polyline `divider`
+/// (a staircase from outside the outline, in through the ring, ending on the
+/// edge the two share): the half holding `keep`, then the other. Each half
+/// is one closed path of the outlines' own segments (curves split where the
+/// divider crosses them) and the divider between the two outlines.
+fn split_ring(
+    (outline, in_outline): (&BezPath, impl Fn(Point) -> bool),
+    hole: Option<(&BezPath, impl Fn(Point) -> bool)>,
+    divider: &[Point],
+    keep: Point,
+) -> Option<(BezPath, BezPath)> {
+    let o = Cut::new(outline, divider, in_outline)?;
+    let h = match hole {
+        Some((hole, in_hole)) => Some(Cut::new(hole, divider, in_hole)?),
+        None => None,
+    };
+    // The divider's points strictly between positions `a` and `b`.
+    let between = |a: f64, b: f64| {
+        divider
+            .iter()
+            .enumerate()
+            .filter(move |&(i, _)| (i as f64) > a && (i as f64) < b)
+            .map(|(_, &q)| q)
+    };
+    let mut first = BezPath::new();
+    let mut second = BezPath::new();
+    first.move_to(o.point(o.enter));
+    o.walk(o.enter, o.leave, &mut first);
+    second.move_to(o.point(o.leave));
+    o.walk(o.leave, o.enter, &mut second);
+    match &h {
+        Some(h) => {
+            // Back round the hole to where the divider came into it, then
+            // out along the divider; the other half the other way.
+            first.line_to(h.point(h.leave));
+            h.walk_back(h.leave, h.enter, &mut first);
+            for q in between(o.enter.0, h.enter.0)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
+                first.line_to(q);
+            }
+            for q in between(o.enter.0, h.enter.0) {
+                second.line_to(q);
+            }
+            second.line_to(h.point(h.enter));
+            h.walk_back(h.enter, h.leave, &mut second);
+        }
+        None => {
+            for q in between(o.enter.0, o.leave.0)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
+                first.line_to(q);
+            }
+            for q in between(o.enter.0, o.leave.0) {
+                second.line_to(q);
+            }
+        }
+    }
+    first.close_path();
+    second.close_path();
+    if first.winding(keep) != 0 {
+        Some((first, second))
+    } else {
+        Some((second, first))
+    }
+}
+
+/// [`side_quad`] with its two diagonals as staircases on the device grid
+/// ([`stairs`]), so the parts of a box split each pixel on a diagonal
+/// whole, as Blink's aliased side clips do (#2375). `transform` only
+/// translates (its offset puts the staircase on the device grid).
+fn side_region(
+    outer: Rect,
+    side: bevel::Side,
+    radii: BorderRadii,
+    bw: f64,
+    transform: Affine,
+) -> BezPath {
+    let [.., e, f] = transform.as_coeffs();
+    let Rect { x0, y0, x1, y1 } = outer;
+    let half = outer.width().min(outer.height()) / 2.0;
+    // Each corner: the box's corner, the way in along its diagonal, and how
+    // deep into it the ring can reach: past that the diagonal crosses no
+    // ring pixel, and is drawn straight.
+    let corner = |p: (f64, f64), dir: (f64, f64), r: Vec2| {
+        let reach = (r.x.max(r.y).max(bw) + 2.0).min(half);
+        (Point::new(p.0, p.1), Vec2::new(dir.0, dir.1), reach)
+    };
+    let tl = corner((x0, y0), (1.0, 1.0), radii.top_left);
+    let tr = corner((x1, y0), (-1.0, 1.0), radii.top_right);
+    let br = corner((x1, y1), (-1.0, -1.0), radii.bottom_right);
+    let bl = corner((x0, y1), (1.0, -1.0), radii.bottom_left);
+    // The side's corners in the order its outer edge runs.
+    let (first, second) = match side {
+        bevel::Side::Top => (tl, tr),
+        bevel::Side::Right => (tr, br),
+        bevel::Side::Bottom => (br, bl),
+        bevel::Side::Left => (bl, tl),
+    };
+    let offset = Vec2::new(e, f);
+    // A corner's diagonal from the box's corner to the middle of the box:
+    // the staircase as deep as the ring reaches, then straight.
+    let diagonal = |(p, dir, reach): (Point, Vec2, f64)| {
+        let mut pts = stairs(p + offset, p + offset + dir * reach);
+        for q in &mut pts {
+            *q -= offset;
+        }
+        pts.push(p + dir * half);
+        pts
+    };
+    let mut path = BezPath::new();
+    path.move_to(first.0);
+    // Out along the edge, in along the second corner's diagonal, back along
+    // the first's.
+    for q in diagonal(second) {
+        path.line_to(q);
+    }
+    for q in diagonal(first).into_iter().rev() {
+        path.line_to(q);
+    }
+    path.close_path();
+    path
+}
+
+/// The 45° segment `p` to `q` (device px) as a staircase on the pixel grid:
+/// on each pixel row it crosses, a vertical edge at the pixel boundary
+/// nearest where the segment crosses the row's middle, a pixel whose centre
+/// is on the segment going to the larger x. Two regions that share the
+/// segment and both take this staircase split every pixel on it whole.
+/// Starts at `p`, ends at `q`.
+fn stairs(p: Point, q: Point) -> Vec<Point> {
+    let mut pts = vec![p];
+    let (dy, dx) = (q.y - p.y, q.x - p.x);
+    if dy == 0.0 {
+        pts.push(q);
+        return pts;
+    }
+    let (sy, slope) = (dy.signum(), dx / dy);
+    let (lo, hi) = (p.y.min(q.y), p.y.max(q.y));
+    let mut row = if sy > 0.0 {
+        lo.floor()
+    } else {
+        hi.ceil() - 1.0
+    };
+    loop {
+        let (r0, r1) = (row.max(lo), (row + 1.0).min(hi));
+        if r1 > r0 {
+            let mid = row + 0.5;
+            let boundary = (p.x + slope * (mid - p.y) - 0.5).ceil();
+            let (from, to) = if sy > 0.0 { (r0, r1) } else { (r1, r0) };
+            pts.push(Point::new(boundary, from));
+            pts.push(Point::new(boundary, to));
+        }
+        row += sy;
+        if row + 1.0 <= lo || row >= hi {
+            break;
+        }
+    }
+    pts.push(q);
+    pts
+}
+
+/// The part of a box that belongs to one side, for clipping a rounded
+/// border's side: the outer edge and the 45° diagonals in from its corners,
+/// which meet where the arc paths' halves do (a corner split at its middle).
+fn side_quad(outer: Rect, side: bevel::Side) -> BezPath {
+    let Rect { x0, y0, x1, y1 } = outer;
+    let d = outer.width().min(outer.height()) / 2.0;
+    let pts = match side {
+        bevel::Side::Top => [(x0, y0), (x1, y0), (x1 - d, y0 + d), (x0 + d, y0 + d)],
+        bevel::Side::Right => [(x1, y0), (x1, y1), (x1 - d, y1 - d), (x1 - d, y0 + d)],
+        bevel::Side::Bottom => [(x1, y1), (x0, y1), (x0 + d, y1 - d), (x1 - d, y1 - d)],
+        bevel::Side::Left => [(x0, y1), (x0, y0), (x0 + d, y0 + d), (x0 + d, y1 - d)],
+    };
+    let mut path = BezPath::new();
+    path.move_to(pts[0]);
+    for p in &pts[1..] {
+        path.line_to(*p);
+    }
+    path.close_path();
+    path
 }
 
 /// Build BezPath for each side of a rounded rect.
 ///
 /// Each side includes: second half of the preceding corner arc + straight segment
 /// + first half of the following corner arc. Corner arcs are split at t=0.5
-///   using De Casteljau subdivision.
+///   using De Casteljau subdivision. Each corner is a quarter ellipse with its
+///   own horizontal (`x`) and vertical (`y`) radius (#977).
 #[allow(clippy::too_many_arguments)]
 fn build_per_side_arc_paths(
     ix: f64,
     iy: f64,
     iw: f64,
     ih: f64,
-    tl: f64,
-    tr: f64,
-    br: f64,
-    bl: f64,
+    tl: Vec2,
+    tr: Vec2,
+    br: Vec2,
+    bl: Vec2,
 ) -> [BezPath; 4] {
-    // κ for quarter-circle cubic Bézier approximation
+    // κ for quarter-ellipse cubic Bézier approximation
     const K: f64 = 0.5522847498;
 
     // Corner arc endpoints and control points.
-    // TL: from (ix, iy+tl) to (ix+tl, iy)  [left→top, counterclockwise around corner]
-    let tl_p0 = Point::new(ix, iy + tl);
-    let tl_p1 = Point::new(ix, iy + tl - tl * K);
-    let tl_p2 = Point::new(ix + tl - tl * K, iy);
-    let tl_p3 = Point::new(ix + tl, iy);
+    // TL: from (ix, iy+tl.y) to (ix+tl.x, iy)  [left→top, counterclockwise around corner]
+    let tl_p0 = Point::new(ix, iy + tl.y);
+    let tl_p1 = Point::new(ix, iy + tl.y - tl.y * K);
+    let tl_p2 = Point::new(ix + tl.x - tl.x * K, iy);
+    let tl_p3 = Point::new(ix + tl.x, iy);
 
-    // TR: from (ix+iw-tr, iy) to (ix+iw, iy+tr)  [top→right]
-    let tr_p0 = Point::new(ix + iw - tr, iy);
-    let tr_p1 = Point::new(ix + iw - tr + tr * K, iy);
-    let tr_p2 = Point::new(ix + iw, iy + tr - tr * K);
-    let tr_p3 = Point::new(ix + iw, iy + tr);
+    // TR: from (ix+iw-tr.x, iy) to (ix+iw, iy+tr.y)  [top→right]
+    let tr_p0 = Point::new(ix + iw - tr.x, iy);
+    let tr_p1 = Point::new(ix + iw - tr.x + tr.x * K, iy);
+    let tr_p2 = Point::new(ix + iw, iy + tr.y - tr.y * K);
+    let tr_p3 = Point::new(ix + iw, iy + tr.y);
 
-    // BR: from (ix+iw, iy+ih-br) to (ix+iw-br, iy+ih)  [right→bottom]
-    let br_p0 = Point::new(ix + iw, iy + ih - br);
-    let br_p1 = Point::new(ix + iw, iy + ih - br + br * K);
-    let br_p2 = Point::new(ix + iw - br + br * K, iy + ih);
-    let br_p3 = Point::new(ix + iw - br, iy + ih);
+    // BR: from (ix+iw, iy+ih-br.y) to (ix+iw-br.x, iy+ih)  [right→bottom]
+    let br_p0 = Point::new(ix + iw, iy + ih - br.y);
+    let br_p1 = Point::new(ix + iw, iy + ih - br.y + br.y * K);
+    let br_p2 = Point::new(ix + iw - br.x + br.x * K, iy + ih);
+    let br_p3 = Point::new(ix + iw - br.x, iy + ih);
 
-    // BL: from (ix+bl, iy+ih) to (ix, iy+ih-bl)  [bottom→left]
-    let bl_p0 = Point::new(ix + bl, iy + ih);
-    let bl_p1 = Point::new(ix + bl - bl * K, iy + ih);
-    let bl_p2 = Point::new(ix, iy + ih - bl + bl * K);
-    let bl_p3 = Point::new(ix, iy + ih - bl);
+    // BL: from (ix+bl.x, iy+ih) to (ix, iy+ih-bl.y)  [bottom→left]
+    let bl_p0 = Point::new(ix + bl.x, iy + ih);
+    let bl_p1 = Point::new(ix + bl.x - bl.x * K, iy + ih);
+    let bl_p2 = Point::new(ix, iy + ih - bl.y + bl.y * K);
+    let bl_p3 = Point::new(ix, iy + ih - bl.y);
+    // A corner is drawn when it is rounded at all (a square one is `ZERO`).
+    let (tl, tr, br, bl) = (
+        tl.x.max(tl.y),
+        tr.x.max(tr.y),
+        br.x.max(br.y),
+        bl.x.max(bl.y),
+    );
 
     // Split each corner arc at t=0.5
     let (tl_first, tl_second) = split_cubic_half(tl_p0, tl_p1, tl_p2, tl_p3);
@@ -319,19 +1564,28 @@ fn midpt(a: Point, b: Point) -> Point {
     Point::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5)
 }
 
-/// Create a Stroke with dash pattern based on border style.
+/// The stroke for a border or outline of `style`.
+///
+/// Every style takes a **miter** join. A uniform border or an outline is one
+/// stroke around the rectangle through the middle of its band, and kurbo's
+/// `Stroke::new` defaults to `Join::Round`, which leaves each outer corner
+/// square of the band unpainted — a notch `width / 2` on a side, enough to
+/// make a 50px border on a 100px box read as rounded (#1022). A 90° miter
+/// reaches exactly the corner (ratio √2, under the default limit of 4), so
+/// the band is the border box minus the padding box, as CSS draws it. On a
+/// rounded rect the path is smooth at every joint and the join is moot.
+///
+/// `dashed` and `dotted` never reach a painter as a dash pattern: they are
+/// laid out by `border_dashes` (#2371, #2372), and this returns them a plain
+/// stroke.
 pub(super) fn make_border_stroke(width: f64, style: BorderStyleValue) -> Stroke {
     match style {
-        BorderStyleValue::Dashed => Stroke::new(width).with_dashes(0.0, [width * 3.0, width * 3.0]),
-        BorderStyleValue::Dotted => Stroke::new(width)
-            .with_dashes(0.0, [width, width])
-            .with_caps(Cap::Round),
         BorderStyleValue::Double => {
             // For double, draw at 1/3 width (the caller draws two passes)
             // We approximate by drawing a single thinner stroke
-            Stroke::new((width / 3.0).max(1.0))
+            Stroke::new((width / 3.0).max(1.0)).with_join(Join::Miter)
         }
-        _ => Stroke::new(width), // Solid and others
+        _ => Stroke::new(width).with_join(Join::Miter), // Solid and others
     }
 }
 
@@ -345,7 +1599,7 @@ pub(super) fn paint_outline(
     y: f64,
     w: f64,
     h: f64,
-    radii: RoundedRectRadii,
+    radii: BorderRadii,
     transform: Affine,
 ) {
     let cs = &node.computed_style;
@@ -376,24 +1630,81 @@ pub(super) fn paint_outline(
         y + h + offset + half,
     );
 
-    let has_radius = radii.top_left > 0.0
-        || radii.top_right > 0.0
-        || radii.bottom_right > 0.0
-        || radii.bottom_left > 0.0;
-
-    if has_radius {
-        let expand = offset + half;
-        let outline_radii = RoundedRectRadii::new(
-            radii.top_left + expand,
-            radii.top_right + expand,
-            radii.bottom_right + expand,
-            radii.bottom_left + expand,
+    if let Some(dash) = Dash::of(cs.outline_style) {
+        // Laid out as a uniform border on the outline's own box (Chrome
+        // paints an outline with its border painter, #2371).
+        let inner_rect = Rect::new(x - offset, y - offset, x + w + offset, y + h + offset);
+        let outer_rect = inner_rect.inflate(ow, ow);
+        if radii.is_square() {
+            border_dashes::paint_square_uniform(painter, transform, color, outer_rect, ow, dash);
+        } else {
+            let centre = border_dashes::centre_line(outline_rect, radii.grown(offset + half));
+            let mut ring = radii.grown(offset + ow).path(outer_rect);
+            if inner_rect.width() > 0.0 && inner_rect.height() > 0.0 {
+                ring = punched(ring, &radii.grown(offset).path(inner_rect));
+            }
+            border_dashes::paint_rounded(
+                painter, transform, color, &centre, &ring, None, ow, ow, dash,
+            );
+        }
+    } else if radii.as_circular().is_none() && matches!(cs.outline_style, BorderStyleValue::Solid) {
+        // A solid outline round an elliptical corner (#977) is the ring
+        // between the border box grown by the offset and that grown by the
+        // offset and the width, each radius grown by the same amount on both
+        // axes — one even-odd fill, as for a solid border, since an offset
+        // ellipse is no ellipse and a stroke of one draws the wrong band. A
+        // circular corner keeps the stroke, which is exact for it.
+        let inner_rect = Rect::new(x - offset, y - offset, x + w + offset, y + h + offset);
+        let outer_rect = inner_rect.inflate(ow, ow);
+        let mut ring = radii.grown(offset + ow).path(outer_rect);
+        if inner_rect.width() > 0.0 && inner_rect.height() > 0.0 {
+            ring = punched(ring, &radii.grown(offset).path(inner_rect));
+        }
+        painter.fill_color(Fill::NonZero, transform, color, &ring.into());
+    } else if !radii.is_square() {
+        // Each radius grows by how far the outline's centre line is from the
+        // border edge, on both axes (an elliptical corner stays elliptical).
+        let outline_radii = radii.grown(offset + half);
+        painter.stroke_color(
+            &stroke,
+            transform,
+            color,
+            &outline_radii.shape(outline_rect),
         );
-        let rrect = outline_rect.to_rounded_rect(outline_radii);
-        painter.stroke_color(&stroke, transform, color, &rrect.into());
     } else {
         painter.stroke_color(&stroke, transform, color, &outline_rect.into());
     }
+}
+
+/// The corner radius of an outer shadow's shape, for a border radius `r`
+/// grown by `spread` (css-backgrounds-3 §7.1.1, "Shadow Shape, Spread, and
+/// Knockout").
+///
+/// The radius grows with the spread, as the rect does, and a negative spread
+/// shrinks it, floored at zero. But where `r` is less than the spread, the
+/// spread is first multiplied by `1 + (r/spread - 1)^3` — so a square corner
+/// (`r == 0`, a factor of `0`) stays square however far it is spread, and a
+/// small radius grows continuously out of it instead of jumping to
+/// `r + spread`. Chrome 153 paints exactly this (#351, measured in
+/// `tests/box_shadow_spread_radius_tests.rs`).
+pub(super) fn spread_corner_radius(r: f64, spread: f64) -> f64 {
+    if spread > 0.0 && r < spread {
+        let ratio = r / spread;
+        r + spread * (1.0 + (ratio - 1.0).powi(3))
+    } else {
+        (r + spread).max(0.0)
+    }
+}
+
+/// [`spread_corner_radius`] for all four corners, each axis on its own
+/// (§7.1.1 applies the rule to every radius; #977).
+fn spread_radii(radii: BorderRadii, spread: f64) -> BorderRadii {
+    radii.map(|c| {
+        Vec2::new(
+            spread_corner_radius(c.x, spread),
+            spread_corner_radius(c.y, spread),
+        )
+    })
 }
 
 /// Paint CSS box-shadow from typed computed values.
@@ -410,24 +1721,15 @@ pub(super) fn paint_box_shadow(
     node: &crate::node::Node,
     transform: Affine,
 ) {
-    // Get per-corner border-radius from computed style
-    let radii = {
-        let cs = &node.computed_style;
-        let resolve_size = node.layout.width.min(node.layout.height);
-        let tl = cs.border_radius_top_left.resolve(resolve_size).max(0.0) as f64 * scale;
-        let tr = cs.border_radius_top_right.resolve(resolve_size).max(0.0) as f64 * scale;
-        let br = cs.border_radius_bottom_right.resolve(resolve_size).max(0.0) as f64 * scale;
-        let bl = cs.border_radius_bottom_left.resolve(resolve_size).max(0.0) as f64 * scale;
-        RoundedRectRadii::new(tl, tr, br, bl)
-    };
-    let has_radius = radii.top_left > 0.0
-        || radii.top_right > 0.0
-        || radii.bottom_right > 0.0
-        || radii.bottom_left > 0.0;
+    // The element's corners, as its background draws them (#977: per axis,
+    // fitted to the box).
+    let radii = super::border_radii(node, scale);
+    let has_radius = !radii.is_square();
 
     // The element's own border box, which an outer shadow is never painted
     // inside of. Every layer below is drawn as this hole punched out of the
-    // layer's expanded rect, with `Fill::EvenOdd` doing the punching.
+    // layer's expanded rect, wound against it under `Fill::NonZero`
+    // (`punched`).
     //
     // It is what CSS says — an outer `box-shadow` is clipped to the outside of
     // the border box — and it is also, on a software rasteriser, the difference
@@ -455,42 +1757,45 @@ pub(super) fn paint_box_shadow(
     // anti-aliased edge should be the page, not a shadow the element covers.
     // See card K24.
     let element_box = Rect::new(x, y, x + w, y + h);
-    let hole: BezPath = if has_radius {
-        element_box.to_rounded_rect(radii).into_path(0.1)
-    } else {
-        element_box.into_path(0.1)
-    };
-
-    /// The layer's expanded shape with the element's border box cut out of it.
-    ///
-    /// `Fill::EvenOdd` over the two subpaths is what does the cutting: a point
-    /// inside both is crossed an even number of times and so is left alone,
-    /// which is the ring, and only the ring.
-    fn ring(outer: BezPath, hole: &BezPath) -> BezPath {
-        let mut path = outer;
-        path.extend(hole.iter());
-        path
-    }
+    let hole: BezPath = radii.path(element_box);
 
     /// Whether the hole is wholly inside `outer` — the precondition the punch
     /// needs, and not a rounding detail.
     ///
-    /// `Fill::EvenOdd` counts crossings, so a point inside the hole and
-    /// *outside* the layer is crossed once and fills. Where the border box
+    /// The punch is the hole wound against the layer (`punched`), so a point
+    /// inside the hole and *outside* the layer winds to -1 and fills (under
+    /// `Fill::EvenOdd`, which it used to be, it is crossed once and fills
+    /// just the same). Where the border box
     /// escapes the layer's rect the punch therefore stops subtracting and
     /// starts adding, painting shadow inside the element that CSS says is not
     /// there. It escapes whenever a shadow is offset further than the layer is
     /// expanded — the near edge of `0 4px 12px`, say, whose first layers are
     /// expanded by less than the 4px they are pushed down — and the strip it
     /// paints only stays hidden while the element's own background is fully
-    /// opaque. So the punch is applied only where it provably subtracts, and
-    /// the layer is filled whole (as it always was) where it does not.
+    /// opaque. So the punch is applied only where it provably subtracts; where
+    /// it does not, the shadow is filled through a clip that excludes the box
+    /// instead (`paint_shadow_layers`, #976).
     fn hole_fits(
         hole_rect: Rect,
-        hole_radii: RoundedRectRadii,
+        hole_radii: BorderRadii,
         outer_rect: Rect,
-        outer_radii: RoundedRectRadii,
+        outer_radii: BorderRadii,
     ) -> bool {
+        // The test below is for circular corners. With an elliptical one
+        // (#977) both shapes are convex, so the hole is inside the layer when
+        // every vertex of the hole's outline, flattened finely, is.
+        let (Some(hole_radii), Some(outer_radii)) =
+            (hole_radii.as_circular(), outer_radii.as_circular())
+        else {
+            let mut inside = true;
+            peniko::kurbo::flatten(hole_radii.path(hole_rect), 0.05, |el| {
+                use peniko::kurbo::PathEl;
+                if let PathEl::MoveTo(p) | PathEl::LineTo(p) = el {
+                    inside &= outer_radii.contains(outer_rect, p);
+                }
+            });
+            return inside;
+        };
         if hole_rect.x0 < outer_rect.x0
             || hole_rect.y0 < outer_rect.y0
             || hole_rect.x1 > outer_rect.x1
@@ -502,10 +1807,29 @@ pub(super) fn paint_box_shadow(
         // centres are `d` apart, so the layer's radius has to beat the hole's
         // by at least that much. A square layer corner (`or == 0`) cuts
         // nothing off, so there the rect check above is the whole story.
-        let corner = |hc: (f64, f64), hr: f64, oc: (f64, f64), or: f64| {
-            or <= 0.0 || (hc.0 - oc.0).hypot(hc.1 - oc.1) + hr <= or + 1e-6
+        //
+        // Nor does a layer corner the hole never reaches. The layer's arc
+        // only cuts the quadrant beyond its own centre — for the top-left,
+        // `x < oc.0 && y < oc.1` — and a hole whose rect starts at or past
+        // that centre on either axis has no point there at all. That is the
+        // shape a small radius under a large spread takes (#351): the spread
+        // ratio rule makes the shadow's corner *sharper* than `r + spread`, so
+        // its arc's centre sits outside the element and the arc-in-arc test
+        // below, which assumes the two arcs face each other, fails a hole that
+        // is plainly inside.
+        //
+        // `inward` is the corner's direction into the box: `(1, 1)` for the
+        // top-left, `(-1, 1)` for the top-right, and so on.
+        let corner = |inward: (f64, f64), hc: (f64, f64), hr: f64, oc: (f64, f64), or: f64| {
+            // The hole's rect edges at this corner.
+            let edge = (hc.0 - inward.0 * hr, hc.1 - inward.1 * hr);
+            or <= 0.0
+                || (edge.0 - oc.0) * inward.0 >= 0.0
+                || (edge.1 - oc.1) * inward.1 >= 0.0
+                || (hc.0 - oc.0).hypot(hc.1 - oc.1) + hr <= or + 1e-6
         };
         corner(
+            (1.0, 1.0),
             (
                 hole_rect.x0 + hole_radii.top_left,
                 hole_rect.y0 + hole_radii.top_left,
@@ -517,6 +1841,7 @@ pub(super) fn paint_box_shadow(
             ),
             outer_radii.top_left,
         ) && corner(
+            (-1.0, 1.0),
             (
                 hole_rect.x1 - hole_radii.top_right,
                 hole_rect.y0 + hole_radii.top_right,
@@ -528,6 +1853,7 @@ pub(super) fn paint_box_shadow(
             ),
             outer_radii.top_right,
         ) && corner(
+            (-1.0, -1.0),
             (
                 hole_rect.x1 - hole_radii.bottom_right,
                 hole_rect.y1 - hole_radii.bottom_right,
@@ -539,6 +1865,7 @@ pub(super) fn paint_box_shadow(
             ),
             outer_radii.bottom_right,
         ) && corner(
+            (1.0, -1.0),
             (
                 hole_rect.x0 + hole_radii.bottom_left,
                 hole_rect.y1 - hole_radii.bottom_left,
@@ -552,15 +1879,17 @@ pub(super) fn paint_box_shadow(
         )
     }
 
-    const SQUARE: RoundedRectRadii = RoundedRectRadii {
-        top_left: 0.0,
-        top_right: 0.0,
-        bottom_right: 0.0,
-        bottom_left: 0.0,
-    };
+    const SQUARE: BorderRadii = BorderRadii::ZERO;
 
-    for shadow in shadows {
-        // TODO: inset shadows not yet supported
+    // Every layer of every outer shadow, in paint order (#976).
+    let mut shadow_layers: Vec<ShadowLayer> = Vec::new();
+
+    // css-backgrounds-3 §7.1: the first shadow is on top, so the list is
+    // painted back to front (#1009) — as `paint_inset_box_shadow` paints its
+    // own.
+    for shadow in shadows.iter().rev() {
+        // Inset shadows are painted above the background, by
+        // `paint_inset_box_shadow`.
         if shadow.inset {
             continue;
         }
@@ -569,6 +1898,7 @@ pub(super) fn paint_box_shadow(
         let offset_y = shadow.offset_y as f64 * scale;
         let blur = shadow.blur_radius as f64 * scale;
         let spread = shadow.spread_radius as f64 * scale;
+        let spread_shape_radii = spread_radii(radii, spread);
         // `peniko::Color` *is* `AlphaColor<Srgb>`, so the `to_rgba8` round trip
         // this used to do was a re-snap of a value already in the painter's
         // colour space. It was **redundant, not lossy**: a shadow colour
@@ -620,29 +1950,21 @@ pub(super) fn paint_box_shadow(
                 }
                 let layer_color = color.multiply_alpha(alpha_scale as f32);
                 let (outer_radii, outer) = if has_radius {
-                    let expanded_radii = RoundedRectRadii::new(
-                        radii.top_left + layer_expand,
-                        radii.top_right + layer_expand,
-                        radii.bottom_right + layer_expand,
-                        radii.bottom_left + layer_expand,
-                    );
-                    (
-                        expanded_radii,
-                        layer_rect.to_rounded_rect(expanded_radii).into_path(0.1),
-                    )
+                    // The spread shape's radius, then grown (or shrunk, for
+                    // the inner layers) by how far this layer's blur takes it
+                    // past the spread. Where `r >= spread` this is the
+                    // `r + layer_expand` it always was; it differs only where
+                    // the spread ratio rule sharpens a small corner (#351).
+                    let grow = |r: f64| (r + layer_expand - spread).max(0.0);
+                    let expanded_radii = spread_shape_radii
+                        .map(|c| Vec2::new(grow(c.x), grow(c.y)))
+                        .fitted(layer_rect.width(), layer_rect.height());
+                    (expanded_radii, expanded_radii.path(layer_rect))
                 } else {
                     (SQUARE, layer_rect.into_path(0.1))
                 };
-                if hole_fits(element_box, radii, layer_rect, outer_radii) {
-                    painter.fill_color(
-                        Fill::EvenOdd,
-                        transform,
-                        layer_color,
-                        &ring(outer, &hole).into(),
-                    );
-                } else {
-                    painter.fill_color(Fill::NonZero, transform, layer_color, &outer.into());
-                }
+                let fits = hole_fits(element_box, radii, layer_rect, outer_radii);
+                shadow_layers.push((layer_color, layer_rect, outer, fits, true));
             }
         } else {
             // No blur: simple offset shadow
@@ -654,15 +1976,499 @@ pub(super) fn paint_box_shadow(
                 y + h + offset_y + total_expand,
             );
             let (outer_radii, outer) = if has_radius {
-                (radii, shadow_rect.to_rounded_rect(radii).into_path(0.1))
+                let fitted = spread_shape_radii.fitted(shadow_rect.width(), shadow_rect.height());
+                (fitted, fitted.path(shadow_rect))
             } else {
                 (SQUARE, shadow_rect.into_path(0.1))
             };
-            if hole_fits(element_box, radii, shadow_rect, outer_radii) {
-                painter.fill_color(Fill::EvenOdd, transform, color, &ring(outer, &hole).into());
-            } else {
-                painter.fill_color(Fill::NonZero, transform, color, &outer.into());
+            let fits = hole_fits(element_box, radii, shadow_rect, outer_radii);
+            shadow_layers.push((color, shadow_rect, outer, fits, false));
+        }
+    }
+
+    paint_shadow_layers(painter, transform, &hole, shadow_layers);
+}
+
+/// One layer of an outer shadow: its colour, its rect, its shape, whether
+/// the element's border box lies inside it (`hole_fits`), and whether it is
+/// one of a blur's soft layers (painted with `Painter::set_coarse_curves`:
+/// eight layers approximating a blur need no 0.03px edge, #2321).
+type ShadowLayer = (AlphaColor<Srgb>, Rect, BezPath, bool, bool);
+
+/// Paint an element's outer-shadow layers, in paint order, outside its border
+/// box `hole` (#976).
+///
+/// Where the hole lies inside every layer, each layer is its ring — the
+/// layer's shape with the hole wound against it (`punched`), which subtracts the
+/// hole and fills only the pixels the ring covers (see `hole_fits` for why
+/// that needs the hole inside the layer).
+///
+/// Where it does not — a shadow offset further than some layer is expanded,
+/// which is every hard offset shadow and the near edge of every blurred one —
+/// the even-odd fill would *add* the part of the hole outside the layer, so
+/// every layer is filled whole through **one** clip for the element that is
+/// everything but the hole: a rect around all the layers and the hole, plus
+/// the hole wound against it (`punched`). They used to be filled whole with no clip,
+/// which painted the shadow through an element without an opaque background,
+/// where CSS clips an outer shadow to the outside of the border box. The hole
+/// is the same for every shadow of the element, so a shadow list costs one
+/// clip mask, not one per shadow, and all its layers share one edge along the
+/// hole.
+fn paint_shadow_layers(
+    painter: &mut dyn Painter,
+    transform: Affine,
+    hole: &BezPath,
+    layers: Vec<ShadowLayer>,
+) {
+    if layers.iter().all(|&(_, _, _, fits, _)| fits) {
+        for (color, _, layer, _, soft) in layers {
+            // The layer with the hole wound against it is what cuts: a
+            // point inside both winds to zero and is left alone.
+            let ring = punched(layer, hole);
+            painter.set_coarse_curves(soft);
+            painter.fill_color(Fill::NonZero, transform, color, &ring.into());
+        }
+        painter.set_coarse_curves(false);
+        return;
+    }
+    let Some(around) = layers
+        .iter()
+        .map(|(_, rect, _, _, _)| *rect)
+        .reduce(|a, b| a.union(b))
+    else {
+        return;
+    };
+    // Grown past the layers' anti-aliased edges and around the hole, so the
+    // clip has no edge but the hole's anywhere a layer paints. Two *device*
+    // pixels: the rect is in the element's own space, and under a downscale
+    // (`scale(0.125)`) a pad of two local pixels would sit inside the
+    // shadow's own edge pixel and dim it.
+    let linear = transform.determinant().abs().sqrt();
+    let pad = if linear > 1e-6 { 2.0 / linear } else { 2.0 };
+    let around = around.union(hole.bounding_box()).inflate(pad, pad);
+    let outside_hole = punched(around.into_path(0.1), hole);
+    painter.push_clip(Fill::NonZero, transform, &outside_hole.into());
+    for (color, _, outer, _, soft) in layers {
+        painter.set_coarse_curves(soft);
+        painter.fill_color(Fill::NonZero, transform, color, &outer.into());
+    }
+    painter.set_coarse_curves(false);
+    painter.pop_layer();
+}
+
+/// Paint the `inset` shadows of `shadows` (#974). Called after the element's
+/// background and before its border, which is where css-backgrounds-3 §7.1
+/// puts an inner shadow; the outer ones are `paint_box_shadow`'s.
+///
+/// An inner shadow is drawn inside the **padding** box, as if everything
+/// outside the padding edge were opaque: the shadow is the padding box minus
+/// a hole, the hole being the padding box moved by the offset and shrunk by
+/// the spread, its radii the padding box's shrunk by the spread (the inset
+/// half of §7.1.1 — a negative spread grows them by the ratio rule outer
+/// shadows use). First shadow on top.
+///
+/// Each shadow reaches each pixel **once**, through **one** clip — the padding box's
+/// rounded shape. (A `GameViewport` inside the box clears the shadow under it
+/// when paint reaches it, #1866.) Once matters on the software painter:
+/// tiny-skia applies the clip mask per draw, so a stack of translucent fills through one rounded clip
+/// multiplies the clip's edge coverage into itself and leaves a dark rim
+/// along the curve (review of #1014, F1), where Vello composites the clip
+/// once.
+///
+/// - **Unblurred**: the ring is a vector fill (the hole cut out by `punched`).
+/// - **Blurred**: the shadow is drawn as images whose alpha is the colour's
+///   alpha times one minus the hole's coverage blurred by a Gaussian of
+///   `sigma = blur / 2` — the definition in §7.1 — so corners and rounded
+///   holes come out as in Chrome 153 (`tests/box_shadow_inset_tests.rs`).
+///   See [`blurred_inset_images`] for how, and for what it costs. A blur as
+///   wide as the box or wider comes out darker than Chrome's (the centre of
+///   `inset 0 0 200px` on a 100px box: alpha 0.87 here, 0.74 in Chrome 153).
+///
+/// Nothing is drawn outside the border box, so no ink reach, layer bound or
+/// damage rect needs to know about an inset shadow (`own_ink_outsets` and
+/// `layer_bounds` skip them).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn paint_inset_box_shadow(
+    painter: &mut dyn Painter,
+    shadows: &[crate::computed_style::BoxShadowValue],
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    scale: f64,
+    radii: BorderRadii,
+    node: &Node,
+    transform: Affine,
+    perf: &crate::perf::PerfCounters,
+) {
+    if !shadows.iter().any(|s| s.inset) {
+        return;
+    }
+    let cs = &node.computed_style;
+    let width = |w: f32, style: BorderStyleValue| {
+        if matches!(style, BorderStyleValue::None | BorderStyleValue::Hidden) {
+            0.0
+        } else {
+            w.max(0.0) as f64 * scale
+        }
+    };
+    let bt = width(cs.border_top_width.to_px(), cs.border_top_style);
+    let br = width(cs.border_right_width.to_px(), cs.border_right_style);
+    let bb = width(cs.border_bottom_width.to_px(), cs.border_bottom_style);
+    let bl = width(cs.border_left_width.to_px(), cs.border_left_style);
+    let pad = Rect::new(x + bl, y + bt, x + w - br, y + h - bb);
+    if pad.width() <= 0.0 || pad.height() <= 0.0 {
+        return;
+    }
+    // The padding box's radii: the border radius less the adjacent borders,
+    // each axis by its own (§5.5; a corner whose two borders differ is
+    // elliptical, #977).
+    let pad_radii = radii.inner(bt, br, bb, bl);
+    let (clip, clip_fill): (PaintShape, Fill) = (pad_radii.shape(pad), Fill::NonZero);
+
+    // The first shadow is on top, so paint back to front.
+    for shadow in shadows.iter().rev().filter(|s| s.inset) {
+        let offset_x = shadow.offset_x as f64 * scale;
+        let offset_y = shadow.offset_y as f64 * scale;
+        let blur = shadow.blur_radius.max(0.0) as f64 * scale;
+        let spread = shadow.spread_radius as f64 * scale;
+        let color: AlphaColor<Srgb> = shadow
+            .color
+            .unwrap_or_else(|| AlphaColor::<Srgb>::from_rgba8(0, 0, 0, 40));
+        if color.components[3] <= 0.0 {
+            continue;
+        }
+        let hole = (pad + Vec2::new(offset_x, offset_y)).inset(-spread);
+        let hole_radii = spread_radii(pad_radii, -spread).fitted(hole.width(), hole.height());
+        let hole_empty = hole.width() <= 0.0 || hole.height() <= 0.0;
+
+        if blur > 0.0 && !hole_empty {
+            let images =
+                blurred_inset_images(pad, hole, hole_radii, blur * 0.5, color, transform, perf);
+            if !images.is_empty() {
+                painter.push_clip(clip_fill, transform, &clip);
+                for (origin, image) in &images {
+                    painter.draw_image(
+                        &super::painter::PaintImage {
+                            data: &image.data,
+                            width: image.width,
+                            height: image.height,
+                            decoded: None,
+                            frame: None,
+                            opaque: false,
+                            sampling: Default::default(),
+                        },
+                        transform * Affine::translate(*origin),
+                    );
+                }
+                painter.pop_layer();
+            }
+            continue;
+        }
+
+        painter.push_clip(clip_fill, transform, &clip);
+        if hole_empty {
+            // No hole left: the whole padding box is shadow.
+            painter.fill_color(
+                Fill::NonZero,
+                transform,
+                color,
+                &pad.inflate(1.0, 1.0).into(),
+            );
+        } else {
+            let hole_path: BezPath = hole_radii.path(hole);
+            // The padding box (and the hole, wherever the offset took it)
+            // with the hole cut out (`punched`); the clip trims it to the
+            // padding shape. The outer rect contains the hole, so the
+            // hole wound against it only ever subtracts.
+            let path = punched(pad.union(hole).inflate(1.0, 1.0).into_path(0.1), &hole_path);
+            painter.fill_color(Fill::NonZero, transform, color, &path.into());
+        }
+        painter.pop_layer();
+    }
+}
+
+/// `outer` with `hole` cut out of it under `Fill::NonZero`: the hole's
+/// contours are appended wound against `outer`'s, so a point inside both
+/// winds to zero. `hole` must lie inside `outer` — a part of it outside
+/// winds to -1 and fills — which every caller ensures (a border's padding
+/// box, an outline's border box, a shadow's hole that `hole_fits`, the rects
+/// grown around a hole).
+///
+/// Not `Fill::EvenOdd`, which gives the same coverage for a hole inside
+/// `outer` (#1865 D9). Vello's MSAA even-odd fill (`fill_path_ms_evenodd` in
+/// `vello_shaders`' `fine.wgsl`, 0.7 and upstream `main`) clears its
+/// workgroup winding arrays at the start of a fill with no barrier after the
+/// previous fill's last reads of them, so a subgroup narrower than the
+/// 64-invocation workgroup can zero a row another subgroup has not read yet.
+/// Lavapipe (8-wide subgroups, run one after another) does it every time:
+/// a rounded border came out as a 1/8-coverage wash over its whole corner
+/// tile. A GPU whose subgroups are narrower than the workgroup has the same
+/// race in principle (it did not show on RADV, whose wave runs the whole
+/// workgroup). The
+/// non-zero path reads only its own quad's words after its last barrier, and
+/// a hole wound against its outline is also what Vello's analytic area
+/// coverage needs (`BorderRadii::path_with_holes`).
+fn punched(mut outer: BezPath, hole: &BezPath) -> BezPath {
+    if (outer.area() > 0.0) == (hole.area() > 0.0) {
+        outer.extend(hole.reverse_subpaths().iter());
+    } else {
+        outer.extend(hole.iter());
+    }
+    outer
+}
+
+/// The signed distance from `(u, v)` — relative to an ellipse's centre — to
+/// the ellipse of radii `r`, positive outside: the first-order estimate
+/// `(e - 1) / |∇e|` with `e = |(u / rx, v / ry)|`. Exactly `|(u, v)| - r` for
+/// a circle, which is what the blurred inset shadow's corners used before
+/// they could be elliptical (#977).
+fn ellipse_distance(u: f64, v: f64, r: Vec2) -> f64 {
+    let (nu, nv) = (u / r.x, v / r.y);
+    let e = nu.hypot(nv);
+    if e <= 1e-12 {
+        return -r.x.min(r.y);
+    }
+    let grad = (nu / r.x).hypot(nv / r.y) / e;
+    (e - 1.0) / grad
+}
+
+/// A straight-alpha RGBA8 image to draw.
+struct ShadowImage {
+    data: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+/// The largest blurred inset shadow built, in image pixels. Past it the
+/// shadow is not drawn. The image is cropped to what can be seen first, so
+/// only a box this large painted with no known visible rect (`paint_subtree`
+/// into a pixmap of its own) or under a singular transform reaches it.
+const MAX_INSET_IMAGE_PIXELS: usize = 16 * 1024 * 1024;
+
+/// Past this `sigma` a 1-D blur is three box blurs rather than a sampled
+/// Gaussian kernel: the kernel costs `6 sigma` per sample, the boxes a
+/// constant, and above it the boxes are within a level of the Gaussian.
+const DIRECT_KERNEL_MAX_SIGMA: f64 = 2.5;
+
+/// The blurred inset shadow over the padding box `pad` (device pixels), as
+/// images and the device-space origins to draw them at; empty when nothing of
+/// it can be seen.
+///
+/// The shadow's alpha is the colour's alpha times one minus the hole's
+/// coverage blurred by a Gaussian of `sigma`. The hole is a rounded rect, and
+/// the blur is computed as the rect's (which is separable: the product of two
+/// 1-D blurs, so O(width + height)) less, at each rounded corner, the blur of
+/// the sliver the rounding takes off the rect (a 2-D blur, but only over the
+/// corner's own square grown by the blur's reach). So the cost is the image
+/// itself plus four small corner patches, whatever the blur.
+fn blurred_inset_images(
+    pad: Rect,
+    hole: Rect,
+    hole_radii: BorderRadii,
+    sigma: f64,
+    color: AlphaColor<Srgb>,
+    transform: Affine,
+    perf: &crate::perf::PerfCounters,
+) -> Vec<(Vec2, ShadowImage)> {
+    // The image covers `pad` on whole device pixels, cropped to what can be
+    // seen: the render target, every clip the painter has open, and the
+    // damage of a partial repaint, pulled back through the box's transform
+    // (its bounding box, so a rotated crop keeps every pixel the rotated image
+    // can land on). A pixel's value does not depend on the crop — each is
+    // computed from lines grown by the blur's reach — so the crop changes no
+    // pixel, only how many are computed. Without the damage, a caret blink in
+    // a large panel rebuilt the panel's whole mask every frame (review of
+    // #1014, round 2).
+    let mut area = Rect::new(pad.x0.floor(), pad.y0.floor(), pad.x1.ceil(), pad.y1.ceil());
+    if transform.determinant().abs() > 1e-9 {
+        if let Some(visible) = super::visible_paint_rect() {
+            let visible = transform.inverse().transform_rect_bbox(visible);
+            area = area.intersect(Rect::new(
+                visible.x0.floor(),
+                visible.y0.floor(),
+                visible.x1.ceil(),
+                visible.y1.ceil(),
+            ));
+        }
+    }
+    if area.width() <= 0.0 || area.height() <= 0.0 {
+        return Vec::new();
+    }
+    let (iw, ih) = (area.width() as usize, area.height() as usize);
+    if iw.saturating_mul(ih) > MAX_INSET_IMAGE_PIXELS {
+        return Vec::new();
+    }
+    perf.add(crate::perf::Counter::InsetShadowMaskPx, (iw * ih) as u64);
+    let blur = Blur1d::new(sigma, DIRECT_KERNEL_MAX_SIGMA);
+    let reach = blur.reach();
+    let mut tmp = Vec::new();
+
+    // The rect's blurred coverage, one axis at a time, over the image grown
+    // by the reach (what lies further out cannot reach the image).
+    let axis = |lo: f64, h0: f64, h1: f64, n: usize| -> Vec<f32> {
+        let mut line: Vec<f32> = (0..n + 2 * reach)
+            .map(|i| {
+                let p = lo - reach as f64 + i as f64;
+                ((p + 1.0).min(h1) - p.max(h0)).max(0.0) as f32
+            })
+            .collect();
+        blur.apply(&mut line, &mut Vec::new());
+        line.drain(..reach);
+        line.truncate(n);
+        line
+    };
+    let bx = axis(area.x0, hole.x0, hole.x1, iw);
+    let by = axis(area.y0, hole.y0, hole.y1, ih);
+    let mut covered = vec![0.0f32; iw * ih];
+    for (j, row) in covered.chunks_exact_mut(iw).enumerate() {
+        for (v, &x) in row.iter_mut().zip(&bx) {
+            *v = x * by[j];
+        }
+    }
+
+    // Less each rounded corner's sliver, blurred. The radii are already
+    // fitted to the hole (§5.5), and each corner is a quarter ellipse (#977).
+    let corners = [
+        (hole_radii.top_left, hole.x0, hole.y0, 1.0, 1.0),
+        (hole_radii.top_right, hole.x1, hole.y0, -1.0, 1.0),
+        (hole_radii.bottom_right, hole.x1, hole.y1, -1.0, -1.0),
+        (hole_radii.bottom_left, hole.x0, hole.y1, 1.0, -1.0),
+    ];
+    for (r, hx, hy, sx, sy) in corners {
+        if r.x <= 0.0 || r.y <= 0.0 {
+            continue;
+        }
+        // The corner's box, and the arc's centre.
+        let sq = Rect::new(hx, hy, hx + sx * r.x, hy + sy * r.y).abs();
+        let (ccx, ccy) = (hx + sx * r.x, hy + sy * r.y);
+        // The patch: the square on whole pixels, grown by the reach, kept to
+        // the image grown by the reach.
+        let px0 = (sq.x0.floor() as i64 - reach as i64).max(area.x0 as i64 - reach as i64);
+        let py0 = (sq.y0.floor() as i64 - reach as i64).max(area.y0 as i64 - reach as i64);
+        let px1 = (sq.x1.ceil() as i64 + reach as i64).min(area.x1 as i64 + reach as i64);
+        let py1 = (sq.y1.ceil() as i64 + reach as i64).min(area.y1 as i64 + reach as i64);
+        if px1 <= px0 || py1 <= py0 {
+            continue;
+        }
+        let (pw, ph) = ((px1 - px0) as usize, (py1 - py0) as usize);
+        // The sliver: the part of the pixel inside the rect's corner square
+        // and outside the arc, approximated at the pixel centre with one
+        // pixel of anti-aliasing across the arc.
+        let mut patch = vec![0.0f32; pw * ph];
+        for j in 0..ph {
+            let y = (py0 + j as i64) as f64;
+            let oy = ((y + 1.0).min(sq.y1) - y.max(sq.y0)).max(0.0);
+            if oy <= 0.0 {
+                continue;
+            }
+            for i in 0..pw {
+                let x = (px0 + i as i64) as f64;
+                let ox = ((x + 1.0).min(sq.x1) - x.max(sq.x0)).max(0.0);
+                if ox <= 0.0 {
+                    continue;
+                }
+                let d = ellipse_distance(x + 0.5 - ccx, y + 0.5 - ccy, r);
+                let outside_arc = (0.5 + d).clamp(0.0, 1.0);
+                patch[j * pw + i] = (ox * oy * outside_arc) as f32;
+            }
+        }
+        // Only the rows the sliver is on have anything to blur across.
+        for row in patch.chunks_exact_mut(pw) {
+            if row.iter().any(|&v| v != 0.0) {
+                blur.apply(row, &mut tmp);
+            }
+        }
+        let mut col = vec![0.0f32; ph];
+        for i in 0..pw {
+            for j in 0..ph {
+                col[j] = patch[j * pw + i];
+            }
+            blur.apply(&mut col, &mut tmp);
+            for j in 0..ph {
+                patch[j * pw + i] = col[j];
+            }
+        }
+        // Subtract where the patch meets the image.
+        let ax0 = area.x0 as i64;
+        let ay0 = area.y0 as i64;
+        for j in 0..ph {
+            let iy = py0 + j as i64 - ay0;
+            if iy < 0 || iy >= ih as i64 {
+                continue;
+            }
+            for i in 0..pw {
+                let ix = px0 + i as i64 - ax0;
+                if ix < 0 || ix >= iw as i64 {
+                    continue;
+                }
+                covered[iy as usize * iw + ix as usize] -= patch[j * pw + i];
             }
         }
     }
+
+    let alpha = color.components[3];
+    let alpha_at = |m: f32| (alpha * (1.0 - m.clamp(0.0, 1.0)) * 255.0).round() as u8;
+    // Only the pixels with some shadow are drawn: a blurred inset shadow is a
+    // ring, often only a band along one edge, and on the software painter a
+    // drawn pixel costs a pipeline stage whether it is transparent or not. So
+    // the ring is cut into up to four images — the rows above and below the
+    // clear middle, and the columns either side of it — which never overlap,
+    // so each pixel is still drawn through the clip once.
+    let clear_row = |j: usize, cols: std::ops::Range<usize>| {
+        cols.into_iter().all(|i| alpha_at(covered[j * iw + i]) == 0)
+    };
+    // The clear middle: the columns and rows where the rect's blur leaves no
+    // shadow, shrunk until every pixel in it is clear (the corners' slivers
+    // can reach into it).
+    let first = |v: &[f32]| v.iter().position(|&m| alpha_at(m) == 0);
+    let last = |v: &[f32]| v.iter().rposition(|&m| alpha_at(m) == 0).map(|i| i + 1);
+    let mut regions: Vec<(usize, usize, usize, usize)> = Vec::new();
+    match (first(&bx), last(&bx), first(&by), last(&by)) {
+        (Some(xl), Some(xr), Some(mut yt), Some(mut yb)) if xl < xr && yt < yb => {
+            while yt < yb && !clear_row(yt, xl..xr) {
+                yt += 1;
+            }
+            while yb > yt && !clear_row(yb - 1, xl..xr) {
+                yb -= 1;
+            }
+            if yt < yb {
+                regions.push((0, 0, iw, yt));
+                regions.push((0, yb, iw, ih));
+                regions.push((0, yt, xl, yb));
+                regions.push((xr, yt, iw, yb));
+            } else {
+                regions.push((0, 0, iw, ih));
+            }
+        }
+        _ => regions.push((0, 0, iw, ih)),
+    }
+
+    let rgba = color.to_rgba8();
+    let mut out = Vec::new();
+    for (x0, y0, x1, y1) in regions {
+        if x1 <= x0 || y1 <= y0 {
+            continue;
+        }
+        let (w, h) = (x1 - x0, y1 - y0);
+        let mut data = vec![0u8; w * h * 4];
+        for (j, row) in data.chunks_exact_mut(w * 4).enumerate() {
+            let src = &covered[(y0 + j) * iw + x0..(y0 + j) * iw + x1];
+            for (px, &m) in row.as_chunks_mut::<4>().0.iter_mut().zip(src) {
+                px[0] = rgba.r;
+                px[1] = rgba.g;
+                px[2] = rgba.b;
+                px[3] = alpha_at(m);
+            }
+        }
+        out.push((
+            Vec2::new(area.x0 + x0 as f64, area.y0 + y0 as f64),
+            ShadowImage {
+                data,
+                width: w as u32,
+                height: h as u32,
+            },
+        ));
+    }
+    out
 }

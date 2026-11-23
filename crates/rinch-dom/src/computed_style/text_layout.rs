@@ -6,15 +6,26 @@ use super::values::*;
 impl ComputedStyle {
     /// Build a Parley text layout from this style's typography fields.
     ///
-    /// This is the SINGLE SOURCE OF TRUTH for text layout configuration,
-    /// used by measurement, painting, and hit testing.
+    /// This is the SINGLE SOURCE OF TRUTH for the configuration of text one
+    /// style shapes on its own — no inline formatting context around it: an
+    /// `<input>`'s or a `<textarea>`'s value and a closed `<select>`'s label
+    /// (through [`Self::build_parley_layout_with_brush`], #320, #789), whose
+    /// paint, caret, hit testing and measure all come from the layout this
+    /// returns, an `<img>`'s alt text, and the MCP debug tools. The IFC's
+    /// producers are the full-fidelity path and push the same properties per
+    /// span ([`Self::same_text_layout_inputs`]' table).
+    ///
+    /// What it reads is [`Self::hash_text_layout_inputs`]: a cache of a layout
+    /// this built keys on that.
     ///
     /// # Arguments
     /// * `text` - The text content to lay out
-    /// * `scale` - DPI scale factor
+    /// * `scale` - DPI scale factor: multiplies every length it reads (the
+    ///   font size, an absolute line height, the letter and word spacing), so
+    ///   the layout is in device px
     /// * `font_cx` - Parley font context
     /// * `layout_cx` - Parley layout context
-    /// * `max_width` - Optional maximum width for line breaking
+    /// * `max_width` - Optional maximum width for line breaking, device px
     pub fn build_parley_layout(
         &self,
         text: &str,
@@ -23,25 +34,39 @@ impl ComputedStyle {
         layout_cx: &mut parley::LayoutContext<peniko::Brush>,
         max_width: Option<f32>,
     ) -> parley::layout::Layout<peniko::Brush> {
-        use parley::style::{FontFamily, FontWeight as ParleyFontWeight, StyleProperty};
-        use std::borrow::Cow;
+        self.build_parley_layout_with_brush(text, scale, None, font_cx, layout_cx, max_width)
+    }
+
+    /// [`Self::build_parley_layout`], with the glyphs' `brush` (paint's
+    /// colour; `None` is parley's default, for a layout only measured or hit
+    /// tested — the brush moves no glyph).
+    pub fn build_parley_layout_with_brush(
+        &self,
+        text: &str,
+        scale: f32,
+        brush: Option<peniko::Brush>,
+        font_cx: &mut parley::FontContext,
+        layout_cx: &mut parley::LayoutContext<peniko::Brush>,
+        max_width: Option<f32>,
+    ) -> parley::layout::Layout<peniko::Brush> {
+        use parley::style::{FontWeight as ParleyFontWeight, StyleProperty};
 
         let scaled_font_size = self.font_size * scale;
 
+        let font_family = crate::fonts::parley_text_family(font_cx, &self.font_family, text);
         let mut builder = layout_cx.ranged_builder(font_cx, text, 1.0, true);
 
         // Set font size (scaled for DPI)
         builder.push_default(StyleProperty::FontSize(scaled_font_size));
 
-        // Set font family (default to sans-serif if empty)
-        let font_family = if self.font_family.is_empty() {
-            "sans-serif"
-        } else {
-            &self.font_family
-        };
-        builder.push_default(StyleProperty::FontFamily(FontFamily::Source(Cow::Owned(
-            font_family.to_string(),
-        ))));
+        if let Some(brush) = brush {
+            builder.push_default(StyleProperty::Brush(brush));
+        }
+
+        // Font family: empty is sans-serif, a missing family takes its Blink
+        // alternate, and a stack that resolves to nothing is finished with
+        // the default font (#1198, #2250, #2255).
+        font_family.push_to(&mut builder);
 
         // Set font weight if not normal (400)
         if (self.font_weight - 400.0).abs() > 1.0 {
@@ -55,12 +80,19 @@ impl ComputedStyle {
             builder.push_default(StyleProperty::FontStyle(self.font_style.to_parley()));
         }
 
-        // Set line height if not normal
+        // Set line height if not normal. An absolute one is a length, in
+        // device px like the font size; a relative one scales with it.
         if let Some(line_height) = self.line_height.to_parley() {
+            let line_height = match line_height {
+                parley::style::LineHeight::Absolute(px) => {
+                    parley::style::LineHeight::Absolute(px * scale)
+                }
+                other => other,
+            };
             builder.push_default(StyleProperty::LineHeight(line_height));
         }
 
-        // Set letter/word spacing if not zero.
+        // Set letter/word spacing if not zero, in device px.
         //
         // **The `!= 0.0` guard is right here and wrong at every other producer
         // in the table below**, so do not port it. This builder shapes one text
@@ -71,17 +103,27 @@ impl ComputedStyle {
         // `letter-spacing: normal` computes to 0 and that 0 is the whole of the
         // reset — guarding there drops it (#698).
         if self.letter_spacing != 0.0 {
-            builder.push_default(StyleProperty::LetterSpacing(self.letter_spacing));
+            builder.push_default(StyleProperty::LetterSpacing(self.letter_spacing * scale));
         }
 
         if self.word_spacing != 0.0 {
-            builder.push_default(StyleProperty::WordSpacing(self.word_spacing));
+            builder.push_default(StyleProperty::WordSpacing(self.word_spacing * scale));
         }
 
         // Set overflow-wrap for emergency line-breaking
         if self.overflow_wrap != OverflowWrapValue::Normal {
             builder.push_default(StyleProperty::OverflowWrap(self.overflow_wrap.to_parley()));
         }
+
+        // `word-break` and `line-break` (#2388); the override steps aside
+        // where they add opportunities (`ifc::CHROME_LINE_BREAKS`).
+        builder.set_line_break_override(Some(crate::ifc::CHROME_LINE_BREAKS));
+        builder.push_default(StyleProperty::WordBreak(self.word_break.to_parley()));
+        builder.push_default(StyleProperty::LineBreak(self.line_break.to_parley()));
+        // `hyphens` (#2621).
+        builder.push_default(StyleProperty::Hyphens(crate::ifc::hyphens_to_parley(
+            self.hyphens_none,
+        )));
 
         let mut layout = builder.build(text);
         layout.break_all_lines(max_width);
@@ -111,6 +153,32 @@ impl ComputedStyle {
         layout
     }
 
+    /// Feed `h` every input [`Self::build_parley_layout`] reads — the font
+    /// size, family, weight and style, the line height, the letter and word
+    /// spacing, `overflow-wrap`, `word-break` and `line-break` — so a cache of a layout it built (a form
+    /// control's caret and extent, a select's widest label, an alt text) is
+    /// keyed on exactly what shaped it. A property the builder starts reading
+    /// goes here in the same change, or a restyle of it alone keeps the old
+    /// layout (#320).
+    pub fn hash_text_layout_inputs<H: std::hash::Hasher>(&self, h: &mut H) {
+        use std::hash::Hash;
+        self.font_size.to_bits().hash(h);
+        self.font_family.hash(h);
+        self.font_weight.to_bits().hash(h);
+        (self.font_style as u8).hash(h);
+        match self.line_height {
+            LineHeightValue::Normal => 0u8.hash(h),
+            LineHeightValue::Absolute(v) => (1u8, v.to_bits()).hash(h),
+            LineHeightValue::Relative(v) => (2u8, v.to_bits()).hash(h),
+        }
+        self.letter_spacing.to_bits().hash(h);
+        self.word_spacing.to_bits().hash(h);
+        (self.overflow_wrap as u8).hash(h);
+        self.word_break.hash(h);
+        self.line_break.hash(h);
+        self.hyphens_none.hash(h);
+    }
+
     /// Whether `self` and `other` would shape the same text into the same
     /// Parley layout — i.e. whether a layout built from one is still valid
     /// after a recascade produced the other (issue #654).
@@ -134,11 +202,11 @@ impl ComputedStyle {
     ///
     /// | producer | what it reads |
     /// |---|---|
-    /// | [`Self::build_parley_layout`] | `font_size`, `font_family`, `font_weight`, `font_style`, `line_height`, `letter_spacing`, `word_spacing`, `overflow_wrap` |
-    /// | `RinchDocument::build_inline_layout`'s `root_text_style` | the above plus `color`, `text_decoration`, `text_underline_offset`, `white_space` (both the collapse mode and whether `max_width` applies at all) and `text_align` |
-    /// | `RinchDocument::inline_style_props`, the per-span properties | `font_size`, `font_weight`, `font_style`, `color`, `text_decoration`, `text_underline_offset`, `line_height`, `letter_spacing`, `word_spacing` |
-    /// | `RinchDocument::push_inline_spans`, which builds `InlineLayout::background_spans` and `::decoration_spans` | `background_color()`, the four paddings, `border_radius_top_left`, `text_decoration` |
-    /// | the `TextMeasure` context `RinchDocument::sync_text_contexts` fills | `font_size`, `font_weight`, `font_family`, `line_height`, `color`, `white_space`, `letter_spacing`, `word_spacing`, `overflow_wrap`, `text_overflow`, `overflow_x` |
+    /// | [`Self::build_parley_layout`] | `font_size`, `font_family`, `font_weight`, `font_style`, `line_height`, `letter_spacing`, `word_spacing`, `overflow_wrap`, `word_break`, `line_break` |
+    /// | `RinchDocument::build_inline_layout`'s `root_text_style` | the above plus `color`, `text_decoration`, `text_underline_offset`, `white_space` (both the collapse mode and whether `max_width` applies at all), `text_align` and `text_indent` (#2628) |
+    /// | `RinchDocument::inline_style_props`, the per-span properties | `font_size`, `font_family` (#677), `font_weight`, `font_style`, `color`, `text_decoration`, `text_underline_offset`, `line_height`, `letter_spacing`, `word_spacing`, `word_break`, `line_break` (#2388) |
+    /// | `RinchDocument::push_inline_spans`, which builds `InlineLayout::background_spans` and `::decoration_spans`, and the edge boxes `walk_inline_children` pushes (#1426) | `background_color()`, the four paddings, the border widths and styles, the horizontal margins, `border_radius_top_left`, `text_decoration` |
+    /// | the `TextMeasure` context `RinchDocument::sync_text_contexts` fills | `font_size`, `font_weight`, `font_family`, `line_height`, `color`, `white_space`, `letter_spacing`, `word_spacing`, `overflow_wrap`, `word_break`, `line_break`, `text_indent`, `text_overflow`, `overflow_x` |
     ///
     /// `letter_spacing` and `word_spacing` reached only the first of those rows
     /// until #698, whose one caller pair is the MCP debug tools — so both
@@ -146,21 +214,27 @@ impl ComputedStyle {
     /// anyone could see. They are now on every row that shapes text, which is
     /// what makes their presence in this list mean something.
     ///
-    /// Four producers are **not** on this list and must not be added to it:
-    /// `paint::contenteditable`'s text, `paint::select`'s label, and the two
-    /// input hit-test builders in `crates/rinch/src/app/`. Those are the
-    /// form-control text engine, which shapes an `<input>`/`<textarea>`/
-    /// `<select>`'s own value rather than an inline formatting context, keeps
-    /// no `InlineLayout` for this predicate to invalidate, and must move as one
-    /// piece because paint and hit testing have to agree glyph for glyph.
-    /// Unifying it onto `build_parley_layout` is #320.
+    /// Two callers of the first row are **not** on this list and must not be
+    /// added to it: `form_control::field_text_layout`, the one layout an
+    /// `<input>`/`<textarea>`'s text is shaped with for paint, hit testing,
+    /// the caret rects and the scroll (#827), and
+    /// `select::select_label_layout`. They shape a control's own value rather
+    /// than an inline formatting context and keep no `InlineLayout` for this
+    /// predicate to invalidate; their caches key on
+    /// [`Self::hash_text_layout_inputs`] instead. Both are
+    /// [`Self::build_parley_layout`] since #320 / #789.
     ///
     /// Plus `text_transform`, which `walk_inline_children` applies to the text
     /// before it is pushed.
     ///
-    /// Two entries are not typography and are here because a producer reads
+    /// Three entries are not typography and are here because a producer reads
     /// them anyway. `overflow_x` is half the `text-overflow: ellipsis`
-    /// condition, which decides whether the layout is rebuilt truncated. The
+    /// condition, which decides whether the layout is rebuilt truncated, and
+    /// whether `display` is a flex or grid container is another part of it
+    /// (a grid's own text is an anonymous item and takes no "…", #904) — only
+    /// that bit, not `display` itself, because an IFC root that flips between
+    /// grid and block keeps its width and its text and nothing else would
+    /// rebuild it (#1046). The
     /// background-span row is **gated on `display: inline`**, because only a
     /// non-atomic inline box contributes a span. There are **three**
     /// `push_inline_spans` call sites, all in `walk_inline_children` and
@@ -180,7 +254,9 @@ impl ComputedStyle {
     /// every call site tests `Node::display_mode`. The two agree because
     /// `RinchDocument::apply_stylo_styles_to_taffy` derives the second from the
     /// first — `DisplayValue::Inline => DisplayMode::Inline`, the only arm that
-    /// produces `DisplayMode::Inline` — a few lines after it calls this
+    /// produces `DisplayMode::Inline` (a replaced element at `display: inline`
+    /// is mapped to `InlineBlock` instead, #1089, which only over-lists here) —
+    /// a few lines after it calls this
     /// predicate, in the same loop iteration and from the same `new_style`. So
     /// there is no ordering hazard and no third source of truth *for a node the
     /// cascade has reached*. `display_mode`'s other writers cannot reintroduce
@@ -223,9 +299,71 @@ impl ComputedStyle {
             && self.text_underline_offset == other.text_underline_offset
             && self.white_space == other.white_space
             && self.overflow_wrap == other.overflow_wrap
+            && self.tab_size == other.tab_size
+            && self.line_clamp == other.line_clamp
+            && self.webkit_box == other.webkit_box
+            && self.word_break == other.word_break
+            && self.line_break == other.line_break
+            && self.hyphens_none == other.hyphens_none
+            && self.text_indent == other.text_indent
             && self.text_overflow == other.text_overflow
             && self.overflow_x == other.overflow_x
+            && self.vertical_align == other.vertical_align
+            && self.display.is_flex_or_grid_container() == other.display.is_flex_or_grid_container()
             && (!inline_level || self.same_inline_background_inputs(other))
+            && (!inline_level || self.same_relative_offset_inputs(other))
+            && self.same_atomic_line_margins(other)
+    }
+
+    /// Whether a `display: inline` element's `position` is the same (#1425,
+    /// #2346): a relative one records an `InlineRelativeSpan` with the
+    /// IFC's lines, so a change of it rebuilds them; as does a static one
+    /// that is a stacking context (#2869, `ifc::is_static_inline_layer`), so
+    /// whether it is one is compared too. Its four insets are not
+    /// compared here: the offset they resolve to is a post-layout move that
+    /// sizes nothing and breaks no line, so a change of one alone keeps the
+    /// lines and moves the span ([`Self::same_relative_insets`], #2412).
+    fn same_relative_offset_inputs(&self, other: &ComputedStyle) -> bool {
+        self.position == other.position
+            && crate::ifc::is_static_inline_layer(self) == crate::ifc::is_static_inline_layer(other)
+    }
+
+    /// Whether the four insets a `position: relative` inline element's
+    /// offset is resolved from are the same (#2412). Asked by the cascade of
+    /// a `display: inline` element that is relative before and after: a
+    /// change keeps the IFC's lines and asks for the offsets to be resolved
+    /// again on them (`NodeTree::relative_offset_roots`).
+    pub(crate) fn same_relative_insets(&self, other: &ComputedStyle) -> bool {
+        use super::values::LengthPercentageAutoValue as L;
+        let same = |a: L, b: L| match (a, b) {
+            (L::Auto, L::Auto) => true,
+            (L::Length(x), L::Length(y)) | (L::Percent(x), L::Percent(y)) => x == y,
+            (L::Calc { px: a, pct: b }, L::Calc { px: c, pct: d }) => a == c && b == d,
+            _ => false,
+        };
+        same(self.top, other.top)
+            && same(self.left, other.left)
+            && same(self.right, other.right)
+            && same(self.bottom, other.bottom)
+    }
+
+    /// Whether an inline-level box's top and bottom margins, as its line lines
+    /// it up (`crate::ifc::atomic_vertical_margins`), are the same: an atomic
+    /// inline's margin box is its `InlineBox` on the block axis, so a change
+    /// moves its line and its place in it with no change in its own size,
+    /// which is all the re-measure of a dirty atomic inline compares (review
+    /// of #2308). Part of [`Self::same_text_layout_inputs`] only: a margin is
+    /// a Taffy property, so its change already sets `layout_dirty`, and it
+    /// moves no box's width, which is why it is not in
+    /// [`Self::same_measured_text_inputs`] (a mutant that dropped it from there
+    /// changed no answer). A block's margins change no line and are not
+    /// compared.
+    pub fn same_atomic_line_margins(&self, other: &ComputedStyle) -> bool {
+        use super::values::DisplayValue::{Inline, InlineBlock, InlineFlex, InlineGrid};
+        let inline_level = |d| matches!(d, Inline | InlineBlock | InlineFlex | InlineGrid);
+        !(inline_level(self.display) || inline_level(other.display))
+            || crate::ifc::atomic_vertical_margins(self)
+                == crate::ifc::atomic_vertical_margins(other)
     }
 
     /// The `InlineBackgroundSpan` half of [`Self::same_text_layout_inputs`],
@@ -234,11 +372,28 @@ impl ComputedStyle {
     /// box model: `push_inline_spans` reads exactly these for the background it pushes.
     fn same_inline_background_inputs(&self, other: &ComputedStyle) -> bool {
         self.background_color() == other.background_color()
+            && crate::ifc::has_inline_image(self) == crate::ifc::has_inline_image(other)
             && self.padding_left.to_px() == other.padding_left.to_px()
             && self.padding_right.to_px() == other.padding_right.to_px()
             && self.padding_top.to_px() == other.padding_top.to_px()
             && self.padding_bottom.to_px() == other.padding_bottom.to_px()
             && self.border_radius_top_left.to_px() == other.border_radius_top_left.to_px()
+            && self.same_inline_edge_inputs(other)
+            && self.border_top_width.to_px() == other.border_top_width.to_px()
+            && self.border_bottom_width.to_px() == other.border_bottom_width.to_px()
+            && self.border_top_style == other.border_top_style
+            && self.border_bottom_style == other.border_bottom_style
+    }
+
+    /// What the edge boxes of a `display: inline` element are built from
+    /// (`ifc::inline_edge_widths`, #1426): its horizontal margins, borders
+    /// and paddings, which take room on its first and last lines.
+    fn same_inline_edge_inputs(&self, other: &ComputedStyle) -> bool {
+        crate::ifc::inline_edge_widths(self, true) == crate::ifc::inline_edge_widths(other, true)
+            && self.border_left_width.to_px() == other.border_left_width.to_px()
+            && self.border_right_width.to_px() == other.border_right_width.to_px()
+            && self.border_left_style == other.border_left_style
+            && self.border_right_style == other.border_right_style
     }
 
     /// The subset of [`Self::same_text_layout_inputs`] that can change a
@@ -261,11 +416,17 @@ impl ComputedStyle {
     /// the producer that reads it consumes a width rather than producing one:
     /// `color`, `text_align` (it distributes a line inside a width it is given),
     /// `text_decoration` and `text_underline_offset` (ink, no advance),
-    /// `text_overflow` (the ellipsis rebuild truncates to a width already
-    /// decided) and the `same_inline_background_inputs` group. `overflow_x` is
+    /// `text_overflow` (the ellipsis cut is made in lines already broken at
+    /// a width already decided) and the `same_inline_background_inputs` group. `overflow_x` is
     /// absent for a different reason: it is a Taffy property, so a change in it
     /// is already caught by the Taffy style comparison that sets `layout_dirty`
-    /// in the first place. The same is true of the paddings inside that group.
+    /// in the first place. The same is true of the paddings inside that group,
+    /// and of the flex-or-grid bit of `display` (#1046), which only decides
+    /// whether the ellipsis cut is made. The horizontal margins, borders and paddings
+    /// of a `display: inline` element (its edge boxes, #1426) do move a size,
+    /// and are absent too: they are in the larger predicate's background
+    /// group, whose change already drops the IFC's measures, and Taffy
+    /// properties besides.
     ///
     /// `color` is the one pinned by a fixture
     /// (`frozen_box_remeasure_tests::a_colour_only_restyle_still_skips_taffy`),
@@ -289,5 +450,15 @@ impl ComputedStyle {
             && self.text_transform == other.text_transform
             && self.white_space == other.white_space
             && self.overflow_wrap == other.overflow_wrap
+            && self.tab_size == other.tab_size
+            && self.line_clamp == other.line_clamp
+            && self.webkit_box == other.webkit_box
+            && self.word_break == other.word_break
+            && self.line_break == other.line_break
+            && self.hyphens_none == other.hyphens_none
+            // It narrows a line's room and widens a box (#2628).
+            && self.text_indent == other.text_indent
+            // A moved span grows its line (#1357): a height.
+            && self.vertical_align == other.vertical_align
     }
 }

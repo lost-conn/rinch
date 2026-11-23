@@ -1,4 +1,6 @@
-use crate::{EditCommand, EditableDocument, Position, Range, Selection, TextOperation, UndoStack};
+use crate::{
+    EditCommand, EditableDocument, Position, Range, Selection, TextOperation, UndoMark, UndoStack,
+};
 
 /// Orchestrates document, selection, and undo for text editing.
 #[derive(Debug)]
@@ -24,7 +26,38 @@ impl<D: EditableDocument> EditableState<D> {
     }
 
     /// Execute an edit command and return the clipboard content if Copy/Cut.
+    ///
+    /// A command is **one** undo step however many operations it made — typing
+    /// over a selection deletes and then inserts, and one undo brings the
+    /// selected text back (issue #288).
     pub fn execute(&mut self, cmd: EditCommand) -> Option<String> {
+        if matches!(cmd, EditCommand::Undo | EditCommand::Redo) {
+            return self.execute_ungrouped(cmd);
+        }
+        let mark = self.undo_stack.mark();
+        let out = self.execute_ungrouped(cmd);
+        self.group_undo_since(mark);
+        out
+    }
+
+    /// Fold every undo entry pushed since `mark` into one [`TextOperation::Group`],
+    /// so they undo and redo as a single step. Nothing to fold, or one entry,
+    /// leaves the stack as it is.
+    ///
+    /// A host uses it to make a command and whatever it caused *outside* the
+    /// engine one step — rinch's desktop runtime folds the rewrite a controlled
+    /// field's `oninput` makes in answer to a keystroke into that keystroke, so
+    /// undo never replays the raw text a normalizer is about to rewrite again.
+    pub fn group_undo_since(&mut self, mark: UndoMark) {
+        let mut ops = self.undo_stack.take_since(mark);
+        match ops.len() {
+            0 => {}
+            1 => self.undo_stack.push(ops.pop().expect("one entry")),
+            _ => self.undo_stack.push(TextOperation::Group(ops)),
+        }
+    }
+
+    fn execute_ungrouped(&mut self, cmd: EditCommand) -> Option<String> {
         match cmd {
             // Text modification
             EditCommand::InsertText(text) => {
@@ -205,14 +238,11 @@ impl<D: EditableDocument> EditableState<D> {
             // Delete selection
             self.delete_selection();
         } else if self.selection.head.0 > 0 {
-            // Find previous character boundary
+            // An emoji sequence goes whole, any other cluster one code point
+            // at a time, as in Chrome (#1684).
             let text = self.document.to_text();
             let pos = self.selection.head.0;
-            let prev_pos = text[..pos]
-                .char_indices()
-                .last()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
+            let prev_pos = rinch_words::backspace_start(&text, pos);
             let range = Range::new(prev_pos, pos);
             let deleted = self.document.text_slice(range);
             self.document.delete(range);
@@ -228,13 +258,10 @@ impl<D: EditableDocument> EditableState<D> {
         if !self.selection.is_cursor() {
             self.delete_selection();
         } else if self.selection.head.0 < self.document.text_length() {
+            // The whole grapheme cluster after the caret (#1684).
             let text = self.document.to_text();
             let pos = self.selection.head.0;
-            let next_pos = text[pos..]
-                .char_indices()
-                .nth(1)
-                .map(|(i, _)| pos + i)
-                .unwrap_or(text.len());
+            let next_pos = rinch_words::next_grapheme_boundary(&text, pos);
             let range = Range::new(pos, next_pos);
             let deleted = self.document.text_slice(range);
             self.document.delete(range);
@@ -250,7 +277,7 @@ impl<D: EditableDocument> EditableState<D> {
             self.delete_selection();
         } else {
             let pos = self.selection.head.0;
-            let word_start = self.find_word_start(pos);
+            let word_start = self.word_delete_start(pos);
             if word_start < pos {
                 let range = Range::new(word_start, pos);
                 let deleted = self.document.text_slice(range);
@@ -269,7 +296,7 @@ impl<D: EditableDocument> EditableState<D> {
             self.delete_selection();
         } else {
             let pos = self.selection.head.0;
-            let word_end = self.find_word_end(pos);
+            let word_end = self.word_delete_end(pos);
             if word_end > pos {
                 let range = Range::new(pos, word_end);
                 let deleted = self.document.text_slice(range);
@@ -341,13 +368,10 @@ impl<D: EditableDocument> EditableState<D> {
             // Collapse to start
             self.selection = Selection::cursor(self.selection.start());
         } else if self.selection.head.0 > 0 {
+            // One grapheme cluster (#1684).
             let text = self.document.to_text();
             let pos = self.selection.head.0;
-            let prev_pos = text[..pos]
-                .char_indices()
-                .last()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
+            let prev_pos = rinch_words::prev_grapheme_boundary(&text, pos);
             if extend {
                 self.selection.head = Position(prev_pos);
             } else {
@@ -361,13 +385,10 @@ impl<D: EditableDocument> EditableState<D> {
             // Collapse to end
             self.selection = Selection::cursor(self.selection.end());
         } else if self.selection.head.0 < self.document.text_length() {
+            // One grapheme cluster (#1684).
             let text = self.document.to_text();
             let pos = self.selection.head.0;
-            let next_pos = text[pos..]
-                .char_indices()
-                .nth(1)
-                .map(|(i, _)| pos + i)
-                .unwrap_or(text.len());
+            let next_pos = rinch_words::next_grapheme_boundary(&text, pos);
             if extend {
                 self.selection.head = Position(next_pos);
             } else {
@@ -516,59 +537,54 @@ impl<D: EditableDocument> EditableState<D> {
                 self.document.delete(*range);
                 self.selection = Selection::cursor(range.start);
             }
+            TextOperation::Group(ops) => {
+                for op in ops {
+                    self.apply_operation(op);
+                }
+            }
         }
     }
 
     // === Word boundary helpers ===
 
-    fn find_word_start(&self, pos: usize) -> usize {
+    /// Where a backward word delete from `pos` stops: the word start, but
+    /// never across a line break. Right after one it deletes just the break
+    /// (Chrome 155: `"ab \n|"` → `"ab "`, `"a\n|b"` → `"ab"`).
+    fn word_delete_start(&self, pos: usize) -> usize {
         let text = self.document.to_text();
-        if pos == 0 {
-            return 0;
-        }
-
         let before = &text[..pos.min(text.len())];
-        let mut chars = before.char_indices().rev();
-
-        // Skip whitespace backwards, then skip non-whitespace to find word start
-        for (_, ch) in &mut chars {
-            if !ch.is_whitespace() {
-                // Found a word char; now scan back past remaining word chars
-                for (j, ch2) in chars {
-                    if ch2.is_whitespace() {
-                        return j + ch2.len_utf8();
-                    }
-                }
-                return 0;
-            }
+        match before.rfind('\n') {
+            Some(nl) if nl + 1 == before.len() => nl,
+            Some(nl) => self.find_word_start(pos).max(nl + 1),
+            None => self.find_word_start(pos),
         }
-
-        0
     }
 
-    fn find_word_end(&self, pos: usize) -> usize {
+    /// Where a forward word delete from `pos` stops: the word end, but never
+    /// across a line break. Right before one it deletes just the break.
+    fn word_delete_end(&self, pos: usize) -> usize {
         let text = self.document.to_text();
-        let len = text.len();
-        if pos >= len {
-            return len;
+        let pos = pos.min(text.len());
+        match text[pos..].find('\n') {
+            Some(0) => pos + 1,
+            Some(nl) => self.find_word_end(pos).min(pos + nl),
+            None => self.find_word_end(pos),
         }
+    }
 
-        let after = &text[pos.min(len)..];
-        let mut chars = after.char_indices();
+    /// Where Ctrl+Left lands from `pos`: the start of the word before it, a
+    /// word being what the rich editor's word motion steps over
+    /// ([`rinch_words::text_word_boundary`], #1619) — so `foo-bar|` stops at
+    /// `foo-|bar`. A line break is one stop: at a line's start it lands just
+    /// before the break (the word *delete* still never crosses one, above).
+    fn find_word_start(&self, pos: usize) -> usize {
+        rinch_words::text_word_boundary(&self.document.to_text(), pos, false)
+    }
 
-        // Skip non-whitespace (word chars) forwards, then skip whitespace
-        let mut found_word = false;
-        for (i, ch) in &mut chars {
-            if ch.is_whitespace() {
-                if found_word {
-                    return pos + i;
-                }
-            } else {
-                found_word = true;
-            }
-        }
-
-        len
+    /// Where Ctrl+Right lands from `pos`: the end of the word after it (a
+    /// line break is a word of its own).
+    fn find_word_end(&self, pos: usize) -> usize {
+        rinch_words::text_word_boundary(&self.document.to_text(), pos, true)
     }
 }
 
@@ -614,11 +630,94 @@ mod tests {
         assert_eq!(state.document.to_text(), "hello");
     }
 
+    /// Typing over a selection deletes and inserts; one undo brings the
+    /// selected text back and one redo retypes (#288).
+    #[test]
+    fn replacing_a_selection_is_one_undo_step() {
+        let mut state = EditableState::new(StringDocument::with_text("hello world"));
+        state.selection = Selection::new(6, 11);
+        state.execute(EditCommand::InsertText("there".into()));
+        assert_eq!(state.document.to_text(), "hello there");
+        state.execute(EditCommand::Undo);
+        assert_eq!(state.document.to_text(), "hello world");
+        state.execute(EditCommand::Redo);
+        assert_eq!(state.document.to_text(), "hello there");
+        assert_eq!(state.selection, Selection::cursor(11));
+    }
+
+    /// A host folds a command and what followed it into one step; the group
+    /// undoes last-first, so an insert followed by a rewrite of it comes back
+    /// out in the right order (#288).
+    #[test]
+    fn a_host_group_undoes_last_first() {
+        let mut state = EditableState::new(StringDocument::new());
+        state.execute(EditCommand::InsertText("x".into()));
+        let mark = state.undo_stack.mark();
+        state.execute(EditCommand::InsertText("a".into()));
+        state.adopt_text("xA");
+        state.group_undo_since(mark);
+        assert_eq!(state.document.to_text(), "xA");
+
+        state.execute(EditCommand::Undo);
+        assert_eq!(
+            state.document.to_text(),
+            "x",
+            "the keystroke and its rewrite"
+        );
+        state.execute(EditCommand::Undo);
+        assert_eq!(state.document.to_text(), "");
+        state.execute(EditCommand::Redo);
+        state.execute(EditCommand::Redo);
+        assert_eq!(state.document.to_text(), "xA");
+        assert_eq!(state.selection, Selection::cursor(2));
+    }
+
+    /// Undo and redo are not pushes: a mark taken before one groups nothing it
+    /// did.
+    #[test]
+    fn undo_and_redo_do_not_move_the_mark() {
+        let mut state = EditableState::new(StringDocument::new());
+        state.execute(EditCommand::InsertText("a".into()));
+        state.execute(EditCommand::InsertText("b".into()));
+        let mark = state.undo_stack.mark();
+        state.execute(EditCommand::Undo);
+        state.execute(EditCommand::Redo);
+        assert_eq!(state.undo_stack.mark(), mark);
+        state.group_undo_since(mark);
+        state.execute(EditCommand::Undo);
+        assert_eq!(state.document.to_text(), "a", "still two separate steps");
+    }
+
     #[test]
     fn test_select_all() {
         let mut state = EditableState::new(StringDocument::with_text("hello"));
         state.execute(EditCommand::SelectAll);
         assert_eq!(state.selection.start().0, 0);
         assert_eq!(state.selection.end().0, 5);
+    }
+
+    /// A word delete never crosses a line break (#951's review): right beside
+    /// one it takes the break alone, and further along it stops at it.
+    #[test]
+    fn a_word_delete_stops_at_a_line_break() {
+        let run = |text: &str, at: usize, cmd: EditCommand| {
+            let mut state = EditableState::new(StringDocument::with_text(text));
+            state.selection = Selection::cursor(at);
+            state.execute(cmd);
+            state.document.to_text()
+        };
+        assert_eq!(run("ab \n", 4, EditCommand::DeleteWordBackward), "ab ");
+        assert_eq!(run("a\nb", 2, EditCommand::DeleteWordBackward), "ab");
+        assert_eq!(
+            run("ab\n  cd", 7, EditCommand::DeleteWordBackward),
+            "ab\n  "
+        );
+        assert_eq!(run("ab\n   ", 6, EditCommand::DeleteWordBackward), "ab\n");
+        assert_eq!(run("ab\ncd", 2, EditCommand::DeleteWordForward), "abcd");
+        assert_eq!(
+            run("ab   \ncd", 2, EditCommand::DeleteWordForward),
+            "ab\ncd"
+        );
+        assert_eq!(run("one two", 7, EditCommand::DeleteWordBackward), "one ");
     }
 }

@@ -28,10 +28,10 @@
 //! | a filling entry is counted (but settled) | 6: every fixture here, and the shell |
 //! | the finishing tick does not dirty the node | 5: the four fixtures that go through `finished`, and the shell |
 //! | `has_running_animations` counts a settled fill | 3: `a_finished_forwards_animation_asks_for_no_frames`, `a_restyle_keeps_showing_the_fill`, the shell |
-//! | a restyle never clears `fill_settled` (a latch) | `a_restyle_that_extends_a_finished_animation_runs_it_again`, **alone** |
-//! | a restyle always clears `fill_settled` | `a_restyle_keeps_showing_the_fill`, **alone** |
+//! | a restyle never clears `settled` (a latch) | `a_restyle_that_extends_a_finished_animation_runs_it_again`, **alone** |
+//! | a restyle always clears `settled` | `a_restyle_keeps_showing_the_fill`, **alone** |
 //! | the text-measure pre-pass re-measures a settled fill | `a_finished_font_size_fill_owes_no_layout`, **alone** |
-//! | `fill_settled` is recomputed **before** #771's refresh block (the naive rebase) | `a_theme_change_that_lengthens_a_finished_animation_runs_it_again`, **alone** |
+//! | `settled` is recomputed **before** #771's refresh block (the naive rebase) | `a_theme_change_that_lengthens_a_finished_animation_runs_it_again`, **alone** |
 
 #![cfg(feature = "software-renderer")]
 
@@ -68,6 +68,7 @@ fn animations(doc: &RinchDocument, node: NodeId) -> usize {
 
 fn mount(class: &str) -> (RinchDocument, NodeId) {
     let mut doc = RinchDocument::new();
+    doc.set_animation_clock_ms(Some(1_000_000.0)); // pinned: exact samples (#2267)
     doc.load_css(CSS);
     let body = doc.body();
     let node = doc.create_element("div");
@@ -95,7 +96,7 @@ fn finished(class: &str) -> (RinchDocument, NodeId) {
         doc.tree.has_running_animations(),
         "precondition: it is running before it finishes"
     );
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    doc.advance_animation_clock_ms(150.0);
     hand_off(&mut doc, node);
 
     doc.tick_animations();
@@ -206,7 +207,7 @@ fn a_restyle_that_extends_a_finished_animation_runs_it_again() {
 #[test]
 fn a_finished_font_size_fill_owes_no_layout() {
     let (mut doc, node) = mount("box once-type");
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    doc.advance_animation_clock_ms(150.0);
     hand_off(&mut doc, node);
     doc.tick_animations();
     assert_eq!(
@@ -226,11 +227,11 @@ fn a_finished_font_size_fill_owes_no_layout() {
 }
 
 /// A **full restyle** — a theme change — that lengthens a finished animation
-/// makes it run again, and `fill_settled` has to be recomputed against the
+/// makes it run again, and `settled` has to be recomputed against the
 /// timing that restyle just gave it.
 ///
-/// #771 refreshes a kept animation's keyframes, duration and delay inside
-/// `recompute_all_styles_full` (outside it a new duration is ignored, #780).
+/// A kept animation takes its keyframes, duration and delay afresh on every
+/// cascade (#771 on this path, #780 on the others).
 /// Asking "is it still filling?" *before* that refresh asks against the old
 /// timing, which for this shape answers "yes": the entry stays settled, so
 /// `has_running_animations()` says `false` for an animation that is running,
@@ -244,7 +245,7 @@ fn a_theme_change_that_lengthens_a_finished_animation_runs_it_again() {
     assert!(!doc.tree.has_running_animations(), "precondition: settled");
 
     // The theme: the same animation, eight times longer. The clock is kept, so
-    // the ~150ms already spent is now a fraction of the run rather than past
+    // the 150ms already spent is now a fraction of the run rather than past
     // its end.
     doc.load_css(".once-fwd { animation: k782-grow 400ms linear 1 forwards; }");
     doc.recompute_all_styles_full();
@@ -254,19 +255,17 @@ fn a_theme_change_that_lengthens_a_finished_animation_runs_it_again() {
     assert!(
         doc.tree.has_running_animations(),
         "it is running again, so the frame clock has to run again — this is \
-         what a stale `fill_settled` gets wrong"
+         what a stale `settled` gets wrong"
     );
     hand_off(&mut doc, node);
     assert!(doc.tick_animations(), "and the tick advances it");
     let mid = width_px(&doc, node).expect("a length");
-    assert!(
-        (40.0..100.0).contains(&mid),
-        "precondition: mid-run, not at the fill — read {mid}px"
-    );
+    // The clock is pinned (#2267): 150ms into 400ms, 40 + 60 × 150/400.
+    assert_eq!(mid, 62.5, "precondition: mid-run, not at the fill");
 
     // …and it finishes a second time, properly: that tick dirties the node and
     // writes the fill, and the entry settles again.
-    std::thread::sleep(std::time::Duration::from_millis(400));
+    doc.advance_animation_clock_ms(400.0);
     hand_off(&mut doc, node);
     doc.tick_animations();
     assert!(

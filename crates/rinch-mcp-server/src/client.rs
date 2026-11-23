@@ -1,10 +1,33 @@
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Mutex;
 
-/// Wire protocol types (mirrored from rinch-debug)
+// Wire protocol types (mirrored from rinch-debug)
 
+/// The unit of a [`DebugCommandKind::Scroll`] delta (mirrored from
+/// `rinch-debug` in lockstep). Also the `scroll` tool's `unit` parameter.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ScrollUnit {
+    /// Pixels, injected as a pixel `MouseWheel` (a trackpad): scrolls at once.
+    #[default]
+    Pixel,
+    /// Wheel notches, injected as `MouseWheelLines` (a mouse wheel): the
+    /// default scroll glides over about 200 ms.
+    Line,
+}
+
+impl ScrollUnit {
+    fn is_pixel(&self) -> bool {
+        *self == ScrollUnit::Pixel
+    }
+}
+
+/// The different commands the debug server can receive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum DebugCommandKind {
@@ -15,7 +38,7 @@ pub enum DebugCommandKind {
         #[serde(default)]
         max_depth: Option<u32>,
         #[serde(default)]
-        root_id: Option<usize>,
+        root_id: Option<u64>,
         /// Include each node's computed styles. Must stay in sync with
         /// `rinch_debug::protocol::DebugCommandKind` — this enum is a mirror of
         /// it, and a field missing here is a capability the MCP server silently
@@ -26,15 +49,19 @@ pub enum DebugCommandKind {
     #[serde(rename = "query_selector")]
     QuerySelector { selector: String },
     #[serde(rename = "get_node")]
-    GetNode { id: usize },
+    GetNode { id: u64 },
     #[serde(rename = "get_text_content")]
-    GetTextContent { id: usize },
+    GetTextContent { id: u64 },
     #[serde(rename = "click")]
     Click {
         x: f32,
         y: f32,
         #[serde(default)]
         button: Option<String>,
+        /// Modifier names held for the press/release (the `key_press` array
+        /// shape). Mirrored from rinch-debug in lockstep.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modifiers: Option<Vec<String>>,
     },
     #[serde(rename = "type_text")]
     TypeText { text: String },
@@ -43,7 +70,7 @@ pub enum DebugCommandKind {
     #[serde(rename = "close_app")]
     CloseApp,
     #[serde(rename = "get_computed_styles")]
-    GetComputedStyles { id: usize },
+    GetComputedStyles { id: u64 },
     #[serde(rename = "mouse_move")]
     MouseMove { x: f32, y: f32 },
     #[serde(rename = "mouse_down")]
@@ -52,6 +79,10 @@ pub enum DebugCommandKind {
         y: f32,
         #[serde(default)]
         button: Option<String>,
+        /// Modifier names held for the press/release (the `key_press` array
+        /// shape). Mirrored from rinch-debug in lockstep.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modifiers: Option<Vec<String>>,
     },
     #[serde(rename = "mouse_up")]
     MouseUp {
@@ -59,6 +90,10 @@ pub enum DebugCommandKind {
         y: f32,
         #[serde(default)]
         button: Option<String>,
+        /// Modifier names held for the press/release (the `key_press` array
+        /// shape). Mirrored from rinch-debug in lockstep.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modifiers: Option<Vec<String>>,
     },
     #[serde(rename = "scroll")]
     Scroll {
@@ -66,6 +101,10 @@ pub enum DebugCommandKind {
         y: f32,
         delta_x: f64,
         delta_y: f64,
+        /// `"pixel"` (the default; also what a request without the field
+        /// means) or `"line"`: notches of a mouse wheel, which glide.
+        #[serde(default, skip_serializing_if = "ScrollUnit::is_pixel")]
+        unit: ScrollUnit,
     },
     #[serde(rename = "key_press")]
     KeyPress {
@@ -79,10 +118,50 @@ pub enum DebugCommandKind {
         #[serde(default)]
         modifiers: Vec<String>,
     },
+    /// Press without releasing (issue #485's `key_down`/`key_up` pair).
+    /// Mirrored from rinch-debug in lockstep.
+    #[serde(rename = "key_down")]
+    KeyDown {
+        key: String,
+        #[serde(default)]
+        shift: bool,
+        #[serde(default)]
+        ctrl: bool,
+        #[serde(default)]
+        alt: bool,
+        #[serde(default)]
+        modifiers: Vec<String>,
+    },
+    /// Release a key held with `key_down` (issue #485). Mirrored from
+    /// rinch-debug in lockstep.
+    #[serde(rename = "key_up")]
+    KeyUp {
+        key: String,
+        #[serde(default)]
+        shift: bool,
+        #[serde(default)]
+        ctrl: bool,
+        #[serde(default)]
+        alt: bool,
+        #[serde(default)]
+        modifiers: Vec<String>,
+    },
     #[serde(rename = "get_caret_position")]
-    GetCaretPosition { node_id: usize, byte_offset: usize },
+    GetCaretPosition { node_id: u64, byte_offset: usize },
     #[serde(rename = "get_glyph_bounds")]
-    GetGlyphBounds { node_id: usize, byte_offset: usize },
+    GetGlyphBounds { node_id: u64, byte_offset: usize },
+    /// The document's performance counters (`rinch_dom::perf`): the last
+    /// completed frame, the frame in progress, the running total and the
+    /// frame count, each counter keyed by its `snake_case` name. `reset`
+    /// zeroes them all after they are read.
+    #[serde(rename = "perf_stats")]
+    PerfStats {
+        #[serde(default)]
+        reset: bool,
+    },
+    /// Drop files on the window at a point (#1806); see rinch-debug.
+    #[serde(rename = "drop_files")]
+    DropFiles { x: f32, y: f32, paths: Vec<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +193,10 @@ pub struct Response {
 pub struct HandshakeRequest {
     pub protocol: String,
     pub version: u32,
+    /// The token from the app's discovery file (#2481); `None` for an app
+    /// from before #2481, which ignores the field anyway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -154,7 +237,10 @@ pub struct DebugClient {
 }
 
 impl DebugClient {
-    pub fn connect(port: u16) -> Result<Self, String> {
+    /// Connect to the app on `port` and handshake with `token`, the one in
+    /// its discovery file. An app from #2481 on refuses a missing or wrong
+    /// token, and says so.
+    pub fn connect(port: u16, token: Option<&str>) -> Result<Self, String> {
         let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
             .map_err(|e| format!("Failed to connect to 127.0.0.1:{}: {}", port, e))?;
 
@@ -166,12 +252,18 @@ impl DebugClient {
         let handshake = HandshakeRequest {
             protocol: "rinch-debug".into(),
             version: 1,
+            token: token.map(str::to_string),
         };
         let data = serde_json::to_vec(&handshake).unwrap();
         write_frame(&mut stream, &data).map_err(|e| format!("Handshake write failed: {}", e))?;
 
         let resp_data =
             read_frame(&mut stream).map_err(|e| format!("Handshake read failed: {}", e))?;
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp_data)
+            && let Some(error) = v.get("error").and_then(|e| e.as_str())
+        {
+            return Err(format!("The app refused the connection: {error}"));
+        }
         let resp: HandshakeResponse = serde_json::from_slice(&resp_data)
             .map_err(|e| format!("Invalid handshake response: {}", e))?;
 
@@ -198,5 +290,103 @@ impl DebugClient {
             serde_json::from_slice(&resp_data).map_err(|e| format!("Invalid response: {}", e))?;
 
         Ok(response.result)
+    }
+}
+
+#[cfg(test)]
+mod drop_files_1806_tests {
+    use super::*;
+
+    /// The mirror writes the shape rinch-debug's own test reads
+    /// (`protocol::drop_files_1806_tests::drop_files_deserializes_from_the_wire_shape`).
+    #[test]
+    fn drop_files_is_written_in_the_wire_shape() {
+        let req = Request {
+            id: 1,
+            command: DebugCommandKind::DropFiles {
+                x: 1.0,
+                y: 2.0,
+                paths: vec!["/x".into()],
+            },
+        };
+        let v: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"id":1,"method":"drop_files","params":{"x":1.0,"y":2.0,"paths":["/x"]}})
+        );
+    }
+}
+
+/// Issue #2481, end to end: the real rinch-debug server, found through this
+/// crate's own discovery copy and reached through this client. Runs in a child
+/// process with `HOME` of its own, so the discovery file never lands in the
+/// real `~/.rinch/debug` and no other test sees the environment change.
+#[cfg(test)]
+mod token_handshake_2481_tests {
+    use super::*;
+
+    const CHILD: &str = "RINCH_MCP_2481_CHILD";
+
+    #[test]
+    fn the_client_reads_the_token_and_gets_in() {
+        let home = std::env::temp_dir().join(format!("rinch-mcp-2481-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "client::token_handshake_2481_tests::child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", &home)
+            .env_remove("RINCH_DEBUG_PORT")
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "child failed: {stderr}");
+        assert!(
+            stderr.contains("CHILD-2481-OK"),
+            "child never ran: {stderr}"
+        );
+    }
+
+    #[test]
+    fn child() {
+        if std::env::var(CHILD).is_err() {
+            return;
+        }
+        let (server, rx) = rinch_debug::attach("mcp-2481", || {}).expect("server starts");
+        std::thread::spawn(move || {
+            for cmd in rx.0 {
+                let _ = cmd.response_tx.send(rinch_debug::DebugResult::Json {
+                    data: serde_json::json!("pong"),
+                });
+            }
+        });
+
+        let apps = crate::discovery::list_apps();
+        let app = apps
+            .iter()
+            .find(|a| a.pid == std::process::id())
+            .expect("the app is listed");
+        assert_eq!(app.port, server.port());
+        assert!(app.token.is_some(), "no token in the discovery file");
+
+        // Without the token: refused, and the client says why.
+        let err = DebugClient::connect(app.port, None)
+            .err()
+            .expect("connected without the token");
+        assert!(err.contains("refused") && err.contains("token"), "{err}");
+
+        let c = DebugClient::connect(app.port, app.token.as_deref()).expect("connects");
+        assert_eq!(c.app_name, "mcp-2481");
+        match c.execute(DebugCommandKind::WaitFrame).unwrap() {
+            DebugResult::Json { data } => assert_eq!(data, serde_json::json!("pong")),
+            other => panic!("{other:?}"),
+        }
+        eprintln!("CHILD-2481-OK");
     }
 }

@@ -1114,7 +1114,7 @@ mod transform_dpi_covariance {
     use peniko::kurbo::Affine;
 
     /// One `<div>` carrying `style`, laid out, plus its node id.
-    pub(super) fn styled_div(style: &str) -> (RinchDocument, usize) {
+    pub(super) fn styled_div(style: &str) -> (RinchDocument, u64) {
         let mut doc = RinchDocument::new();
         let body = doc.body();
         let div = doc.create_element("div");
@@ -1668,7 +1668,7 @@ fn test_block_content_behind_display_contents_still_paints() {
     /// Builds `<div width:400px><!--for--> [wrapper] <div 100x40 red></div>`,
     /// with the red block either behind a `display:contents` wrapper or a
     /// direct child, and returns (draw op count, wrapper's `ifc_root`).
-    fn build(wrapped: bool) -> (usize, Option<usize>) {
+    fn build(wrapped: bool) -> (usize, Option<u64>) {
         let mut doc = RinchDocument::new();
         let body = doc.body();
 
@@ -1745,7 +1745,7 @@ fn test_block_appended_into_a_marked_contents_wrapper_still_paints() {
     /// `<div width:400px><!--show--><div display:contents/></div>`, laid out
     /// once while the wrapper is empty, then given a 100x40 block child.
     /// Returns (draw op count after the second pass, wrapper's `ifc_root`).
-    fn build(wrapped: bool) -> (usize, Option<usize>) {
+    fn build(wrapped: bool) -> (usize, Option<u64>) {
         let mut doc = RinchDocument::new();
         let body = doc.body();
 
@@ -1892,7 +1892,7 @@ fn test_inline_after_a_block_wrapper_is_not_orphaned() {
 fn test_a_display_none_child_does_not_push_a_contents_wrapper_out_of_the_ifc() {
     /// `<div width:400px><!--show--><span display:contents>VISIBLE[hidden?]</span></div>`.
     /// Returns (the wrapper's `ifc_root`, the container IFC's laid-out text).
-    fn build(with_hidden_child: bool) -> (Option<usize>, String) {
+    fn build(with_hidden_child: bool) -> (Option<u64>, String) {
         let mut doc = RinchDocument::new();
         let body = doc.body();
 
@@ -2311,10 +2311,15 @@ mod scrollbar_paint {
     }
 
     /// The corner, on the paint side: with both bars up each track gives up the
-    /// other bar's footprint, so the bottom-right square stays empty — the same
-    /// square hit-testing gives to neither bar.
+    /// `HIT_THICKNESS` square at the bottom-right, so that square stays empty —
+    /// the same square hit-testing gives to neither bar (#444). It used to give
+    /// up only the other bar's drawn footprint, an 8px square, and paint the
+    /// last ~6px of each thumb into the 16px one no press can grab.
     #[test]
     fn neither_thumb_paints_into_the_corner() {
+        use rinch_dom::paint::scrollbar::HIT_THICKNESS;
+        let c = (200.0 - HIT_THICKNESS) as u32;
+        let r = (100.0 - HIT_THICKNESS) as u32;
         // Both scrolled hard to the end, which is when the two thumbs would
         // otherwise pile into the same square.
         let p = paint_scroller(
@@ -2323,15 +2328,15 @@ mod scrollbar_paint {
             (600.0, 700.0),
         );
         assert!(
-            any_thumb(&p, 150, 92, 190, 98),
+            any_thumb(&p, c - 8, 92, c, 98),
             "the horizontal thumb reaches the end of its shortened track"
         );
         assert!(
-            any_thumb(&p, 192, 50, 198, 90),
+            any_thumb(&p, 192, r - 8, 198, r),
             "the vertical thumb reaches the end of its shortened track"
         );
         assert!(
-            !any_thumb(&p, 192, 92, 200, 100),
+            !any_thumb(&p, c, r, 200, 100),
             "and the corner square is bare"
         );
     }
@@ -2504,9 +2509,10 @@ mod software_video_inline {
     /// `contain` fits the width and leaves a letterbox bar above and below.
     fn magenta_frame() -> SurfacePixelData {
         SurfacePixelData {
-            data: [255u8, 0, 255, 255].repeat(40 * 10),
+            data: [255u8, 0, 255, 255].repeat(40 * 10).into(),
             width: 40,
             height: 10,
+            opaque: false,
         }
     }
 
@@ -2647,6 +2653,91 @@ mod software_video_inline {
             "no entry for this viewport — the hole is still punched and nothing \
              is painted into it, exactly as on the GPU backend"
         );
+    }
+
+    // ── #361: the same inline path for a `GameViewport` ─────────────────────
+    //
+    // A `GameViewport` differs from video in one way that paint can see: it
+    // *is* a hole. It stamps no `data-viewport-ready`, and on the software
+    // shell its name is in the active set whenever it has a frame, so its
+    // ancestors' backgrounds are cut away under it. Its letterbox is therefore
+    // that hole — what the old post-paint blit left there, and see-through on a
+    // transparent window — not video's black bars.
+
+    /// The same card as [`paint_video`], but the viewport is a `GameViewport`:
+    /// no readiness attribute, and its name active, so it punches.
+    fn paint_game(overlay: bool) -> TinySkiaPainter {
+        let mut doc = RinchDocument::new();
+        let body = doc.body();
+        let card = doc.create_element("div");
+        doc.set_attribute(
+            card,
+            "style",
+            "width: 200px; height: 100px; background-color: white; overflow: hidden;",
+        );
+        doc.append_child(body, card);
+
+        let viewport = doc.create_element("div");
+        doc.set_attribute(viewport, "style", "width: 100%; height: 100%;");
+        doc.set_attribute(viewport, "data-viewport", "g");
+        doc.append_child(card, viewport);
+
+        if overlay {
+            // A HUD panel over the left half of the game, painted after it.
+            let hud = doc.create_element("div");
+            doc.set_attribute(
+                hud,
+                "style",
+                "position: absolute; left: 0; top: 0; width: 60px; height: 100px; \
+                 background-color: rgb(0, 0, 255);",
+            );
+            doc.append_child(body, hud);
+        }
+
+        doc.resolve_layout(800.0, 600.0);
+
+        set_active_viewports(Some(HashSet::from(["g".to_string()])));
+        set_viewport_pixels(Some(HashMap::from([("g".to_string(), magenta_frame())])));
+        let mut painter = TinySkiaPainter::new(800, 600);
+        paint_skia(&mut doc, &mut painter);
+        set_viewport_pixels(None);
+        set_active_viewports(None);
+        painter
+    }
+
+    /// The game frame lands inline, and a HUD painted after it keeps its
+    /// pixels — the frame shows only where the HUD does not cover it.
+    #[test]
+    fn a_hud_painted_after_a_game_viewport_covers_it() {
+        let p = paint_game(true);
+        assert!(
+            is_opaque_blue(pixel_at(&p, 30, 50)),
+            "the HUD over the game keeps its pixels (#361), got {:?}",
+            pixel_at(&p, 30, 50)
+        );
+        assert!(
+            is_magenta(pixel_at(&p, 140, 50)),
+            "the game frame shows where the HUD does not cover it, got {:?}",
+            pixel_at(&p, 140, 50)
+        );
+    }
+
+    /// A punched viewport's letterbox is its hole, not a black bar: the
+    /// ancestors' backgrounds are cut away there and nothing else is drawn, so
+    /// on a transparent window it stays see-through, as it did under the blit.
+    #[test]
+    fn a_punched_viewport_letterbox_is_the_hole_not_black() {
+        let p = paint_game(false);
+        assert!(is_magenta(pixel_at(&p, 100, 50)), "the frame is painted");
+        for (x, y) in [(100u32, 10u32), (100, 90), (5, 5), (195, 95)] {
+            assert_eq!(
+                pixel_at(&p, x, y)[3],
+                0,
+                "the letterbox of a GameViewport at ({x}, {y}) is its hole — \
+                 no black backdrop, no card background — got {:?}",
+                pixel_at(&p, x, y)
+            );
+        }
     }
 }
 
@@ -2820,7 +2911,7 @@ mod opacity_layer_bounds {
 
     /// `<body><div id=subject style=...>{children}</div></body>`, laid out.
     /// Returns the document and the subject's id.
-    fn doc_with(subject_style: &str, children: &[&str]) -> (RinchDocument, usize) {
+    fn doc_with(subject_style: &str, children: &[&str]) -> (RinchDocument, u64) {
         let mut doc = RinchDocument::new();
         let body = doc.body();
         let subject = doc.create_element("div");
@@ -2836,13 +2927,13 @@ mod opacity_layer_bounds {
     }
 
     /// The bounds paint would hand the layer it opens around `id`.
-    fn bounds_of(doc: &RinchDocument, id: usize) -> Rect {
+    fn bounds_of(doc: &RinchDocument, id: u64) -> Rect {
         let (x, y) = compute_absolute_position(&doc.tree, id, 1.0);
         opacity_layer_bounds(&doc.tree, id, 1.0, x, y)
     }
 
     /// Where a node's border box actually is, in the same space as the bounds.
-    fn box_of(doc: &RinchDocument, id: usize) -> Rect {
+    fn box_of(doc: &RinchDocument, id: u64) -> Rect {
         let (x, y) = compute_absolute_position(&doc.tree, id, 1.0);
         let l = doc.tree.get(id).unwrap().layout;
         Rect::new(x, y, x + l.width as f64, y + l.height as f64)
@@ -3182,7 +3273,7 @@ mod opacity_layer_bounds {
 
     /// `layer(opacity) > clipper(overflow: hidden) > [children…]`, one child per
     /// name. Returns `(doc, layer, the fixed child if any)`.
-    fn layer_over_clipper(children: &[&str]) -> (RinchDocument, usize, usize) {
+    fn layer_over_clipper(children: &[&str]) -> (RinchDocument, u64, u64) {
         let mut doc = RinchDocument::new();
         let body = doc.body();
 
@@ -3231,7 +3322,7 @@ mod opacity_layer_bounds {
 
     /// `layer > clipper > [n plain fillers…, fixed]` — the fixed box **last**,
     /// behind enough siblings to exhaust `MAX_VISITS`.
-    fn clipper_over_fillers_then_fixed(n: usize) -> (RinchDocument, usize, usize) {
+    fn clipper_over_fillers_then_fixed(n: usize) -> (RinchDocument, u64, u64) {
         let mut doc = RinchDocument::new();
         let body = doc.body();
 
@@ -3272,7 +3363,7 @@ mod opacity_layer_bounds {
     /// `layer > clipper > (depth nested divs) > fixed` — deeper than
     /// `MAX_DEPTH`, so the walk gives up on depth rather than on the budget.
     /// No wide node anywhere, which is what makes this a separate route.
-    fn clipper_over_deep_nest_then_fixed(depth: usize) -> (RinchDocument, usize, usize) {
+    fn clipper_over_deep_nest_then_fixed(depth: usize) -> (RinchDocument, u64, u64) {
         let (mut doc, layer, clipper) = layer_and_clipper();
         let mut cursor = clipper;
         for _ in 0..depth {
@@ -3297,7 +3388,7 @@ mod opacity_layer_bounds {
     fn clipper_over_long_text_then_inline_fixed(
         words: usize,
         display: &str,
-    ) -> (RinchDocument, usize, usize) {
+    ) -> (RinchDocument, u64, u64) {
         let (mut doc, layer, clipper) = layer_and_clipper();
         let para = doc.create_element("p");
         doc.set_attribute(para, "style", "width: 40px; font-size: 12px");

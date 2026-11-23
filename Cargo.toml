@@ -11,6 +11,7 @@ exclude = [
     "examples/events-web",
     "examples/islands-web",
     "examples/editor-web",
+    "examples/editor-node-views-web",
     "examples/collab-editor-web",
     "examples/webgpu-surface-web",
 ]
@@ -27,36 +28,116 @@ rinch = { path = "crates/rinch", default-features = false }
 rinch-core = { path = "crates/rinch-core" }
 rinch-http = { path = "crates/rinch-http" }
 rinch-ws = { path = "crates/rinch-ws" }
+rinch-dsp = { path = "crates/rinch-dsp" }
+rinch-rtc = { path = "crates/rinch-rtc" }
 rinch-macros = { path = "crates/rinch-macros" }
 rinch-renderer = { path = "crates/rinch-renderer" }
 rinch-theme = { path = "crates/rinch-theme" }
 rinch-components = { path = "crates/rinch-components" }
+rinch-html = { path = "crates/rinch-html" }
 rinch-tabler-icons = { path = "crates/rinch-tabler-icons" }
 rinch-storage = { path = "crates/rinch-storage" }
 rinch-dom = { path = "crates/rinch-dom", default-features = false }
 rinch-editor-core = { path = "crates/rinch-editor-core" }
 rinch-editor-collab = { path = "crates/rinch-editor-collab" }
 rinch-editor-view = { path = "crates/rinch-editor-view" }
+rinch-graph-core = { path = "crates/rinch-graph-core" }
+rinch-graph-view = { path = "crates/rinch-graph-view" }
 rinch-debug = { path = "crates/rinch-debug" }
 rinch-editable = { path = "crates/rinch-editable" }
+rinch-words = { path = "crates/rinch-words" }
+rinch-spell = { path = "crates/rinch-spell" }
 rinch-platform = { path = "crates/rinch-platform" }
 rinch-visual-test = { path = "crates/rinch-visual-test" }
 rinch-web = { path = "crates/rinch-web" }
 rinch-video = { path = "crates/rinch-video" }
 rinch-av = { path = "crates/rinch-av" }
-rinch-webrtc = { path = "crates/rinch-webrtc" }
-rinch-signaling = { path = "crates/rinch-signaling" }
 rinch-screen-capture = { path = "crates/rinch-screen-capture" }
 rinch-android = { path = "crates/rinch-android" }
 
 # Rendering
-anyrender = "0.7"
-anyrender_vello = "0.7"
-vello = "0.7"
-wgpu = "27"
+# Vello from joeleaver/vello-fork, pinned to one commit (#1955): vello 0.11.0
+# plus one commit to `vello_encoding`'s image atlas, which the fork's `vello`
+# takes by path. It fixes two Vello 0.9+ atlas behaviours: a render of a scene
+# with no image, gradient or glyph run wiped the persistent atlas (every
+# resident image then drew transparent), and an image stayed resident for two
+# renders after its last use, so the atlas had to hold three scenes' images and
+# large or many images went undrawn. And its bump buffers
+# (joeleaver/vello-fork#1, #3, #4): they have floors that follow the target, and a
+# frame that overflows them anyway grows them and is reported through
+# `Renderer::check_frames` without `render_to_texture` waiting for the GPU, so
+# the shell draws it again. It used to be dropped, and a transparent window went
+# blank. And its blend stack (joeleaver/vello-fork#5, #2103): a clip's backdrop
+# is kept at 16 bits a channel, not 8, so a split surface's above slice,
+# rendered over transparent, composites as the window's scene does. And its
+# tinted alpha-mask images (joeleaver/vello-fork#6, #2286): an image draw can paint a colour in the
+# image's alpha, which is how the glyph-mask atlas draws each glyph, one mask
+# for every colour. And its subpixel (LCD) masks (#2286 stage 3): mask mode 2
+# composites a per-channel coverage mask over an opaque pixel, grey elsewhere.
+# And its bump buffers' first sizes (joeleaver/vello-fork#8, #2466): they follow
+# the target and the scene (`BumpSizes::initial`), calibrated on rinch's
+# examples, instead of Vello's fixed sizes, which held about 165 MiB of GPU
+# memory per renderer whatever it drew.
+# And its `naga_ir` feature (joeleaver/vello-fork#9, #2468): the shaders are
+# made from naga modules parsed at build time, so `Renderer::new` no longer
+# parses their WGSL (119 M of its 149 M instructions on a warm driver cache).
+# `crates/rinch/Cargo.toml` turns it on for native targets only: on WebGPU
+# wgpu would turn the module back into WGSL for the browser.
+# And its bind-group cache (joeleaver/vello-fork#10, #2469): a frame reuses the
+# bind groups of the frames before it where they bind the same resources.
+# And its bilinear image taps (joeleaver/vello-fork#11, #1661, #1755): the
+# extend mode applies to each tap, so an `Extend::Repeat` image blends across
+# its seam as tiny-skia and Chrome do, where it read the edge texel alone.
+# And its per-frame bump reports (joeleaver/vello-fork#13, #2466): asked to, a
+# renderer keeps what each frame needed of its bump buffers beside the rules'
+# first sizes, which `examples/bump-calibration` reads to recalibrate them.
+# Merged with #11 at b800513d.
+# A dependency, not a [patch], so an app on rinch gets it with nothing to
+# copy; apps use `rinch::vello`. Pinned by rev so a push to the fork's branch
+# never changes rinch.
+vello = { git = "https://github.com/joeleaver/vello-fork", rev = "b800513d819ab7e7d78f0ac0501893280b6394cc" }
+wgpu = "30"
 
-# Windowing and input (using fork with Wayland DnD support)
-winit = "0.31.0-beta.2"
+# Windowing and input: winit 0.31.0-beta.4 from joeleaver/winit-fork, branch
+# rinch-patch-beta4, pinned to one commit (#1962). The fork is upstream's
+# v0.31.0-beta.4 tag plus the wlr-layer-shell window role
+# (WindowAttributesWayland::with_layer_shell, #1523; a layer surface's move is
+# confirmed by WindowEvent::Moved, #1597), an X11 fix: each raw pointer
+# event under a pointer grab came twice (#2114), a layer surface's axis
+# anchored to both edges can take the compositor's size (#2413), and monitor
+# changes (ApplicationHandler::monitors_changed on Wayland and X11,
+# xdg_output's logical rectangle; #2414), and an xdg-activation token request
+# that names the seat and serial of the latest input its window received
+# (set_serial, #2501), and popups (#2552, joeleaver/winit-fork#5): upstream
+# winit#4819 (a popup's surface outlives popup_done; a child holds its parent),
+# a popup's grab from the newest press of its parent chain (NoGrabCause when
+# none), Moved for a popup's placement, request_popup_reposition; events
+# queued for a pointer or touch the seat has just released are dropped, not a
+# panic (#2656, joeleaver/winit-fork#6); and the registry's globals
+# (ActiveEventLoopExtWayland::wayland_globals, #2659) and a layer surface's
+# output by wl_output global name (LayerShellAttributes::output_id, #2658),
+# joeleaver/winit-fork#7; and a window's initial scale factor
+# (WindowAttributesWayland::with_initial_scale_factor), with no
+# ScaleFactorChanged for a scale the window already has (#2652); and an X11
+# window another client destroyed answers its last size and position instead
+# of panicking (#2489, joeleaver/winit-fork#9); and a layer surface's size
+# requests, one in flight, ended only at a marker of two wl_display.sync round
+# trips, with no set_size echoed back for a configure (#2552,
+# joeleaver/winit-fork#10); and a surface's input region as a list of rects
+# (WindowExtWayland::set_input_region, #2741); and a layer surface's changes
+# and size request in one commit (set_layer_shell_changes_and_size, #2464);
+# and an existing window activated with an xdg-activation token
+# (WindowExtWayland::activate_with_token, #2817, joeleaver/winit-fork#13);
+# and on Windows a character outside the BMP that SendInput sends as two
+# VK_PACKET presses, one surrogate each, reported whole as the second press's
+# text (#2850, joeleaver/winit-fork#14).
+# Wayland drag and drop is
+# upstream's own since beta.4. A dependency, not a [patch], so an app on rinch needs no
+# patch lines (an app that uses winit itself can name this rev, for one winit
+# in its build). Pinned by rev so a push to the fork's branch never changes
+# rinch. The fork takes crates.io dpi, so the graph has one dpi (muda's too):
+# docs/internals/app-and-windows.md "winit Fork".
+winit = { git = "https://github.com/joeleaver/winit-fork", rev = "debcf476b05eb00181f8dc23219fdf7d3c96ed53" }
 
 # Menus
 muda = "0.15"
@@ -75,17 +156,20 @@ rinch-clipboard = { path = "crates/rinch-clipboard" }
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
-# Text layout
-parley = { version = "0.11.1", features = ["complex-scripts"] }
+# Text layout. parley 0.12.0 from joeleaver/parley-fork, branch `rinch-patch` (fork PRs #6 to #14),
+# pinned to one commit: v0.12.0 plus the commits listed in
+# docs/internals/dependencies.md "Parley Fork". A dependency, not a patch; its
+# workspace's `parlance` is the one `rinch` names too (crates/rinch/Cargo.toml),
+# so the two pins move together.
+parley = { version = "0.12.0", git = "https://github.com/joeleaver/parley-fork", rev = "a95d78063bc05502327e384d9fdac927016d877a", features = ["complex-scripts", "bytemuck"] }
 
 # CSS engine (Stylo from Firefox/Servo)
-stylo = "0.11"
-stylo_traits = "0.11"
-stylo_dom = "0.11"
-stylo_atoms = "0.11"
-stylo_config = "0.11"
-stylo_taffy = { path = "crates/stylo-taffy" }
-servo_arc = "0.4"
+stylo = "0.22"
+stylo_traits = "0.22"
+stylo_dom = "0.22"
+stylo_atoms = "0.22"
+stylo_static_prefs = "0.22"
+servo_arc = "0.5"
 
 # Utilities
 thiserror = "1"
@@ -95,21 +179,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Hot reload
 notify = "7"
 
-# Patch wgpu to use our fork with fixes for Rgba8Unorm storage texture validation
-# Required for transparent windows with Vello on Windows (DX12 + DirectComposition)
-# See: https://github.com/gfx-rs/wgpu/pull/8908 (still open as of Jan 2026)
-# Fork rebased to wgpu v27.0.1 for Vello rendering
-[patch.crates-io]
-wgpu = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
-wgpu-core = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
-wgpu-hal = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
-wgpu-types = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
-naga = { git = "https://github.com/joeleaver/wgpu-fork", branch = "rinch-patch" }
-# Patch winit to use our fork with Wayland DnD support
-# Upstream winit 0.31-beta.2 has no Wayland drag-and-drop implementation
-winit = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
-winit-core = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
-winit-common = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
-winit-wayland = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
-winit-x11 = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
-dpi = { git = "https://github.com/joeleaver/winit-fork", branch = "rinch-patch" }
+# No [patch.crates-io]: the wgpu fork was removed (#1955; rinch renders to an
+# Rgba8Unorm intermediate, whose STORAGE_BINDING WebGPU guarantees), and winit
+# is the dependency above (#1962).

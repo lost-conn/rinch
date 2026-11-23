@@ -5,14 +5,11 @@
 
 use std::sync::atomic::Ordering;
 
-use atomic_refcell::{AtomicRef, AtomicRefMut};
 // Use selectors re-exported from style to ensure version compatibility
 use style::applicable_declarations::ApplicableDeclarationBlock;
 use style::context::{QuirksMode, SharedStyleContext};
-use style::dom::{
-    AttributeProvider, LayoutIterator, NodeInfo, OpaqueNode, TDocument, TElement, TNode,
-    TShadowRoot,
-};
+use style::data::{ElementDataMut, ElementDataRef};
+use style::dom::{LayoutIterator, NodeInfo, OpaqueNode, TDocument, TElement, TNode, TShadowRoot};
 use style::properties::{ComputedValues, PropertyDeclarationBlock};
 use style::selector_parser::{NonTSPseudoClass, PseudoElement, SelectorImpl};
 use style::servo_arc::{Arc, ArcBorrow};
@@ -23,7 +20,7 @@ use style::{Atom, LocalName, Namespace};
 use stylo_dom::ElementState;
 
 // Re-import selectors types from style to ensure version compatibility
-use selectors::attr::{AttrSelectorOperation, AttrSelectorOperator, NamespaceConstraint};
+use selectors::attr::{AttrSelectorOperation, NamespaceConstraint};
 use selectors::matching::{ElementSelectorFlags, MatchingContext};
 use selectors::sink::Push;
 use selectors::{Element, OpaqueElement};
@@ -56,6 +53,33 @@ impl<'a> RinchNode<'a> {
     /// Get the underlying Node reference.
     pub fn node(&self) -> &'a Node {
         &self.tree.nodes[self.id]
+    }
+
+    /// The declarations this cell's table maps onto it, one parsed block per
+    /// distinct mapping for the life of the document.
+    fn table_cell_hints(&self) -> Option<Arc<Locked<PropertyDeclarationBlock>>> {
+        let mut p = self.node().parent;
+        let table = loop {
+            let n = self.tree.nodes.get(p?)?;
+            if n.tag() == Some("table") {
+                break n;
+            }
+            p = n.parent;
+        };
+        let css = crate::legacy_hints::cell_hints_css(table)?;
+        let mut cache = self.tree.cell_hints.lock().unwrap();
+        Some(
+            cache
+                .entry(css)
+                .or_insert_with_key(|css| {
+                    Arc::new(
+                        self.tree
+                            .guard
+                            .wrap(crate::dom_impl::parse_inline_style(css)),
+                    )
+                })
+                .clone(),
+        )
     }
 
     /// Create a RinchNode for a different node in the same tree.
@@ -102,7 +126,7 @@ impl PartialEq for RinchNode<'_> {
 
 impl std::hash::Hash for RinchNode<'_> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        state.write_usize(self.id);
+        state.write_u64(self.id);
     }
 }
 
@@ -117,14 +141,6 @@ impl NodeInfo for RinchNode<'_> {
 
     fn is_text_node(&self) -> bool {
         matches!(self.node().kind, NodeKind::Text(_))
-    }
-}
-
-// === AttributeProvider trait ===
-
-impl AttributeProvider for RinchNode<'_> {
-    fn get_attr(&self, attr: &LocalName) -> Option<String> {
-        self.node().attributes.get(attr.as_ref()).cloned()
     }
 }
 
@@ -214,11 +230,14 @@ impl<'a> TNode for RinchNode<'a> {
     }
 
     fn opaque(&self) -> OpaqueNode {
-        OpaqueNode(self.id)
+        // The whole packed id on a 64-bit target; the slot alone on a 32-bit one
+        // (Stylo identifies a node by it within one restyle, during which no
+        // slot is freed).
+        OpaqueNode(self.id as usize)
     }
 
     fn debug_id(self) -> usize {
-        self.id
+        self.id as usize
     }
 
     fn as_element(&self) -> Option<Self::ConcreteElement> {
@@ -269,44 +288,64 @@ impl<'a> Element for RinchNode<'a> {
         false
     }
 
+    /// The previous sibling that is an element — and not a generated
+    /// `::before` / `::after` / list-marker box. rinch keeps those in the
+    /// child list, but they are not children for selector matching:
+    /// `:nth-child`, `:first-child` and `+` count element children only
+    /// (Selectors 4 §14). Counting them made an element's index depend on
+    /// whether its parent's generated content existed yet — and change,
+    /// unrestyled, when it appeared.
     fn prev_sibling_element(&self) -> Option<Self> {
-        let mut n = 1;
-        while let Some(node) = self.backward(n) {
-            if node.is_element() {
-                return Some(node);
-            }
-            n += 1;
-        }
-        None
+        let parent = &self.tree.nodes[self.node().parent?];
+        let pos = parent.children.iter().position(|&c| c == self.id)?;
+        parent.children[..pos]
+            .iter()
+            .rev()
+            .find(|&&c| is_matchable_element(&self.tree.nodes[c]))
+            .map(|&c| self.with(c))
     }
 
     fn next_sibling_element(&self) -> Option<Self> {
-        let mut n = 1;
-        while let Some(node) = self.forward(n) {
-            if node.is_element() {
-                return Some(node);
-            }
-            n += 1;
-        }
-        None
+        let parent = &self.tree.nodes[self.node().parent?];
+        let pos = parent.children.iter().position(|&c| c == self.id)?;
+        parent.children[pos + 1..]
+            .iter()
+            .find(|&&c| is_matchable_element(&self.tree.nodes[c]))
+            .map(|&c| self.with(c))
     }
 
     fn first_element_child(&self) -> Option<Self> {
         self.node()
             .children
             .iter()
-            .find(|&&id| self.tree.nodes[id].is_element())
+            .find(|&&id| is_matchable_element(&self.tree.nodes[id]))
             .map(|&id| self.with(id))
     }
 
+    /// Used by the selectors crate to decide whether a type selector matches
+    /// its local name ASCII case-insensitively (HTML) or exactly (#683).
+    ///
+    /// rinch carries no element namespace — every node hands Stylo the XHTML
+    /// namespace (see [`Self::namespace`]) — so this answers from the tag
+    /// name instead, the same move `attr_name::is_svg_content_tag` makes for
+    /// the sibling question of attribute-name folding (#688): an element
+    /// whose tag is one of SVG's own (`svg`, `linearGradient`, `clipPath`,
+    /// …) is not an HTML element in an HTML document, whatever its ancestry,
+    /// so a type selector against it is compared with the author's exact
+    /// spelling. The four tags that collide with HTML (`a`, `script`,
+    /// `style`, `title`) stay HTML — same four, same reasoning, see that
+    /// function's doc.
     fn is_html_element_in_html_document(&self) -> bool {
-        true
+        !self
+            .node()
+            .tag()
+            .is_some_and(crate::attr_name::is_svg_content_tag)
     }
 
     fn has_local_name(&self, local_name: &BorrowedLocalName) -> bool {
         self.node()
             .tag()
-            .map(|tag| tag == local_name.as_ref())
+            .map(|tag| tag == AsRef::<str>::as_ref(local_name))
             .unwrap_or(false)
     }
 
@@ -325,34 +364,16 @@ impl<'a> Element for RinchNode<'a> {
         local_name: &LocalName,
         operation: &AttrSelectorOperation<&AtomString>,
     ) -> bool {
-        let Some(attr_value) = self.node().attributes.get(local_name.as_ref()) else {
+        let Some(attr_value) = self.node().attributes.get::<str>(local_name.as_ref()) else {
             return false;
         };
-
-        match operation {
-            AttrSelectorOperation::Exists => true,
-            AttrSelectorOperation::WithValue {
-                operator,
-                case_sensitivity: _,
-                value,
-            } => {
-                let value = value.as_ref();
-                match operator {
-                    AttrSelectorOperator::Equal => attr_value == value,
-                    AttrSelectorOperator::Includes => attr_value
-                        .split_ascii_whitespace()
-                        .any(|word| word == value),
-                    AttrSelectorOperator::DashMatch => {
-                        attr_value.starts_with(value)
-                            && (attr_value.len() == value.len()
-                                || attr_value.chars().nth(value.len()) == Some('-'))
-                    }
-                    AttrSelectorOperator::Prefix => attr_value.starts_with(value),
-                    AttrSelectorOperator::Substring => attr_value.contains(value),
-                    AttrSelectorOperator::Suffix => attr_value.ends_with(value),
-                }
-            }
-        }
+        // The selectors crate's own evaluator: the same one Stylo's
+        // invalidation snapshots use (`ServoElementSnapshot::attr_matches` →
+        // `AttrValue::eval_selector`), so an element and its snapshot can
+        // never disagree about what an attribute selector means — and it
+        // honours the `[attr=v i]` / `[attr=v s]` case flags, which a
+        // hand-rolled comparison used to drop.
+        operation.eval_str(attr_value)
     }
 
     fn match_non_ts_pseudo_class(
@@ -362,22 +383,30 @@ impl<'a> Element for RinchNode<'a> {
     ) -> bool {
         match *pseudo_class {
             NonTSPseudoClass::Hover => {
-                self.node().hover_sensitive.set(true);
+                if !crate::query::querying() {
+                    self.node().hover_sensitive.set(true);
+                }
                 self.node().is_hovered
             }
             NonTSPseudoClass::Active => {
-                self.node().active_sensitive.set(true);
+                if !crate::query::querying() {
+                    self.node().active_sensitive.set(true);
+                }
                 self.node().is_active
             }
             NonTSPseudoClass::Focus => {
-                self.node().focus_sensitive.set(true);
+                if !crate::query::querying() {
+                    self.node().focus_sensitive.set(true);
+                }
                 self.node().is_focused
             }
             NonTSPseudoClass::FocusVisible => {
                 // Shares `focus_sensitive`: the flag only ever changes on the
                 // (gaining/losing) focused node, so focus-change invalidation
                 // covers :focus-visible rules too.
-                self.node().focus_sensitive.set(true);
+                if !crate::query::querying() {
+                    self.node().focus_sensitive.set(true);
+                }
                 self.node().is_focus_visible
             }
             // `:enabled` / `:disabled` (issue #429). These answered a
@@ -427,6 +456,54 @@ impl<'a> Element for RinchNode<'a> {
                     .unwrap_or(false)
             }
             NonTSPseudoClass::Visited => false, // We don't track visited links
+
+            // #681. `:required`/`:optional`, `:read-only`/`:read-write` and
+            // `:placeholder-shown` are plain attribute-derived predicates,
+            // same shape as `:enabled`/`:disabled` above (#429) — narrower
+            // than the full CSS definition on purpose; see
+            // `node::tag_supports_required` / `node::tag_is_readonly_capable`
+            // for the exact scope this leaves out. They are ALSO fed into
+            // `element_state` below (as `ElementState::REQUIRED` etc.), so
+            // Stylo's own invalidation maps see the dependency and restyle
+            // precisely — self, descendants or later siblings — whenever a
+            // `required`/`readonly`/`placeholder`/`value` write flips one,
+            // exactly the mechanism `:checked` already rides.
+            NonTSPseudoClass::Required => crate::node::node_is_required(self.node()),
+            NonTSPseudoClass::Optional => crate::node::node_is_optional(self.node()),
+            NonTSPseudoClass::ReadOnly => crate::node::node_is_read_only(self.node()),
+            NonTSPseudoClass::ReadWrite => crate::node::node_is_read_write(self.node()),
+            NonTSPseudoClass::PlaceholderShown => {
+                crate::node::node_is_placeholder_shown(self.node())
+            }
+
+            // `:defined` (#681): rinch has no custom-element registry, so
+            // every element rinch can build is defined — there is no
+            // "unresolved" state to answer `false` for. Constant, so no
+            // invalidation is needed (nothing can ever flip it).
+            NonTSPseudoClass::Defined => true,
+
+            // `:focus-within` is NOT implemented (#681, left open). A first
+            // attempt propagated an eager `is_focus_within` bit to the
+            // focused node's ancestors on every `update_focus`, the same
+            // chain-walk `update_active` does for `:active` — but
+            // `style_invalidation_twin_tests.rs`'s random-mutation oracle
+            // (`.a:focus-within { --r32: 1; }`, already in its battery)
+            // caught it diverging from a fresh rebuild whenever a `Move`
+            // relocated a subtree while focus lived elsewhere: nothing
+            // re-derives the eagerly-set bit when the TREE changes, only
+            // when FOCUS changes, so a moved ancestor can carry a stale
+            // answer. Reverted rather than shipped broken; see the issue for
+            // the fix sketch (either re-derive on every structural verb while
+            // some node is focused, or answer dynamically from
+            // `self.tree.focused_node` and ensure invalidation reaches
+            // whatever moved).
+
+            // `:lang()` (#681). `lang_attr`/`match_element_lang` below exist
+            // for Stylo's invalidation wrapper; ordinary matching (this
+            // function) never goes through them and resolves inline instead.
+            NonTSPseudoClass::Lang(ref lang) => resolve_lang(self.tree, self.id)
+                .is_some_and(|resolved| lang_tag_matches(&resolved, lang)),
+
             _ => false,
         }
     }
@@ -499,8 +576,11 @@ impl<'a> Element for RinchNode<'a> {
         false
     }
 
+    /// `:empty` (Selectors 4 §14.2): no element children and no text of
+    /// non-zero length — comments and generated `::before` / `::after` boxes
+    /// do not count.
     fn is_empty(&self) -> bool {
-        self.node().children.is_empty()
+        node_is_empty(self.tree, self.id)
     }
 
     fn is_root(&self) -> bool {
@@ -584,20 +664,7 @@ impl<'a> TElement for RinchNode<'a> {
     }
 
     fn state(&self) -> ElementState {
-        let mut state = ElementState::empty();
-        if self.node().is_hovered {
-            state |= ElementState::HOVER;
-        }
-        if self.node().is_focused {
-            state |= ElementState::FOCUS;
-        }
-        if self.node().is_focus_visible {
-            state |= ElementState::FOCUSRING;
-        }
-        if self.node().is_active {
-            state |= ElementState::ACTIVE;
-        }
-        state
+        element_state(self.node())
     }
 
     fn has_part_attr(&self) -> bool {
@@ -651,12 +718,7 @@ impl<'a> TElement for RinchNode<'a> {
     }
 
     fn has_dirty_descendants(&self) -> bool {
-        // Check if any child has STYLE dirty flag
-        self.node().children.iter().any(|&id| {
-            self.tree.nodes[id]
-                .dirty
-                .contains(crate::node::DirtyFlags::STYLE)
-        })
+        self.node().style_dirty_descendants.get()
     }
 
     fn has_snapshot(&self) -> bool {
@@ -671,14 +733,14 @@ impl<'a> TElement for RinchNode<'a> {
         self.node().snapshot_handled.store(true, Ordering::SeqCst);
     }
 
+    /// Stylo's invalidator marks the path from an invalidated element down to
+    /// every invalidated descendant; `resolve_styles` follows it.
     unsafe fn set_dirty_descendants(&self) {
-        // Mark this node as needing style recalc
-        // Note: We can't mutate through a shared reference, so this would need
-        // interior mutability in production. For now, we track dirty state separately.
+        self.node().style_dirty_descendants.set(true);
     }
 
     unsafe fn unset_dirty_descendants(&self) {
-        // Clear dirty descendants flag
+        self.node().style_dirty_descendants.set(false);
     }
 
     fn store_children_to_process(&self, _n: isize) {
@@ -690,38 +752,38 @@ impl<'a> TElement for RinchNode<'a> {
         0
     }
 
-    unsafe fn ensure_data(&self) -> AtomicRefMut<'_, style::data::ElementData> {
-        let mut stylo_data = self.node().stylo_element_data.borrow_mut();
-        if stylo_data.is_none() {
-            *stylo_data = Some(style::data::ElementData::default());
-        }
-        AtomicRefMut::map(stylo_data, |sd| sd.as_mut().unwrap())
+    unsafe fn ensure_data(&self) -> ElementDataMut<'_> {
+        self.node().stylo_element_data.ensure()
     }
 
     unsafe fn clear_data(&self) {
-        *self.node().stylo_element_data.borrow_mut() = None;
+        self.node().stylo_element_data.clear();
     }
 
     fn has_data(&self) -> bool {
-        self.node().stylo_element_data.borrow().is_some()
+        self.node().stylo_element_data.has_data()
     }
 
-    fn borrow_data(&self) -> Option<AtomicRef<'_, style::data::ElementData>> {
-        let stylo_data = self.node().stylo_element_data.borrow();
-        if stylo_data.is_some() {
-            Some(AtomicRef::map(stylo_data, |sd| sd.as_ref().unwrap()))
-        } else {
-            None
-        }
+    fn borrow_data(&self) -> Option<ElementDataRef<'_>> {
+        self.node().stylo_element_data.borrow()
     }
 
-    fn mutate_data(&self) -> Option<AtomicRefMut<'_, style::data::ElementData>> {
-        let stylo_data = self.node().stylo_element_data.borrow_mut();
-        if stylo_data.is_some() {
-            Some(AtomicRefMut::map(stylo_data, |sd| sd.as_mut().unwrap()))
-        } else {
-            None
-        }
+    fn mutate_data(&self) -> Option<ElementDataMut<'_>> {
+        self.node().stylo_element_data.borrow_mut()
+    }
+
+    /// The value of an attribute, for CSS `attr()`, which stylo substitutes
+    /// in the cascade (since 0.21, in any property). The cascade asking means
+    /// this element's style or a `::before`/`::after` of it depends on its
+    /// attributes, so the element is flagged for
+    /// `invalidation::note_attribute_change` (`content_reads_attrs`).
+    ///
+    /// Rinch's attributes have no namespaces, so the namespace is not
+    /// consulted (stylo 0.11's `AttributeProvider::get_attr` passed none).
+    fn get_attr(&self, attr: &LocalName, _namespace: &Namespace) -> Option<String> {
+        let node = self.node();
+        node.content_reads_attrs.set(true);
+        node.attributes.get::<str>(attr.as_ref()).cloned()
     }
 
     fn skip_item_display_fixup(&self) -> bool {
@@ -774,16 +836,45 @@ impl<'a> TElement for RinchNode<'a> {
         None
     }
 
+    /// `false` under a node whose styles are isolated (#2357,
+    /// [`Node::style_isolated`]): Stylo's `RuleCollector` then collects only
+    /// user-agent rules, presentational hints and the `style` attribute for
+    /// this element (and its pseudo-elements), and its style-sharing cache
+    /// and document-rule invalidation leave it out — the treatment a
+    /// browser gives a shadow tree's contents against the document's
+    /// sheets. The isolating node itself is not under itself. O(1): the
+    /// style walk caches the answer ([`Node::under_isolated`]), and while
+    /// the document has no isolated node at all
+    /// ([`crate::NodeTree::isolated_nodes`]) the node is not even read.
+    fn matches_user_and_content_rules(&self) -> bool {
+        // No isolated node in the document: nothing to be under.
+        if self.tree.isolated_nodes == 0 {
+            return true;
+        }
+        !self.node().under_isolated.get()
+    }
+
+    /// The resolved `lang` (#681): this element's own `lang` attribute, or
+    /// the nearest ancestor's — see `resolve_lang`. Used by Stylo's
+    /// invalidation wrapper (`element_wrapper.rs`'s `get_lang`), not by
+    /// ordinary `:lang()` matching, which resolves inline in
+    /// [`Self::match_non_ts_pseudo_class`].
     fn lang_attr(&self) -> Option<style::selector_parser::AttrValue> {
-        None
+        resolve_lang(self.tree, self.id).map(|lang| AtomString::from(lang.as_str()))
     }
 
     fn match_element_lang(
         &self,
-        _override_lang: Option<Option<style::selector_parser::AttrValue>>,
-        _value: &style::selector_parser::Lang,
+        override_lang: Option<Option<style::selector_parser::AttrValue>>,
+        value: &style::selector_parser::Lang,
     ) -> bool {
-        false
+        let resolved = match override_lang {
+            // `Some(None)`: the snapshot says this element and its chain
+            // carried no `lang` at the snapshotted moment — nothing to match.
+            Some(explicit) => explicit.map(|v| v.as_ref().to_owned()),
+            None => resolve_lang(self.tree, self.id),
+        };
+        resolved.is_some_and(|lang| lang_tag_matches(&lang, value))
     }
 
     fn is_html_document_body_element(&self) -> bool {
@@ -798,11 +889,27 @@ impl<'a> TElement for RinchNode<'a> {
     fn synthesize_presentational_hints_for_legacy_attributes<V>(
         &self,
         _visited_handling: selectors::matching::VisitedHandlingMode,
-        _hints: &mut V,
+        hints: &mut V,
     ) where
         V: Push<ApplicableDeclarationBlock>,
     {
-        // TODO: Handle legacy attributes like align, bgcolor, etc.
+        // What a cell's table maps onto it (`legacy_hints`), under its own.
+        if matches!(self.node().tag(), Some("td" | "th"))
+            && let Some(block) = self.table_cell_hints()
+        {
+            hints.push(ApplicableDeclarationBlock::from_declarations(
+                block,
+                style::rule_tree::CascadeLevel::new(style::rule_tree::CascadeOrigin::PresHints),
+                style::stylesheets::layer_rule::LayerOrder::root(),
+            ));
+        }
+        if let Some(block) = &self.node().presentational_hints {
+            hints.push(ApplicableDeclarationBlock::from_declarations(
+                block.clone(),
+                style::rule_tree::CascadeLevel::new(style::rule_tree::CascadeOrigin::PresHints),
+                style::stylesheets::layer_rule::LayerOrder::root(),
+            ));
+        }
     }
 
     fn local_name(&self) -> &BorrowedLocalName {
@@ -1014,9 +1121,148 @@ impl<'a> TElement for RinchNode<'a> {
     }
 }
 
+/// The element state Stylo sees for `node`: the interaction states rinch
+/// tracks, plus `CHECKED` from the `checked` attribute — the same fact
+/// `:checked` is matched from, so Stylo's state-dependency map can say which
+/// selectors a checkbox toggle reaches. Shared by [`TElement::state`] and the
+/// invalidation snapshots, which must agree.
+pub(crate) fn element_state(node: &Node) -> ElementState {
+    let mut state = ElementState::empty();
+    if node.is_hovered {
+        state |= ElementState::HOVER;
+    }
+    if node.is_focused {
+        state |= ElementState::FOCUS;
+    }
+    if node.is_focus_visible {
+        state |= ElementState::FOCUSRING;
+    }
+    if node.is_active {
+        state |= ElementState::ACTIVE;
+    }
+    if node.attributes.contains_key("checked") {
+        state |= ElementState::CHECKED;
+    }
+    // #681: fed from the same facts `match_non_ts_pseudo_class` reads, so
+    // Stylo's invalidation maps see a state dependency on each and restyle
+    // precisely (self/descendants/siblings) when `note_attribute_change`
+    // snapshots an element whose `required`/`readonly`/`placeholder`/`value`
+    // is about to change — the generic mechanism `:checked` above already
+    // rides, not the manual "restyle self+subtree+later-siblings" forcing
+    // `:disabled`/`:enabled`/`href` use (those need the forcing because a
+    // `<fieldset disabled>` changes a *descendant's* answer without that
+    // descendant's own attributes moving, which no per-element state bit can
+    // express; none of these four has that problem).
+    if crate::node::tag_supports_required(node.tag()) {
+        if node.attributes.contains_key("required") {
+            state |= ElementState::REQUIRED;
+        } else {
+            state |= ElementState::OPTIONAL_;
+        }
+    }
+    if crate::node::tag_is_readonly_capable(node.tag()) {
+        if node.attributes.contains_key("readonly") {
+            state |= ElementState::READONLY;
+        } else {
+            state |= ElementState::READWRITE;
+        }
+        if crate::node::node_is_placeholder_shown(node) {
+            state |= ElementState::PLACEHOLDER_SHOWN;
+        }
+    }
+    // `:defined` (#681): constant — rinch has no custom-element registry, so
+    // nothing is ever "undefined". Included for `state()` callers that read
+    // it as a fact rather than matching through `match_non_ts_pseudo_class`.
+    state |= ElementState::DEFINED;
+    state
+}
+
+/// The effective `lang` for `:lang()` (#681): `node`'s own `lang` attribute,
+/// or the nearest ancestor's. An explicit `lang=""` means "no language" per
+/// HTML and stops the walk there (`None`), rather than falling through to an
+/// ancestor that happens to have one.
+pub(crate) fn resolve_lang(tree: &NodeTree, id: RawNodeId) -> Option<String> {
+    let mut cur = Some(id);
+    while let Some(nid) = cur {
+        let node = tree.get(nid)?;
+        if let Some(lang) = node.attributes.get("lang") {
+            return if lang.is_empty() {
+                None
+            } else {
+                Some(lang.clone())
+            };
+        }
+        cur = node.parent;
+    }
+    None
+}
+
+/// Selectors 4 §16.5's basic filtering (RFC 4647 §3.3.1): `want` matches
+/// `resolved` exactly (ASCII case-insensitive), or as a prefix followed by
+/// `-` — so `en` matches `en-US` but not `english`.
+pub(crate) fn lang_tag_matches(resolved: &str, want: &str) -> bool {
+    if resolved.eq_ignore_ascii_case(want) {
+        return true;
+    }
+    resolved.len() > want.len()
+        && resolved.as_bytes()[want.len()] == b'-'
+        && resolved[..want.len()].eq_ignore_ascii_case(want)
+}
+
+/// An element child as selectors count children: an element, and not a
+/// generated pseudo-element box.
+fn is_matchable_element(node: &Node) -> bool {
+    matches!(node.kind, NodeKind::Element(_)) && !node.is_pseudo_element
+}
+
+/// `:empty`: no child element other than a generated pseudo-element box, and
+/// no text node with any text. Comments do not count.
+pub(crate) fn node_is_empty(tree: &NodeTree, id: RawNodeId) -> bool {
+    tree.nodes[id]
+        .children
+        .iter()
+        .all(|&c| !child_defeats_empty(&tree.nodes[c]))
+}
+
+/// Whether `node`, as a child, makes its parent not `:empty`.
+pub(crate) fn child_defeats_empty(child: &Node) -> bool {
+    match &child.kind {
+        NodeKind::Element(_) => !child.is_pseudo_element,
+        NodeKind::Text(t) => !t.content.is_empty(),
+        _ => false,
+    }
+}
+
+/// Whether some child of `id` other than `except` keeps `id` from being
+/// `:empty`.
+pub(crate) fn other_children_defeat_empty(
+    tree: &NodeTree,
+    id: RawNodeId,
+    except: RawNodeId,
+) -> bool {
+    tree.nodes[id]
+        .children
+        .iter()
+        .any(|&c| c != except && child_defeats_empty(&tree.nodes[c]))
+}
+
+/// Whether one child change (an insertion, a removal, a text edit) can have
+/// flipped `id`'s `:empty`: only if, after it, at most one child keeps `id`
+/// from being empty. Anything more and `id` was non-empty before the change
+/// and is after it. What keeps a list build under an `:empty` rule from
+/// restyling the list (and its subtree) on every row.
+pub(crate) fn empty_can_have_flipped(tree: &NodeTree, id: RawNodeId) -> bool {
+    tree.nodes[id]
+        .children
+        .iter()
+        .filter(|&&c| child_defeats_empty(&tree.nodes[c]))
+        .nth(1)
+        .is_none()
+}
+
 /// Intern an arbitrary tag name into a `'static` [`BorrowedLocalName`] so stylo's
 /// type-selector matching recognizes it. The hardcoded fast-path arms in
-/// [`local_name`](RinchElement::local_name) cover the common tags lock-free; this
+/// `local_name` cover the common tags lock-free; this
 /// handles the long tail (table cells `td`/`tr`/`th`, custom elements, …) by
 /// interning on first use and caching the leaked atom. The set of distinct tag
 /// names a document uses is small and finite, so the bounded leak is intentional.

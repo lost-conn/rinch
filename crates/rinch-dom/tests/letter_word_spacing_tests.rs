@@ -57,17 +57,20 @@
 //! is a pin on the local font set, a difference is the declaration. Every
 //! fixture declares `font-size` and `line-height` for the same reason.
 //!
-//! # Percentages are not expressed, and #743 says why that is wrong
+//! # Percentages (#743, fixed)
 //!
-//! `letter-spacing: 50%` / `word-spacing: 50%` compute to `0` here, because
-//! `computed_style::from_stylo::typography` keeps only the length part of a
-//! `LengthPercentage`. **Chrome resolves the percentage against the element's
-//! own font-size** — measured, `50%` at `font-size: 20px` adds 10px per
-//! character — which is a constant the conversion already holds, so the
-//! comment there calling it unrepresentable is wrong about why. That is
-//! issue **#743**, filed from this work and not fixed by it.
-//! `calc_tests::calc_letter_and_word_spacing_keep_px_part` pins the current
-//! behaviour and is the fixture to change with it.
+//! `letter-spacing: 50%` / `word-spacing: 50%` used to compute to `0` here,
+//! because `computed_style::from_stylo::typography` kept only the length
+//! part of a `LengthPercentage`. **Chrome resolves the percentage against
+//! the element's own font-size** — measured, `50%` at `font-size: 20px`
+//! adds 10px per character for either property — which is a constant the
+//! conversion already holds, so the old comment there calling it
+//! unrepresentable was wrong about why. Fixed as issue **#743**; the
+//! percentage arithmetic itself (both properties, `calc()`, and the
+//! font-size-scaling check) is pinned in
+//! `percent_letter_word_spacing_tests.rs`, and
+//! `calc_tests::calc_letter_and_word_spacing_resolve_percentage_against_font_size`
+//! pins the mixed-`calc()` case this file's own `CASES` don't cover.
 
 use rinch_core::dom::{DomDocument, NodeId};
 use rinch_dom::RinchDocument;
@@ -430,7 +433,7 @@ fn an_inline_flex_boxs_text_is_measured_with_the_spacing() {
     }
 }
 
-// ── the two `text-overflow: ellipsis` rebuild paths ────────────────────────
+// ── the `text-overflow: ellipsis` rebuild (there were two paths) ──────────
 
 /// The number of glyphs a `parley::Layout` holds, across every line and run.
 fn glyph_count(layout: &parley::layout::Layout<peniko::Brush>) -> usize {
@@ -446,7 +449,7 @@ fn glyph_count(layout: &parley::layout::Layout<peniko::Brush>) -> usize {
 
 /// The string the IFC-root `text-overflow: ellipsis` path truncates `text` to
 /// in a 150px box under `extra`, and the width it lays that string out at.
-fn ellipsis_ifc(extra: &str, text: &str) -> (String, f32) {
+fn ellipsis_ifc(extra: &str, text: &str) -> (String, f32, f32) {
     let mut doc = RinchDocument::new();
     let body = doc.body();
     let c = el(
@@ -464,32 +467,35 @@ fn ellipsis_ifc(extra: &str, text: &str) -> (String, f32) {
         .text_layout
         .as_ref()
         .expect("no inline layout");
-    (il.text_content.clone(), il.layout.width())
+    // What paint draws, and where its "…" ends (#1100: the lines are kept
+    // and cut at paint).
+    let text = il.painted_text().unwrap_or_else(|| il.text_content.clone());
+    let end = il.ellipsis.as_ref().map_or(il.layout.width(), |c| {
+        c.marks.last().map_or(0.0, |m| m.x) + c.glyph.width()
+    });
+    let ellipsis = il.ellipsis.as_ref().map_or(0.0, |c| c.glyph.width());
+    (text, end, ellipsis)
 }
 
-/// `text-overflow: ellipsis` binary-searches for the longest prefix that fits,
-/// building a throwaway layout per probe. Spacing has to be in **all** of them:
-/// the prefix probes decide how much fits, and the final layout is what paints.
+/// `text-overflow: ellipsis` cuts the line where the "…" still fits, in the
+/// line as laid out (#1100) — with the spacing — and draws a "…" shaped with
+/// it. Spacing has to be in both: the cut decides how much fits, and the
+/// "…" is what paints after it.
 ///
-/// This is the IFC-root path (`build_ellipsis_layout`).
+/// This is the IFC-root path (`ellipsis_cut`).
 ///
-/// Two assertions, because the path has two halves and one mutant each, and
-/// **the second is self-calibrating rather than a threshold**. A prefix probe
-/// without the spacing keeps fitting the unspaced number of characters, so the
-/// *content* stays long. A final layout without it draws the characters that
-/// were chosen at exactly the width those same characters measure unspaced —
-/// so laying the truncated string out again with no declaration gives the
-/// mutant's answer directly, and the real one has to beat it by the spacing it
-/// applied. Measured here: `abcdefgh…` is 144.369 spaced against 108.369
-/// unspaced, `a b c d…` is 126.328 against 96.328.
-///
-/// A fixed lower bound would have had to be different per property — the two
-/// truncations land 18px apart — and would have pinned the local font set.
+/// A cut that ignored the spacing would keep the unspaced number of
+/// characters, so the *content* stays long; and the "…" is shaped in the
+/// block's spacing, so `letter-spacing` widens it by its one character's
+/// spacing and `word-spacing` (it has no word separator) leaves it alone.
+/// (A third assertion pinned the flat rebuild's final layout, laid out again
+/// with the spacing; since #1100 nothing is laid out again — the kept text
+/// is the line as laid out, whose spacing the paint fixtures below pin.)
 #[test]
 fn an_ifc_roots_ellipsis_truncation_is_measured_with_the_spacing() {
     for c in CASES {
-        let (plain_text, _) = ellipsis_ifc("", c.long);
-        let (spaced_text, spaced_w) = ellipsis_ifc(c.decl, c.long);
+        let (plain_text, _, plain_e) = ellipsis_ifc("", c.long);
+        let (spaced_text, spaced_w, spaced_e) = ellipsis_ifc(c.decl, c.long);
         assert!(
             plain_text.ends_with('\u{2026}') && spaced_text.ends_with('\u{2026}'),
             "{}: positive control — nothing was truncated at all; got \
@@ -508,31 +514,25 @@ fn an_ifc_roots_ellipsis_truncation_is_measured_with_the_spacing() {
              {spaced_text:?}",
             c.decl
         );
-        let unspaced = ifc_line_width("", &spaced_text);
+        let widened = if c.name == "letter-spacing" { 4.0 } else { 0.0 };
         assert!(
-            spaced_w - unspaced > 20.0,
-            "{}: the final layout must shape {spaced_text:?} WITH the \
-             declaration — the same string unspaced is {unspaced}, which is \
-             what a final builder that dropped it would return; got {spaced_w}",
+            (spaced_e - plain_e - widened).abs() < 0.01,
+            "{}: the \u{2026} is shaped in the block's spacing: {plain_e} -> {spaced_e}",
             c.decl
         );
     }
 }
 
-/// The other `text-overflow: ellipsis` path: a text node measured through its
-/// `TextMeasure` context (a flex item, as above) is truncated by the
-/// `ellipsis_rebuilds` loop rather than by `build_ellipsis_layout`. Same three
-/// throwaway builders, a different function.
-///
-/// Counted in glyphs because this path keeps no truncated string — the result
-/// is a bare `parley::Layout` on the text node. The reference for the width
-/// half therefore comes from the IFC path, and **the coupling is asserted
-/// rather than assumed**: the two paths must truncate the same input in the
-/// same box to the same number of glyphs, which is a cross-path invariant worth
-/// pinning on its own.
+/// The other `text-overflow: ellipsis` path — a text node measured through
+/// its `TextMeasure` context (a flex item) — stopped being taken in #904's
+/// second review and was deleted in #982: that text is an anonymous flex item,
+/// which does not clip, and Chrome 153 draws it clipped with no "…". This
+/// fixture used to pin that path's spacing (#698); it now pins that the flex
+/// item's text is kept whole, spaced or not, so a rebuild there cannot come
+/// back unnoticed.
 #[test]
-fn a_flex_items_ellipsis_truncation_is_measured_with_the_spacing() {
-    fn truncate(extra: &str, text: &str) -> (usize, f32) {
+fn a_flex_items_text_is_not_ellipsized() {
+    fn glyphs(extra: &str, text: &str) -> usize {
         let mut doc = RinchDocument::new();
         let body = doc.body();
         let c = el(
@@ -551,48 +551,20 @@ fn a_flex_items_ellipsis_truncation_is_measured_with_the_spacing() {
             .cached_text_parley
             .as_ref()
             .expect("the flex item's text was never cached");
-        (glyph_count(l), l.width())
+        glyph_count(l)
     }
     for c in CASES {
-        let (plain_n, _) = truncate("", c.long);
-        let (spaced_n, spaced_w) = truncate(c.decl, c.long);
         let full = c.long.chars().count();
+        // Counter-oracle: the same text in a block container does ellipsize.
+        let (ifc_text, _, _) = ellipsis_ifc(c.decl, c.long);
         assert!(
-            plain_n > 0 && plain_n < full,
-            "{}: positive control — {plain_n} glyphs is not a truncation of \
-             {full} characters",
-            c.name
-        );
-        assert!(
-            spaced_n + 2 <= plain_n,
-            "{}: fewer spaced glyphs must fit in the same 150px box; \
-             got {plain_n} -> {spaced_n}",
+            ifc_text.chars().count() < full,
+            "{}: positive control — the block container truncates",
             c.decl
         );
-        assert!(
-            spaced_w <= 150.0,
-            "{}: the truncation must fit the 150px box; got {spaced_w}",
-            c.decl
-        );
-
-        // The reference string, and the invariant that lets it be one.
-        let (ifc_text, _) = ellipsis_ifc(c.decl, c.long);
-        assert_eq!(
-            ifc_text.chars().count(),
-            spaced_n,
-            "{}: the two ellipsis paths truncated the same input in the same \
-             box differently ({ifc_text:?} against {spaced_n} glyphs), so the \
-             width reference below is not this layout's string",
-            c.decl
-        );
-        let unspaced = ifc_line_width("", &ifc_text);
-        assert!(
-            spaced_w - unspaced > 20.0,
-            "{}: the final layout must shape {ifc_text:?} WITH the declaration \
-             — the same string unspaced is {unspaced}, which is what a final \
-             builder that dropped it would return; got {spaced_w}",
-            c.decl
-        );
+        for extra in ["", c.decl] {
+            assert_eq!(glyphs(extra, c.long), full, "{}: {extra:?}", c.name);
+        }
     }
 }
 

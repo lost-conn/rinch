@@ -138,9 +138,45 @@ Two related guarantees follow from the same queue:
 
 Effects are still de-duplicated per flush: an effect observing two signals that both change in one `batch()` runs once, at the position of its first enqueue.
 
+### An effect does not wake itself
+
+There is one exception to "queued behind the current flush": a write that reaches **the effect that is running** is, for that effect, usually dropped rather than queued.
+
+A write made while no batch is open flushes at once — and every effect body a flush runs is in that state, because a flush runs with the batch closed. So the flush happens while the body that made the write is still on the stack. It reaches the running effect, finds it running, and skips it. The write itself lands, and every *other* effect that reads the signal runs for it. The running effect keeps what it computed on this pass, the wake is not left in the queue for later, and the effect sees the new value the next time something else re-runs it.
+
+"A write the body made" includes code the body calls, and the common case is a scope's cleanup. An effect that disposes a scope runs that scope's `on_cleanup` callbacks inside its own body — `rsx!`'s `if`, `match` and `for` all do when they swap a branch or remove a row — so a cleanup that writes a signal the disposing effect reads does not re-run it. For example, a `for` row whose cleanup writes a signal the list's collection closure reads does not make the list reconcile a second time.
+
+```rust
+let trigger = Signal::new(0);
+let tally = Signal::new(0);
+let child = Scope::new();
+child.on_cleanup(move || tally.update(|n| *n += 1));
+let child = RefCell::new(Some(child));
+
+Effect::new(move || {
+    let t = trigger.get();
+    let seen = tally.get();
+    if t == 1 {
+        let scope = child.borrow_mut().take();
+        if let Some(scope) = scope {
+            scope.dispose(); // its cleanup writes `tally`, which this effect read
+        }
+    }
+    println!("saw tally = {seen}");
+});              // prints "saw tally = 0"
+
+trigger.set(1);  // prints "saw tally = 0"; tally is now 1, and this
+                 // effect does not run again for it
+trigger.set(2);  // prints "saw tally = 1"
+```
+
+This is deliberate, and it is what lets such an effect settle. Were the wake queued instead, an effect that disposes a scope on every run, whose cleanup writes a signal the effect reads, would schedule itself again on every run and never stop. So do not rely on an effect observing a write made by its own cleanup: have a different effect read that signal, or read the signal *after* the disposal in the same body.
+
+The exception has an exception. When the body runs while a batch is **open** — an `Effect::new` or `Effect::run` called directly from an event handler, which is a batch, or inside `batch()` — its writes are queued rather than flushed, the queue drains only after the body has returned, and the effect does run again for its own write.
+
 ## Batching Updates
 
-When you update multiple signals, effects run after each update. To avoid redundant runs, use `batch()`:
+Outside a batch, effects run after each update. To avoid redundant runs, use `batch()`:
 
 ```rust
 batch(|| {
@@ -153,9 +189,60 @@ batch(|| {
 
 A top-level `batch()` flushes synchronously: by the time it returns, every effect its writes woke has run. Batches also **nest** — a `batch()` called inside another batch's closure joins the outer transaction, and the single flush happens when the outermost batch exits. (A `batch()` opened from inside an effect *run by a flush* is its own outermost batch — the flag is restored before the flush begins — so it still flushes before returning. An effect body that runs while a batch is still *open* is different: `Effect::new` runs its body immediately, so an effect created inside a batch closure runs inside that batch, and a `batch()` opened there joins the outer transaction instead of flushing.)
 
-Until the flush, nothing has run: inside the closure — including after a nested `batch()` returns — effects have not executed, and `Memo::get` still returns the pre-batch value.
+Until the flush, no effect has run: inside the closure — including after a nested `batch()` returns — effects have not executed, so a signal an effect writes still holds its old value. **Memos are different: `Memo::get` inside the batch returns the new value.** A write marks every memo that reads it stale synchronously, and the read recomputes it (see [Memos](./memos.md#the-equality-cut-off)). It used to return the pre-batch value, which made a handler that wrote a signal and then read a memo of it act on stale data. **The DOM is different too:** any `NodeHandle` call made in the batch first runs the effects queued so far (see [below](#touching-the-dom-inside-a-handler)).
 
-If the closure **panics**, the panic propagates and the batching flag is restored on the way out, so later writes flush normally. Nothing is flushed during the unwind itself — the effects the aborted batch queued stay pending and run at the next flush (the next unbatched write or outermost batch exit; the runtime does not schedule one on its own).
+If the closure **panics**, the panic propagates and the batching flag is restored on the way out, so later writes flush normally. Nothing is flushed during the unwind itself — the effects the aborted batch queued stay pending and run at the next flush (the next unbatched write or outermost batch exit — every event handler is one, whether or not it writes anything; the runtime does not schedule one on its own).
+
+### Event handlers run as batches
+
+You rarely need to call `batch()` yourself: **rinch runs each of these as one**, on desktop, on the web (the delegated listeners go through the same `rinch_core::events::dispatch_*` functions) and in embed:
+
+- `onclick` and every other `data-rid` handler (the element drag attributes included), `oninput`/`onchange`, `onscroll`, file drops;
+- the keyboard interceptor and the Escape dismiss stack (one transaction for both), the paste interceptor;
+- `Drag` `on_move`, `on_end` and `on_cancel`;
+- menu and tray callbacks, and their shortcuts;
+- a registered focus target's `on_focus_gained`, `on_focus_lost`, `on_key` and `on_ime`;
+- each callback drained from the main-thread queue — `Signal::send`/`update_send` and `run_on_main_thread` called from another thread, and on native `set_timeout`, `rinch-http` and `rinch-ws` completions — **one transaction per callback**, not one for the whole drain, because they were queued independently and a later one may rely on an earlier one's effects;
+- on the web, a `set_timeout` callback, a `rinch-http` completion and a `rinch-ws` event, which arrive straight from the browser.
+- each poll of a `spawn_local` task ([Async Tasks](./async.md)), on every platform.
+
+**Everything else that calls into your code is not batched by rinch**, and its writes flush one by one as they always did. That includes, for example: `run_on_main_thread` called *on* the main thread (it runs its closure there and then, inside whatever transaction is open), `set_selection_callback` / `set_selection_sync_callback`, the configuration-change handler, `on_child_inserted` / `on_child_removed` observers, a `RenderSurface`'s event handler, the editor's `EditorHandle::on_change`, `on_link_click`, `on_link_hover`, `on_key`, `on_selection_change` and `on_caret_moved` callbacks, and effects and memo computations themselves. Wrap any of those in `batch()` yourself if it writes several signals.
+
+So a handler that writes five signals flushes effects **once**, when it returns, and the host is told once (on desktop, one `ReRender`, not five). A handler that writes **no** signal tells the host nothing — no `ReRender`, and an embedded context is not marked dirty — unless the theme changed with `update_theme()` since the host was last told (in this handler, or outside any handler), or effects an earlier batch left queued are still waiting (see the panic note above), which it then runs. A DOM change a handler makes directly, through a `NodeHandle`, is picked up by the host's own dirty-node check, not by this notification — a `scroll_into_view()` or `scroll_to_fraction()` request from a handler that changes nothing else included. Library code that keeps other state a host reads only when told (not a signal, not the DOM) calls `rinch_core::note_host_change()` when it changes, so the batch still notifies. What that means inside the handler:
+
+- **Memos are current.** Write, then read a memo of what you wrote: you get the new value.
+- **Effects run when the handler returns — or earlier, the moment the handler touches the DOM** (next section). Until then a signal an effect derives still holds its old value; read the source signal (or a memo) instead.
+- **Glitch-free.** An effect that reads several of the signals the handler wrote runs once, and sees all of the writes, never a mix of old and new.
+
+#### Touching the DOM inside a handler
+
+A handler that writes a signal and then works on the DOM itself was written expecting the write to have reached the DOM already — it always had:
+
+```rust
+button { onclick: move || {
+    dialog_open.set(true);   // a Modal's effect shows the dialog and focuses its first field
+    email_field.focus();     // …but this handler wants the email field
+}, "Sign in" }
+
+button { onclick: move || {
+    messages.update(|m| m.push(new_message()));  // a `for` effect appends the row
+    log.scroll_to_bottom();                      // …and this should reach it
+}, "Send" }
+```
+
+So **every `NodeHandle` operation made from handler code first runs the effects the handler has queued so far** — `focus()`, `scroll_into_view()`, `set_scroll_top()`, `scroll_to_bottom()`, reads such as `get_attribute`, `children`, `scroll_height` or `get_layout_bounds`, and writes such as `set_attribute` alike. It is the analogue of a browser flushing pending style when script asks for layout. Program order is kept: the `Modal`'s own focus request is made first and the handler's `focus()` overrides it; the new message row exists before the scroll; a `set_attribute` made after a signal write wins over the effect bound to that signal, instead of being overwritten when the handler returns. A handler that only writes signals still flushes exactly once. `rinch_core::flush_pending_effects()` does the same thing explicitly, for code that reaches the DOM some other way.
+
+The rule applies to handler code, not to effects: a `NodeHandle` call inside an effect body or a memo computation never drains the queue, since that code runs *inside* a flush and must not run effects queued behind it ahead of their turn. A handler dispatched *from* an effect (an effect that calls `dispatch_event`, or a web `focus()` that fires a listener synchronously) is handler code again: its batch is a flush context of its own.
+
+**One way to trip over it in your own code.** If a handler writes a signal and then makes a `NodeHandle` call while holding a borrow of a `RefCell` that an effect of that signal also borrows, the effect runs inside that call — and panics with `BorrowError`/`BorrowMutError`. Before handlers were batched the same effect ran at the write itself, before your borrow was taken; the conflict is the same, it just moved from the write to the DOM call. Take the borrow after the DOM call, or drop it before. (Editor *queries* such as `is_mark_active` are not DOM calls and run no effects.)
+
+**Writing a library that keeps its own `RefCell` state?** A `NodeHandle` call inside a handler can now run *user* effects, and a user effect is free to call back into your API. If your code touches the DOM while it holds a borrow of its own state, that is a `BorrowMutError` waiting to happen. Hold `rinch_core::reactive::suppress_effect_flush()` for as long as the borrow lives — no effect runs inside it; the pending ones run at the next DOM access outside it, or when the batch ends — and call `rinch_core::flush_pending_effects()` just *before* taking the borrow, so the caller's earlier writes have reached the DOM you are about to work on. The rich-text editor does exactly this around every borrow of its core, so `tick.set(1); editor.command("toggleBold")` in one handler, or two commands in a row with an `on_change` that bumps a toolbar signal, behave as they did before handlers were batched.
+
+#### Two consequences to know about
+
+**An effect sees only where the handler ended up, never the steps.** `show.set(false); show.set(true)` in one handler does not remount the `if` branch; removing a `for` item and putting one with the same key back keeps that row and its state; closing and re-opening an overlay in one handler neither restores nor re-captures focus. (A `NodeHandle` call in between flushes, so it *does* make the step visible — that is what the rule above is for.)
+
+**A handler that blocks keeps its transaction open.** If a handler shows a native modal dialog (a file picker, a message box) that runs a nested platform event loop — which macOS and Windows dialogs can — its batch stays open until the dialog returns, and anything rinch runs meanwhile, such as a drained `Signal::send` or a timer, joins that batch: its effects run when the dialog closes, not when it arrived.
 
 ## Reading Without Tracking
 
@@ -173,6 +260,72 @@ Effect::new(move || {
 });
 // This effect only re-runs when `count` changes, not when `name` changes
 ```
+
+`untracked` hides only the observer directly above it. That matters only while
+an effect's run is nested inside another effect's run — the first run of an
+`Effect::new` written inside another effect's body, for instance. A read inside
+`untracked` there is recorded on the outer effect. Later re-runs of the inner
+effect normally come from a flush with no effect beneath them and are unaffected (issue
+#932).
+
+### App handlers never subscribe the effect that calls them
+
+A component often calls its app's handler from inside one of its own effects — a
+coordinating effect that ends in `onchange`, a `value_fn` binding that reports
+back. The handler is app code, and it routinely reads signals: the controlled
+idiom `onchange: move |v| if v != store.get() { store.set(v) }` reads the store
+it writes. If that read counted, the component's internal effect would be
+subscribed to the app's store, and a write to the store from anywhere else would
+re-run it out of turn.
+
+So every app-callback type's `invoke` — `Callback`, `ValueCallback<T>`,
+`InputCallback`, `FileDropCallback` and `ScrollCallback` — runs the handler with
+**no** observer in view, however many effects deep the call is (issue #285).
+Handlers respond to events; effects respond to signals. A component author does
+not need to wrap `cb.invoke(..)` in `untracked` any more.
+
+Only tracking changes: batching is untouched, so a handler's writes inside an
+event handler still flush once, when the batch ends. An effect the handler
+creates, or one its writes run, tracks normally.
+
+The same holds for the other app callbacks rinch runs synchronously from a call
+you can make inside an effect (issue #931):
+
+- the rich-text editor's `EditorHandle` hooks — `on_change`,
+  `on_selection_change`, `on_caret_moved`, `on_key`, `on_link_click` and
+  `on_link_hover` — so an app effect that calls `set_selection`, runs a
+  `command` or offers a key is not subscribed to a popup hook's own `open`
+  signal;
+- the child observers (`rinch_core::dom::on_child_inserted` /
+  `on_child_removed`), which every `for` reconcile, `if` branch swap and
+  component re-render reaches from inside its effect;
+- the selection and selection-sync callbacks (`query_selection_ranges`,
+  `fire_selection_sync`), the keyboard and paste interceptors
+  (`dispatch_keyboard_event`, `dispatch_paste_event`), the dismiss stack
+  (`dispatch_dismiss`) and `Drag::cancel`'s `on_cancel`.
+
+Editor **plugin** code is untracked the same way (issue #943): `apply`,
+`init_state`, `decorations`, `handle_paste`, a plugin's commands and input rules
+run under the editor's own borrow, inside whatever effect called the handle, so
+a spellchecker whose `decorations()` reads an app `spellcheck_on` signal does not
+subscribe every effect that moves the selection. A plugin that should react to a
+signal needs something that re-asks it — an effect of its own that dispatches a
+transaction when the signal changes. Plugin code your own `update` closure
+calls (below) is part of that closure, and tracked. The collaboration `outbound`
+sink runs untracked too (issue #948): a transport closure that reads a
+`connected` signal does not subscribe the effect that made the edit.
+
+A closure you pass *as the call itself* is not one of these: the `build` closure
+of `EditorHandle::update(|state| …)` runs as part of your own code, and a signal
+it reads is your effect's dependency like any other.
+
+If you write a component or library that stores an app's callback and calls it
+later, call it through `rinch_core::untracked_handler(|| cb(..))` for the same
+reason. The five callback types do this in their `invoke`; a bare `Rc<dyn Fn()>`
+does not. A closure a component stores and calls itself — an `Rc<dyn Fn()>`, a
+`render_fn` — is an ordinary call and is tracked like any other code in the
+effect; that is what a `_fn` prop such as `value_fn` relies on, and why the
+choice is yours.
 
 ## Memory Management with Scopes
 
@@ -202,6 +355,38 @@ are `Copy` and can outlive their values, reads of a freed handle panic while
 writes are warn-once no-ops; use `try_get()` / `is_alive()` when a handle may
 legitimately be gone. See
 [Lifetimes](./hooks.md#lifetimes-what-owns-your-state) for the full story.
+
+### Cleanups, and taking one back
+
+`on_cleanup(f)` registers `f` with the ambient owner, to run when it is disposed;
+a scope's cleanups run in the order they were registered.
+
+`on_cleanup_removable(f)` does the same and returns a `CleanupHandle`. It is for
+something an owner would otherwise collect one of per use: a long-lived owner (an
+app-lifetime component, a tray icon, a list row) that opens a window, starts a
+request or subscribes to something on every click, where the cleanup only matters
+while that thing is still there. When the thing ends first, it calls
+`handle.remove()`: the cleanup never runs, its closure is dropped at once, and the
+owner keeps nothing of it. With plain `on_cleanup` every use would leave its
+closure on the owner until the owner goes.
+
+```rust
+use rinch_core::reactive::on_cleanup_removable;
+
+// Inside a long-lived component: one subscription per click.
+let sub = subscribe(feed);
+let cleanup = on_cleanup_removable(move || sub.cancel());
+// …and when the subscription ends by itself:
+if let Some(cleanup) = cleanup {
+    cleanup.remove();
+}
+```
+
+A removable cleanup runs in its place among the owner's others. The handle holds
+a weak reference, so it keeps nothing alive. `remove` after the owner is gone or
+its disposal has finished does nothing. A cleanup that removes another during the
+same disposal keeps it from running, if it has not run yet. With no live ambient
+owner, `on_cleanup_removable` registers nothing and returns `None`.
 
 ## Next Steps
 

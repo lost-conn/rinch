@@ -9,12 +9,14 @@
 //!
 //! Selection follows HTML semantics, resolved in this order:
 //! 1. the option whose value equals the select's own `value` attribute, if the
-//!    select has one (this is what the app writes back when the user picks an
-//!    option, and what the `value:` rsx prop sets — HTML has no `value` content
-//!    attribute on `<select>` at all, so this step is rinch's own);
+//!    select has one AND that attribute is the **freshest** of the two
+//!    selection-moving writes (issue #757, below) — this is what the app
+//!    writes back when the user picks an option, and what the `value:` rsx
+//!    prop sets. HTML has no `value` content attribute on `<select>` at all,
+//!    so this step is rinch's own;
 //! 2. otherwise the option whose **selectedness** is set — the live state, not
 //!    the `selected` attribute, which is only its default; see
-//!    [`set_option_selectedness`];
+//!    `set_option_selectedness`;
 //! 3. otherwise the first non-disabled option — a single `<select>` always has a
 //!    selected option in a browser, defaulting to the first. This is also what
 //!    stands in for HTML's "ask for a reset": deselect the selected option and
@@ -24,8 +26,21 @@
 //! is not what a browser tracks (issue #692). The attribute is only an option's
 //! *default* selectedness; the live state moves with the last option **set**, and
 //! the two part company as soon as two options carry the attribute at once. See
-//! [`set_option_selectedness`] for the rule and the Chrome 150 measurements
-//! behind it, and [`options_inserted`] for the four DOM paths that apply it.
+//! `set_option_selectedness` for the rule and the Chrome 150 measurements
+//! behind it, and `options_inserted` for the four DOM paths that apply it.
+//!
+//! **Step 1 used to win unconditionally once the `value` attribute was
+//! present** (issue #757). Chrome and rinch-web have no such separate
+//! attribute at all — only live selectedness — so there, whichever of "a user
+//! picks an option" or "a script sets `option.selected`" happened most
+//! recently is the selection. Letting step 1 win forever meant a desktop
+//! user's pick (which writes `value`) could never be overtaken by a later
+//! programmatic `selected` write, the one divergence from every other rule in
+//! this file. `NodeTree::select_value_fresh` is what makes step 1
+//! conditional: a live write of either kind — the `value` attribute, or an
+//! option's `selected` attribute while it is already attached — clears the
+//! other mechanism's claim to freshness, so the most recent write wins either
+//! way. See its doc for exactly which writes count as "live".
 //!
 //! `<optgroup>`s are flattened: their `<option>` children are collected in
 //! document order as if the group weren't there. (Rendering the group *labels*
@@ -41,8 +56,12 @@ pub struct SelectOption {
     /// Submit value: the `value` attribute, or the label if there is no `value`
     /// attribute (HTML falls back to the text content).
     pub value: String,
-    /// Display label: the `label` attribute if present, else the trimmed text
-    /// content.
+    /// Display label: the `label` attribute **verbatim** if it is not empty
+    /// (a tab or newline in it as a space, a CR or form feed dropped, as
+    /// Chrome 155 draws them), else the text content with ASCII whitespace
+    /// stripped and collapsed — HTML's `option.label` / `option.text`
+    /// (#1130). Untransformed: [`label_as_set`] applies the select's
+    /// `text-transform`.
     pub label: String,
     /// Whether the option carries a `selected` attribute — its *default*
     /// selectedness (`defaultSelected` in the IDL), which is not in general the
@@ -56,6 +75,132 @@ pub struct SelectOption {
     pub selectedness: bool,
     /// Whether the option is `disabled`.
     pub disabled: bool,
+}
+
+/// The closed control's inner box, which Chrome keeps **inside** the select's
+/// own padding (so an author padding adds to it rather than replacing it) and
+/// which the UA stylesheet therefore cannot spell as `padding` (#1098). Measured
+/// in Chrome 153 on Linux: a select is `border + padding + ceil(label) + 20`
+/// wide at every font size, and `border + padding + one line + 2` tall; its
+/// label's first ink sits 4px inside the border and its arrow is centred in the
+/// last 16px.
+///
+/// The label's inset from the content box's left edge, CSS px.
+pub const SELECT_LABEL_INSET: f32 = 4.0;
+/// The arrow box at the content box's right edge, CSS px.
+pub const SELECT_ARROW_BOX: f32 = 16.0;
+/// Space above and below the label's line inside the content box, CSS px.
+pub const SELECT_INNER_BLOCK: f32 = 1.0;
+
+/// `label` as a select in `style` sets it: in the select's `text-transform`
+/// (#1130). Chrome 155 transforms the closed label and its popup rows alike.
+pub fn label_as_set<'a>(
+    style: &crate::computed_style::ComputedStyle,
+    label: &'a str,
+) -> std::borrow::Cow<'a, str> {
+    match style.text_transform.apply(label) {
+        Some(t) => t.into(),
+        None => label.into(),
+    }
+}
+
+/// Shape a select's label the one way both its **measure** (the
+/// widest-option width `apply_stylo_styles_to_taffy` sizes it from) and its
+/// **paint** (`paint::select`) do, so the width the box was given is the width
+/// of the text drawn in it. `scale` multiplies every length in `style` (the
+/// font size and the letter- and word-spacing): 1 for the measure, the device
+/// scale for paint.
+///
+/// The builder is the one ordinary text and a text field's value are shaped
+/// with, `ComputedStyle::build_parley_layout` (#789, #320): the select's
+/// font, `font-style` included, `letter-spacing` and `word-spacing`, and its
+/// `text-transform` applied first ([`label_as_set`]) — Chrome 155 sets the
+/// closed label in all of them (an option's own do not reach it). Its
+/// `line-height` is `normal !important` from the UA sheet. The closed label
+/// has no hit-test twin: an open popup resolves an option by node, not by a
+/// character offset.
+pub(crate) fn select_label_layout(
+    font_cx: &mut parley::FontContext,
+    layout_cx: &mut parley::LayoutContext<peniko::Brush>,
+    style: &crate::computed_style::ComputedStyle,
+    scale: f32,
+    brush: peniko::Brush,
+    label: &str,
+) -> parley::Layout<peniko::Brush> {
+    let label = label_as_set(style, label);
+    // Single line, clipped: never wrap the closed control's label.
+    style.build_parley_layout_with_brush(&label, scale, Some(brush), font_cx, layout_cx, None)
+}
+
+/// The widest of a select's option labels in CSS px, as
+/// [`select_label_layout`] shapes them, and the key it was shaped from (the
+/// labels and every style input the builder reads). When the key matches
+/// `cached`, the cached width is returned and nothing is shaped.
+pub(crate) fn widest_select_label(
+    font_cx: &mut parley::FontContext,
+    layout_cx: &mut parley::LayoutContext<peniko::Brush>,
+    style: &crate::computed_style::ComputedStyle,
+    labels: &[&str],
+    cached: Option<(u64, f32)>,
+    perf: &crate::perf::PerfCounters,
+) -> (u64, f32) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    labels.hash(&mut h);
+    // Everything `select_label_layout` reads (#320).
+    style.hash_text_layout_inputs(&mut h);
+    (style.text_transform as u8).hash(&mut h);
+    let key = h.finish();
+    if let Some((k, w)) = cached
+        && k == key
+    {
+        return (key, w);
+    }
+    (key, widest_shaped(font_cx, layout_cx, style, labels, perf))
+}
+
+fn widest_shaped(
+    font_cx: &mut parley::FontContext,
+    layout_cx: &mut parley::LayoutContext<peniko::Brush>,
+    style: &crate::computed_style::ComputedStyle,
+    labels: &[&str],
+    perf: &crate::perf::PerfCounters,
+) -> f32 {
+    let mut widest = 0.0f32;
+    for label in labels.iter().filter(|l| !l.is_empty()) {
+        perf.bump(crate::perf::Counter::ShapeSelectLabel);
+        let layout = select_label_layout(
+            font_cx,
+            layout_cx,
+            style,
+            1.0,
+            peniko::Brush::default(),
+            label,
+        );
+        widest = widest.max(layout.full_width());
+    }
+    widest
+}
+
+/// The widest of `labels` in CSS px, shaped by `select_label_layout` in
+/// `style` — its family, size, weight, spacing and `text-transform`. For a
+/// caller that sets option labels in a style other than the closed
+/// control's — the desktop runtime's native popup, whose rows are 14px in the
+/// body's font with no letter- or word-spacing and the select's
+/// `text-transform` — and must size its own box to them. Uncached: it shapes
+/// every non-empty label, and counts each in `shape_select_label`.
+pub fn widest_label_at(
+    doc: &mut crate::RinchDocument,
+    style: &crate::computed_style::ComputedStyle,
+    labels: &[&str],
+) -> f32 {
+    widest_shaped(
+        &mut doc.font_cx,
+        &mut doc.layout_cx,
+        style,
+        labels,
+        &doc.tree.perf,
+    )
 }
 
 /// The resolved options of a `<select>` plus which one is currently selected.
@@ -94,10 +239,12 @@ pub fn resolve_select_model(tree: &NodeTree, select_id: RawNodeId) -> SelectMode
 
     collect_options(tree, select_id, &mut options);
 
-    // The select's own `value` attribute is authoritative when present.
+    // The select's own `value` attribute wins over selectedness only while it
+    // is the freshest of the two (#757) — see `resolve_selected_index`.
     let select_value = select.attributes.get("value").map(|s| s.as_str());
+    let value_is_fresh = tree.select_value_fresh.contains(&select_id);
 
-    let selected_index = resolve_selected_index(&options, select_value);
+    let selected_index = resolve_selected_index(&options, select_value, value_is_fresh);
 
     SelectModel {
         options,
@@ -107,29 +254,31 @@ pub fn resolve_select_model(tree: &NodeTree, select_id: RawNodeId) -> SelectMode
 
 /// Walk `<option>` children in document order, descending into `<optgroup>`.
 fn collect_options(tree: &NodeTree, parent_id: RawNodeId, out: &mut Vec<SelectOption>) {
-    let Some(parent) = tree.get(parent_id) else {
+    let Some(parent) = tree.get_live(parent_id) else {
         return;
     };
     for &child_id in &parent.children {
-        let Some(child) = tree.get(child_id) else {
+        let Some(child) = tree.get_live(child_id) else {
             continue;
         };
         match child.tag() {
             Some("option") => {
-                let label_text = element_text(tree, child_id);
+                // HTML's `option.text`: the text content, ASCII whitespace
+                // stripped and collapsed (Chrome 155: `"  a   b  "` is
+                // drawn and sized as `"a b"`; an NBSP stays).
+                let label_text = strip_and_collapse_ascii_whitespace(&element_text(tree, child_id));
+                // A non-empty `label` attribute is the label as written:
+                // Chrome 155 keeps its spaces (`"  x   y "` is 22px wider than
+                // `"x y"`), not even trimming them.
                 let label = child
                     .attributes
                     .get("label")
-                    .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| label_text.trim().to_string());
-                // HTML: an option's value defaults to its text content when the
-                // `value` attribute is absent.
-                let value = child
-                    .attributes
-                    .get("value")
-                    .cloned()
-                    .unwrap_or_else(|| label_text.trim().to_string());
+                    .map(|s| label_attribute_as_drawn(s))
+                    .unwrap_or_else(|| label_text.clone());
+                // HTML: an option's value defaults to its text (`option.text`)
+                // when the `value` attribute is absent.
+                let value = child.attributes.get("value").cloned().unwrap_or(label_text);
                 out.push(SelectOption {
                     node_id: child_id,
                     value,
@@ -150,6 +299,33 @@ fn collect_options(tree: &NodeTree, parent_id: RawNodeId, out: &mut Vec<SelectOp
     }
 }
 
+/// HTML's "strip and collapse ASCII whitespace": every run of tab, LF, FF, CR
+/// and space is one space, and none at either end.
+pub fn strip_and_collapse_ascii_whitespace(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for word in s
+        .split(|c: char| c.is_ascii_whitespace())
+        .filter(|w| !w.is_empty())
+    {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
+}
+
+/// A `label` attribute as Chrome 155 draws it in the closed control: a tab or
+/// a newline as a space, a carriage return or a form feed as nothing (measured:
+/// `"x\ty"` and `"x\ny"` are as wide as `"x y"`, `"x\ry"` and `"x\u{c}y"` as
+/// `"xy"`). Every other character is kept, spaces included.
+fn label_attribute_as_drawn(s: &str) -> String {
+    s.chars()
+        .filter(|&c| c != '\r' && c != '\u{c}')
+        .map(|c| if c == '\t' || c == '\n' { ' ' } else { c })
+        .collect()
+}
+
 /// Concatenate the text of a subtree (an option's visible label).
 fn element_text(tree: &NodeTree, id: RawNodeId) -> String {
     let mut buf = String::new();
@@ -166,12 +342,24 @@ fn element_text(tree: &NodeTree, id: RawNodeId) -> String {
     buf
 }
 
-fn resolve_selected_index(options: &[SelectOption], select_value: Option<&str>) -> Option<usize> {
+fn resolve_selected_index(
+    options: &[SelectOption],
+    select_value: Option<&str>,
+    value_is_fresh: bool,
+) -> Option<usize> {
     if options.is_empty() {
         return None;
     }
-    // 1. Match the select's `value` attribute.
-    if let Some(val) = select_value
+    // 1. Match the select's `value` attribute — but only while it is the
+    //    *freshest* selection write (issue #757: a user's pick must not
+    //    permanently outrank a later programmatic `selected` write, the way
+    //    Chrome and rinch-web let the later write win). `value_is_fresh`
+    //    answers `tree.select_value_fresh.contains(select_id)`, which
+    //    `set_option_selectedness` clears the moment a **live** write moves
+    //    one of this select's options' selectedness — see its doc and
+    //    `NodeTree::select_value_fresh`'s.
+    if value_is_fresh
+        && let Some(val) = select_value
         && let Some(i) = options.iter().position(|o| o.value == val)
     {
         return Some(i);
@@ -248,20 +436,54 @@ fn resolve_selected_index(options: &[SelectOption], select_value: Option<&str>) 
 /// `multiple` is not honoured: rinch's `<select>` model is single-selection
 /// throughout (`selected_index` is one `Option<usize>`), so a `multiple` select
 /// already collapsed to one selected option before this existed.
+///
+/// A **live** write (the only kind that reaches this function; see
+/// [`apply_selectedness_on_attach`] for the other) also clears the owning
+/// select's entry in [`NodeTree::select_value_fresh`], whichever its sign
+/// (#757): a `selected` attribute set *right now*, on an option already
+/// attached to its select, is a fresher selection write than whatever that
+/// select's own `value` attribute last recorded, so it outranks it —
+/// matching Chrome and rinch-web's single "last write wins" model.
 pub(crate) fn set_option_selectedness(tree: &mut NodeTree, option_id: RawNodeId, on: bool) {
+    set_option_selectedness_impl(tree, option_id, on, true);
+}
+
+/// Apply the exclusivity rule for an option whose selectedness was already
+/// decided while it was detached, now that it has joined a select (#692's
+/// [`options_inserted`]). Unlike [`set_option_selectedness`] this does **not**
+/// touch [`NodeTree::select_value_fresh`] (#757): attaching a node that
+/// already carried `selected` in its markup is construction order showing
+/// through, not a new live write, and must not let it silently outrank a
+/// `value:` rsx prop set around the same time —
+/// `select_value_attribute_wins_over_selected_attribute` in `select_tests.rs`
+/// pins exactly this ordering.
+fn apply_selectedness_on_attach(tree: &mut NodeTree, option_id: RawNodeId, on: bool) {
+    set_option_selectedness_impl(tree, option_id, on, false);
+}
+
+fn set_option_selectedness_impl(tree: &mut NodeTree, option_id: RawNodeId, on: bool, live: bool) {
     let Some(node) = tree.get_mut(option_id) else {
         return;
     };
     node.selectedness = Some(on);
-    if !on {
-        return;
-    }
     // An option set while it is detached — which is every option `rsx!` builds,
     // since it writes the attributes before appending — has no select to clear.
     // `options_inserted` runs the same rule when it arrives in one.
     let Some(select_id) = owning_select(tree, option_id) else {
         return;
     };
+    // The closed select paints the selected option's label; the option itself
+    // has no box (`display: none`), so the select is what changed on screen.
+    tree.mark_paint_dirty(select_id);
+    // A live write of either sign is the most recent write, so it retires the
+    // select's own `value` attribute: a deselect with nothing else selected
+    // falls through to the default, as a browser's reset does.
+    if live {
+        tree.select_value_fresh.remove(&select_id);
+    }
+    if !on {
+        return;
+    }
     let mut others = Vec::new();
     collect_option_ids(tree, select_id, &mut others);
     for id in others {
@@ -318,7 +540,7 @@ pub(crate) fn options_inserted(tree: &mut NodeTree, inserted: RawNodeId) {
         .filter(|&id| tree.get(id).and_then(|n| n.selectedness) == Some(true))
         .collect();
     for id in pending {
-        set_option_selectedness(tree, id, true);
+        apply_selectedness_on_attach(tree, id, true);
     }
 }
 
@@ -327,11 +549,11 @@ pub(crate) fn options_inserted(tree: &mut NodeTree, inserted: RawNodeId) {
 /// anywhere else.
 fn owning_select(tree: &NodeTree, option_id: RawNodeId) -> Option<RawNodeId> {
     let parent = tree.get(option_id)?.parent?;
-    match tree.get(parent)?.tag() {
+    match tree.get_live(parent)?.tag() {
         Some("select") => Some(parent),
         Some("optgroup") => {
-            let grandparent = tree.get(parent)?.parent?;
-            (tree.get(grandparent)?.tag() == Some("select")).then_some(grandparent)
+            let grandparent = tree.get_live(parent)?.parent?;
+            (tree.get_live(grandparent)?.tag() == Some("select")).then_some(grandparent)
         }
         _ => None,
     }
@@ -340,11 +562,11 @@ fn owning_select(tree: &NodeTree, option_id: RawNodeId) -> Option<RawNodeId> {
 /// The ids of `parent`'s `<option>` descendants in document order, flattening
 /// `<optgroup>` exactly as [`collect_options`] does.
 fn collect_option_ids(tree: &NodeTree, parent_id: RawNodeId, out: &mut Vec<RawNodeId>) {
-    let Some(parent) = tree.get(parent_id) else {
+    let Some(parent) = tree.get_live(parent_id) else {
         return;
     };
     for &child_id in &parent.children {
-        let Some(child) = tree.get(child_id) else {
+        let Some(child) = tree.get_live(child_id) else {
             continue;
         };
         match child.tag() {

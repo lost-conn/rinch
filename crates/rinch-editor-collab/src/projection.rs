@@ -3,7 +3,7 @@
 //! The CRDT is **not** the model (design §8). The model lives in `rinch-editor-core`;
 //! this is a *projection* of it onto a CRDT so concurrent edits converge. The two are
 //! kept byte-for-byte equivalent by the invariant **`model ≡ project(model)`**: every
-//! local step is projected onto the CRDT ([`crate::project`]), every remote CRDT change
+//! local step is projected onto the CRDT (`crate::project`), every remote CRDT change
 //! is rebuilt back into the model ([`crate::remote`]). Convergence then follows from
 //! yrs's own convergence.
 //!
@@ -19,7 +19,8 @@
 //!
 //! root Array "content"            // a named root type, holding the top-level blocks
 //!   Node (Map):
-//!     "type"  -> string           // "paragraph" | "heading" | "bullet_list" | …
+//!     "type"  -> string           // "paragraph" | "heading" | "blockquote" | …
+//!                                 // (a "table" has a shape of its own: see below)
 //!     "attrs" -> Map<str, Any>    // e.g. heading {"level": 2}, ordered_list {"start": 3}
 //!     and then EXACTLY ONE of:
 //!       "text"    -> Text         // a textblock's plain text
@@ -32,12 +33,16 @@
 //!
 //! A **leaf block atom** (`horizontal_rule` — a block-level node the schema gives no
 //! content at all) is a block whose `text` is simply always **empty**: same `Map`, same
-//! `text` key, an empty `Text` object. It needs no wire shape of its own, so a peer at
-//! this same wire version reads it back as an ordinary node and the format tag does not
-//! move. What keeps that empty text *empty* is [`reconcile_node`]: a node whose type
+//! `text` key, an empty `Text` object. It needs no wire shape of its own, so the format
+//! tag does not move — and that is exactly why the change is **not** backward
+//! compatible: a peer built before leaf atoms were in scope carries the same tag,
+//! accepts the bytes, and then refuses the rule on read (`Unsupported`), which
+//! poisons its session (#196). Loud, not a silent divergence, but a
+//! **coordinated upgrade**: every peer on a shared document must run a build with
+//! leaf atoms in scope before any of them inserts one. What keeps that empty text *empty* is `reconcile_node`: a node whose type
 //! changes into (or out of) a shape with no text is **replaced**, never reconciled in
 //! place, so a peer's concurrent typing cannot land in the `Text` of what has become an
-//! atom. [`build_block`] refuses an atom carrying text loudly rather than dropping it,
+//! atom. `build_block` refuses an atom carrying text loudly rather than dropping it,
 //! which is the only thing left that a foreign writer could produce.
 //!
 //! An **inline atom** (`image`, `hard_break` — atomic and contentless, but living
@@ -48,12 +53,14 @@
 //!       "text" -> Text            // "look: \u{FFFC} and on"
 //!         "@atom" -> Map          // over the U+FFFC char only:
 //!                                 //   {"@type": "image", "src": "cat.png", …}
+//!                                 //   (+ "@id" for an atom a local change moved)
 //! ```
 //!
 //! …which is the *same* shape as a mark with attrs, deliberately: the atom is a char
 //! that happens to be formatted, so every path that already carries a formatted char
-//! carries it — [`read_text_data`] reads it as a [`SpanMark`] with no case of its own,
-//! [`splice_min`] moves it as text, [`resync_marks`] diffs it as formatting. Its own
+//! carries it — `read_text_data` reads it as a `SpanMark` with no case of its own,
+//! `splice_min` moves it as text, `resync_marks` diffs it as formatting (per
+//! *char* rather than per span, for the reason given there). Its own
 //! marks (a link on an image) are ordinary spans over that same char. **Not** a yrs
 //! embed, which is the obvious alternative and is still refused: an embed is opaque to
 //! `Text::diff`'s string path, to the char/UTF-16 offset arithmetic and to the minimal
@@ -63,14 +70,108 @@
 //!
 //! The pairing is checked both ways and neither half is an error on its own: a U+FFFC
 //! with no attribute is text (a user can paste one), and the attribute over any other
-//! char is ignored formatting — see [`is_atom_char`], which is also where the
-//! concurrent-edit measurement that forces that second rule is written down.
+//! char is ignored formatting — see `is_atom_char`, which is also where the
+//! yrs behaviour that forces that second rule is written down.
 //!
-//! Wire-compatibly this is **additive**: [`FORMAT_TAG`] does not move. An older reader
-//! meets the attribute as an unknown *mark name* and fails loud in [`marks_at`]
-//! ("unknown mark type `@atom` in CRDT") rather than half-understanding the document —
-//! which is the outcome a version bump would have bought, at the price of also locking
-//! that reader out of every document with no atom in it.
+//! **An atom's attrs merge per attribute** (`crate::atoms`). The `@atom` value is what
+//! the char was *written* with, and its attrs are not rewritten to change one: a change of
+//! one attr is one entry of the root map `atoms`, keyed by the atom's identity (its
+//! char's yrs id) and the attr, laid over the value on read:
+//!
+//! ```text
+//! root Map "atoms"
+//!   "<identity>/<attr>" -> Any    // e.g. "1234:56/alt" -> "the garden"
+//! ```
+//!
+//! So two peers changing different attrs of one image at once (its `alt`, an app's
+//! `data-*` attribute) both keep their change, and two changing the same attr converge on one
+//! value (the higher client id's). Two identical images side by side are one `@atom`
+//! range but two identities, so a change to each is kept too. A change of a node
+//! attribute of a *block* (a heading's `level`) was already per key: a block's `attrs`
+//! is a map of its own (#193).
+//!
+//! Which char is which atom is the model's answer, not the text's: the text diff
+//! matches an atom only with the same atom (the editor keeps an unchanged node's `Rc`;
+//! `text_splice_bounds`), so a picture inserted right before another never takes that
+//! other's identity. A local change that **moves** an atom (Enter before an image in
+//! its line, Backspace joining it into the line above, a drag) deletes its char and
+//! writes a new one, since yrs has no move; the new char's `@atom` value names the
+//! identity it takes over under the reserved key `@id`, so a peer's concurrent change of
+//! the atom's attrs reaches it where it now is. Before this, a split anywhere before an
+//! atom lost such a change (#861's mechanism). A mark change on a moved *text* char is
+//! still lost that way, and so is an atom's attr change when the model cannot say which
+//! atom moved where (in a table, or in a load or a re-base, which share no node).
+//!
+//! **Compatibility.** A document written before reads unchanged: an atom with no `@id`
+//! is identified by its char, so its attrs merge per attribute from its first change
+//! on. Since #1851 every atom a build writes names its own char (`@for`, no `@id`, no
+//! entry in `atoms`; see `atoms::write_own_value`), so equal atoms never share
+//! formatting markers. A change also marks the atom's char with the reserved formatting
+//! attribute `@entries`, and a move writes `@id`. A build from before #1503 refuses all
+//! three (`unknown mark type`, `unknown reserved key`), which poisons its session
+//! (#196): every peer must be on a #1503 build before any runs #1851. The inline atoms'
+//! **coordinated upgrade** again.
+//!
+//! Wire-compatibly this is **additive**: `FORMAT_TAG` does not move, which also means
+//! it needs a **coordinated upgrade**, as the leaf block atoms above do. An older reader
+//! meets the attribute as an unknown *mark name* and fails loud in `marks_at`
+//! ("unknown mark type `@atom` in CRDT") rather than half-understanding the document.
+//! Joining from a snapshot that holds an atom fails that way. A **live** older peer
+//! whose session integrates an atom is **poisoned** (#196): `SessionPoisoned`, sticky,
+//! inbound *and* outbound, for as long as any atom remains in the shared document (it
+//! heals when the last one is deleted). That is the outcome a version bump would have
+//! bought for atom documents, at the price of also locking the older reader out of
+//! every document with no atom in it — so the tag stays, and every peer on a shared
+//! document must run a build with inline atoms in scope before any of them inserts an
+//! image or a hard break.
+//!
+//! A **block quote** (`blockquote`, `block+`) is a container exactly as a list is: a
+//! node with a `content` array of child nodes, recursively, so a quote holds paragraphs,
+//! headings, code, scene breaks, lists and other quotes, and sits inside list items.
+//! No wire shape of its own, so `FORMAT_TAG` does not move, and it is the leaf atoms'
+//! **coordinated upgrade** again: a peer built before quotes were in scope reads the
+//! container and refuses its type in its `build_node` (`Unsupported`, "container
+//! `blockquote` is not a supported list type"), so joining from a snapshot holding a
+//! quote fails, and a live older peer that integrates one is poisoned (#196) for as long
+//! as the CRDT holds a quote. That can be **for good**: a quote emptied by concurrent
+//! deletions is void (below), which no upgraded peer shows and none ever deletes, so an
+//! older peer stays refused for the life of the document although no upgraded peer can
+//! see a quote in it. Every peer on a shared document must run a build with quotes in
+//! scope before any of them wraps a block in one.
+//!
+//! Two rules keep a converged document one a model can hold, for every container:
+//!
+//! * **A void container reads as absent** (`is_void`): a container whose children
+//!   were all deleted concurrently (two peers each deleting one of a quote's two
+//!   paragraphs, or a list's two items) is skipped by the read-back and by every diff
+//!   that writes (`read_children` pairs each visible child with its raw index). It
+//!   stays in the CRDT, inert, and a peer's concurrent insert into it makes it visible
+//!   again. Before this rule two peers deleting a two-item list's items one each
+//!   converged on `<ul></ul>`. A peer built before the rule still reads that empty
+//!   list; it addresses its own model consistently, so the CRDT still converges, but
+//!   its model differs from an upgraded peer's by the empty container, which is one
+//!   more reason to upgrade together.
+//! * **A container retyped into one that takes different children is replaced**, never
+//!   retyped in place (`retype_keeps_identity`): a list made a quote in place would
+//!   keep its `content` array, and a peer's concurrent `list_item` would land directly
+//!   inside the quote. Only `bullet_list` ↔ `ordered_list` keep their identity.
+//!
+//! Wrapping a block in a quote (or a list) changes the block's kind at its index, which
+//! is a replace: the paragraph is deleted and a quote holding a copy of it inserted. A
+//! peer's concurrent typing in that paragraph lands in the deleted one and is lost
+//! (yrs has no move between arrays); lifting a block out of a quote is the same trade.
+//! Both peers still converge, on the quote.
+//!
+//! A **table** is the one node with a wire shape of its own: no `text` and no
+//! `content`, but a `cols` and a `rows` array naming its columns and rows by id, with
+//! every cell keyed by the row and column it starts in, so that a row and a column
+//! added at once (or two columns) still make a full grid. Its read is total and always
+//! rectangular, by rules that are a pure function of the converged CRDT. The design,
+//! the rules and what concurrency can still lose are in `crate::table`. The format
+//! tag does not move for it either: a peer built before tables reads a node with
+//! neither `text` nor `content` and fails loud (`Schema`), which poisons a live session
+//! that integrates one (#196) and fails a join from a snapshot that holds one. Every
+//! peer must run a build with tables in scope before any of them inserts a table.
 //!
 //! One `Text` per textblock with native formatting attributes over it is the
 //! *rich-text* model — text and formatting merge independently, which is exactly the
@@ -121,20 +222,23 @@
 //! Supported: **flat text-blocks + marks** (`paragraph`/`heading`/`code_block`), the
 //! **inline atoms** inside them (`image`/`hard_break` — one placeholder char each), the
 //! **leaf block atoms** (`horizontal_rule` — a block-level node with no content at all),
-//! and the **list containers** `bullet_list` / `ordered_list` / `list_item`, nested into
-//! each other and around text-blocks to any depth.
+//! the **containers** `bullet_list` / `ordered_list` / `list_item` / `blockquote`,
+//! nested into each other and around text-blocks to any depth, and **tables**
+//! (`table` / `table_row` / `table_cell` / `table_header_cell`, spans included, cells
+//! holding any of the above) whose cells tile their grid.
 //!
 //! Everything else still **fails loud** with
-//! [`CollabError::Unsupported`](crate::CollabError::Unsupported) — **never a silent
-//! drop**: any other nested block (`blockquote`, `table`/`table_row`/cells,
-//! `task_list`/`task_item`), and an embedded value in a block's text, which is not how
-//! this projection writes an atom.
+//! [`CollabError::Unsupported`] — **never a silent
+//! drop**: any other nested block (`task_list`/`task_item`), a table whose cells do not
+//! tile a rectangle (a ragged row, overlapping spans), and an embedded value in a
+//! block's text, which is not how this projection writes an atom.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use yrs::types::Attrs as YAttrs;
-use yrs::types::text::YChange;
 use yrs::updates::decoder::Decode;
 use yrs::{
     Any, Array, ArrayPrelim, ArrayRef, ClientID, Doc, Map, MapPrelim, MapRef, OffsetKind, Options,
@@ -144,13 +248,34 @@ use yrs::{
 
 use rinch_editor_core::{AttrValue, Attrs, Fragment, Mark, Node, NodeType, Schema};
 
+use crate::atoms::{
+    ATOMS, AtomChar, ModelAtom, OverlayCache, invalidate, merged_atoms, overlay_scope, scan_text,
+    write_atom_change, write_own_value,
+};
 use crate::error::{CollabError, Result};
+use crate::steps::Hunk;
+use crate::table::{
+    OversizedTable, TABLE, TableData, is_table_map, lock_oversized, placeholder_reads,
+    read_model_table, read_table_data, reconcile_table, table_map_is_void, write_table,
+};
+
+/// What [`CollabDoc::blank`] builds: the document, its outbox and the observer filling
+/// it, the `atoms` map's read cache and the observer dropping it, and the count of
+/// transactions that changed the document ([`CollabDoc::epoch`]).
+type Blank = (
+    Doc,
+    Outbox,
+    Subscription,
+    OverlayCache,
+    Subscription,
+    Arc<AtomicU64>,
+);
 
 /// yrs key/root names used by the projection.
-const CONTENT: &str = "content";
-const TYPE: &str = "type";
-const ATTRS: &str = "attrs";
-const TEXT: &str = "text";
+pub(crate) const CONTENT: &str = "content";
+pub(crate) const TYPE: &str = "type";
+pub(crate) const ATTRS: &str = "attrs";
+pub(crate) const TEXT: &str = "text";
 /// The root map holding the projection-format marker, and its one key.
 const META: &str = "meta";
 const FORMAT: &str = "format";
@@ -176,7 +301,7 @@ const FORMAT_TAG: &str = "rinch-editor-collab/yrs-1";
 /// guarded rather than trusted: [`read_block`] refuses an inline atom whose own attrs
 /// carry a reserved key, and [`build_block`] refuses a schema that has minted a mark
 /// type in the reserved namespace.
-const RESERVED_PREFIX: char = '@';
+pub(crate) const RESERVED_PREFIX: char = '@';
 
 /// The reserved formatting attribute that turns an [`ATOM_PLACEHOLDER`] char in a
 /// block's text into an **inline atom** (`image`, `hard_break`).
@@ -184,18 +309,18 @@ const RESERVED_PREFIX: char = '@';
 /// Its value is the atom's attrs in [`encode_mark_value`]'s ordinary encoding, plus the
 /// node type name under [`ATOM_TYPE`] — so it rides the wire as any other mark does and
 /// [`read_text_data`] needs no case of its own for it.
-const ATOM_MARK: &str = "@atom";
+pub(crate) const ATOM_MARK: &str = "@atom";
 
 /// The key inside an [`ATOM_MARK`] value carrying the atom's **node type name**
 /// (`"image"`). Reserved (see [`RESERVED_PREFIX`]) so it cannot collide with an attr of
 /// the atom itself — an `image`'s `src`/`alt`/`title` sit in the same map.
-const ATOM_TYPE: &str = "@type";
+pub(crate) const ATOM_TYPE: &str = "@type";
 
 /// U+FFFC OBJECT REPLACEMENT CHARACTER — the one char an inline atom occupies in a
 /// block's projected text, which is also the one model position it occupies
 /// (`Node::node_size` of a leaf is 1). The same stand-in `remote::flat_units` already
 /// uses when it measures a caret across a line holding an inline leaf.
-const ATOM_PLACEHOLDER: char = '\u{FFFC}';
+pub(crate) const ATOM_PLACEHOLDER: char = '\u{FFFC}';
 
 /// Origin tag for a yrs transaction that applies bytes received from a peer, as opposed to
 /// one that projects a local edit. The update observer skips these: they are already
@@ -240,16 +365,36 @@ pub(crate) struct SpanMark {
 /// The plain text of a flat block plus the marks over it, ready to project. A **leaf
 /// block atom** (`horizontal_rule`) is the degenerate case: the same struct with an
 /// empty `text` and no marks — see [`is_leaf_block_atom`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct BlockData {
     pub type_name: String,
     pub attrs: Attrs,
     pub text: String,
     pub marks: Vec<SpanMark>,
+    /// The CRDT block this was read from (its node map's yrs item id); `None` for
+    /// data taken from the model. Not part of equality: two blocks with the same
+    /// content are equal wherever they came from. Read by [`build_block`] for a
+    /// leaf block atom while [`CollabDoc::to_doc_with_atom_ids`] records.
+    pub id: Option<BlockId>,
+    /// The identity (`crate::atoms`) of each inline atom of the text, by char
+    /// offset — read only while [`CollabDoc::to_doc_with_all_atom_ids`] records
+    /// ([`INLINE_IDS`]), empty otherwise. Not part of equality.
+    pub atom_idents: Vec<(usize, Option<String>)>,
 }
 
+impl PartialEq for BlockData {
+    fn eq(&self, other: &Self) -> bool {
+        self.type_name == other.type_name
+            && self.attrs == other.attrs
+            && self.text == other.text
+            && self.marks == other.marks
+    }
+}
+
+impl Eq for BlockData {}
+
 /// One projectable model node: either a flat block ([`BlockData`] — a text-block, or a
-/// leaf block atom with empty text) or a container block (a list / list item) holding
+/// leaf block atom with empty text) or a container block (a list, list item or quote) holding
 /// child nodes recursively. Structural equality is
 /// canonical (marks are sorted in [`read_block`] / [`read_text_data`]), so comparing two
 /// `NodeData` trees is the same as comparing the model nodes they came from — the
@@ -259,12 +404,16 @@ pub(crate) enum NodeData {
     /// A flat text-block (`paragraph`/`heading`/`code_block`): its `text` + marks — or
     /// a leaf block atom (`horizontal_rule`), which is the same thing with no text.
     Block(BlockData),
-    /// A container block (`bullet_list`/`ordered_list`/`list_item`): its child nodes.
+    /// A container block (`bullet_list`/`ordered_list`/`list_item`/`blockquote`): its
+    /// child nodes.
     Container {
         type_name: String,
         attrs: Attrs,
         children: Vec<NodeData>,
     },
+    /// A `table`: its rows of cells, each cell holding child nodes. Its wire shape is
+    /// its own (see [`crate::table`]).
+    Table(TableData),
 }
 
 impl NodeData {
@@ -273,6 +422,7 @@ impl NodeData {
         match self {
             NodeData::Block(b) => &b.type_name,
             NodeData::Container { type_name, .. } => type_name,
+            NodeData::Table(_) => TABLE,
         }
     }
 
@@ -281,17 +431,61 @@ impl NodeData {
         match self {
             NodeData::Block(b) => &b.attrs,
             NodeData::Container { attrs, .. } => attrs,
+            NodeData::Table(t) => &t.attrs,
         }
     }
 }
 
 /// The container block types the projection nests (design A22). A container carries a
 /// `content` array of child nodes instead of a `text`. Deliberately a whitelist: every
-/// other non-text-block node (`blockquote`, tables, `task_list`/`task_item`, atoms)
-/// stays [`CollabError::Unsupported`] so an unsupported shape fails loud rather than
-/// being silently mangled.
+/// other non-text-block node (`task_list`/`task_item`, atoms) stays
+/// [`CollabError::Unsupported`] so an unsupported shape fails loud rather than being
+/// silently mangled.
+///
+/// Every container here requires **at least one** child (`block+`, `list_item+`), which
+/// is what [`is_void`] relies on: a container left with no children by concurrent
+/// deletions reads as absent rather than as a node no model can hold.
 fn is_supported_container(type_name: &str) -> bool {
-    matches!(type_name, "bullet_list" | "ordered_list" | "list_item")
+    matches!(
+        type_name,
+        "bullet_list" | "ordered_list" | "list_item" | "blockquote"
+    )
+}
+
+/// Whether a container retyped from `from` to `to` may keep its CRDT identity (its
+/// `type` key rewritten in place, its children reconciled), rather than being replaced.
+///
+/// Only when the two types accept the **same children**: a bullet list toggled to an
+/// ordered one. Anywhere else the in-place retype is a hazard under concurrency. A
+/// `bullet_list` made a `blockquote` in place keeps its `content` array, and a peer
+/// that concurrently appends a `list_item` to that array leaves the converged document
+/// with a list item directly inside a quote, a shape no model can hold. Replacing makes
+/// the conflict structural instead: the peer's item lands in a node that is gone.
+/// Stated over type names because this layer has no schema to ask.
+fn retype_keeps_identity(from: &str, to: &str) -> bool {
+    let is_list = |t: &str| matches!(t, "bullet_list" | "ordered_list");
+    from == to || (is_list(from) && is_list(to))
+}
+
+/// Whether projected node data is **void**: a container with no (non-void) children.
+///
+/// No model can hold one (every [`is_supported_container`] requires a child), and no
+/// local edit writes one, but concurrency can leave one in the CRDT: two peers each
+/// deleting a different one of a quote's two paragraphs, or a list's two items, delete
+/// both. A void container **reads as absent** — [`read_children`] skips it, so it never
+/// reaches the model, and every write path addresses children through the same skip
+/// (raw indices kept beside the visible ones). It stays in the CRDT, inert: deleting it
+/// would race a third peer's concurrent insert into it, and that insert makes it
+/// visible again, holding just what was inserted. The rule is a pure function of the
+/// converged CRDT, so every replica reads the same document.
+///
+/// A table is void when it has no live row or no live column (see [`crate::table`]).
+fn is_void(nd: &NodeData) -> bool {
+    match nd {
+        NodeData::Container { children, .. } => children.is_empty(),
+        NodeData::Table(t) => t.rows.is_empty() || t.width == 0,
+        NodeData::Block(_) => false,
+    }
 }
 
 /// A **leaf block atom** — a block-level node type that holds no content of its own and
@@ -315,7 +509,7 @@ fn is_supported_container(type_name: &str) -> bool {
 ///
 /// A textblock can be none of these (its content match accepts `text`), so the three
 /// never overlap with [`Node::is_textblock`].
-fn is_leaf_block_atom(typ: &NodeType) -> bool {
+pub(crate) fn is_leaf_block_atom(typ: &NodeType) -> bool {
     typ.is_block() && typ.is_atom() && typ.is_leaf()
 }
 
@@ -349,9 +543,55 @@ pub struct CollabDoc {
     pub(crate) content: ArrayRef,
     /// Updates from locally-projected transactions, awaiting broadcast.
     pub(crate) outbox: Outbox,
+    /// Whether the top-level `content` array holds a **void** container ([`is_void`]).
+    /// While it does not, visible block `i` is raw block `i`, and a local edit reads
+    /// nothing but the blocks it changed; while it does, every local edit first scans
+    /// the top level's shapes to find the raw index of each visible block.
+    ///
+    /// Only a **remote** merge can change it — no local edit writes a void container or
+    /// removes one (the model holds none, and the diff never addresses one) — so it is
+    /// computed when bytes arrive ([`CollabDoc::load`], [`CollabDoc::apply_update`]) and
+    /// nowhere else. If it were ever stale `false` with a void present, the raw count
+    /// would exceed the model's and `project_change`'s count gate would fail loud: a
+    /// stall, never a write to the wrong block.
+    pub(crate) top_void: bool,
+    /// The tables in the CRDT too large to read (`table` rule 5), as the last model
+    /// read found them ([`CollabDoc::to_doc`], the join gate). While it is non-empty a
+    /// session refuses every local change; see `CollabSession::record_local`.
+    pub(crate) oversized: Mutex<Vec<OversizedTable>>,
     /// Keeps the update observer alive — dropping the subscription unsubscribes it, and
     /// the outbox would silently stop filling.
     _updates: Subscription,
+    /// The last read of the `atoms` map (`crate::atoms::overlay_scope`), dropped by an
+    /// observer on the map whenever it changes.
+    pub(crate) overlay: OverlayCache,
+    /// Keeps that observer alive.
+    _atoms_changed: Subscription,
+    /// How many transactions have changed the CRDT, local or remote: the update
+    /// observer counts every one. A table cell index (`table::locate_cell`) is valid
+    /// at one value of it, and is carried to the next only by a write known to leave
+    /// its grid alone, so no other write can leave it stale; the document the session
+    /// knows its CRDT reads as (`atom_cache::synced`) is valid at one value too.
+    pub(crate) epoch: Arc<AtomicU64>,
+    /// This document's key in the table cell index, unique in the process.
+    pub(crate) uid: u64,
+    /// What the last update applied ([`CollabDoc::apply_decoded`]) changed, for the
+    /// integrate that follows it (#1241).
+    pub(crate) last_apply: Option<crate::sync::AppliedChanges>,
+    /// Whether the last local change projected ([`CollabDoc::project_change`]) may have
+    /// written, rewritten or removed an atom of either kind: a block it changed holds
+    /// one, before or after. `true` until a change says otherwise.
+    pub(crate) touched_atoms: bool,
+    /// The upper bound of every client's clocks in the updates applied from peers (and
+    /// the snapshot loaded): past the store's state vector for a client while a gap in
+    /// its clocks is open (review of #1926, `sync::AppliedChanges::spoiled`).
+    pub(crate) clocks_seen: StateVector,
+}
+
+impl Drop for CollabDoc {
+    fn drop(&mut self) {
+        crate::table::forget_cell_index(self.uid);
+    }
 }
 
 // `Subscription` is not `Debug`, and neither is the observer closure behind it, so the
@@ -385,9 +625,9 @@ impl CollabDoc {
     /// `ClientID::random()`. That randomness is load-bearing: the client id breaks ties
     /// between concurrent inserts at the same position, so two live replicas sharing one
     /// produce colliding block ids and corrupt the shared document. Only the test-only
-    /// [`crate::testing`] seam passes `Some`, and only so a fuzz trial replays
+    /// `crate::testing` seam passes `Some`, and only so a fuzz trial replays
     /// bit-for-bit (issue #214).
-    fn blank(client_id: Option<ClientID>) -> (Doc, Outbox, Subscription) {
+    fn blank(client_id: Option<ClientID>) -> Blank {
         let mut options = Options {
             offset_kind: OffsetKind::Utf16,
             ..Default::default()
@@ -399,17 +639,28 @@ impl CollabDoc {
         let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
         let sink = outbox.clone();
         let remote = Origin::from(ENGINE_APPLY_ORIGIN);
+        let epoch = Arc::new(AtomicU64::new(0));
+        let count = epoch.clone();
         // yrs does not fire this for a transaction that changed nothing, so the outbox
         // never collects an empty update and "outbox is empty" really does mean "nothing
-        // to send".
+        // to send". It fires for every other one, local or remote, which is what makes
+        // it the place to count them ([`CollabDoc::epoch`]).
         let updates = doc
             .observe_update_v1(move |txn, e| {
+                count.fetch_add(1, Ordering::Relaxed);
                 if txn.origin() != Some(&remote) {
                     lock_outbox(&sink).push(e.update.clone());
                 }
             })
             .expect("a freshly built document has no live transaction to conflict with");
-        (doc, outbox, updates)
+        // The `atoms` map's read is kept between operations and dropped by any change of
+        // the map, local or remote. Resolving the root writes nothing to the document.
+        let overlay: OverlayCache = Arc::new(Mutex::new(None));
+        let stale = overlay.clone();
+        let atoms_changed = yrs::Observable::observe(&doc.get_or_insert_map(ATOMS), move |_, _| {
+            invalidate(&stale)
+        });
+        (doc, outbox, updates, overlay, atoms_changed, epoch)
     }
 
     /// Build a fresh projection from a model document. Fails loud
@@ -431,7 +682,8 @@ impl CollabDoc {
             nodes.push(read_node(doc.child(i))?);
         }
 
-        let (ydoc, outbox, updates) = CollabDoc::blank(client_id);
+        let (ydoc, outbox, updates, overlay, atoms_changed, epoch) = CollabDoc::blank(client_id);
+        let clocks_seen = StateVector::default();
         // Both roots are resolved before the write transaction opens: resolving one takes
         // exclusive store access and panics if a transaction is already live.
         let content = ydoc.get_or_insert_array(CONTENT);
@@ -453,7 +705,19 @@ impl CollabDoc {
             doc: ydoc,
             content,
             outbox,
+            // A projection of a model holds no void container: the model cannot.
+            top_void: false,
+            // Nor a table too large to read: the model's own tables are bounded the
+            // same way on write.
+            oversized: Mutex::new(Vec::new()),
             _updates: updates,
+            overlay,
+            _atoms_changed: atoms_changed,
+            epoch,
+            uid: crate::atom_cache::next_uid(),
+            last_apply: None,
+            touched_atoms: true,
+            clocks_seen,
         })
     }
 
@@ -465,7 +729,7 @@ impl CollabDoc {
     ///
     /// Two gates, in this order:
     ///
-    /// 1. **The format marker** ([`FORMAT_TAG`] under the `meta` root) must be present
+    /// 1. **The format marker** (`FORMAT_TAG` under the `meta` root) must be present
     ///    and exact. This is the discriminator for "are these our bytes at all", and it
     ///    cannot be replaced by a check on the root's *type*, because a root type carries
     ///    no type tag on the wire: a root arriving from a peer reads as
@@ -495,7 +759,8 @@ impl CollabDoc {
         client_id: Option<ClientID>,
     ) -> Result<CollabDoc> {
         let update = Update::decode_v1(bytes)?;
-        let (ydoc, outbox, updates) = CollabDoc::blank(client_id);
+        let clocks_seen = crate::sync::clocks_inserted(&update);
+        let (ydoc, outbox, updates, overlay, atoms_changed, epoch) = CollabDoc::blank(client_id);
         {
             let mut txn = ydoc.transact_mut_with(Origin::from(ENGINE_APPLY_ORIGIN));
             txn.apply_update(update)?;
@@ -504,7 +769,7 @@ impl CollabDoc {
         // transaction for both gates.
         let content = ydoc.get_or_insert_array(CONTENT);
         let meta = ydoc.get_or_insert_map(META);
-        {
+        let (top_void, oversized) = {
             let txn = ydoc.transact();
             match meta.get(&txn, FORMAT) {
                 Some(Out::Any(Any::String(tag))) if &*tag == FORMAT_TAG => {}
@@ -515,16 +780,34 @@ impl CollabDoc {
                     )));
                 }
             }
-            for i in 0..content.len(&txn) {
-                read_node_data(&txn, &content, i)?;
+            // The model's read: a table too large to read joins as its placeholder,
+            // as `to_doc` builds it, so a guest can join and delete it.
+            let placeholders = placeholder_reads();
+            for child in content.iter(&txn) {
+                read_out_data(&txn, child)?;
             }
-        }
+            (holds_void(&txn, &content), placeholders.finish())
+        };
         Ok(CollabDoc {
             doc: ydoc,
             content,
             outbox,
+            top_void,
+            oversized: Mutex::new(oversized),
             _updates: updates,
+            overlay,
+            _atoms_changed: atoms_changed,
+            epoch,
+            uid: crate::atom_cache::next_uid(),
+            last_apply: None,
+            touched_atoms: true,
+            clocks_seen,
         })
+    }
+
+    /// How many transactions have changed the CRDT so far ([`CollabDoc::epoch`]).
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
     }
 
     /// Save the whole projection (for forking a peer): the complete document state as
@@ -533,6 +816,65 @@ impl CollabDoc {
         self.doc
             .transact()
             .encode_state_as_update_v1(&StateVector::default())
+    }
+
+    /// [`Self::to_doc`], with the identity of every **leaf block atom** of the
+    /// document it reads (an `embed`, a `horizontal_rule`) — its CRDT block, in
+    /// document order. `None` when one could not be told. What [`crate::remote`]
+    /// compares to tell an atom whose attributes changed from a different atom that
+    /// came to stand where it stood, and two equal atoms a peer swapped from the same
+    /// two left alone.
+    pub(crate) fn to_doc_with_atom_ids(
+        &self,
+        schema: &Schema,
+    ) -> Result<(Node, Option<Vec<BlockId>>)> {
+        self.to_doc_with_ids(schema, false)
+            .map(|(doc, ids, _)| (doc, ids))
+    }
+
+    /// [`Self::to_doc_with_atom_ids`], with the identity of every **inline atom**
+    /// too (an `image`, a `hard_break`: `crate::atoms`), in document order — `None`
+    /// in the list for one whose char yrs cannot locate, and `None` for the list
+    /// when the read's atoms could not be counted. What tells a picture whose
+    /// attributes a peer changed from another picture at its place (node views C).
+    pub(crate) fn to_doc_with_all_atom_ids(&self, schema: &Schema) -> Result<AllAtomIds> {
+        self.to_doc_with_ids(schema, true)
+    }
+
+    fn to_doc_with_ids(&self, schema: &Schema, inline: bool) -> Result<AllAtomIds> {
+        struct InlineRecording;
+        impl Drop for InlineRecording {
+            fn drop(&mut self) {
+                INLINE_IDS.with(|ids| *ids.borrow_mut() = None);
+            }
+        }
+        let inline_recording = inline.then(|| {
+            INLINE_IDS.with(|ids| *ids.borrow_mut() = Some(Vec::new()));
+            InlineRecording
+        });
+        let (doc, ids) = self.to_doc_with_block_ids(schema)?;
+        let inline_ids = INLINE_IDS
+            .with(|ids| ids.borrow_mut().take())
+            .filter(|list| list.len() == crate::remote::inline_atoms(&doc));
+        drop(inline_recording);
+        Ok((doc, ids, inline_ids))
+    }
+
+    fn to_doc_with_block_ids(&self, schema: &Schema) -> Result<(Node, Option<Vec<BlockId>>)> {
+        struct Recording;
+        impl Drop for Recording {
+            fn drop(&mut self) {
+                ATOM_IDS.with(|ids| *ids.borrow_mut() = None);
+            }
+        }
+        ATOM_IDS.with(|ids| *ids.borrow_mut() = Some(Ok(Vec::new())));
+        let recording = Recording;
+        let doc = self.to_doc(schema)?;
+        let ids = ATOM_IDS
+            .with(|ids| ids.borrow_mut().take())
+            .and_then(|r| r.ok());
+        drop(recording);
+        Ok((doc, ids))
     }
 
     /// Rebuild the whole model document from the projection (the canonical, total
@@ -550,13 +892,17 @@ impl CollabDoc {
     /// CRDT that does not hold it.
     pub fn to_doc(&self, schema: &Schema) -> Result<Node> {
         let mut blocks = {
+            // The model's read: a table past the read's budget is a placeholder here
+            // (and in the join gate, nowhere else), and the tables read so are what
+            // [`CollabDoc::oversized_tables`] answers from now on.
+            let placeholders = placeholder_reads();
+            let _overlay = overlay_scope(&self.overlay);
             let txn = self.doc.transact();
-            let n = self.content.len(&txn);
-            let mut blocks = Vec::with_capacity(n as usize);
-            for i in 0..n {
-                let nd = read_node_data(&txn, &self.content, i)?;
+            let mut blocks = Vec::new();
+            for (_, nd) in read_children(&txn, &self.content)? {
                 blocks.push(build_node(schema, &nd)?);
             }
+            *lock_oversized(&self.oversized) = placeholders.finish();
             blocks
         };
         if blocks.is_empty() {
@@ -574,6 +920,308 @@ impl CollabDoc {
     }
 }
 
+// --- a remote change read back from what it changed (#1241) --------------------
+
+/// What [`CollabDoc::read_changed`] read: the document the CRDT now reads as, its
+/// atoms' identities as [`CollabDoc::to_doc_with_all_atom_ids`] gives them, and the
+/// top-level blocks the change touched.
+pub(crate) struct ChangedRead {
+    pub doc: Node,
+    pub block_ids: Vec<BlockId>,
+    pub inline_ids: Vec<Option<String>>,
+    pub touched: Vec<Touched>,
+}
+
+/// A top-level block a change touched: its index, its node map, and how it was read.
+pub(crate) struct Touched {
+    pub index: usize,
+    pub map: MapRef,
+    pub read: TouchedRead,
+}
+
+/// How [`CollabDoc::read_changed`] read a touched top-level block.
+pub(crate) enum TouchedRead {
+    /// A table whose cells' blocks alone changed, read cell by cell: its grid and its
+    /// cell maps are the ones it had.
+    Cells,
+    /// A table read whole, with its cells when it may be indexed
+    /// (`table::indexable_cells`).
+    Table(Option<crate::table::IndexedCells>),
+    /// Any other block, read whole.
+    Block,
+}
+
+/// One node [`CollabDoc::read_changed`] read: where it stands (a top-level index,
+/// and a cell's row and place when it is a cell of the table there), the node it
+/// replaces, and what was read with its atoms' identities.
+struct ReadPart {
+    at: (usize, Option<(usize, usize)>),
+    old: Node,
+    new: Node,
+    blocks: Vec<BlockId>,
+    inline: Vec<Option<String>>,
+}
+
+/// Run `read` with the atoms' identities recorded, as
+/// [`CollabDoc::to_doc_with_all_atom_ids`] records them: `None` when it fails, when a
+/// leaf block atom had no id, or when its inline atoms could not be counted.
+fn read_recording(
+    read: impl FnOnce() -> Result<Node>,
+) -> Option<(Node, Vec<BlockId>, Vec<Option<String>>)> {
+    struct Recording;
+    impl Drop for Recording {
+        fn drop(&mut self) {
+            ATOM_IDS.with(|ids| *ids.borrow_mut() = None);
+            INLINE_IDS.with(|ids| *ids.borrow_mut() = None);
+        }
+    }
+    let _recording = Recording;
+    ATOM_IDS.with(|ids| *ids.borrow_mut() = Some(Ok(Vec::new())));
+    INLINE_IDS.with(|ids| *ids.borrow_mut() = Some(Vec::new()));
+    let node = read().ok()?;
+    let blocks = ATOM_IDS.with(|ids| ids.borrow_mut().take())?.ok()?;
+    let inline = INLINE_IDS.with(|ids| ids.borrow_mut().take())?;
+    (inline.len() == crate::remote::inline_atoms(&node)).then_some((node, blocks, inline))
+}
+
+/// The atoms of `old` before the node `at` names, and that node's own, as ranges of
+/// the document-order lists: (leaf block atoms, inline atoms).
+fn atom_ranges(
+    old: &Node,
+    at: (usize, Option<(usize, usize)>),
+) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+    use crate::remote::{block_atoms, inline_atoms};
+    let (mut b, mut i) = (0, 0);
+    let mut count = |n: &Node| {
+        b += block_atoms(n);
+        i += inline_atoms(n);
+    };
+    (0..at.0).for_each(|j| count(old.child(j)));
+    let node = match at.1 {
+        None => old.child(at.0),
+        Some((r, k)) => {
+            let table = old.child(at.0);
+            (0..r).for_each(|j| count(table.child(j)));
+            let row = table.child(r);
+            (0..k).for_each(|j| count(row.child(j)));
+            row.child(k)
+        }
+    };
+    (b..b + block_atoms(node), i..i + inline_atoms(node))
+}
+
+impl CollabDoc {
+    /// The document this CRDT reads as after the update [`Self::apply_decoded`] last
+    /// applied (`changes`), built from `old` — the document it read as before that
+    /// update, whose atoms' identities are `old_ids` and `old_inline` — by reading
+    /// back only what the update changed (#1241): each top-level block it changed,
+    /// and in a table whose cells' blocks alone changed, each such cell's blocks. The
+    /// rest of `old` is kept, `Rc` for `Rc`, so the diff that follows compares a
+    /// pointer per block it did not touch.
+    ///
+    /// `None` whenever only a whole read can say what the document is, and the caller
+    /// then makes one: the update inserted or deleted a top-level block, changed an
+    /// atom's entry, failed or changed more than [`AppliedChanges::MAX_PATHS`](crate::sync::AppliedChanges::MAX_PATHS) types;
+    /// the top level holds a void container; a block it reads is too large to read
+    /// (only the whole read records an [`OversizedTable`]) or fails to read; a table's
+    /// cell is not one its index (`table::places_of`) knows at the update's epoch, in
+    /// which case the table is read whole instead. `no_atoms` says `old` holds no atom,
+    /// so nothing is counted to place the identities read.
+    ///
+    /// Equal to [`Self::to_doc_with_all_atom_ids`] whenever `old` is this CRDT's read
+    /// before the update: a block is read by the functions the whole read uses, and a
+    /// cell's blocks by the ones the table read uses (`table::read_cell_blocks`), into
+    /// the cell's own type and attrs, which only a change of the grid would move.
+    /// `testing::set_incremental_read_check` compares the two on every integrate.
+    pub(crate) fn read_changed(
+        &self,
+        schema: &Schema,
+        old: &Node,
+        changes: &crate::sync::AppliedChanges,
+        old_ids: &[BlockId],
+        old_inline: &[Option<String>],
+        no_atoms: bool,
+    ) -> Option<ChangedRead> {
+        use yrs::types::PathSegment;
+        if self.top_void {
+            return None;
+        }
+        let tops = changes.top_level_blocks()?;
+        let _overlay = overlay_scope(&self.overlay);
+        let txn = self.doc.transact();
+        let n = old.child_count();
+        if n == 0 || self.content.len(&txn) as usize != n {
+            return None;
+        }
+        let mut parts: Vec<ReadPart> = Vec::new();
+        let mut touched = Vec::with_capacity(tops.len());
+        for &top in &tops {
+            let i = top as usize;
+            if i >= n {
+                return None;
+            }
+            let map = child_map(&txn, &self.content, top)?;
+            let old_block = old.child(i);
+            let tails: Vec<Vec<PathSegment>> = changes
+                .paths
+                .iter()
+                .filter(|p| matches!(p.front(), Some(PathSegment::Index(j)) if *j == top))
+                .map(|p| p.iter().skip(1).cloned().collect())
+                .collect();
+            if !is_table_map(&txn, &map) {
+                let (new, blocks, inline) = read_recording(|| {
+                    let nd = read_map_data(&txn, &map)?;
+                    if is_void(&nd) {
+                        return Err(CollabError::schema("a void block where none is"));
+                    }
+                    build_node(schema, &nd)
+                })?;
+                parts.push(ReadPart {
+                    at: (i, None),
+                    old: old_block.clone(),
+                    new,
+                    blocks,
+                    inline,
+                });
+                touched.push(Touched {
+                    index: i,
+                    map,
+                    read: TouchedRead::Block,
+                });
+                continue;
+            }
+            if node_type(&txn, &map).as_deref() != Some(TABLE) {
+                return None;
+            }
+            // The cells whose blocks alone changed, by their place in the grid the
+            // table's index knows.
+            let cells = (|| {
+                let tails: Vec<&[PathSegment]> = tails.iter().map(Vec::as_slice).collect();
+                let keys = crate::table::changed_cells(&tails)?;
+                let places =
+                    crate::table::places_of(self.uid, changes.epoch, &map, old_block, &keys)?;
+                let mut read = Vec::with_capacity(places.len());
+                for ((r, k), cell) in &places {
+                    let (r, k) = (*r, *k);
+                    let old_cell = old_block
+                        .content()
+                        .maybe_child(r)?
+                        .content()
+                        .maybe_child(k)?;
+                    let (new, blocks, inline) = read_recording(|| {
+                        let mut nodes = Vec::new();
+                        for nd in crate::table::read_cell_blocks(&txn, cell)? {
+                            nodes.push(build_node(schema, &nd)?);
+                        }
+                        schema
+                            .create_node(
+                                old_cell.type_name(),
+                                old_cell.attrs().clone(),
+                                Fragment::from_children(nodes),
+                            )
+                            .map_err(CollabError::from)
+                    })?;
+                    read.push(ReadPart {
+                        at: (i, Some((r, k))),
+                        old: old_cell.clone(),
+                        new,
+                        blocks,
+                        inline,
+                    });
+                }
+                read.sort_by_key(|p| p.at);
+                Some(read)
+            })();
+            match cells {
+                Some(cells) => {
+                    parts.extend(cells);
+                    touched.push(Touched {
+                        index: i,
+                        map,
+                        read: TouchedRead::Cells,
+                    });
+                }
+                None => {
+                    // Read inside the recording: the inline atoms' identities are
+                    // noted as their texts are read.
+                    let mut read = None;
+                    let (new, blocks, inline) = read_recording(|| {
+                        let table = crate::table::read_table(&txn, &map)?;
+                        let node = build_node(schema, &NodeData::Table(table.data.clone()))?;
+                        read = Some(table);
+                        Ok(node)
+                    })?;
+                    let cells = crate::table::indexable_cells(&txn, read?);
+                    parts.push(ReadPart {
+                        at: (i, None),
+                        old: old_block.clone(),
+                        new,
+                        blocks,
+                        inline,
+                    });
+                    touched.push(Touched {
+                        index: i,
+                        map,
+                        read: TouchedRead::Table(cells),
+                    });
+                }
+            }
+        }
+
+        // The atoms' identities: `old`'s, with each part's own in place of what it
+        // replaces (back to front, so the ranges found in `old` stay true).
+        let (mut block_ids, mut inline_ids) = (old_ids.to_vec(), old_inline.to_vec());
+        if no_atoms {
+            if !(old_ids.is_empty() && old_inline.is_empty()) {
+                return None;
+            }
+            for p in &parts {
+                block_ids.extend(p.blocks.iter().copied());
+                inline_ids.extend(p.inline.iter().cloned());
+            }
+        } else {
+            let ranges: Vec<_> = parts.iter().map(|p| atom_ranges(old, p.at)).collect();
+            for (p, (b, i)) in parts.iter().zip(ranges).rev() {
+                if b.end > block_ids.len() || i.end > inline_ids.len() {
+                    return None;
+                }
+                block_ids.splice(b, p.blocks.iter().copied());
+                inline_ids.splice(i, p.inline.iter().cloned());
+            }
+        }
+
+        // The document: `old`, each part in place of the node it replaces.
+        let mut content = old.content().clone();
+        let mut k = 0;
+        while k < parts.len() {
+            let i = parts[k].at.0;
+            let block = if parts[k].at.1.is_none() {
+                k += 1;
+                parts[k - 1].new.clone()
+            } else {
+                let mut table = old.child(i).clone();
+                while k < parts.len() && parts[k].at.0 == i {
+                    let (r, c) = parts[k].at.1?;
+                    debug_assert!(table.child(r).child(c).same_ref(&parts[k].old));
+                    let row = table.child(r);
+                    let row =
+                        row.copy_with_content(row.content().replace_child(c, parts[k].new.clone()));
+                    table = table.copy_with_content(table.content().replace_child(r, row));
+                    k += 1;
+                }
+                table
+            };
+            content = content.replace_child(i, block);
+        }
+        Some(ChangedRead {
+            doc: old.copy_with_content(content),
+            block_ids,
+            inline_ids,
+            touched,
+        })
+    }
+}
+
 // --- offset conversion ----------------------------------------------------------
 
 /// The UTF-16 code-unit offset of char offset `chars` inside `s`.
@@ -582,7 +1230,7 @@ impl CollabDoc {
 /// every index handed to a `Text` goes through here. A char offset past the end clamps
 /// to the end: [`Text::remove_range`] **panics** on an out-of-range index (automerge
 /// returned an error), and a panic here would take the whole app down.
-fn u16_offset(s: &str, chars: usize) -> u32 {
+pub(crate) fn u16_offset(s: &str, chars: usize) -> u32 {
     s.chars().take(chars).map(|c| c.len_utf16() as u32).sum()
 }
 
@@ -595,17 +1243,223 @@ fn u16_span(s: &str, start: usize, end: usize) -> (u32, u32) {
 
 // --- structural read helpers (any transaction) ----------------------------------
 
+thread_local! {
+    /// How many CRDT nodes this thread has examined — one per [`read_map_data`] (a node
+    /// read back with its text and children) and one per [`map_is_void`] (a node's shape
+    /// checked). Read by [`crate::testing::node_reads`] so a test can pin that a local
+    /// keystroke reads O(changed) nodes, not the whole document. A thread-local `Cell`
+    /// increment is all it costs, so it is compiled into every build.
+    static NODE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn count_node_read() {
+    NODE_READS.with(|c| c.set(c.get() + 1));
+}
+
+/// Run `f` leaving this thread's work counts as they were: a check that a test turns
+/// on (`testing::set_incremental_read_check`) costs nothing the counts pin.
+pub(crate) fn uncounted<R>(f: impl FnOnce() -> R) -> R {
+    let reads = NODE_READS.with(|c| c.get());
+    let atoms = crate::atoms::counts();
+    let out = f();
+    NODE_READS.with(|c| c.set(reads));
+    crate::atoms::set_counts(atoms);
+    out
+}
+
+/// A block's identity in the CRDT: its node map's yrs item id `(client, clock)`.
+pub(crate) type BlockId = (u64, u32);
+
+/// The [`BlockId`] of a node map, `None` for a root map (never a block).
+fn block_id(node: &MapRef) -> Option<BlockId> {
+    match AsRef::<yrs::branch::Branch>::as_ref(node).id() {
+        yrs::branch::BranchID::Nested(id) => Some((id.client.get(), id.clock)),
+        yrs::branch::BranchID::Root(_) => None,
+    }
+}
+
+thread_local! {
+    /// While [`CollabDoc::to_doc_with_atom_ids`] reads: the [`BlockId`] of every
+    /// leaf block atom [`build_block`] builds, in document order (the order the
+    /// model is built in, so a table's cells and fillers cannot reorder it), or
+    /// `Err` once one had no id.
+    static ATOM_IDS: std::cell::RefCell<Option<std::result::Result<Vec<BlockId>, ()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A read with its atoms' identities: the document, its leaf block atoms' CRDT
+/// blocks and its inline atoms' identities ([`CollabDoc::to_doc_with_all_atom_ids`]).
+pub(crate) type AllAtomIds = (Node, Option<Vec<BlockId>>, Option<Vec<Option<String>>>);
+
+thread_local! {
+    /// While [`CollabDoc::to_doc_with_all_atom_ids`] reads: the identity of every
+    /// inline atom [`build_block`] builds, in document order.
+    static INLINE_IDS: std::cell::RefCell<Option<Vec<Option<String>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Whether [`INLINE_IDS`] records (the read then looks inline atoms' identities up).
+fn inline_ids_recording() -> bool {
+    INLINE_IDS.with(|ids| ids.borrow().is_some())
+}
+
+/// Note an inline atom's identity while [`INLINE_IDS`] records.
+fn note_inline_id(id: Option<String>) {
+    INLINE_IDS.with(|ids| {
+        if let Some(list) = ids.borrow_mut().as_mut() {
+            list.push(id);
+        }
+    });
+}
+
+/// Note a leaf block atom's id while [`ATOM_IDS`] records.
+fn note_atom_id(id: Option<BlockId>) {
+    ATOM_IDS.with(|ids| {
+        if let Some(record) = ids.borrow_mut().as_mut() {
+            match (id, record) {
+                (Some(id), Ok(list)) => list.push(id),
+                (None, record) => *record = Err(()),
+                (_, Err(())) => {}
+            }
+        }
+    });
+}
+
+/// The running count behind `crate::testing::node_reads`.
+#[cfg_attr(not(feature = "test-util"), allow(dead_code))]
+pub(crate) fn node_reads() -> u64 {
+    NODE_READS.with(|c| c.get())
+}
+
 /// The map object of the child at `index` of a content array (the root `content` or a
 /// container's nested `content`).
-fn child_map<T: ReadTxn>(txn: &T, list: &ArrayRef, index: u32) -> Option<MapRef> {
+pub(crate) fn child_map<T: ReadTxn>(txn: &T, list: &ArrayRef, index: u32) -> Option<MapRef> {
+    // A lookup by index walks the array from its start.
+    crate::steps::count_work(index as usize + 1);
     match list.get(txn, index) {
         Some(Out::YMap(m)) => Some(m),
         _ => None,
     }
 }
 
+/// Whether finding `count` children of an array, at ascending indices from `first`
+/// to `last`, costs less in one pass over it ([`child_maps`]) than by a lookup each
+/// ([`child_map`], which walks the array from its start): a lookup per child of a
+/// change that rewrites every child cost (children × children) (#2526). A pass's step
+/// reads the child's value where a lookup's only skips it, about seven times the cost
+/// (221 instructions a child against 31, a keystroke in the middle of 2,000 paragraphs
+/// under Callgrind), so a few children, or ones near the start, are looked up.
+pub(crate) fn one_pass_cheaper(count: usize, first: u32, last: u32) -> bool {
+    let lookups = count as u64 * (u64::from(first) + u64::from(last) + 2) / 2;
+    count > 1 && lookups > 8 * (u64::from(last) + 1)
+}
+
+/// The node maps of the children at `indices` (ascending) of `list`, in one
+/// sequential pass up to the last of them (see [`one_pass_cheaper`]). `None` for an
+/// index that holds no node map, or is past the end.
+pub(crate) fn child_maps<T: ReadTxn>(
+    txn: &T,
+    list: &ArrayRef,
+    indices: &[u32],
+) -> Vec<Option<MapRef>> {
+    debug_assert!(indices.is_sorted(), "child_maps: indices out of order");
+    let mut out = Vec::with_capacity(indices.len());
+    let mut children = list.iter(txn).enumerate();
+    for &want in indices {
+        let found = children.by_ref().find_map(|(i, child)| {
+            crate::steps::count_work(1);
+            (i as u32 >= want).then_some((i as u32, child))
+        });
+        match found {
+            Some((i, Out::YMap(m))) if i == want => out.push(Some(m)),
+            Some(_) | None => {
+                // Past the end, or not a map: no later index can be found either way
+                // but by its own lookup.
+                out.push(None);
+                out.extend(
+                    indices[out.len()..]
+                        .iter()
+                        .map(|&i| child_map(txn, list, i)),
+                );
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// Whether the node map `node` is a void container ([`is_void`]) — read off the map's
+/// shape alone, without reading any text: a node with no `text` whose `content` holds
+/// only void nodes. A node with neither is not void (it is corrupt, and the read-back
+/// reports it).
+pub(crate) fn map_is_void<T: ReadTxn>(txn: &T, node: &MapRef) -> bool {
+    count_node_read();
+    if block_text(txn, node).is_some() {
+        return false;
+    }
+    if is_table_map(txn, node) {
+        return table_map_is_void(txn, node);
+    }
+    let Some(content) = node_content(txn, node) else {
+        return false;
+    };
+    content
+        .iter(txn)
+        .all(|child| matches!(child, Out::YMap(m) if map_is_void(txn, &m)))
+}
+
+/// Whether any child of `list` is a void container ([`map_is_void`]): one sequential
+/// pass over the children's shapes, reading no text.
+pub(crate) fn holds_void<T: ReadTxn>(txn: &T, list: &ArrayRef) -> bool {
+    list.iter(txn)
+        .any(|child| matches!(child, Out::YMap(m) if map_is_void(txn, &m)))
+}
+
+/// The raw index of every **visible** child of `list` (void containers skipped, as
+/// [`read_children`] skips them), read off the children's shapes alone in one
+/// sequential pass. A child that is not a node map at all is kept: it is not void, and
+/// reading it back fails loud.
+pub(crate) fn visible_indices<T: ReadTxn>(txn: &T, list: &ArrayRef) -> Vec<u32> {
+    list.iter(txn)
+        .enumerate()
+        .filter_map(|(i, child)| match child {
+            Out::YMap(m) if map_is_void(txn, &m) => None,
+            _ => Some(i as u32),
+        })
+        .collect()
+}
+
+/// Where each **visible** child of a content array lives in it: the raw index a write
+/// to visible child `i` addresses.
+#[derive(Clone, Copy)]
+pub(crate) enum RawIndex<'a> {
+    /// The array holds no void container, so visible child `i` is raw child `i`. Carries
+    /// the array's length, so the index past the last child is known without a read.
+    Identity(u32),
+    /// Visible child `i` is raw child `raw[i]`.
+    Mapped(&'a [u32]),
+}
+
+impl RawIndex<'_> {
+    /// The raw index of visible child `i`, `None` past the last one.
+    pub(crate) fn get(self, i: usize) -> Option<u32> {
+        match self {
+            RawIndex::Identity(len) => u32::try_from(i).ok().filter(|&i| i < len),
+            RawIndex::Mapped(raw) => raw.get(i).copied(),
+        }
+    }
+
+    /// How many visible children there are.
+    pub(crate) fn len(self) -> usize {
+        match self {
+            RawIndex::Identity(len) => len as usize,
+            RawIndex::Mapped(raw) => raw.len(),
+        }
+    }
+}
+
 /// The `text` Text object of a text-block node.
-fn block_text<T: ReadTxn>(txn: &T, node: &MapRef) -> Option<TextRef> {
+pub(crate) fn block_text<T: ReadTxn>(txn: &T, node: &MapRef) -> Option<TextRef> {
     match node.get(txn, TEXT) {
         Some(Out::YText(t)) => Some(t),
         _ => None,
@@ -613,7 +1467,7 @@ fn block_text<T: ReadTxn>(txn: &T, node: &MapRef) -> Option<TextRef> {
 }
 
 /// The `content` Array object of a container node.
-fn node_content<T: ReadTxn>(txn: &T, node: &MapRef) -> Option<ArrayRef> {
+pub(crate) fn node_content<T: ReadTxn>(txn: &T, node: &MapRef) -> Option<ArrayRef> {
     match node.get(txn, CONTENT) {
         Some(Out::YArray(a)) => Some(a),
         _ => None,
@@ -621,7 +1475,7 @@ fn node_content<T: ReadTxn>(txn: &T, node: &MapRef) -> Option<ArrayRef> {
 }
 
 /// A node's `type` string.
-fn node_type<T: ReadTxn>(txn: &T, node: &MapRef) -> Option<String> {
+pub(crate) fn node_type<T: ReadTxn>(txn: &T, node: &MapRef) -> Option<String> {
     match node.get(txn, TYPE) {
         Some(Out::Any(Any::String(s))) => Some(s.to_string()),
         _ => None,
@@ -629,7 +1483,7 @@ fn node_type<T: ReadTxn>(txn: &T, node: &MapRef) -> Option<String> {
 }
 
 /// A node's `attrs` map read back into a model attr set (empty when absent).
-fn node_attrs<T: ReadTxn>(txn: &T, node: &MapRef) -> Attrs {
+pub(crate) fn node_attrs<T: ReadTxn>(txn: &T, node: &MapRef) -> Attrs {
     match node.get(txn, ATTRS) {
         Some(Out::YMap(m)) => read_attrs(txn, &m),
         _ => Attrs::new(),
@@ -685,7 +1539,16 @@ fn write_node(txn: &mut TransactionMut, node: &MapRef, nd: &NodeData) -> Result<
             // wire version reads it back without knowing atoms exist.
             let text = node.insert(txn, TEXT, TextPrelim::new(b.text.as_str()));
             for m in &b.marks {
-                apply_mark(txn, &text, &b.text, m);
+                // An atom per char, named for its own char (#1851): equal atoms side
+                // by side never share formatting markers.
+                if m.name == ATOM_MARK {
+                    for i in m.start..m.end {
+                        let (at, _) = u16_span(&b.text, i, i + 1);
+                        write_own_value(txn, &text, at, &m.attrs);
+                    }
+                } else {
+                    apply_mark(txn, &text, &b.text, m);
+                }
             }
         }
         NodeData::Container { children, .. } => {
@@ -694,6 +1557,7 @@ fn write_node(txn: &mut TransactionMut, node: &MapRef, nd: &NodeData) -> Result<
                 insert_node(txn, &content, i as u32, child)?;
             }
         }
+        NodeData::Table(t) => write_table(txn, node, t)?,
     }
     Ok(())
 }
@@ -706,20 +1570,45 @@ fn write_node(txn: &mut TransactionMut, node: &MapRef, nd: &NodeData) -> Result<
 /// Two kinds of change are **replaced** wholesale instead: a node changing kind
 /// (text-block ↔ container), and a node retyped into a shape that holds no text (a
 /// paragraph becoming a `horizontal_rule`) — see the comments on each below.
+///
+/// `model` is this node in the model before and after the edit, when the caller has
+/// them: the nested diffs below match children by **identity** through it (see
+/// [`Model`]).
+///
+/// `node` is the node map at `index` of `list` ([`child_maps`]).
 pub(crate) fn reconcile_node(
     txn: &mut TransactionMut,
     list: &ArrayRef,
     index: u32,
+    node: MapRef,
     target: &NodeData,
+    model: Model<'_>,
+    per_char: &BTreeSet<String>,
 ) -> Result<()> {
-    let node = child_map(txn, list, index)
-        .ok_or_else(|| CollabError::schema("reconcile_node: missing node"))?;
-
-    // A node changing *kind* (text-block <-> container — e.g. a paragraph wrapped
+    // A node changing *kind* (text-block, container, table — e.g. a paragraph wrapped
     // into a list) can't be reconciled in place; replace it wholesale. Rare, so the
     // coarse-grained replace is fine.
     let crdt_is_block = block_text(txn, &node).is_some();
-    let target_is_block = matches!(target, NodeData::Block(_));
+    let crdt_kind = if crdt_is_block {
+        0
+    } else if is_table_map(txn, &node) {
+        2
+    } else {
+        1
+    };
+    let target_kind = match target {
+        NodeData::Block(_) => 0,
+        NodeData::Container { .. } => 1,
+        NodeData::Table(_) => 2,
+    };
+    // A container retyped into one that accepts different children (a list made a
+    // quote) is replaced too; see `retype_keeps_identity`.
+    let container_retyped = match target {
+        NodeData::Container { type_name, .. } if !crdt_is_block => {
+            node_type(txn, &node).is_some_and(|current| !retype_keeps_identity(&current, type_name))
+        }
+        _ => false,
+    };
     // A node retyped into something that holds no text — a paragraph becoming a
     // `horizontal_rule`, the scene break — is replaced for the same reason, and it is
     // the guard that keeps a leaf block atom's text empty. Reconciled in place it would
@@ -739,9 +1628,13 @@ pub(crate) fn reconcile_node(
         NodeData::Block(b) => {
             b.text.is_empty() && node_type(txn, &node).as_deref() != Some(b.type_name.as_str())
         }
-        NodeData::Container { .. } => false,
+        NodeData::Container { .. } | NodeData::Table(_) => false,
     };
-    if crdt_is_block != target_is_block || retyped_to_empty {
+    if crdt_kind != target_kind
+        || retyped_to_empty
+        || container_retyped
+        || changed_atom_identity(model)
+    {
         check_index(txn, list, index, false)?;
         list.remove(txn, index);
         return insert_node(txn, list, index, target);
@@ -765,13 +1658,14 @@ pub(crate) fn reconcile_node(
         NodeData::Block(b) => {
             let text = block_text(txn, &node)
                 .ok_or_else(|| CollabError::schema("reconcile_node: missing text"))?;
-            reconcile_text(txn, &text, b)
+            reconcile_text(txn, &text, b, per_char, model)
         }
         NodeData::Container { children, .. } => {
             let content = node_content(txn, &node)
                 .ok_or_else(|| CollabError::schema("reconcile_node: missing content"))?;
-            reconcile_child_list(txn, &content, children)
+            reconcile_child_list(txn, &content, children, model, per_char)
         }
+        NodeData::Table(t) => reconcile_table(txn, &node, t, model, per_char),
     }
 }
 
@@ -786,15 +1680,96 @@ pub(crate) fn reconcile_node(
 /// computes a zero-length delete and an empty insert and issues neither, so even a
 /// corrupt atom that *did* hold text is healed (spliced back to empty) rather than
 /// erroring.
-fn reconcile_text(txn: &mut TransactionMut, text: &TextRef, b: &BlockData) -> Result<()> {
+fn reconcile_text(
+    txn: &mut TransactionMut,
+    text: &TextRef,
+    b: &BlockData,
+    per_char: &BTreeSet<String>,
+    model: Model<'_>,
+) -> Result<()> {
     let (old, old_marks) = read_text_data(txn, text)?;
-    let spliced = old != b.text;
-    if spliced {
-        splice_min(txn, text, &old, &b.text);
-    }
-
     let mut target_marks = b.marks.clone();
     target_marks.sort_by(|a, b| (a.start, a.end, &a.name).cmp(&(b.start, b.end, &b.name)));
+
+    let o: Vec<char> = old.chars().collect();
+    let n: Vec<char> = b.text.chars().collect();
+    // A block whose stored text the model reads differently from how it is stored
+    // (#1227) is diffed as it reads: see `reconcile_read_text`. Only an inline atom
+    // can read as anything but itself, so a block with none the model reads
+    // otherwise (every plain keystroke) skips the per-char pass below.
+    if let Some((before, after)) = model.filter(|(before, after)| {
+        old_marks.iter().any(|m| m.name == ATOM_MARK)
+            && before.is_textblock()
+            && after.is_textblock()
+            && after.type_name() == b.type_name
+            && reads_otherwise(before.node_type(), after.node_type(), &old_marks, &o)
+    }) {
+        let (old_typ, new_typ) = (before.node_type(), after.node_type());
+        let new_kinds: Vec<CharKind> = (0..o.len())
+            .map(|i| kind_in(new_typ, &old_marks, &o, i, o[i]))
+            .collect();
+        let old_kinds: Vec<CharKind> = if old_typ.name() == new_typ.name() {
+            new_kinds.clone()
+        } else {
+            (0..o.len())
+                .map(|i| kind_in(old_typ, &old_marks, &o, i, o[i]))
+                .collect()
+        };
+        // The text as the model before this change read it, where that hid an atom;
+        // as the new type reads it everywhere else.
+        let diff_kinds: Vec<CharKind> = (0..o.len())
+            .map(|i| {
+                if old_kinds[i] == CharKind::Atom
+                    || matches!(old_kinds[i], CharKind::Text(c) if c == o[i])
+                {
+                    new_kinds[i]
+                } else {
+                    old_kinds[i]
+                }
+            })
+            .collect();
+        let view = TextView::from_kinds(&o, &diff_kinds);
+        if view.normalised {
+            return reconcile_read_text(
+                txn,
+                text,
+                (&o, &old_marks),
+                (&view, &diff_kinds, &new_kinds),
+                (&n, &target_marks),
+                per_char,
+                model,
+                new_typ,
+            );
+        }
+    }
+    // The changed places: each place the transaction's steps changed, when they changed
+    // this block at two or more (#1885, `crate::steps`); else the one middle between a
+    // common prefix and suffix.
+    let hunks = match model.and_then(|(before, after)| step_hunks_fitting(before, after, &o, &n)) {
+        Some(hunks) => hunks,
+        None => {
+            let (prefix, suffix) = text_splice_bounds(&o, &old_marks, &n, &target_marks, model);
+            if prefix + suffix < o.len() || prefix + suffix < n.len() {
+                vec![Hunk {
+                    old: prefix..o.len() - suffix,
+                    new: prefix..n.len() - suffix,
+                }]
+            } else {
+                Vec::new()
+            }
+        }
+    };
+    let spliced = !hunks.is_empty();
+    // Last to first, so each hunk's old offsets are still the stored text's.
+    for hunk in hunks.iter().rev() {
+        if inserts_after_non_inclusive(&o, &old_marks, &target_marks, per_char, hunk) {
+            splice_min_with_marks(txn, text, &o, &n, &target_marks, hunk);
+        } else {
+            splice_min(txn, text, &o, &n, hunk);
+        }
+    }
+    // The chars the splices inserted, in the new text's offsets.
+    let inserted: Vec<std::ops::Range<usize>> = hunks.iter().map(|h| h.new.clone()).collect();
 
     // Marks must be compared *after* the splice: yrs has already shifted existing
     // formatting ranges with the text, and text inserted **inside** a formatted run
@@ -807,86 +1782,981 @@ fn reconcile_text(txn: &mut TransactionMut, text: &TextRef, b: &BlockData) -> Re
     } else {
         (old, old_marks)
     };
-    if current_marks != target_marks {
-        resync_marks(txn, text, &current, &current_marks, &target_marks);
+    // An atom the splice inserted is written even when the marks already agree: it
+    // may have inherited an equal neighbour's value (#1851, `resync_atoms`).
+    if current_marks != target_marks || inserts_an_atom(&target_marks, &inserted) {
+        resync_marks(
+            txn,
+            text,
+            &current,
+            &current_marks,
+            &target_marks,
+            per_char,
+            &inserted,
+        );
     }
     Ok(())
+}
+
+/// Whether some inline atom of a textblock's stored text (`o`, its spans `spans`) reads
+/// as anything but an atom in [`reconcile_text`]'s read of it (#1227): as `old_typ`
+/// where that hides it, else as `new_typ`. The cheap test that gates that read's
+/// per-char pass: it visits only the chars an [`ATOM_MARK`] span covers, and
+/// [`kind_in`] reads every other char as itself, so `false` here is exactly
+/// [`TextView::normalised`] being `false` there.
+fn reads_otherwise(old_typ: &NodeType, new_typ: &NodeType, spans: &[SpanMark], o: &[char]) -> bool {
+    spans
+        .iter()
+        .filter(|m| m.name == ATOM_MARK)
+        .flat_map(|m| m.start..m.end.min(o.len()))
+        .any(|i| {
+            let new_kind = kind_in(new_typ, spans, o, i, o[i]);
+            let old_kind = if old_typ.name() == new_typ.name() {
+                new_kind
+            } else {
+                kind_in(old_typ, spans, o, i, o[i])
+            };
+            let read = if old_kind == CharKind::Atom
+                || matches!(old_kind, CharKind::Text(c) if c == o[i])
+            {
+                new_kind
+            } else {
+                old_kind
+            };
+            !matches!(read, CharKind::Atom) && read != CharKind::Text(o[i])
+        })
+}
+
+/// Whether a char in `inserted` is an inline atom in `target`.
+fn inserts_an_atom(target: &[SpanMark], inserted: &[std::ops::Range<usize>]) -> bool {
+    inserted.iter().any(|r| {
+        !r.is_empty()
+            && target
+                .iter()
+                .any(|m| m.name == ATOM_MARK && m.start < r.end && r.start < m.end)
+    })
+}
+
+/// [`crate::steps::step_hunks`] for a block whose stored text is `o` and model text
+/// `n`, when the text it leaves between the hunks is the same on both sides, each hunk
+/// trimmed to what it changes. A hunk's chars are compared as text only: an atom's
+/// placeholder in one is never kept, since the step replaced the node it stood for.
+fn step_hunks_fitting(before: &Node, after: &Node, o: &[char], n: &[char]) -> Option<Vec<Hunk>> {
+    let hunks = crate::steps::step_hunks(before, after, o.len(), n.len())?;
+    let (mut po, mut pn) = (0, 0);
+    let mut out = Vec::with_capacity(hunks.len());
+    for h in hunks.iter().chain(std::iter::once(&Hunk {
+        old: o.len()..o.len(),
+        new: n.len()..n.len(),
+    })) {
+        if h.old.start - po != h.new.start - pn || o[po..h.old.start] != n[pn..h.new.start] {
+            return None;
+        }
+        (po, pn) = (h.old.end, h.new.end);
+        let (os, ns) = (&o[h.old.clone()], &n[h.new.clone()]);
+        let (pre, suf) = common_runs(os.len(), ns.len(), |i, j| {
+            os[i] == ns[j] && os[i] != ATOM_PLACEHOLDER
+        });
+        if pre + suf < os.len() || pre + suf < ns.len() {
+            out.push(Hunk {
+                old: h.old.start + pre..h.old.end - suf,
+                new: h.new.start + pre..h.new.end - suf,
+            });
+        }
+    }
+    // A hunk that deletes or writes an inline atom takes the one-hunk path, which the
+    // atom identity rules were built and measured on (#1851, #1890): writing an atom's
+    // char alone, or deleting one alone, beside a peer's concurrent edit read back as a
+    // literal U+FFFC in the randomized trial (`typed_once_1850.rs`, seed 402: an undo
+    // deleting a picture and a char at two places of one line).
+    if out.iter().any(|h| {
+        o[h.old.clone()].contains(&ATOM_PLACEHOLDER) || n[h.new.clone()].contains(&ATOM_PLACEHOLDER)
+    }) {
+        return None;
+    }
+    Some(out)
+}
+
+/// [`reconcile_text`] for a block whose stored text the model reads differently from
+/// how it is stored ([`TextView`], #1227): a hard-break atom read as `'\n'` in a code
+/// block, an atom read as nothing. The diff runs over the text **as read** (`view`, by
+/// the type the model held before this change wherever that hid an atom), so a
+/// converted break compares equal to the model's `'\n'` and a dropped atom is skipped,
+/// and its bounds are taken back to stored indices. A hidden atom is left where it is,
+/// `@atom` value and all: rewriting a converted break into a `'\n'` char on every peer
+/// that edits the block would leave one line break per peer, and the stored text a
+/// peer diffed against would no longer share a suffix with anyone's. Stray marks on
+/// hidden chars are cleared like any other mark the model does not hold (idempotent).
+///
+/// Only a retype that makes a hidden atom readable again (a code block made a
+/// paragraph: its stored hard break would read as one, where the model holds `'\n'`)
+/// rewrites it, one char at a time, outside the diffed range: two peers doing that
+/// concurrently leave two line breaks there.
+///
+/// The per-char non-inclusive insert ([`splice_min_with_marks`]) is not used here: a
+/// plain splice, then the mark resync.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_read_text(
+    txn: &mut TransactionMut,
+    text: &TextRef,
+    (o, old_marks): (&[char], &[SpanMark]),
+    (view, diff_kinds, new_kinds): (&TextView, &[CharKind], &[CharKind]),
+    (n, target_marks): (&[char], &[SpanMark]),
+    per_char: &BTreeSet<String>,
+    model: Model<'_>,
+    typ: &NodeType,
+) -> Result<()> {
+    let read_marks = view.spans_read(old_marks);
+    let (prefix, suffix) = text_splice_bounds(&view.chars, &read_marks, n, target_marks, model);
+    let spliced = prefix + suffix < view.chars.len() || prefix + suffix < n.len();
+    // Stored range of the read middle `prefix .. len - suffix`, shrunk off any dropped
+    // atoms at its edges so they stay where they are.
+    let (mut from, mut to) = (o.len(), o.len());
+    let mut ins = String::new();
+    if spliced {
+        from = if prefix == 0 {
+            0
+        } else {
+            view.stored[prefix - 1] + 1
+        };
+        to = view.stored_at(view.chars.len() - suffix);
+        while from < to && view.before[from] == view.before[from + 1] {
+            from += 1;
+        }
+        while to > from && view.before[to - 1] == view.before[to] {
+            to -= 1;
+        }
+        ins = n[prefix..n.len() - suffix].iter().collect();
+    }
+    let ins_len = ins.chars().count();
+    // Hidden chars outside the splice that the new type reads otherwise than the model
+    // does: (stored index after the splice, what it must become — `None` to go).
+    let mut fixups: Vec<(usize, Option<char>)> = Vec::new();
+    for i in (0..o.len()).filter(|i| !(from..to).contains(i)) {
+        if diff_kinds[i] == new_kinds[i] {
+            continue;
+        }
+        let at = if i < from {
+            i
+        } else {
+            i - (to - from) + ins_len
+        };
+        match diff_kinds[i] {
+            CharKind::Text(c) => fixups.push((at, Some(c))),
+            CharKind::Gone => fixups.push((at, None)),
+            CharKind::Atom => {}
+        }
+    }
+    if spliced {
+        let at: u32 = o[..from].iter().map(|c| c.len_utf16() as u32).sum();
+        let del: u32 = o[from..to].iter().map(|c| c.len_utf16() as u32).sum();
+        if del > 0 {
+            text.remove_range(txn, at, del);
+        }
+        if !ins.is_empty() {
+            text.insert(txn, at, &ins);
+        }
+    }
+    let mut inserted = Vec::new();
+    if spliced {
+        inserted.push(from..from + ins_len);
+    }
+    if !fixups.is_empty() {
+        let (stored, _) = read_text_data(txn, text)?;
+        let stored: Vec<char> = stored.chars().collect();
+        for (at, with) in fixups.into_iter().rev() {
+            let pos: u32 = stored[..at].iter().map(|c| c.len_utf16() as u32).sum();
+            text.remove_range(txn, pos, stored[at].len_utf16() as u32);
+            if let Some(c) = with {
+                text.insert(txn, pos, &c.to_string());
+            }
+        }
+    }
+
+    // The marks the model holds, taken to stored indices of the text as it now is; a
+    // hidden atom keeps its `@atom` value.
+    let (current, current_marks) = read_text_data(txn, text)?;
+    let cur: Vec<char> = current.chars().collect();
+    let now = TextView::of(typ, &cur, &current_marks);
+    if now.chars.as_slice() != n {
+        // Not reachable by the writes above; the marks are left as they are rather
+        // than written at offsets that do not line up.
+        return Ok(());
+    }
+    let mut target: Vec<SpanMark> = Vec::new();
+    for m in target_marks {
+        if m.start < m.end {
+            let (start, end) = (now.stored[m.start], now.stored[m.end - 1] + 1);
+            push_mark_span(&mut target, &m.name, m.attrs.clone(), start, end);
+        }
+    }
+    for m in current_marks.iter().filter(|m| m.name == ATOM_MARK) {
+        for i in m.start..m.end {
+            if now.hidden_atom[i] {
+                push_mark_span(&mut target, ATOM_MARK, m.attrs.clone(), i, i + 1);
+            }
+        }
+    }
+    target.sort_by(|a, b| (a.start, a.end, &a.name).cmp(&(b.start, b.end, &b.name)));
+    if current_marks != target || inserts_an_atom(&target, &inserted) {
+        resync_marks(
+            txn,
+            text,
+            &current,
+            &current_marks,
+            &target,
+            per_char,
+            &inserted,
+        );
+    }
+    Ok(())
+}
+
+/// What [`model_atom_scope`] holds: the keys ([`node_key`]) of every inline atom in
+/// the blocks a local change touches, before and after it, and whether the two
+/// documents are one document edited (`related`).
+type ModelAtomSets = (HashSet<usize>, HashSet<usize>, bool);
+
+thread_local! {
+    /// While a [`model_atom_scope`] is held: the change's [`ModelAtomSets`].
+    static MODEL_ATOMS: RefCell<Option<ModelAtomSets>> = const { RefCell::new(None) };
+}
+
+/// While the returned guard lives, [`text_splice_bounds`] asks whether an atom is in
+/// the change at all against these sets (the whole change's, so an atom moved to
+/// another block counts as kept) rather than against its own block's, and trusts the
+/// model's identities only when `related` (see [`text_splice_bounds`]).
+pub(crate) fn model_atom_scope(
+    before: &[ModelAtom],
+    after: &[ModelAtom],
+    related: bool,
+) -> ModelAtomScope {
+    let set = |v: &[ModelAtom]| v.iter().map(|a| node_key(&a.node)).collect();
+    let prev = MODEL_ATOMS.with(|c| c.replace(Some((set(before), set(after), related))));
+    ModelAtomScope(prev)
+}
+
+/// The guard [`model_atom_scope`] returns; restores the previous sets on drop.
+pub(crate) struct ModelAtomScope(Option<ModelAtomSets>);
+
+impl Drop for ModelAtomScope {
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        MODEL_ATOMS.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+/// Whether `before` and `after` have a child in common (`Node::same_ref`): one pass
+/// over each by [`node_key`] (pair by pair for a short list). Comparing every pair cost (children × children) for a
+/// change that rewrote both the first and the last child (#2526).
+pub(crate) fn shares_a_child(before: &Node, after: &Node) -> bool {
+    let (b, a) = (before.content().children(), after.content().children());
+    // A short list (a cell's blocks) is cheaper compared pair by pair.
+    if b.len() * a.len() <= 64 {
+        crate::steps::count_work(b.len() * a.len());
+        return a.iter().any(|y| b.iter().any(|x| x.same_ref(y)));
+    }
+    crate::steps::count_work(b.len());
+    let keys: crate::steps::KeySet = b.iter().map(node_key).collect();
+    a.iter().any(|c| {
+        crate::steps::count_work(1);
+        keys.contains(&node_key(c))
+    })
+}
+
+/// A key for a model node's identity: two nodes have one key exactly when they are
+/// `Node::same_ref`, while both live. (The address of the attrs inside the node's
+/// shared allocation; the model exposes no pointer of its own.)
+pub(crate) fn node_key(node: &Node) -> usize {
+    std::ptr::from_ref(node.attrs()) as usize
+}
+
+/// The inline atoms of `node` in document order, each with its projected value,
+/// descending through containers but not into tables (see `atoms::find_atoms`).
+pub(crate) fn model_atoms(node: &Node, out: &mut Vec<ModelAtom>) {
+    if node.type_name() == TABLE {
+        return;
+    }
+    if node.is_textblock() {
+        for i in 0..node.child_count() {
+            let child = node.child(i);
+            if child.text().is_none()
+                && is_inline_atom(child.node_type())
+                && let Ok(value) = atom_attrs(child)
+            {
+                out.push(ModelAtom {
+                    node: child.clone(),
+                    value,
+                });
+            }
+        }
+        return;
+    }
+    for i in 0..node.child_count() {
+        model_atoms(node.child(i), out);
+    }
+}
+
+/// The common leading and trailing runs [`splice_min`] keeps when it turns `o` into
+/// `n`: chars that are equal, where an inline atom's placeholder equals another only
+/// when it is **the same atom** (review of #1503, F2). Every atom is the same U+FFFC,
+/// so a diff by chars alone lines a picture inserted right before another up with that
+/// other: the old char would hold the new picture and a new char the old one, and the
+/// identity (the char's id), with every attr a peer changes under it, would go to the
+/// wrong picture.
+///
+/// The same atom is told from the model (`model`, the block before and after): the
+/// editor keeps the `Rc` of an atom an edit does not rebuild, so an atom `same_ref` to
+/// one before it is that atom. An atom changed in place (its attrs set: a new node) is
+/// `same_ref` to nothing; it is taken to be the atom at its place before when that one
+/// is `same_ref` to no atom after the change either, both have one type and both the
+/// same `src` (or neither has one), and — when the caller proves which atoms the change
+/// only set attributes of ([`kept_atoms_scope`], what an editor does) — it is one of
+/// those: an attr change, kept in place. Anything else makes a new atom, and a peer's
+/// concurrent change of the old one is lost rather than shown on another picture: a
+/// `src` change (the reason is with `same_place` below), and, with the proof, a picture
+/// pasted over a selected one, `src` and all (decision (f)). Without a
+/// model that reads as the CRDT's text, or when the before and after share no node (a
+/// load, a re-base: two documents, not one edited), an atom matches only one with an
+/// equal value: an attr change there replaces the atom (a peer's concurrent change of
+/// it is lost), and two equal copies of one picture cannot be told apart.
+fn text_splice_bounds(
+    o: &[char],
+    old_marks: &[SpanMark],
+    n: &[char],
+    target: &[SpanMark],
+    model: Model<'_>,
+) -> (usize, usize) {
+    if !o.contains(&ATOM_PLACEHOLDER) || !n.contains(&ATOM_PLACEHOLDER) {
+        return common_runs(o.len(), n.len(), |i, j| o[i] == n[j]);
+    }
+    let values = |marks: &[SpanMark], len: usize| -> Vec<Option<Attrs>> {
+        let mut v = vec![None; len];
+        for m in marks.iter().filter(|m| m.name == ATOM_MARK) {
+            for slot in &mut v[m.start.min(len)..m.end.min(len)] {
+                *slot = Some(m.attrs.clone());
+            }
+        }
+        v
+    };
+    let (ov, nv) = (values(old_marks, o.len()), values(target, n.len()));
+    // Each placeholder's model node, when the model's block reads as this text.
+    let nodes = |block: &Node, chars: &[char]| -> Option<Vec<Option<Node>>> {
+        let data = read_block(block).ok()?;
+        if data.text.chars().ne(chars.iter().copied()) {
+            return None;
+        }
+        let mut atoms = Vec::new();
+        model_atoms(block, &mut atoms);
+        let mut atoms = atoms.into_iter();
+        let mut out = Vec::with_capacity(chars.len());
+        for (i, c) in chars.iter().enumerate() {
+            let is_atom = *c == ATOM_PLACEHOLDER
+                && data
+                    .marks
+                    .iter()
+                    .any(|m| m.name == ATOM_MARK && m.start <= i && i < m.end);
+            out.push(if is_atom {
+                Some(atoms.next()?.node)
+            } else {
+                None
+            });
+        }
+        Some(out)
+    };
+    let scoped = MODEL_ATOMS.with(|c| c.borrow().clone());
+    // Two documents that share no node (a load, a re-base) say nothing about which
+    // atom is which: every atom would be "changed in place".
+    let related = |before: &Node, after: &Node| match &scoped {
+        Some((_, _, related)) => *related,
+        None => (0..before.child_count())
+            .any(|i| (0..after.child_count()).any(|j| before.child(i).same_ref(after.child(j)))),
+    };
+    let pair = match model {
+        Some((before, after)) if related(before, after) => nodes(before, o).zip(nodes(after, n)),
+        _ => None,
+    };
+    let (before_set, after_set): (HashSet<usize>, HashSet<usize>) = match (scoped, &pair) {
+        (Some((before, after, _)), _) => (before, after),
+        (None, Some((on, nn))) => (
+            on.iter().flatten().map(node_key).collect(),
+            nn.iter().flatten().map(node_key).collect(),
+        ),
+        (None, None) => Default::default(),
+    };
+    // An atom changed in place is the same atom only with the same type and the same
+    // `src`. Chosen by Joe (2026-10-09): a wrong attribution is worse than a lost one —
+    // app data keyed to a picture would show on the wrong picture. An app that inserts
+    // a picture only once its final `src` is known, and writes a fresh copy rather than
+    // changing a live picture's `src`, loses nothing to it. The rejected alternative,
+    // type alone, kept a picture's identity through a `src` change (and a peer's
+    // concurrent change of another attr with it), but the model cannot tell a `src`
+    // change from a picture pasted over a selected one (both put a new node where the
+    // old one was), so a peer's concurrent app attribute on the old picture then showed
+    // on the pasted one.
+    let same_place =
+        |a: &Attrs, b: &Attrs| a.get(ATOM_TYPE) == b.get(ATOM_TYPE) && a.get("src") == b.get("src");
+    // An editor that proves which nodes a change only set attributes of
+    // (`CollabSession::record_local_edit`, the `SetNodeAttrStep`s of its
+    // transaction) keeps an atom's identity for those alone (decision (f), Joe
+    // 2026-10-19): any other new node at the old one's place — a picture pasted over
+    // another with the same `src` included — is a new char, so a peer's node view
+    // drawn for the old picture is remounted rather than handed the pasted one, and a
+    // peer's concurrent change of the old picture is lost rather than shown on it.
+    // Without that proof (`CollabSession::record_local`) the `src` rule alone decides.
+    let proven_in_place = |p: &Node, q: &Node| !kept_atoms_known() || is_kept_pair(p, q);
+    common_runs(o.len(), n.len(), |i, j| {
+        if o[i] != n[j] {
+            return false;
+        }
+        if o[i] != ATOM_PLACEHOLDER {
+            return true;
+        }
+        let (Some(a), Some(b)) = (&ov[i], &nv[j]) else {
+            return ov[i].is_none() && nv[j].is_none();
+        };
+        match &pair {
+            Some((on, nn)) => match (&on[i], &nn[j]) {
+                (Some(p), Some(q)) => {
+                    // A pair the editor proved with its old node is its own char even
+                    // where the model holds one of the two `Rc`s twice (an in-editor
+                    // copy): the set checks below would refuse it and write the
+                    // proved edit as a new char, beside a peer's concurrent paste over
+                    // the same picture, which is a new char too — two pictures where
+                    // there was one (review 2 of #1595, G2, identical-pictures seed 785).
+                    p.same_ref(q)
+                        || (has_old_proof(q) && is_kept_pair(p, q) && same_place(a, b))
+                        || (!after_set.contains(&node_key(p))
+                            && !before_set.contains(&node_key(q))
+                            && same_place(a, b)
+                            && proven_in_place(p, q))
+                }
+                _ => false,
+            },
+            None => a == b,
+        }
+    })
+}
+
+/// The model's before and after of the node being reconciled, when the caller has
+/// them (`None` otherwise).
+///
+/// A child list is diffed by a common leading and trailing run of **unchanged**
+/// children. Unchanged is a question of identity, not value: a model edit keeps the
+/// `Rc` of every node it does not touch (the editor's transactions share untouched
+/// subtrees, table commands included — `table_commands_keep_every_row_and_cell_they_do_not_touch`),
+/// so a child the edit left alone is `same_ref` before and after, and one it rebuilt
+/// is not, however equal. Matching by value instead attributes an edit among **equal**
+/// siblings to the wrong one — three empty paragraphs in a quote, the first deleted,
+/// reads as the *last* deleted — and a peer's concurrent typing in the sibling nobody
+/// touched goes with it (#1240). The document's top level has always matched by
+/// identity ([`project_change`](CollabDoc::project_change)); this carries it down.
+///
+/// Identity needs each model sibling to be its own `Rc`: a model that shared one node
+/// between two siblings would make them indistinguishable again (nothing in the editor
+/// or the projection's read does). And it needs the before and after to be **related**:
+/// a load while collaborating, or the re-base of a stalled outbound on the CRDT's
+/// read-back, hands over two documents that share no node, and identity would pair
+/// every child by index. A level whose before and after share no child therefore
+/// matches by value, and still hands the model down, since a level below may share.
+pub(crate) type Model<'a> = Option<(&'a Node, &'a Node)>;
+
+/// What the caller of a change proved about its atoms ([`kept_atoms_scope`],
+/// [`kept_pairs_scope`]).
+#[derive(Clone)]
+pub(crate) struct Proof {
+    /// The atoms — leaf block atoms and inline atoms — of the change's `after`
+    /// document that are the **same atom** as the node standing at their place before
+    /// it (an attribute change the editor proved with a `SetNodeAttrStep`), each with
+    /// that old node when the caller knows it. A pair with its old node matches only
+    /// that old node (review 2 of #1595, G1: proved by its new half alone, a kept atom
+    /// right after a deleted one was paired with the deleted one's char or block).
+    pairs: Vec<(Option<Node>, Node)>,
+    /// The before and after are one document edited (a transaction), not two
+    /// documents (a load): see [`proof_is_an_edit`].
+    edit: bool,
+}
+
+thread_local! {
+    /// The [`Proof`] held now, if any. See [`changed_atom_identity`] and
+    /// [`text_splice_bounds`].
+    static KEPT_ATOMS: RefCell<Option<Proof>> = const { RefCell::new(None) };
+}
+
+/// Restores [`KEPT_ATOMS`] when dropped.
+pub(crate) struct KeptAtomsScope(Option<Proof>);
+
+impl Drop for KeptAtomsScope {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        KEPT_ATOMS.with(|k| *k.borrow_mut() = previous);
+    }
+}
+
+/// While the returned guard lives, a reconcile pairing a leaf block atom of the
+/// model's `after` with a **different** model node at its place writes it as a new
+/// CRDT block unless it is one of `kept` ([`changed_atom_identity`]), and a picture
+/// likewise as a new char. `kept` names only the new nodes, so each one matches
+/// whatever node stood at its place. `None` is the positional rule a change always
+/// had: the pair is reconciled in place.
+pub(crate) fn kept_atoms_scope(kept: Option<&[Node]>) -> KeptAtomsScope {
+    set_proof(kept.map(|k| Proof {
+        pairs: k.iter().map(|n| (None, n.clone())).collect(),
+        edit: false,
+    }))
+}
+
+/// [`kept_atoms_scope`] for an editor's transaction: each kept atom with the node it
+/// was before the change, and the before and after one document edited.
+pub(crate) fn kept_pairs_scope(kept: &[(Node, Node)]) -> KeptAtomsScope {
+    set_proof(Some(Proof {
+        pairs: kept
+            .iter()
+            .map(|(o, n)| (Some(o.clone()), n.clone()))
+            .collect(),
+        edit: true,
+    }))
+}
+
+fn set_proof(proof: Option<Proof>) -> KeptAtomsScope {
+    KeptAtomsScope(KEPT_ATOMS.with(|k| k.replace(proof)))
+}
+
+/// While the returned guard lives, the proof held now is weakened for a re-base on
+/// the CRDT's read-back (a stalled outbound, #220): that `before` holds none of the
+/// caller's old nodes, so each pair keeps its new node only, and the two documents
+/// are not one edited.
+pub(crate) fn rebase_proof_scope() -> KeptAtomsScope {
+    let now = KEPT_ATOMS.with(|k| {
+        k.borrow().as_ref().map(|p| Proof {
+            pairs: p.pairs.iter().map(|(_, n)| (None, n.clone())).collect(),
+            edit: false,
+        })
+    });
+    set_proof(now)
+}
+
+/// Whether a [`kept_atoms_scope`] with `Some` is held now: the change's caller
+/// proved which atoms it only set attributes of.
+pub(crate) fn kept_atoms_known() -> bool {
+    KEPT_ATOMS.with(|k| k.borrow().is_some())
+}
+
+/// Whether the proof held now says the change's before and after are one document
+/// edited ([`kept_pairs_scope`]). A level that shares no node is still matched by
+/// value then (pairing it by index would move a peer's concurrent typing when a lone
+/// paragraph is split at its start — the round-3 review of #1595, F1), but an atom
+/// compares equal only to itself or a kept pair ([`equal_under_proof`]), so an
+/// equal fresh copy of a picture is a change, not "no change" (review 2 of #1595,
+/// G3). At the top level the model's atom pairing is kept for the changed run too.
+/// A load is not an edit: there an equal atom stays its old char, or every load
+/// while collaborating would rewrite every picture as a new char.
+pub(crate) fn proof_is_an_edit() -> bool {
+    KEPT_ATOMS.with(|k| k.borrow().as_ref().is_some_and(|p| p.edit))
+}
+
+/// Equality by value for the value rule of a level that shares no node ([`Model`]),
+/// except that under an editor's proof ([`proof_is_an_edit`]) an atom (a leaf that
+/// is not text) is equal only to the same node or to the node a kept pair names it
+/// as ([`is_kept_pair`]): an equal fresh copy of a picture or an embed is a change
+/// there, so its CRDT char or block is written anew (review 2 of #1595, G3), while a
+/// paragraph split at its start still finds its text again by value (the round-3
+/// review of #1595, F1). Plain `==` for every other caller.
+pub(crate) fn equal_under_proof(b: &Node, a: &Node) -> bool {
+    if b.same_ref(a) {
+        return true;
+    }
+    if !proof_is_an_edit() || b.is_text() {
+        return b == a;
+    }
+    if b.is_leaf() {
+        return b == a && is_kept_pair(b, a);
+    }
+    b.type_name() == a.type_name()
+        && b.attrs() == a.attrs()
+        && b.marks() == a.marks()
+        && b.child_count() == a.child_count()
+        && (0..b.child_count()).all(|i| equal_under_proof(b.child(i), a.child(i)))
+}
+
+/// Whether the proof held now names `node`: the editor proved it is the atom that
+/// stood at its place before the change, with other attributes.
+pub(crate) fn is_kept_atom(node: &Node) -> bool {
+    KEPT_ATOMS.with(|k| {
+        k.borrow()
+            .as_ref()
+            .is_some_and(|p| p.pairs.iter().any(|(_, n)| n.same_ref(node)))
+    })
+}
+
+/// Whether the proof held now pairs `old` (a node before the change) with `new` (one
+/// after it): it names `new`, with `old` as its old node or with no old node.
+pub(crate) fn is_kept_pair(old: &Node, new: &Node) -> bool {
+    KEPT_ATOMS.with(|k| {
+        k.borrow().as_ref().is_some_and(|p| {
+            p.pairs
+                .iter()
+                .any(|(o, n)| n.same_ref(new) && o.as_ref().is_none_or(|o| o.same_ref(old)))
+        })
+    })
+}
+
+/// Whether the proof held now names `new` together with its old node.
+fn has_old_proof(new: &Node) -> bool {
+    KEPT_ATOMS.with(|k| {
+        k.borrow()
+            .as_ref()
+            .is_some_and(|p| p.pairs.iter().any(|(o, n)| o.is_some() && n.same_ref(new)))
+    })
+}
+
+/// Whether reconciling the model pair `model` (a node before and after the change,
+/// at one place) would hand a leaf block atom's CRDT block to **another atom**: the
+/// two are different model nodes, and the editor did not prove the new one is the
+/// old one with other attributes ([`kept_atoms_scope`]). An embed a peer's view keys
+/// an app's state to must never take another embed's attributes in place — a move
+/// (delete and insert) would read, position by position, exactly like an attribute
+/// change, and the receiver could not tell them apart. Such a pair is replaced, so
+/// the new atom is a new block on every replica.
+fn changed_atom_identity(model: Model<'_>) -> bool {
+    let Some((before, after)) = model else {
+        return false;
+    };
+    if !(after.is_leaf() && after.is_block()) || before.same_ref(after) {
+        return false;
+    }
+    kept_atoms_known() && !is_kept_pair(before, after)
+}
+
+/// The `i`-th children of a [`Model`] pair, given the before and after index.
+pub(crate) fn model_child<'a>(model: Model<'a>, before: usize, after: usize) -> Model<'a> {
+    model.map(|(b, a)| (b.child(before), a.child(after)))
+}
+
+/// A common leading and trailing run of `bn` before and `an` after items under `same`:
+/// the lengths of the two runs, never overlapping.
+pub(crate) fn common_runs(
+    bn: usize,
+    an: usize,
+    same: impl Fn(usize, usize) -> bool,
+) -> (usize, usize) {
+    let mut prefix = 0;
+    while prefix < bn && prefix < an && same(prefix, prefix) {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < bn - prefix && suffix < an - prefix && same(bn - 1 - suffix, an - 1 - suffix) {
+        suffix += 1;
+    }
+    (prefix, suffix)
+}
+
+/// [`common_runs`] by identity over two child lists: their common leading and
+/// trailing runs of the same `Rc`s. Walks the slices directly — a keystroke in a long
+/// document pays it once per top-level block, and the index-based closure cost about
+/// two more instructions per block (`editor::collab_keystroke`).
+pub(crate) fn identity_runs(before: &Node, after: &Node) -> (usize, usize) {
+    let (b, a) = (before.content().children(), after.content().children());
+    let prefix = b.iter().zip(a).take_while(|(x, y)| x.same_ref(y)).count();
+    let suffix = b[prefix..]
+        .iter()
+        .rev()
+        .zip(a[prefix..].iter().rev())
+        .take_while(|(x, y)| x.same_ref(y))
+        .count();
+    (prefix, suffix)
 }
 
 /// Reconcile a container's `content` array to `target`. Diffs the CRDT's current
-/// children against `target` by *structural* equality (a common leading/trailing run
-/// is left untouched, keeping the CRDT identity — and merge behaviour — of every
-/// node in it), reconciles the overlapping middle in place, and inserts/deletes the
-/// count difference. This is the same block-list diff as
-/// [`project_change`](CollabDoc::project_change), one level down; recursion carries it
-/// to any depth.
-fn reconcile_child_list(
+/// children against `target` by a common leading and trailing run left untouched
+/// (keeping the CRDT identity — and merge behaviour — of every node in it), reconciles
+/// the overlapping middle in place, and inserts/deletes the count difference. This is
+/// the same block-list diff as [`project_change`](CollabDoc::project_change), one level
+/// down; recursion carries it to any depth.
+///
+/// The runs are taken by model identity when `model` is given and describes this list
+/// (see [`Model`]); by *structural* equality otherwise.
+pub(crate) fn reconcile_child_list(
     txn: &mut TransactionMut,
     content: &ArrayRef,
     target: &[NodeData],
+    model: Model<'_>,
+    per_char: &BTreeSet<String>,
 ) -> Result<()> {
-    let cn = content.len(txn) as usize;
-    let mut cur = Vec::with_capacity(cn);
-    for i in 0..cn {
-        cur.push(read_node_data(txn, content, i as u32)?);
-    }
+    // The visible children, each with its raw index: a void container ([`is_void`]) is
+    // not part of the model's list, so the diff runs over the others and every write
+    // addresses the raw index of the child it means.
+    let (raw, cur): (Vec<u32>, Vec<NodeData>) = read_children(txn, content)?.into_iter().unzip();
+    let cn = cur.len();
     let tn = target.len();
 
-    let mut prefix = 0;
-    while prefix < cn && prefix < tn && cur[prefix] == target[prefix] {
-        prefix += 1;
-    }
-    let mut suffix = 0;
-    while suffix < cn - prefix
-        && suffix < tn - prefix
-        && cur[cn - 1 - suffix] == target[tn - 1 - suffix]
-    {
-        suffix += 1;
-    }
+    // The model describes this list only when its children line up with it (they
+    // always do: the model is the projection).
+    let model = model.filter(|(b, a)| b.child_count() == cn && a.child_count() == tn);
+    // A before and after that share no child carry no identity at this level (a load,
+    // a re-base, a lone item split at its start); their children may still. They are
+    // matched by value, with an editor's atoms compared by `equal_under_proof`: a list
+    // item whose only content was replaced by an equal copy is an edit, not "no
+    // change" (G3), and Enter at the start of a lone item keeps a peer's typing with
+    // its text (F1).
+    let runs = model.and_then(|(b, a)| {
+        let runs = identity_runs(b, a);
+        let related = runs != (0, 0) || shares_a_child(b, a);
+        related.then_some(runs)
+    });
+    let (prefix, suffix) = match runs {
+        Some(runs) => runs,
+        // By value, but under an editor's proof an atom it does not keep is equal
+        // to nothing but itself (`equal_under_proof`).
+        None => common_runs(cn, tn, |i, j| {
+            cur[i] == target[j]
+                && model.is_none_or(|(b, a)| equal_under_proof(b.child(i), a.child(j)))
+        }),
+    };
 
     let cur_mid = cn - prefix - suffix;
     let tgt_mid = tn - prefix - suffix;
-    let common = cur_mid.min(tgt_mid);
 
-    // Reconcile the overlapping changed children in place (keeps identity).
-    for k in 0..common {
-        reconcile_node(txn, content, (prefix + k) as u32, &target[prefix + k])?;
+    write_child_diff(
+        txn,
+        content,
+        RawIndex::Mapped(&raw),
+        prefix..prefix + cur_mid,
+        &target[prefix..prefix + tgt_mid],
+        model,
+        per_char,
+    )
+}
+
+/// Apply a child-list diff to `content`. The diff keeps the visible children before
+/// `mid` (`prefix` of them) and replaces the `cur_mid` in it with `targets`: the overlapping
+/// changed children are reconciled in place (keeping their identity), then the extra
+/// targets are inserted or the extra current children deleted. At most one of the two
+/// runs, since the overlap is the shorter of the two changed runs.
+///
+/// `raw` gives the raw CRDT index of visible child `i` (see [`read_children`]): the
+/// diff is computed over what the model sees, and written where it lives. Extra
+/// children are inserted right before the visible child that follows them (or at the
+/// end of the array), so a void container between two visible children stays where it
+/// was relative to the one after it.
+///
+/// `model`, when given, is the before and after of the node whose list this is, with
+/// children lined up with `raw` and with `prefix + targets.len()` and beyond: each
+/// reconciled pair is handed its own children's identity ([`Model`]).
+pub(crate) fn write_child_diff(
+    txn: &mut TransactionMut,
+    content: &ArrayRef,
+    raw: RawIndex<'_>,
+    mid: std::ops::Range<usize>,
+    targets: &[NodeData],
+    model: Model<'_>,
+    per_char: &BTreeSet<String>,
+) -> Result<()> {
+    let (prefix, cur_mid) = (mid.start, mid.len());
+    let tgt_mid = targets.len();
+    let common = cur_mid.min(tgt_mid);
+    // Where the extra children go (or the gone ones were): after the first `gap`
+    // changed children, the rest paired up behind them (`gap_of_least_moved_text`).
+    let gap = gap_of_least_moved_text(model, prefix, cur_mid, tgt_mid);
+    let (extra_cur, extra_tgt) = (cur_mid - common, tgt_mid - common);
+    // Reconcile the paired changed children in place (keeps identity). A replace
+    // inside `reconcile_node` removes and re-inserts at the same raw index, so no raw
+    // index moves.
+    let pair_of = |k: usize| {
+        if k < gap {
+            (k, k)
+        } else {
+            (k + extra_cur, k + extra_tgt)
+        }
+    };
+    let at_of = |k: usize| {
+        raw.get(prefix + pair_of(k).0)
+            .ok_or_else(|| CollabError::schema("write_child_diff: missing child"))
+    };
+    // The paired children's node maps, found in one pass when that is cheaper. A
+    // replace below removes and re-inserts one child at its own index, which leaves
+    // every other child's map and index as they were.
+    let mut nodes = None;
+    if common > 1 && one_pass_cheaper(common, at_of(0)?, at_of(common - 1)?) {
+        let ats = (0..common).map(at_of).collect::<Result<Vec<_>>>()?;
+        nodes = Some(child_maps(txn, content, &ats).into_iter());
     }
-    // Insert the extra target children.
-    for k in common..tgt_mid {
-        insert_node(txn, content, (prefix + k) as u32, &target[prefix + k])?;
+    for k in 0..common {
+        let (c, t) = pair_of(k);
+        let at = at_of(k)?;
+        let node = match nodes.as_mut() {
+            Some(nodes) => nodes.next().flatten(),
+            None => child_map(txn, content, at),
+        }
+        .ok_or_else(|| CollabError::schema("reconcile_node: missing node"))?;
+        let pair = model_child(model, prefix + c, prefix + t);
+        reconcile_node(txn, content, at, node, &targets[t], pair, per_char)?;
+    }
+    // Insert the extra targets, consecutively, before the visible child that comes
+    // after them.
+    if extra_tgt > 0 {
+        let at = raw.get(prefix + gap).unwrap_or_else(|| content.len(txn));
+        for (n, target) in targets[gap..gap + extra_tgt].iter().enumerate() {
+            insert_node(txn, content, at + n as u32, target)?;
+        }
     }
     // Delete the extra current children (from the end so earlier indices stay valid).
-    for idx in (prefix + common..prefix + cur_mid).rev() {
-        check_index(txn, content, idx as u32, false)?;
-        content.remove(txn, idx as u32);
+    for idx in (prefix + gap..prefix + gap + extra_cur).rev() {
+        let at = raw
+            .get(idx)
+            .ok_or_else(|| CollabError::schema("write_child_diff: missing child"))?;
+        check_index(txn, content, at, false)?;
+        content.remove(txn, at);
     }
     Ok(())
 }
 
-/// Minimal common-prefix/suffix splice: replace only the changed middle so unchanged
-/// characters keep their CRDT identity (and merge across peers). yrs has no
+/// Where a child-list diff whose changed run grows or shrinks puts the children it
+/// inserts or deletes (issue #1850): after the first `gap` changed children, the
+/// others paired up behind them, so the pairs keep as much of their text as they can.
+///
+/// The projection has no move: a pair reconciled in place keeps its characters'
+/// CRDT identity, and text that lands in a block on the other side of the gap is
+/// deleted and written again. A peer editing that text concurrently edits the old
+/// copy, so its edit is lost or the text arrives twice. Enter at the start of a line
+/// used to pair the line with the new empty block before it and copy all of the
+/// line's text into a new block — two peers doing it at once left the line twice.
+/// Here the gap is the one whose pairs keep the most text in place: Enter at the start
+/// of a line inserts the empty block before it and the line keeps its text, Backspace
+/// at the start of a line after an empty one deletes the empty one, a split keeps the
+/// longer half in place and writes the shorter one anew, and a join keeps the block
+/// holding more of the joined text. Ties keep the old answer: the extra children at the
+/// end of the run (a split's tail written anew, a join keeping the first block).
+///
+/// What moves is still moved: a peer's concurrent edit of the shorter half of a split
+/// lands on the old copy. A peer typing at the start of a line split in its middle,
+/// head shorter than tail, now follows the tail.
+///
+/// Without the model (a list matched by value with no model to describe it) the
+/// answer is the old one.
+fn gap_of_least_moved_text(
+    model: Model<'_>,
+    prefix: usize,
+    cur_mid: usize,
+    tgt_mid: usize,
+) -> usize {
+    let common = cur_mid.min(tgt_mid);
+    let Some((before, after)) = model else {
+        return common;
+    };
+    if cur_mid == tgt_mid || common == 0 {
+        return common;
+    }
+    let (extra_cur, extra_tgt) = (cur_mid - common, tgt_mid - common);
+    let cur: Vec<Vec<char>> = (0..cur_mid)
+        .map(|i| flat_text(before.child(prefix + i)))
+        .collect();
+    let tgt: Vec<Vec<char>> = (0..tgt_mid)
+        .map(|j| flat_text(after.child(prefix + j)))
+        .collect();
+    let score = |c: usize, t: usize| -> usize {
+        GAP_SCORES.with(|n| n.set(n.get() + 1));
+        let (b, a) = (before.child(prefix + c), after.child(prefix + t));
+        let same_kind = (b.is_textblock() && a.is_textblock()) || b.type_name() == a.type_name();
+        if !same_kind {
+            return 0;
+        }
+        let (x, y) = (&cur[c], &tgt[t]);
+        let head = x.iter().zip(y).take_while(|(p, q)| p == q).count();
+        let room = x.len().min(y.len()) - head;
+        let tail = x
+            .iter()
+            .rev()
+            .zip(y.iter().rev())
+            .take(room)
+            .take_while(|(p, q)| p == q)
+            .count();
+        head + tail
+    };
+    // Each pair is scored once (#1859's review: scoring the whole run per gap made a
+    // whole-document replace quadratic): `front[g]` keeps the first `g` pairs by index,
+    // `back[g]` pairs the rest across the gap.
+    let mut front = vec![0usize; common + 1];
+    for k in 0..common {
+        front[k + 1] = front[k] + score(k, k);
+    }
+    let mut back = vec![0usize; common + 1];
+    for k in (0..common).rev() {
+        back[k] = back[k + 1] + score(k + extra_cur, k + extra_tgt);
+    }
+    // The largest total; among equals, the largest gap (the old answer).
+    (0..=common)
+        .max_by_key(|&g| (front[g] + back[g], g))
+        .unwrap_or(common)
+}
+
+thread_local! {
+    /// How many pairs [`gap_of_least_moved_text`] has scored on this thread.
+    static GAP_SCORES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many pairs [`gap_of_least_moved_text`] has scored on this thread so far
+/// (`testing::gap_scores`).
+#[cfg_attr(not(feature = "test-util"), allow(dead_code))]
+pub(crate) fn gap_scores() -> u64 {
+    GAP_SCORES.with(std::cell::Cell::get)
+}
+
+/// A node's text as one char run, an inline atom as U+FFFC, its blocks run together.
+fn flat_text(node: &Node) -> Vec<char> {
+    fn walk(n: &Node, out: &mut Vec<char>) {
+        if let Some(t) = n.text() {
+            out.extend(t.chars());
+        } else if n.is_inline() {
+            out.push('\u{FFFC}');
+        } else {
+            for i in 0..n.child_count() {
+                walk(n.child(i), out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(node, &mut out);
+    out
+}
+
+/// The **visible** children of a content array — every child except a void container
+/// ([`is_void`]) — each paired with its raw index in the array. This is the one way
+/// the projection reads a child list, so the read-back ([`CollabDoc::to_doc`]), the
+/// diffs that write ([`reconcile_child_list`], `project_change`) and the sticky-index
+/// walk all agree on which child "index `i`" is.
+pub(crate) fn read_children<T: ReadTxn>(txn: &T, list: &ArrayRef) -> Result<Vec<(u32, NodeData)>> {
+    let mut out = Vec::with_capacity(list.len(txn) as usize);
+    // One sequential pass: `ArrayRef::get` walks the array from its start, so reading
+    // child `i` by index for each `i` would cost O(len²).
+    for (i, child) in list.iter(txn).enumerate() {
+        let nd = read_out_data(txn, child)?;
+        if !is_void(&nd) {
+            out.push((i as u32, nd));
+        }
+    }
+    Ok(out)
+}
+
+/// Minimal common-prefix/suffix splice: replace only the changed middle (between the
+/// `(prefix, suffix)` runs [`text_splice_bounds`] keeps) so unchanged characters keep
+/// their CRDT identity (and merge across peers). yrs has no
 /// `update_text` equivalent, so the diff is computed here and applied as a
 /// remove-then-insert pair, converted from char offsets into UTF-16 code units.
-pub(crate) fn splice_min(txn: &mut TransactionMut, text: &TextRef, old: &str, new: &str) {
-    let o: Vec<char> = old.chars().collect();
-    let n: Vec<char> = new.chars().collect();
-    let mut prefix = 0;
-    while prefix < o.len() && prefix < n.len() && o[prefix] == n[prefix] {
-        prefix += 1;
-    }
-    let mut suffix = 0;
-    while suffix < o.len() - prefix
-        && suffix < n.len() - prefix
-        && o[o.len() - 1 - suffix] == n[n.len() - 1 - suffix]
-    {
-        suffix += 1;
-    }
-    let del = o.len() - prefix - suffix;
-    let ins: String = n[prefix..n.len() - suffix].iter().collect();
+pub(crate) fn splice_min(
+    txn: &mut TransactionMut,
+    text: &TextRef,
+    o: &[char],
+    n: &[char],
+    hunk: &Hunk,
+) {
+    let ins: String = n[hunk.new.clone()].iter().collect();
 
-    let at: u32 = o[..prefix].iter().map(|c| c.len_utf16() as u32).sum();
-    let del_u16: u32 = o[prefix..prefix + del]
+    let at: u32 = o[..hunk.old.start]
+        .iter()
+        .map(|c| c.len_utf16() as u32)
+        .sum();
+    let del_u16: u32 = o[hunk.old.clone()]
         .iter()
         .map(|c| c.len_utf16() as u32)
         .sum();
@@ -895,6 +2765,116 @@ pub(crate) fn splice_min(txn: &mut TransactionMut, text: &TextRef, old: &str, ne
     }
     if !ins.is_empty() {
         text.insert(txn, at, &ins);
+    }
+}
+
+/// Whether the splice turning `old` into `new` inserts text right after a char that
+/// carries a non-inclusive mark (`per_char`) and is not an inline atom, **and** the first
+/// inserted char carries exactly the marks the char after the insertion point carries
+/// (nothing, at the block's end): the one case [`splice_min_with_marks`] is for. Only
+/// then does `insert_with_attributes` walk past every formatting marker between the
+/// two chars and write none of its own. Anywhere else it stops at the first marker
+/// whose value differs and writes `{link:null} X {link:old}`, and that trailing
+/// restore depends on the link's original end marker: a peer's concurrent removal of
+/// the link deletes it, and the restore brings the link back over the following text
+/// (review of #901, round 2 — a bold link, or an image right after the link). An atom is left out on purpose: an insert that
+/// steps past an image's end marker instead of clearing its own char is exposed to a
+/// peer's concurrent `src` change re-writing that marker, and a literal U+FFFC absorbed
+/// into the image's `@atom` range reads back as a second image (measured) — the
+/// insert-then-clear path of [`resync_marks`] is right for an atom.
+fn inserts_after_non_inclusive(
+    o: &[char],
+    old_marks: &[SpanMark],
+    target: &[SpanMark],
+    per_char: &BTreeSet<String>,
+    hunk: &Hunk,
+) -> bool {
+    if per_char.is_empty() {
+        return false;
+    }
+    if hunk.old.start == 0 || hunk.new.is_empty() {
+        return false;
+    }
+    let at = |marks: &[SpanMark], i: usize| -> Vec<(String, Attrs)> {
+        let mut v: Vec<(String, Attrs)> = marks
+            .iter()
+            .filter(|m| m.start <= i && i < m.end)
+            .map(|m| (m.name.clone(), m.attrs.clone()))
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    };
+    let before = at(old_marks, hunk.old.start - 1);
+    if !before.iter().any(|(name, _)| per_char.contains(name))
+        || before.iter().any(|(name, _)| name == ATOM_MARK)
+    {
+        return false;
+    }
+    let after = if hunk.old.end == o.len() {
+        Vec::new()
+    } else {
+        at(old_marks, hunk.old.end)
+    };
+    at(target, hunk.new.start) == after
+}
+
+/// [`splice_min`], but the inserted chars are written **with** the formatting `target`
+/// gives them (`insert_with_attributes`) rather than inheriting whatever surrounds the
+/// insertion point. Used when the text is inserted right after a char carrying a
+/// non-inclusive mark such as `link` ([`inserts_after_non_inclusive`]).
+///
+/// Why it matters (review of #901, D2): a char typed right after a link is plain in the
+/// model, but a plain `insert` puts it *inside* the link's range in the CRDT, and the
+/// clear that [`resync_marks`] then writes over it (`format(X, link: null)`) also
+/// deletes the link's own end marker as redundant. A peer's concurrent formatting that
+/// relied on that marker — extending the link over the text after it, or linking that
+/// text elsewhere — then lost to the typer's null, which governed everything after the
+/// typed char. Inserted with its attributes, the char steps past the existing end
+/// marker (yrs `minimize_attr_changes`) and writes no markers at all, so nothing a peer
+/// depends on is touched; where no end marker exists (the link ends its block) it
+/// writes a clear of its own, which is the same thing the resync would have written.
+///
+/// yrs unsets every current attribute an insert does not name, so each inserted run
+/// carries its **whole** target mark set, not only the per-char ones; the chars are
+/// grouped into runs of equal attributes, one insert per run.
+fn splice_min_with_marks(
+    txn: &mut TransactionMut,
+    text: &TextRef,
+    o: &[char],
+    n: &[char],
+    target: &[SpanMark],
+    hunk: &Hunk,
+) {
+    let mut at: u32 = o[..hunk.old.start]
+        .iter()
+        .map(|c| c.len_utf16() as u32)
+        .sum();
+    let del_u16: u32 = o[hunk.old.clone()]
+        .iter()
+        .map(|c| c.len_utf16() as u32)
+        .sum();
+    if del_u16 > 0 {
+        text.remove_range(txn, at, del_u16);
+    }
+    let attrs_at = |p: usize| -> YAttrs {
+        target
+            .iter()
+            .filter(|m| m.start <= p && p < m.end)
+            .map(|m| (m.name.as_str().into(), encode_mark_value(&m.attrs)))
+            .collect()
+    };
+    let end = hunk.new.end;
+    let mut i = hunk.new.start;
+    while i < end {
+        let attrs = attrs_at(i);
+        let start = i;
+        while i < end && attrs_at(i) == attrs {
+            i += 1;
+        }
+        let run: String = n[start..i].iter().collect();
+        let run_u16: u32 = n[start..i].iter().map(|c| c.len_utf16() as u32).sum();
+        text.insert_with_attributes(txn, at, &run, attrs);
+        at += run_u16;
     }
 }
 
@@ -929,24 +2909,55 @@ fn apply_mark(txn: &mut TransactionMut, text: &TextRef, s: &str, m: &SpanMark) {
 /// applies, so a span that changed extent (cleared at the old range, re-applied at the
 /// new) nets out to exactly the new range.
 ///
-/// An **inline atom**'s [`ATOM_MARK`] span rides through here as an ordinary span, and
-/// safely so: a yrs formatting clear is per *attribute key*, so a peer clearing `bold`
-/// over the atom's char cannot take `@atom` with it, and the per-span difference above
-/// means a local edit that did not touch the atom does not rewrite it either. Writing
-/// the attribute *with* the placeholder's insert instead (`insert_with_attributes`)
-/// would buy nothing: it is the same format markers around the same char. What it
-/// could not prevent either way is the boundary inheritance [`is_atom_char`] describes
-/// — an insert landing *inside* those markers — which is why that is handled on the
-/// read side rather than guarded against here.
+/// An **inline atom**'s [`ATOM_MARK`] attribute is the one exception: it is diffed **per
+/// char** by [`resync_atoms`], never per span. A span is too coarse for it,
+/// because yrs extends a formatted range over an insert at its end boundary: a char
+/// typed right after an image lands inside the image's `@atom` range at the CRDT level
+/// while the model holds it as plain text, so the current span covers `[image, typed]`
+/// with one value against a target of `[image]`. Diffed per span, that clears the image
+/// char too and re-applies its attrs as a fresh write, which outlives a peer's
+/// concurrent change of those attrs — the #193 resurrection, reached by typing one
+/// letter after a picture (review of #838). Per char, the image's own char is unchanged
+/// and is not written; only the stray char is cleared. Two *identical adjacent* atoms
+/// coalesce into one span the same way, and per-char diffing stops an edit of one from
+/// rewriting the other. An atom whose attrs changed is not reformatted at all: the
+/// change is written per attribute under its identity (`crate::atoms`).
+///
+/// A **non-inclusive** mark (`per_char`: the names the caller found with
+/// `MarkSpec::inclusive == false` on the model — the starter kit's `link`) is the same
+/// shape and is diffed per char for the same reason: a char that lands inside a
+/// link's range in the CRDT while the model holds it plain would, per span, clear the
+/// link and write it again, reverting a peer's concurrent change of its `href` or
+/// bringing back a link the peer removed. (A char *typed* right after a link no longer
+/// lands inside: [`splice_min_with_marks`] inserts it outside the range, because the
+/// clear this pass would write over it also deletes the link's end marker, which a
+/// peer's concurrent extension of the link depends on.) Every other mark
+/// stays per span: it is inclusive in the model too, so a char typed at its end
+/// carries it and there is no stray to clear — and the review of #838 found that
+/// diffing *every* mark per char loses a peer's concurrent link change in a typing
+/// shape of its own.
+///
+/// A yrs formatting clear is per *attribute key*, so a peer clearing `bold` over the
+/// atom's char cannot take `@atom` with it. Writing the attribute *with* the
+/// placeholder's insert (`insert_with_attributes`) instead would not prevent the
+/// boundary inheritance [`is_atom_char`] describes either — it is the same format
+/// markers around the same char.
 fn resync_marks(
     txn: &mut TransactionMut,
     text: &TextRef,
     current: &str,
     current_marks: &[SpanMark],
     target: &[SpanMark],
+    per_char: &BTreeSet<String>,
+    inserted: &[std::ops::Range<usize>],
 ) {
+    let is_per_char = |name: &str| name == ATOM_MARK || per_char.contains(name);
+    resync_atoms(txn, text, current, current_marks, target, inserted);
+    for name in per_char {
+        resync_per_char(txn, text, current, current_marks, target, name);
+    }
     for m in current_marks {
-        if target.contains(m) {
+        if is_per_char(&m.name) || target.contains(m) {
             continue;
         }
         let (at, len) = u16_span(current, m.start, m.end);
@@ -961,8 +2972,177 @@ fn resync_marks(
         );
     }
     for m in target {
-        if !current_marks.contains(m) {
+        if !is_per_char(&m.name) && !current_marks.contains(m) {
             apply_mark(txn, text, current, m);
+        }
+    }
+}
+
+/// The per-char half of [`resync_marks`] for one attribute `name` — [`ATOM_MARK`], or a
+/// non-inclusive mark (see there for why each). Clears the attribute from every maximal
+/// run of chars that carry it now and should not, then writes it over every maximal run
+/// of chars whose target value differs from the current one — and over nothing else,
+/// so a char that already carries its target value gets no write at all. Costs nothing
+/// when neither side holds the attribute.
+fn resync_per_char(
+    txn: &mut TransactionMut,
+    text: &TextRef,
+    current: &str,
+    current_marks: &[SpanMark],
+    target: &[SpanMark],
+    name: &str,
+) {
+    if !current_marks.iter().chain(target).any(|m| m.name == name) {
+        return;
+    }
+    let n = current.chars().count();
+    let per_char = |spans: &[SpanMark]| -> Vec<Option<Attrs>> {
+        let mut v = vec![None; n];
+        for m in spans.iter().filter(|m| m.name == name) {
+            for slot in &mut v[m.start.min(n)..m.end.min(n)] {
+                *slot = Some(m.attrs.clone());
+            }
+        }
+        v
+    };
+    let (cur, tgt) = (per_char(current_marks), per_char(target));
+
+    // Clears first: a char that carries the attribute and should carry none.
+    let mut i = 0;
+    while i < n {
+        if cur[i].is_none() || tgt[i].is_some() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < n && cur[i].is_some() && tgt[i].is_none() {
+            i += 1;
+        }
+        let (at, len) = u16_span(current, start, i);
+        text.format(txn, at, len, YAttrs::from([(name.into(), Any::Null)]));
+    }
+    // Then writes: a char whose target value is not what it carries now. A run is
+    // extended only while the target value stays the same, so one write never spans two
+    // different atoms.
+    let mut i = 0;
+    while i < n {
+        let Some(want) = tgt[i].as_ref().filter(|w| cur[i].as_ref() != Some(*w)) else {
+            i += 1;
+            continue;
+        };
+        let start = i;
+        while i < n && tgt[i].as_ref() == Some(want) && cur[i].as_ref() != Some(want) {
+            i += 1;
+        }
+        apply_mark(
+            txn,
+            text,
+            current,
+            &SpanMark {
+                name: name.into(),
+                attrs: want.clone(),
+                start,
+                end: i,
+            },
+        );
+    }
+}
+
+/// The [`ATOM_MARK`] half of [`resync_marks`]: [`resync_per_char`]'s per-char diff,
+/// with an atom whose attrs changed written as `crate::atoms` says rather than by
+/// rewriting its `@atom` value.
+///
+/// * A char that carries `@atom` and should carry none is cleared, as any per-char
+///   attribute is (a char typed right after an image inherits the image's value).
+/// * A char the splice inserted (`inserted`, in `current`'s offsets) that should be an
+///   atom is written with its whole value, named for its own char (`@for`, no `@id`,
+///   no `atoms` entry), whatever it inherited ([`write_own_value`], #1851). Its char
+///   is its identity from then on. A build from before per-attribute merging (#1503)
+///   refuses the reserved key.
+/// * A char that should be an atom and carries no `@atom` is written the same way.
+/// * A char the diff kept as the same atom ([`text_splice_bounds`]) with other attrs
+///   gets one `atoms` entry per attr that changed, so a peer's concurrent change of
+///   another attr is kept.
+/// * Anything else (another type of atom) is rewritten whole under a fresh identity.
+fn resync_atoms(
+    txn: &mut TransactionMut,
+    text: &TextRef,
+    current: &str,
+    current_marks: &[SpanMark],
+    target: &[SpanMark],
+    inserted: &[std::ops::Range<usize>],
+) {
+    if !current_marks
+        .iter()
+        .chain(target)
+        .any(|m| m.name == ATOM_MARK)
+    {
+        return;
+    }
+    let n = current.chars().count();
+    let per_char = |spans: &[SpanMark]| -> Vec<Option<Attrs>> {
+        let mut v = vec![None; n];
+        for m in spans.iter().filter(|m| m.name == ATOM_MARK) {
+            for slot in &mut v[m.start.min(n)..m.end.min(n)] {
+                *slot = Some(m.attrs.clone());
+            }
+        }
+        v
+    };
+    let (cur, tgt) = (per_char(current_marks), per_char(target));
+
+    // Clears first, by maximal runs.
+    let mut i = 0;
+    while i < n {
+        if cur[i].is_none() || tgt[i].is_some() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < n && cur[i].is_some() && tgt[i].is_none() {
+            i += 1;
+        }
+        let (at, len) = u16_span(current, start, i);
+        text.format(txn, at, len, YAttrs::from([(ATOM_MARK.into(), Any::Null)]));
+    }
+    // Then each atom whose value is not what the model holds. The chars as written are
+    // read once, and only when an atom's attrs changed.
+    let mut written: Option<Vec<AtomChar>> = None;
+    for i in 0..n {
+        let Some(want) = tgt[i].as_ref() else {
+            continue;
+        };
+        match cur[i].as_ref() {
+            // A char this change inserted is written with its whole value, whatever it
+            // inherited from the atom before it (yrs extends a range over an insert at
+            // its end), and so is a char that should be an atom and carries none. The
+            // value names its own char ([`write_own_value`], #1851): no two atoms ever
+            // share formatting markers, which a peer's concurrent delete would remove.
+            None => {
+                let (at, _) = u16_span(current, i, i + 1);
+                write_own_value(txn, text, at, want);
+            }
+            Some(_) if inserted.iter().any(|r| r.contains(&i)) => {
+                let (at, _) = u16_span(current, i, i + 1);
+                write_own_value(txn, text, at, want);
+            }
+            Some(have) if have == want => {}
+            Some(have) => {
+                if written.is_none() {
+                    // A read of what this transaction already wrote cannot fail where
+                    // the read of `current` just succeeded; an error leaves the atom
+                    // unwritten rather than half-written.
+                    written = Some(scan_text(txn, text).map(|s| s.atoms).unwrap_or_default());
+                }
+                let Some(atom) = written
+                    .as_ref()
+                    .and_then(|w| w.iter().find(|a| a.index == i))
+                    .cloned()
+                else {
+                    continue;
+                };
+                write_atom_change(txn, text, &atom, have, want);
+            }
         }
     }
 }
@@ -978,58 +3158,86 @@ fn resync_marks(
 /// value, which is outside the staged scope (A22) and fails loud rather than being
 /// dropped.
 fn read_text_data<T: ReadTxn>(txn: &T, text: &TextRef) -> Result<(String, Vec<SpanMark>)> {
-    let mut s = String::new();
-    let mut marks: Vec<SpanMark> = Vec::new();
-    for chunk in text.diff(txn, YChange::identity) {
-        let Out::Any(Any::String(part)) = &chunk.insert else {
-            return Err(CollabError::unsupported(
-                "an embedded value inside a block's text is not supported; an inline \
-                 atom is projected as a placeholder char with an `@atom` attribute, \
-                 never as a yrs embed",
-            ));
-        };
-        let start = s.chars().count();
-        s.push_str(part);
-        let end = s.chars().count();
-        if let Some(attrs) = &chunk.attributes {
-            for (name, value) in attrs.iter() {
-                // A cleared format can linger as an explicit null; it is not a mark.
-                if matches!(value, Any::Null | Any::Undefined) {
-                    continue;
-                }
-                push_mark_span(&mut marks, name, decode_mark_value(value)?, start, end);
-            }
-        }
-    }
-    marks.sort_by(|a, b| (a.start, a.end, &a.name).cmp(&(b.start, b.end, &b.name)));
-    Ok((s, marks))
+    read_text_data_with_idents(txn, text, None)
 }
 
-/// Read the node at `index` of `list` back out of the CRDT as [`NodeData`]. A node
-/// carrying a `text` object is a block (a text-block, or a leaf block atom whose text is
-/// empty — the schema, consulted in [`build_block`], is what tells those apart, and this
-/// layer has none); a node carrying a `content` array is a container, read recursively.
-/// Fails loud on a node that is neither (a corrupt projection), rather than
-/// materializing a broken shape.
-pub(crate) fn read_node_data<T: ReadTxn>(txn: &T, list: &ArrayRef, index: u32) -> Result<NodeData> {
-    let node = child_map(txn, list, index)
-        .ok_or_else(|| CollabError::schema("read_node_data: missing node"))?;
-    let type_name = node_type(txn, &node).ok_or_else(|| CollabError::schema("node has no type"))?;
-    let attrs = node_attrs(txn, &node);
-    if let Some(text_obj) = block_text(txn, &node) {
-        let (text, marks) = read_text_data(txn, &text_obj)?;
+/// [`read_text_data`], noting each inline atom's identity by char offset in
+/// `idents` when given.
+fn read_text_data_with_idents<T: ReadTxn>(
+    txn: &T,
+    text: &TextRef,
+    idents: Option<&mut Vec<(usize, Option<String>)>>,
+) -> Result<(String, Vec<SpanMark>)> {
+    let scanned = scan_text(txn, text)?;
+    if let Some(idents) = idents {
+        idents.extend(
+            scanned
+                .atoms
+                .iter()
+                .filter(|a| a.placeholder)
+                .map(|a| (a.index, a.identity(txn, text))),
+        );
+    }
+    let mut marks: Vec<SpanMark> = Vec::new();
+    for (name, attrs, start, end) in &scanned.spans {
+        push_mark_span(&mut marks, name, attrs.clone(), *start, *end);
+    }
+    // An atom's value is what its char was written with, laid over by the per-attribute
+    // writes made since (`crate::atoms`). Pushed per char and coalesced as any span is.
+    for (i, value) in merged_atoms(txn, text, &scanned)? {
+        push_mark_span(&mut marks, ATOM_MARK, value, i, i + 1);
+    }
+    marks.sort_by(|a, b| (a.start, a.end, &a.name).cmp(&(b.start, b.end, &b.name)));
+    Ok((scanned.text, marks))
+}
+
+/// [`read_map_data`] for a child value already in hand (an array iterator's item).
+fn read_out_data<T: ReadTxn>(txn: &T, child: Out) -> Result<NodeData> {
+    match child {
+        Out::YMap(node) => read_map_data(txn, &node),
+        _ => Err(CollabError::schema("read_node_data: missing node")),
+    }
+}
+
+/// Read a node map back out of the CRDT as [`NodeData`]. A node carrying a `text`
+/// object is a block (a text-block, or a leaf block atom whose text is empty — the
+/// schema, consulted in [`build_block`], is what tells those apart, and this layer has
+/// none); a node carrying a `content` array is a container, read recursively. Fails
+/// loud on a node that is neither (a corrupt projection), rather than materializing a
+/// broken shape.
+pub(crate) fn read_map_data<T: ReadTxn>(txn: &T, node: &MapRef) -> Result<NodeData> {
+    count_node_read();
+    let type_name = node_type(txn, node).ok_or_else(|| CollabError::schema("node has no type"))?;
+    let attrs = node_attrs(txn, node);
+    if let Some(text_obj) = block_text(txn, node) {
+        let mut atom_idents = Vec::new();
+        let (text, marks) = read_text_data_with_idents(
+            txn,
+            &text_obj,
+            inline_ids_recording().then_some(&mut atom_idents),
+        )?;
         Ok(NodeData::Block(BlockData {
+            atom_idents,
+            id: block_id(node),
             type_name,
             attrs,
             text,
             marks,
         }))
-    } else if let Some(content) = node_content(txn, &node) {
-        let len = content.len(txn);
-        let mut children = Vec::with_capacity(len as usize);
-        for i in 0..len {
-            children.push(read_node_data(txn, &content, i)?);
+    } else if is_table_map(txn, node) {
+        if type_name != TABLE {
+            return Err(CollabError::schema(format!(
+                "node `{type_name}` carries a table's `rows`"
+            )));
         }
+        Ok(NodeData::Table(read_table_data(txn, node)?))
+    } else if let Some(content) = node_content(txn, node) {
+        // Only the visible children: a void child container is not part of this one
+        // (see `is_void`), and a container whose every child is void is void itself.
+        let children = read_children(txn, &content)?
+            .into_iter()
+            .map(|(_, nd)| nd)
+            .collect();
         Ok(NodeData::Container {
             type_name,
             attrs,
@@ -1037,7 +3245,7 @@ pub(crate) fn read_node_data<T: ReadTxn>(txn: &T, list: &ArrayRef, index: u32) -
         })
     } else {
         Err(CollabError::schema(format!(
-            "node `{type_name}` has neither a `text` nor a `content` object"
+            "node `{type_name}` has neither a `text`, a `content` nor a table's `rows`"
         )))
     }
 }
@@ -1045,16 +3253,28 @@ pub(crate) fn read_node_data<T: ReadTxn>(txn: &T, list: &ArrayRef, index: u32) -
 // --- model → NodeData ----------------------------------------------------------
 
 /// Validate a model node is projectable and extract its [`NodeData`], recursing into
-/// list containers. A flat text-block — or a leaf block atom ([`is_leaf_block_atom`]) —
-/// becomes [`NodeData::Block`]; a supported list container ([`is_supported_container`])
+/// containers. A flat text-block — or a leaf block atom ([`is_leaf_block_atom`]) —
+/// becomes [`NodeData::Block`]; a supported container ([`is_supported_container`])
 /// becomes [`NodeData::Container`] over its recursively-read children. Anything else —
-/// an unsupported nested block (`blockquote`, table, task list) or an *inline* atom —
-/// fails loud (design A22).
+/// an unsupported nested block (a task list) or an *inline* atom — fails loud
+/// (design A22).
 pub(crate) fn read_node(node: &Node) -> Result<NodeData> {
     if node.is_textblock() || is_leaf_block_atom(node.node_type()) {
         return Ok(NodeData::Block(read_block(node)?));
     }
+    if node.type_name() == TABLE {
+        return Ok(NodeData::Table(read_model_table(node)?));
+    }
     if is_supported_container(node.type_name()) {
+        // The read-back never yields an empty container (it reads as absent — see
+        // `is_void`), so one in the model could not round-trip. The schema forbids it,
+        // so only a node built past the schema gets here.
+        if node.child_count() == 0 {
+            return Err(CollabError::schema(format!(
+                "container `{}` holds no children; every projected container requires one",
+                node.type_name()
+            )));
+        }
         let mut children = Vec::with_capacity(node.child_count());
         for i in 0..node.child_count() {
             children.push(read_node(node.child(i))?);
@@ -1066,9 +3286,9 @@ pub(crate) fn read_node(node: &Node) -> Result<NodeData> {
         });
     }
     Err(CollabError::unsupported(format!(
-        "node `{}` is not a flat text-block, a leaf block atom, or a supported list \
-         container (bullet_list/ordered_list/list_item); other nested blocks and tables \
-         are not yet supported",
+        "node `{}` is not a flat text-block, a leaf block atom, a table, or a supported \
+         container (bullet_list/ordered_list/list_item/blockquote); task lists are not \
+         yet supported",
         node.type_name()
     )))
 }
@@ -1095,6 +3315,8 @@ pub(crate) fn read_block(block: &Node) -> Result<BlockData> {
             )));
         }
         return Ok(BlockData {
+            atom_idents: Vec::new(),
+            id: None,
             type_name: block.type_name().to_string(),
             attrs: block.attrs().clone(),
             text: String::new(),
@@ -1150,6 +3372,8 @@ pub(crate) fn read_block(block: &Node) -> Result<BlockData> {
     }
     marks.sort_by(|a, b| (a.start, a.end, &a.name).cmp(&(b.start, b.end, &b.name)));
     Ok(BlockData {
+        atom_idents: Vec::new(),
+        id: None,
         type_name: block.type_name().to_string(),
         attrs: block.attrs().clone(),
         text,
@@ -1192,7 +3416,9 @@ fn push_mark_span(marks: &mut Vec<SpanMark>, name: &str, attrs: Attrs, start: us
 /// an attr in the reserved namespace would be indistinguishable from it, so it is
 /// refused here rather than silently overwritten.
 fn atom_attrs(atom: &Node) -> Result<Attrs> {
-    let mut attrs = Attrs::new();
+    // Built once, not with `Attrs::with` per attr (which copies the map each
+    // time: quadratic in an atom's attribute count).
+    let mut attrs: Vec<(&str, AttrValue)> = Vec::with_capacity(atom.attrs().len() + 1);
     for (k, v) in atom.attrs().iter() {
         if k.starts_with(RESERVED_PREFIX) {
             return Err(CollabError::schema(format!(
@@ -1201,9 +3427,10 @@ fn atom_attrs(atom: &Node) -> Result<Attrs> {
                 atom.type_name()
             )));
         }
-        attrs = attrs.with(k, v.clone());
+        attrs.push((k, v.clone()));
     }
-    Ok(attrs.with(ATOM_TYPE, AttrValue::from(atom.type_name())))
+    attrs.push((ATOM_TYPE, AttrValue::from(atom.type_name())));
+    Ok(Attrs::from_iter(attrs))
 }
 
 /// The inverse of [`atom_attrs`]: an [`ATOM_MARK`] span's attrs split back into the
@@ -1212,7 +3439,7 @@ fn atom_attrs(atom: &Node) -> Result<Attrs> {
 /// rather than materializing a guess.
 fn atom_span_type(span: &SpanMark) -> Result<(String, Attrs)> {
     let mut type_name: Option<String> = None;
-    let mut attrs = Attrs::new();
+    let mut attrs: Vec<(&str, AttrValue)> = Vec::new();
     for (k, v) in span.attrs.iter() {
         if k == ATOM_TYPE {
             let AttrValue::Str(name) = v else {
@@ -1226,9 +3453,10 @@ fn atom_span_type(span: &SpanMark) -> Result<(String, Attrs)> {
                 "unknown reserved key `{k}` in an inline atom's `{ATOM_MARK}` value"
             )));
         } else {
-            attrs = attrs.with(k, v.clone());
+            attrs.push((k, v.clone()));
         }
     }
+    let attrs = Attrs::from_iter(attrs);
     let type_name = type_name.ok_or_else(|| {
         CollabError::schema(format!(
             "an `{ATOM_MARK}` span carries no `{ATOM_TYPE}`, so there is no node to build"
@@ -1247,7 +3475,7 @@ fn atom_span_at(spans: &[SpanMark], i: usize) -> Option<&SpanMark> {
 
 // --- NodeData → model ----------------------------------------------------------
 
-/// Rebuild a model node from projected [`NodeData`], recursing into list containers.
+/// Rebuild a model node from projected [`NodeData`], recursing into containers.
 /// The inbound scope guard (A22) is shared with the outbound [`read_node`]: a container
 /// type must be one [`is_supported_container`] permits, so a peer CRDT can never
 /// materialize an out-of-scope shape here even though [`Schema::create_node`] would
@@ -1262,7 +3490,7 @@ fn build_node(schema: &Schema, nd: &NodeData) -> Result<Node> {
         } => {
             if !is_supported_container(type_name) {
                 return Err(CollabError::unsupported(format!(
-                    "container `{type_name}` is not a supported list type in the CRDT"
+                    "container `{type_name}` is not a supported container type in the CRDT"
                 )));
             }
             let mut kids = Vec::with_capacity(children.len());
@@ -1271,6 +3499,39 @@ fn build_node(schema: &Schema, nd: &NodeData) -> Result<Node> {
             }
             schema
                 .create_node(type_name, attrs.clone(), Fragment::from_children(kids))
+                .map_err(CollabError::from)
+        }
+        NodeData::Table(t) => {
+            let mut rows = Vec::with_capacity(t.rows.len());
+            for row in &t.rows {
+                let mut cells = Vec::with_capacity(row.cells.len());
+                for cell in &row.cells {
+                    let mut blocks = Vec::with_capacity(cell.children.len());
+                    for c in &cell.children {
+                        blocks.push(build_node(schema, c)?);
+                    }
+                    cells.push(
+                        schema
+                            .create_node(
+                                &cell.type_name,
+                                cell.attrs.clone(),
+                                Fragment::from_children(blocks),
+                            )
+                            .map_err(CollabError::from)?,
+                    );
+                }
+                rows.push(
+                    schema
+                        .create_node(
+                            "table_row",
+                            row.attrs.clone(),
+                            Fragment::from_children(cells),
+                        )
+                        .map_err(CollabError::from)?,
+                );
+            }
+            schema
+                .create_node(TABLE, t.attrs.clone(), Fragment::from_children(rows))
                 .map_err(CollabError::from)
         }
     }
@@ -1282,6 +3543,20 @@ fn build_node(schema: &Schema, nd: &NodeData) -> Result<Node> {
 ///
 /// A char that is an inline atom ([`is_atom_char`]) breaks every run and becomes a node
 /// of its own, carrying whatever real marks cover it.
+///
+/// **The read is normalised to the block's type** (#1227). A textblock is retyped in
+/// place ([`reconcile_node`] rewrites its `type` key and keeps its `Text`, so a peer's
+/// concurrent typing survives a paragraph → code block change), and a peer's concurrent
+/// formatting and inline atoms merge into that `Text` all the same: a paragraph made a
+/// code block while a peer bolds a char and inserts a hard break converges on a bold
+/// mark and a `hard_break` in a `code_block`, which allows neither. So a mark the type
+/// does not allow is not read ([`marks_at`]), and an inline atom it does not accept is
+/// read as ProseMirror's `setBlockType` (`clearIncompatible`) would leave it: a
+/// `hard_break` in a [`code`](rinch_editor_core::NodeSpec::code) block is the line break
+/// `"\n"`, any other is dropped ([`char_kind`]). Every replica reads the same CRDT, so
+/// this converges by construction. The stored text keeps the hidden atoms; a local edit
+/// of the block is diffed as the block reads ([`TextView`], `reconcile_read_text`) and
+/// clears the stray marks.
 fn build_block(schema: &Schema, b: &BlockData) -> Result<Node> {
     // Inbound scope guard (A22): a peer CRDT must not be able to materialize a
     // non-flat block here — `create_node` would happily build a `blockquote`/`list`,
@@ -1305,6 +3580,7 @@ fn build_block(schema: &Schema, b: &BlockData) -> Result<Node> {
                 b.marks.len()
             )));
         }
+        note_atom_id(b.id);
         return schema
             .create_node(&b.type_name, b.attrs.clone(), Fragment::empty())
             .map_err(CollabError::from);
@@ -1326,41 +3602,246 @@ fn build_block(schema: &Schema, b: &BlockData) -> Result<Node> {
         )));
     }
     let chars: Vec<char> = b.text.chars().collect();
+    // What each char reads as in a block of this type (#1227): an inline atom the
+    // block does not accept is a line break or nothing, never a node it cannot hold.
+    let kinds = chars
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| char_kind(schema, typ, &b.marks, &chars, i, c))
+        .collect::<Result<Vec<CharKind>>>()?;
     let mut runs: Vec<Node> = Vec::new();
     let mut i = 0usize;
     while i < chars.len() {
-        // An inline atom: one placeholder char carrying the reserved attribute, built
-        // as its own node with whatever real marks cover that char. One node **per
-        // char**, never per span: `push_mark_span` coalesces two adjacent identical
-        // atoms (two hard breaks, the same image twice) into a single two-char span,
-        // and those are two nodes.
-        if is_atom_char(&b.marks, &chars, i) {
-            let span = atom_span_at(&b.marks, i).expect("is_atom_char found one");
-            runs.push(build_inline_atom(
-                schema,
-                span,
-                marks_at(schema, &b.marks, i)?,
-            )?);
-            i += 1;
-            continue;
+        match kinds[i] {
+            CharKind::Gone => {
+                i += 1;
+                continue;
+            }
+            // An inline atom: one placeholder char carrying the reserved attribute,
+            // built as its own node with whatever real marks cover that char. One node
+            // **per char**, never per span: `push_mark_span` coalesces two adjacent
+            // identical atoms (two hard breaks, the same image twice) into a single
+            // two-char span, and those are two nodes.
+            CharKind::Atom => {
+                let span = atom_span_at(&b.marks, i).expect("is_atom_char found one");
+                if inline_ids_recording() {
+                    note_inline_id(
+                        b.atom_idents
+                            .iter()
+                            .find(|(at, _)| *at == i)
+                            .and_then(|(_, id)| id.clone()),
+                    );
+                }
+                runs.push(build_inline_atom(
+                    schema,
+                    span,
+                    marks_at(schema, &b.type_name, &b.marks, i)?,
+                )?);
+                i += 1;
+                continue;
+            }
+            CharKind::Text(_) => {}
         }
         // Otherwise a run of text: extend while the mark set holds and no atom starts.
-        let cur = marks_at(schema, &b.marks, i)?;
-        let run_start = i;
-        i += 1;
-        while i < chars.len()
-            && !is_atom_char(&b.marks, &chars, i)
-            && same_mark_set(&cur, &marks_at(schema, &b.marks, i)?)
-        {
-            i += 1;
+        // A dropped atom inside the run is stepped over, so the text around it is one
+        // node, as the model would hold it.
+        let cur = marks_at(schema, &b.type_name, &b.marks, i)?;
+        let mut s = String::new();
+        while i < chars.len() {
+            match kinds[i] {
+                CharKind::Gone => i += 1,
+                CharKind::Text(c)
+                    if same_mark_set(&cur, &marks_at(schema, &b.type_name, &b.marks, i)?) =>
+                {
+                    s.push(c);
+                    i += 1;
+                }
+                _ => break,
+            }
         }
-        let s: String = chars[run_start..i].iter().collect();
         runs.push(schema.text_with_marks(&s, cur).map_err(CollabError::from)?);
     }
     let attrs = b.attrs.clone();
     schema
         .create_node(&b.type_name, attrs, Fragment::from_children(runs))
         .map_err(CollabError::from)
+}
+
+/// What one char of a textblock's CRDT text reads as in the model (see [`build_block`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CharKind {
+    /// A text char: the char itself, or `'\n'` for a line break in a code block.
+    Text(char),
+    /// An inline atom the block accepts, built as a node of its own.
+    Atom,
+    /// An inline atom the block does not accept and has no text for: not read.
+    Gone,
+}
+
+/// What char `i` (`c`) of a block of type `typ` reads as (#1227), in [`build_block`]: an
+/// atom of a type the schema does not know, or that is not an inline atom, stays
+/// [`CharKind::Atom`] so that [`build_inline_atom`] fails loud on it as before; anything
+/// else is [`kind_in`]'s answer.
+fn char_kind(
+    schema: &Schema,
+    typ: &NodeType,
+    spans: &[SpanMark],
+    chars: &[char],
+    i: usize,
+    c: char,
+) -> Result<CharKind> {
+    if !is_atom_char(spans, chars, i) {
+        return Ok(CharKind::Text(c));
+    }
+    let span = atom_span_at(spans, i).expect("is_atom_char found one");
+    let (type_name, _) = atom_span_type(span)?;
+    match schema.node_type(&type_name) {
+        Some(atom_type) if is_inline_atom(atom_type) => Ok(kind_in(typ, spans, chars, i, c)),
+        _ => Ok(CharKind::Atom),
+    }
+}
+
+/// What char `i` (`c`) of a textblock's stored text reads as in a block of type `typ`
+/// (#1227), with no schema in hand. A char that is not an inline atom
+/// ([`is_atom_char`]) is text; an atom the block's content expression accepts is an
+/// atom. One it does not accept is a `'\n'` when it is a `hard_break` and the block is
+/// a [`code`](rinch_editor_core::NodeSpec::code) block that takes text (ProseMirror's
+/// `linebreakReplacement`, and what its clipboard and its HTML parser do with a `<br>`
+/// in `<pre>`), and is dropped otherwise, as `clearIncompatible` drops it.
+///
+/// The read ([`build_block`]), the write-back ([`reconcile_text`]) and sticky indexes
+/// (`crate::sticky`) all see a block through this one function ([`TextView`]), so a
+/// converted break compares equal to the model's `'\n'` and a dropped atom is skipped
+/// rather than diffed.
+fn kind_in(typ: &NodeType, spans: &[SpanMark], chars: &[char], i: usize, c: char) -> CharKind {
+    if !is_atom_char(spans, chars, i) {
+        return CharKind::Text(c);
+    }
+    let Some(type_name) = atom_span_at(spans, i)
+        .and_then(|span| atom_span_type(span).ok())
+        .map(|(name, _)| name)
+    else {
+        return CharKind::Atom;
+    };
+    let content = typ.content_match();
+    if content.accepts(&type_name) {
+        CharKind::Atom
+    } else if type_name == "hard_break" && typ.spec().code && content.accepts("text") {
+        CharKind::Text('\n')
+    } else {
+        CharKind::Gone
+    }
+}
+
+/// A textblock's stored text (its CRDT `Text`) as a block of some type reads it
+/// ([`kind_in`]): what the model holds, and where each char of it is stored.
+pub(crate) struct TextView {
+    /// The text as read: a converted break is `'\n'`, a dropped atom is absent, an
+    /// atom is its placeholder.
+    pub chars: Vec<char>,
+    /// For each read char, its index in the stored text.
+    pub stored: Vec<usize>,
+    /// For each stored index `0..=len`, how many read chars come before it.
+    pub before: Vec<usize>,
+    /// Whether some stored char reads as anything but itself.
+    pub normalised: bool,
+    /// For each stored char, whether it is an atom the read does not show as one (a
+    /// converted break or a dropped atom): its `@atom` value is left alone by a
+    /// write-back.
+    pub hidden_atom: Vec<bool>,
+}
+
+/// A textblock's stored text and the [`TextView`] of it the model block `model` reads,
+/// when that read is `model`'s text — the one test a sticky index makes before it maps
+/// a model position to a stored one or back (#1227: a block whose stored text holds a
+/// converted break or a dropped atom reads differently from how it is stored).
+pub(crate) fn model_view<T: ReadTxn>(
+    txn: &T,
+    text: &TextRef,
+    model: &Node,
+) -> Option<(String, TextView)> {
+    if !model.is_textblock() {
+        return None;
+    }
+    let (stored, spans) = read_text_data(txn, text).ok()?;
+    let chars: Vec<char> = stored.chars().collect();
+    let view = TextView::of(model.node_type(), &chars, &spans);
+    read_block(model)
+        .ok()?
+        .text
+        .chars()
+        .eq(view.chars.iter().copied())
+        .then_some((stored, view))
+}
+
+impl TextView {
+    pub(crate) fn of(typ: &NodeType, stored: &[char], spans: &[SpanMark]) -> TextView {
+        let kinds: Vec<CharKind> = (0..stored.len())
+            .map(|i| kind_in(typ, spans, stored, i, stored[i]))
+            .collect();
+        TextView::from_kinds(stored, &kinds)
+    }
+
+    fn from_kinds(stored: &[char], kinds: &[CharKind]) -> TextView {
+        let mut view = TextView {
+            chars: Vec::with_capacity(stored.len()),
+            stored: Vec::with_capacity(stored.len()),
+            before: Vec::with_capacity(stored.len() + 1),
+            normalised: false,
+            hidden_atom: vec![false; stored.len()],
+        };
+        for (i, (&c, &kind)) in stored.iter().zip(kinds).enumerate() {
+            view.before.push(view.chars.len());
+            match kind {
+                CharKind::Text(r) => {
+                    if r != c {
+                        view.normalised = true;
+                        view.hidden_atom[i] = true;
+                    }
+                    view.chars.push(r);
+                    view.stored.push(i);
+                }
+                CharKind::Atom => {
+                    view.chars.push(c);
+                    view.stored.push(i);
+                }
+                CharKind::Gone => {
+                    view.normalised = true;
+                    view.hidden_atom[i] = true;
+                }
+            }
+        }
+        view.before.push(view.chars.len());
+        view
+    }
+
+    /// The stored index a position `k` (`0..=chars.len()`) of the read text names:
+    /// right before the `k`-th read char (after any dropped atoms before it), or the
+    /// stored text's end.
+    pub(crate) fn stored_at(&self, k: usize) -> usize {
+        self.stored
+            .get(k)
+            .copied()
+            .unwrap_or_else(|| self.before.len() - 1)
+    }
+
+    /// `spans`, given over the stored text, over the read text instead; a span that
+    /// covers only dropped atoms is gone, and so is the atom value of a hidden atom
+    /// (the read shows none there).
+    fn spans_read(&self, spans: &[SpanMark]) -> Vec<SpanMark> {
+        spans
+            .iter()
+            .filter(|m| !(m.name == ATOM_MARK && self.hidden_atom.get(m.start) == Some(&true)))
+            .filter_map(|m| {
+                let (start, end) = (self.before[m.start], self.before[m.end]);
+                (start < end).then(|| SpanMark {
+                    start,
+                    end,
+                    ..m.clone()
+                })
+            })
+            .collect()
+    }
 }
 
 /// Whether char `i` is an inline atom: the [`ATOM_PLACEHOLDER`] **and** covered by an
@@ -1378,11 +3859,15 @@ fn build_block(schema: &Schema, b: &BlockData) -> Result<Node> {
 /// leans that way (A22), because an ordinary concurrent edit produces it. A yrs insert
 /// at the **end boundary** of a formatted range is swallowed into that range — that is
 /// rich-text CRDT behaviour, the same rule that continues bold when you type at the end
-/// of a bold word — so a peer typing immediately after an image inherits the image's
-/// `@atom` attribute on its new chars. Measured: it happens for every client-id order
-/// and both integration orders. Refusing it would turn "two authors, one of them typing
-/// just after a picture" into a poisoned session (issue #196) over a formatting
-/// artifact that carries no content at all.
+/// of a bold word — so any char inserted immediately after a placeholder with no
+/// formatting of its own inherits the image's `@atom` attribute. This projection's own
+/// typer never *sends* such a span: its [`resync_marks`] clears the inherited attribute
+/// from its new chars in the same transaction. But a peer that is not this projection
+/// (any Yjs client, or a projection built before the per-char resync) sends exactly
+/// that, and `a_stray_atom_attribute_from_a_peer_is_text_and_is_cleared_by_the_next_local_edit`
+/// in `tests/collab.rs` delivers one through `integrate_incremental`. Refusing it would
+/// turn "a peer typed just after a picture" into a poisoned session (issue #196) over a
+/// formatting artifact that carries no content at all.
 fn is_atom_char(spans: &[SpanMark], chars: &[char], i: usize) -> bool {
     chars.get(i) == Some(&ATOM_PLACEHOLDER) && atom_span_at(spans, i).is_some()
 }
@@ -1412,12 +3897,13 @@ fn build_inline_atom(schema: &Schema, span: &SpanMark, marks: Vec<Mark>) -> Resu
     })
 }
 
-/// The model marks active at char index `i`, resolved against the schema.
+/// The model marks active at char index `i` of a block of type `block`, resolved
+/// against the schema, leaving out every mark the block type does not allow.
 ///
 /// [`ATOM_MARK`] spans are skipped: the attribute names an inline atom, not a mark, and
 /// the schema has no mark type of that name to resolve it against — asking for one
 /// would fail loud on every atom in the document.
-fn marks_at(schema: &Schema, spans: &[SpanMark], i: usize) -> Result<Vec<Mark>> {
+fn marks_at(schema: &Schema, block: &str, spans: &[SpanMark], i: usize) -> Result<Vec<Mark>> {
     let mut out = Vec::new();
     for s in spans {
         if s.name == ATOM_MARK {
@@ -1428,7 +3914,13 @@ fn marks_at(schema: &Schema, spans: &[SpanMark], i: usize) -> Result<Vec<Mark>> 
                 CollabError::schema(format!("unknown mark type `{}` in CRDT", s.name))
             })?;
             let attrs = mt.compute_attrs(&s.attrs).map_err(CollabError::from)?;
-            out.push(Mark::new(mt.clone(), attrs));
+            // A mark the block type does not allow is not read (#1227): a peer's
+            // concurrent formatting of a block retyped into one that takes no marks
+            // (a code block) merges into its `Text` all the same. Checked after the
+            // type lookup, so a mark the schema does not know still fails loud.
+            if schema.allows_mark(block, &s.name) {
+                out.push(Mark::new(mt.clone(), attrs));
+            }
         }
     }
     // Canonical (mark-type-name) order, matching `Mark::add_to_set`. `spans` is sorted
@@ -1448,7 +3940,7 @@ fn same_mark_set(a: &[Mark], b: &[Mark]) -> bool {
 
 /// Write a model attr set into a yrs map. Values stay **typed** — an integer is an
 /// integer, not a stringified one.
-fn write_attrs(txn: &mut TransactionMut, obj: &MapRef, attrs: &Attrs) {
+pub(crate) fn write_attrs(txn: &mut TransactionMut, obj: &MapRef, attrs: &Attrs) {
     for (k, v) in attrs.iter() {
         // `attr_to_any` yields `None` for `AttrValue::Null`, which means "explicitly
         // absent" — storing it would be indistinguishable from a cleared key on
@@ -1468,7 +3960,12 @@ fn write_attrs(txn: &mut TransactionMut, obj: &MapRef, attrs: &Attrs) {
 /// no longer carries — or carries as [`AttrValue::Null`], which [`write_attrs`] never
 /// stores — are removed; keys whose value differs are written; equal keys are left
 /// untouched, keeping their CRDT history out of the transaction entirely.
-fn reconcile_attrs(txn: &mut TransactionMut, node: &MapRef, current: &Attrs, target: &Attrs) {
+pub(crate) fn reconcile_attrs(
+    txn: &mut TransactionMut,
+    node: &MapRef,
+    current: &Attrs,
+    target: &Attrs,
+) {
     let obj = match node.get(txn, ATTRS) {
         Some(Out::YMap(m)) => m,
         // Every projected node is written with an attrs map (`write_node`), but a
@@ -1500,20 +3997,20 @@ fn reconcile_attrs(txn: &mut TransactionMut, node: &MapRef, current: &Attrs, tar
 /// Read a yrs map back into a model attr set. Values yrs cannot have come from
 /// [`write_attrs`] (a nested shared type, a buffer) are skipped rather than guessed at.
 fn read_attrs<T: ReadTxn>(txn: &T, obj: &MapRef) -> Attrs {
-    let mut out = Attrs::new();
+    let mut out: Vec<(&str, AttrValue)> = Vec::new();
     for (key, value) in obj.iter(txn) {
         if let Out::Any(any) = value
             && let Some(v) = any_to_attr(&any)
         {
-            out = out.with(key, v);
+            out.push((key, v));
         }
     }
-    out
+    Attrs::from_iter(out)
 }
 
 /// One model attr value as a yrs [`Any`]. `None` for [`AttrValue::Null`], which is not
 /// stored at all.
-fn attr_to_any(v: &AttrValue) -> Option<Any> {
+pub(crate) fn attr_to_any(v: &AttrValue) -> Option<Any> {
     match v {
         AttrValue::Str(s) => Some(Any::String(s.as_ref().into())),
         // Written explicitly as a `BigInt` so the encoding does not depend on the
@@ -1546,7 +4043,7 @@ fn any_to_attr(v: &Any) -> Option<AttrValue> {
 /// (bold, italic) and a `Map` of typed values for an attr-bearing one (a link's
 /// `href`). yrs formatting attributes carry structured values, so — unlike automerge,
 /// whose marks held a single scalar — no JSON-string indirection is needed.
-fn encode_mark_value(attrs: &Attrs) -> Any {
+pub(crate) fn encode_mark_value(attrs: &Attrs) -> Any {
     if attrs.is_empty() {
         return Any::Bool(true);
     }
@@ -1561,7 +4058,7 @@ fn encode_mark_value(attrs: &Attrs) -> Any {
 /// [`encode_mark_value`] could not have produced — a wrong value kind, a non-integer
 /// number, a nested collection — rather than silently dropping a peer's corrupted mark
 /// attrs (A22).
-fn decode_mark_value(value: &Any) -> Result<Attrs> {
+pub(crate) fn decode_mark_value(value: &Any) -> Result<Attrs> {
     let map = match value {
         // The attr-less encoding — no attributes to decode.
         Any::Bool(_) => return Ok(Attrs::new()),
@@ -1572,28 +4069,34 @@ fn decode_mark_value(value: &Any) -> Result<Attrs> {
             )));
         }
     };
-    let mut out = Attrs::new();
+    let mut out: Vec<(&str, AttrValue)> = Vec::with_capacity(map.len());
     for (k, v) in map.iter() {
-        let av = match v {
-            Any::String(s) => AttrValue::from(s.to_string()),
-            Any::Bool(b) => AttrValue::Bool(*b),
-            Any::BigInt(i) => AttrValue::Int(*i),
-            Any::Number(n) if n.fract() == 0.0 => AttrValue::Int(*n as i64),
-            Any::Number(n) => {
-                return Err(CollabError::schema(format!(
-                    "non-integer number in mark attr `{k}`: {n}"
-                )));
-            }
-            Any::Null | Any::Undefined => AttrValue::Null,
-            other => {
-                return Err(CollabError::schema(format!(
-                    "unsupported value in mark attr `{k}`: {other:?}"
-                )));
-            }
-        };
-        out = out.with(k.as_str(), av);
+        out.push((k.as_str(), decode_attr_value(k, v)?));
     }
-    Ok(out)
+    Ok(Attrs::from_iter(out))
+}
+
+/// One attr value of a mark's (or an atom's) formatting value, decoded as
+/// [`decode_mark_value`] decodes each. Fails loud on a value [`attr_to_any`] could not
+/// have written.
+pub(crate) fn decode_attr_value(k: &str, v: &Any) -> Result<AttrValue> {
+    Ok(match v {
+        Any::String(s) => AttrValue::from(s.to_string()),
+        Any::Bool(b) => AttrValue::Bool(*b),
+        Any::BigInt(i) => AttrValue::Int(*i),
+        Any::Number(n) if n.fract() == 0.0 => AttrValue::Int(*n as i64),
+        Any::Number(n) => {
+            return Err(CollabError::schema(format!(
+                "non-integer number in mark attr `{k}`: {n}"
+            )));
+        }
+        Any::Null | Any::Undefined => AttrValue::Null,
+        other => {
+            return Err(CollabError::schema(format!(
+                "unsupported value in mark attr `{k}`: {other:?}"
+            )));
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1611,6 +4114,8 @@ mod tests {
         // silently materialized.
         let s = schema();
         let bad = BlockData {
+            atom_idents: Vec::new(),
+            id: None,
             type_name: "blockquote".into(),
             attrs: Attrs::new(),
             text: "x".into(),
@@ -1620,6 +4125,8 @@ mod tests {
         assert!(matches!(err, CollabError::Unsupported(_)), "got {err:?}");
 
         let unknown = BlockData {
+            atom_idents: Vec::new(),
+            id: None,
             type_name: "not_a_real_type".into(),
             attrs: Attrs::new(),
             text: "x".into(),
@@ -1632,6 +4139,8 @@ mod tests {
 
         // a flat textblock is accepted
         let good = BlockData {
+            atom_idents: Vec::new(),
+            id: None,
             type_name: "paragraph".into(),
             attrs: Attrs::new(),
             text: "ok".into(),
@@ -1686,6 +4195,8 @@ mod tests {
         assert_eq!(
             data,
             BlockData {
+                atom_idents: Vec::new(),
+                id: None,
                 type_name: "horizontal_rule".into(),
                 attrs: Attrs::new(),
                 text: String::new(),
@@ -1704,6 +4215,8 @@ mod tests {
         // a shape no model can express, so it must fail loud rather than be dropped.
         let s = schema();
         let with_text = BlockData {
+            atom_idents: Vec::new(),
+            id: None,
             type_name: "horizontal_rule".into(),
             attrs: Attrs::new(),
             text: "smuggled".into(),
@@ -1889,6 +4402,8 @@ mod tests {
         // text. Erroring would poison a live session for it.
         let s = schema();
         let stray = BlockData {
+            atom_idents: Vec::new(),
+            id: None,
             type_name: "paragraph".into(),
             attrs: Attrs::new(),
             text: "xy".into(),
@@ -1911,6 +4426,8 @@ mod tests {
         // be silently dropped or silently invented (A22).
         let s = schema();
         let block = |attrs: Attrs| BlockData {
+            atom_idents: Vec::new(),
+            id: None,
             type_name: "paragraph".into(),
             attrs: Attrs::new(),
             text: "\u{FFFC}".into(),
@@ -2017,6 +4534,8 @@ mod tests {
         let err = build_block(
             &hostile,
             &BlockData {
+                atom_idents: Vec::new(),
+                id: None,
                 type_name: "paragraph".into(),
                 attrs: Attrs::new(),
                 text: "hi".into(),
@@ -2082,7 +4601,7 @@ mod tests {
 
     /// Encode a whole foreign document as an update, for the `load` guard cases.
     fn foreign_update(build: impl FnOnce(&Doc)) -> Vec<u8> {
-        let (doc, _outbox, _sub) = CollabDoc::blank(None);
+        let (doc, _outbox, _sub, _overlay, _atoms, _epoch) = CollabDoc::blank(None);
         build(&doc);
         doc.transact()
             .encode_state_as_update_v1(&StateVector::default())
@@ -2163,6 +4682,8 @@ mod tests {
     /// projection.
     fn plausible_block() -> NodeData {
         NodeData::Block(BlockData {
+            atom_idents: Vec::new(),
+            id: None,
             type_name: "paragraph".into(),
             attrs: Attrs::new(),
             text: "hi".into(),

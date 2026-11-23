@@ -1,38 +1,66 @@
 #![allow(clippy::collapsible_if)]
+// See the identical attribute (and its rationale) in `rinch-core/src/lib.rs`
+// (#598, #372): Android's target spec has no native ELF thread-local support,
+// so `std::sys::thread_local` erases the const/non-const distinction
+// `missing_const_for_thread_local` checks for before the lint ever runs, and it
+// fires on this target on statics that are already `const { .. }`.
+#![cfg_attr(target_os = "android", allow(clippy::missing_const_for_thread_local))]
 //! rinch-dom: Custom layout engine for Rinch.
 //!
 //! Uses a direct Taffy + Parley + Vello pipeline.
-//! Implements the [`DomDocument`] trait from rinch-core.
+//! Implements the [`DomDocument`](rinch_core::dom::DomDocument) trait from rinch-core.
 
 pub mod animation;
 pub mod attr_name;
 mod calc_layout;
 pub mod computed_style;
 mod dom_impl;
+mod float_wrap;
+mod floats;
+mod font_metrics;
 pub mod fonts;
+pub mod form_control;
+pub mod hit_cache;
 pub mod html_parser;
 pub mod html_serializer;
 mod ifc;
+pub mod ifc_scope;
 pub mod image_cache;
+#[cfg(feature = "color-management")]
+pub mod image_color;
+mod image_metadata;
+pub mod image_minify;
+pub mod img_placeholder;
 pub mod layout;
 mod layout_engine;
+mod legacy_hints;
+mod list_marker;
 pub mod node;
+pub mod node_slab;
 mod out_of_flow;
 pub mod paint;
+pub mod perf;
+pub mod query;
+pub mod replaced;
 pub mod select;
 pub mod stacking;
 mod style_resolution;
 pub mod stylesheet;
 pub mod stylo_impl;
+pub mod svg_image;
+mod svg_sanitize;
+pub mod table_layout;
 pub mod testing;
 pub mod text_query;
 pub mod transition;
+pub mod visibility;
+mod webkit_box;
 
 pub use computed_style::ComputedStyle;
 pub use dom_impl::RinchDocument;
-pub use ifc::TreeCheckVerdict;
+pub use ifc::{HangStats, TreeCheckVerdict};
 pub use node::{
     DirtyFlags, DisplayMode, ElementData, IfcTextRange, InlineFlowRole, InlineLayout, LayoutResult,
-    Node, NodeContext, NodeKind, NodeTree, TextData, TextMeasure, first_legend_child,
-    node_is_disabled, node_is_disabled_in_tree, tag_is_disableable,
+    Node, NodeContext, NodeKind, NodeTree, SpellingMarks, TextData, TextMeasure,
+    first_legend_child, node_is_disabled, node_is_disabled_in_tree, tag_is_disableable,
 };

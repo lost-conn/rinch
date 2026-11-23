@@ -42,15 +42,17 @@ diff in the view.
 
 - **`Node`** — a value in the tree. It has a schema node type, typed attrs, a
   `Fragment` of children (empty for leaves), marks (on inline/text leaves), and
-  optional text (for the `text` node). `hard_break`, `horizontal_rule`, and `image`
-  are first-class nodes, not strings.
+  optional text (for the `text` node). `hard_break`, `horizontal_rule`, `embed` and
+  `image` are first-class nodes, not strings.
 - **`Mark`** — an inline annotation (`bold`, `italic`, `link{href}`, …) carried on
   text and inline leaves, with typed attrs.
 - **`Fragment`** — an ordered, sized, `Rc`-shared child list with the cut / append /
   replace primitives the transform engine needs.
 - **`Slice`** — `{ content: Fragment, open_start, open_end }`. The open depths let a
   copied or pasted range merge into the surrounding structure; it is the unit that
-  `replace` and paste operate on.
+  `replace` and paste operate on. `replace` wants the open depths to line up with
+  the range; `replace_range` fits a slice that does not (see
+  [Fitting a slice](#fitting-a-slice-replace_range)).
 
 ```rust
 use rinch::prelude::*;            // Node, Mark, Slice, Schema, Selection, Pos, …
@@ -79,10 +81,131 @@ The **schema** defines which nodes and marks exist and what content each node ma
 contain. The starter-kit catalogue:
 
 - **Nodes:** `doc`, `paragraph`, `heading{level}`, `blockquote`, `code_block`,
-  `bullet_list`, `ordered_list`, `list_item`, `horizontal_rule`, `hard_break`,
-  `text`, `image{src, alt}`, plus the table nodes.
+  `bullet_list`, `ordered_list`, `list_item`, `horizontal_rule`, `embed{data-*}`,
+  `hard_break`, `text`, `image{src, alt, title, width, data-*}`, plus the table nodes.
 - **Marks:** `bold`, `italic`, `underline`, `strike`, `code`, `link{href}`,
-  `highlight{color?}`, `text_color{color}`, `subscript`, `superscript`.
+  `highlight{color?}`, `text_color{color}`, `subscript`, `superscript`. Every mark
+  is inclusive except `link` (see [inherited marks](#state-selection-stored-marks)).
+
+An image keeps an app's own `data-*` attributes — any valid HTML custom data
+attribute name (`data-` and at least one character, no uppercase letter, no `:`, at
+most 64 bytes), with a string value — beside `src`, `alt`, `title` and `width`. That
+is what HTML's data attributes are for: an annotation id, a reference into the app's
+own store, whatever the app needs to find the picture again. The editor keeps them
+through edits, copy and paste (each written to HTML and to the host `<img>` as
+itself, an empty one included) and collaboration, and does nothing else with them.
+
+- **Reserved names.** A name rinch's own code reads or writes on elements is never
+  kept, written, stamped or read from HTML: `data-pm-*`, `data-rinch-*`, the shell's
+  state families `data-text-sel*`, `data-cursor-*`, `data-selection-*`, `data-tcm-*`,
+  and the whole names in `rinch_editor_core::schema::RESERVED_DATA_ATTRS` — `data-rid`,
+  each `data-on…` event name `rsx!` writes (exactly those: `data-one` or `data-online`
+  are yours), `data-nofocus`, `data-block-index`, `data-type`, `data-checked`, ….
+  `is_app_data_attr(name)` is the one test; a ratchet test fails when rinch's sources
+  start using a name that is neither reserved nor known to be safe.
+- **Bounds.** A node keeps at most 32 app data attributes (`MAX_DATA_ATTRS`), each
+  value at most 1024 bytes (`MAX_DATA_ATTR_VALUE`). Past either bound an attribute
+  is dropped whole, never truncated; the first ones are kept (in document order from
+  HTML, in name order otherwise), and of two with one name, the first. The bound
+  is the model's: every node of an opted-in type is built through it
+  (`create_node`, a `SetNodeAttrStep`, a node collaboration builds from a peer's
+  update, which a peer that does not bound them can send), so the document holds
+  exactly what HTML, `DocNode` and the view keep. A reserved, invalid or
+  non-string `data-*` on such a node is dropped the same way.
+- **Paste.** The default paste keeps an image's data attributes only when rinch's
+  own copy-out wrote them: `selection_clipboard` marks each element that carries
+  them with `data-rinch-clip` (`serialize::CLIPBOARD_MARK`, reserved, so it never
+  reaches a document), and the paste (`replace_selection_with_html`,
+  `serialize::slice_from_pasted_html`) keeps them only beside it. So a copy between
+  two rinch editors keeps them with no plugin, and another application's (Slack's
+  `data-stringify-type`, Vue's `data-v-…`, React's `data-reactid`, a lazy loader's
+  `data-src`) are dropped. A `Plugin::handle_paste` sees `PasteContent::html` whole
+  and can keep what it wants. A load (`load_html`, `slice_from_html`) keeps every
+  one, bounded. An app inserting its own markup with `replace_selection_with_html`
+  keeps its data attributes by writing `data-rinch-clip=""` on the element that
+  carries them (or builds the node and inserts it with `update`). The mark is a
+  filter for other applications' noise, not proof of where markup came from: a
+  page can write it too, and what it then keeps still passes the reserved list
+  and the bounds.
+
+Set or remove one like any attribute:
+
+```rust
+handle.update(|state| {
+    let mut tr = state.tr();
+    tr.step(Box::new(SetNodeAttrStep::new(pos, "data-annotation-id", AttrValue::from("a1"))))
+        .ok()?;
+    Some(tr)
+});
+```
+
+The opt-in is the node spec's: `NodeSpec::data_attrs` (`NodeSpecBuilder::data_attrs(true)`).
+The starter kit's `image` and `embed` set it, and nothing else does. Only a **leaf**
+node type (an atom: `<img>`, `<hr>`, `<br>`, an embed's `<div>`) may set it —
+`SchemaBuilder::build` panics for one with content — because HTML carries the
+attributes only on an element that holds none of the document's content. An
+attribute a node's spec neither declares nor keeps is dropped by validation
+(`to_doc`, `node_from_doc`), and the HTML writer does not write it.
+
+`width` (whole CSS pixels, absent or not positive for the natural width; read from
+HTML by HTML's dimension rules, so `320px` is 320, rounded and at most 65535) is the
+`<img>`'s `width` hint and HTML's `width`. A GFM image `![alt](src)` has neither
+`width` nor data attributes, so it is written without them; an image in a table
+written as HTML keeps both. Like every attr of an inline atom they merge per
+attribute when collaborating: two peers changing different attrs of one image at
+once both keep their change, two changing the same one converge on one value, and a
+peer's attribute follows its picture through Enter, Backspace, drags and pictures
+inserted beside it, and never shows on another picture. A picture keeps its identity
+only through a change the editor can prove only set its attributes; a change of an
+image's `src`, and any picture pasted over it (with the same `src` too), makes a new
+picture, and a concurrent change of the old one is dropped;
+so does cutting and pasting a picture, undoing its delete, or dragging it after an
+in-editor copy of it. Chosen by Joe (2026-10-09): a wrong attribution is worse than a
+lost one — app data keyed to a picture would show on the wrong picture
+(`rinch-editor-collab/tests/image_attrs.rs`, `atom_attr_merge.rs`,
+`atom_identity_differential.rs`).
+
+**`embed`** is a selectable block-level leaf atom with no attrs of its own and the
+app's `data-*` attributes (the same reserved names, bounds and paste rule as an
+image's): a block an app draws itself, which the document stores only as the atom and
+those attributes. Commands, arrows and selection treat it exactly as a
+`horizontal_rule` (`tests/embed_node.rs` runs the two side by side). It has no HTML
+tag: a block leaf whose spec has no `parse_html_tags` — `embed`, or an app schema's
+own — is written as `<div data-pm-type="NAME" data-…></div>` and read back from a
+`<div>` carrying that marker (a `<div>` without it is a container as before; the
+default paste needs rinch's copy-out mark `data-rinch-clip` beside it too, and reads
+another application's marked `<div>` as a container), and
+`serialize::set_html_fallback` gives the HTML export markup to write inside it (the
+reader ignores what is inside; see
+[the guide](contenteditable.md#embeds-blocks-an-app-draws)). Markdown writes the bare
+element as an HTML block. Collaboration projects it as a leaf block atom (empty text)
+whose attrs merge per key, like any block's
+(`rinch-editor-collab/tests/embed.rs`).
+
+**Node views.** An app draws a component in place of a leaf node with
+`EditorHandle::register_node_view` ([the guide](contenteditable.md#node-views-your-component-in-the-document)).
+The view crate gives each node of a claimed type a slot on its `ViewDesc`; the diff
+only queues work, run after the core borrow is released. A slotted node keeps its
+mount only while it is the same `Rc` or a node a `SetNodeAttrStep` of the
+transaction changed (the transaction's *kept* nodes: where each stands now and the
+node it was, so a node a step put in place is not one of them); anything else at its
+place is remounted. On the collaboration side `CollabSession::integrate_incremental_transaction`
+compares the CRDT block of every leaf block atom before and after the update: an atom
+that is another block is replaced even when equal by value, one that is the same block
+with other attributes gets `SetNodeAttrStep`s, and every other changed block is
+replaced on its own. `record_local_edit` writes an atom put in another node's place
+as a new CRDT block (a picture as a new char) unless the editor proved it the same:
+the editor hands each atom a transaction only set attributes of together with the
+node it was, so a kept atom right after one the transaction deleted is matched with
+its own old node, never with the deleted one's block. CRDT block identity and editor
+identity therefore agree. An app driving `CollabSession` itself should record a
+transaction with its mapping (`record_local_mapped`, or `record_local_edit_mapped`, which
+the editor uses): a transaction that changed one paragraph at two places is then
+written place by place, so a peer's concurrent edit between them merges. Without the
+mapping, everything between the first and the last change is rewritten (#1885). Backspace at the start of the block after a selectable leaf atom
+(and Delete before one) selects it, and the next press removes it — deliberately
+unlike ProseMirror, whose `joinBackward` deletes the atom in one press when the
+block is not empty.
 
 Each node spec carries a **content expression** (e.g. `blockquote > block+`,
 `list_item > block+`, `bullet_list > list_item+`). These compile to a **ContentMatch
@@ -109,17 +232,19 @@ handle off the document (or off `state.schema()`, which is the same instance).
 The same pointer identity is why comparing `Node`s across two editor handles fails even
 for structurally identical documents — compare their serialized HTML instead.
 
-**This reaches `EditorHandle` too.** `create_editor` mints a new `Rc<Schema>` per handle,
-and `load_doc` installs the `Node` you give it as-is, so `b.load_doc(a.doc())` hands `b` a
-document built by `a`'s schema. `b` then reports `is_mark_active("bold") == false` over
-text that is bold, and its formatting commands return `false` rather than editing it —
-before the guard above they returned `true` and left the run carrying *two* `bold` marks,
-one per schema. Move a document between handles through a serialization instead:
-
-```rust
-b.load_html(&to_html(&a.doc()));        // or
-b.load_doc(b_schema.node_from_doc(&a.doc().to_doc())?);
-```
+**This used to reach `EditorHandle` too, and no longer does (#440).** `create_editor`
+mints a new `Rc<Schema>` per handle, so `b.load_doc(a.doc())` hands `b` a document built
+by `a`'s schema — but `load_doc` (and therefore `load_html`, and the collaboration guest
+join) now re-homes the incoming document onto the receiving schema first
+(`Node::rebind`), matching every node and mark type by *name* against `b`'s own interned
+handles before installing it. `b.is_mark_active("bold")` then answers `true` over the
+adopted bold text, and `toggleBold` removes the mark rather than returning `false` (the
+pre-#440 guard's refusal) or — on an unfixed build older than #217's guard — duplicating
+it. `b.load_doc(a.doc())` is the documented way to move a document between handles; no
+manual serialization round-trip is needed for it any more. `Node::rebind` costs one
+pointer comparison per node/mark when the document is already on the target schema (the
+guest-join case: `projected_doc` already builds through the guest's own schema), and a
+rebuild only for a genuinely foreign type.
 
 ### Serialization
 
@@ -129,6 +254,262 @@ name and there is no string-tag fallthrough; deserialize consults the schema and
 **rejects** unknown types rather than dropping them silently. HTML serialization
 derives tags from the schema's `parse_html_tags`, so copy-out and paste-in share one
 table — the same one `Editor`'s `content:` prop and `load_html` use.
+
+The HTML import is **total about text** (#1397): `slice_from_html` does not fail on
+markup, the text of every element it reads is in the slice it returns (it reads no
+CSS, and drops a fixed set of elements whole: scripts, styles, embedded content,
+`<select>`, `<svg>`, `<math>`), and the slice's content is valid. It is two passes. The tree builder
+(`serialize/html_tree.rs`) follows the HTML parsing rules as far as they decide what
+is text and what holds what: a tag name runs to the next whitespace, `/` or `>` (so
+`<o:p>` is an element — the old tokenizer stopped reading at the colon); comments,
+`<![if …]>`, `<style>`, `<script>`, `<title>` and `<head>` give nothing; a `<p>`,
+`<li>`, `<td>` or `<tr>` ends where a browser ends it; an end tag closes the nearest
+open element of its name unless a table cell (or, for an inline element, a block) is
+in between; a formatting element's end tag (`</b>`, `</i>`, `</a>`, …) across an open
+block ends the element there and leaves what the block already holds formatted
+(#1410: the adoption agency algorithm, done by turning the element's stack entry
+into a placeholder and copying the element around what each element open above it
+holds, so the tree gets no deeper; skipped with more than 7 blocks or 32 elements
+open in between); a `</p>` with no `<p>` to close ends the line; an unclosed `<svg>`
+or `<math>` ends at the first HTML element. Character references are the HTML
+standard's 2,231 (#1415; decoded by `rinch_core::html_entities`, which
+`set_inner_html` on desktop shares, #2239; its `table.rs` is generated by
+`crates/rinch-core/tools/gen_html_entities.py` from the standard's `entities.json`). The tree
+is at most 192 elements deep (`html_tree::MAX_DEPTH`), so the reader's recursion is
+bounded (10,000 nested `<div>`s overflowed the stack): an element opened deeper is
+still open, so its end tag is its own, but it is flattened into the element at the
+limit — a block as a child of it, split around the blocks inside it, an inline
+element as its content alone — so past the limit no text is lost and every block
+is still a line of its own. Chrome's limit is 512 and it too keeps every element; 192 is what an
+unoptimized build reads on a 2 MB stack (about 6.4 KB a level). A tag scans the
+innermost 192 open elements for the one it closes and past those asks an index of
+where each name is open (`open_at`), so it closes what an unbounded scan would at a
+fixed cost: reading stays linear with thousands of elements open, and a block's end
+tag ends it however many unclosed elements are inside. The reader (`serialize/html.rs`) then maps the tree onto the schema:
+
+- An element with no node or mark is read through. It is inline unless it holds a
+  block or is a block-level HTML element (`div`, `section`, …).
+- A block-level element that holds no block ends the line before it (#1413) and is
+  a line itself when the text it holds directly is more than ASCII whitespace (a
+  non-breaking space); empty, or holding only spaces and line ends directly, it is
+  none. (A space inside an inline element in it still makes a paragraph:
+  `<div><span> </span></div>`.) An inline element that
+  holds a block ends none: its children are read where it stands, so the inline
+  content beside the block stays on the line of what is beside the element.
+- A run of table parts with no `<table>` is a table; what has no place in a table
+  (text in a row, a `<caption>`) is read as blocks in front of it, as a browser's
+  foster parenting puts it.
+- A textblock element (a heading) that holds blocks is not flattened: its blocks stay
+  blocks and the inline content between them takes the element's type.
+- A `<div style="white-space: pre">` is a code block, one line per `<div>` or `<br>`
+  (what VS Code copies); so is `<pre>`, where a `<br>` is a line end too.
+- A mark element around blocks marks what the same element marks around inline
+  content: text and images, not hard breaks (#1401). Mark elements nested directly
+  in one another mark the blocks once for each mark type; with a block-level
+  element between them it is once a level, as before. Neighbouring text with the same
+  marks is one text node, and a mark of a type replaces an outer mark of that type.
+
+`tests/html_reader_total_1397.rs` is the property test: a tag-soup generator that
+knows what a browser shows, checked for text conservation, validity and reading back
+the same, plus a step-count pin that reading is linear;
+`tests/html_reader_clipboard_samples.rs` holds what Word, Excel, Sheets, Docs, Notion,
+GitHub, VS Code, Apple Notes and Mail, Slack and Gmail write.
+
+The HTML import reads its three integer attributes as Chrome 153 does (#1164):
+`<ol start>` by HTML's rules for parsing integers (`" 3"`, `"3abc"` and `"2.5"`
+are 3, 3 and 2; a value past `i32` is the default 1), and `colspan` / `rowspan`
+clamped to 1..=1000 and 0..=65534, a value too large to parse being the maximum,
+and a negative or unparsable value 1.
+The model has no "to the end" span, so `rowspan="0"` is imported as the number of
+rows left in the cell's row group (`<thead>`, `<tbody>`, `<tfoot>`, or a run of
+bare `<tr>`s), counting its own — rows the import keeps: a `<tr>` with no cells is
+dropped and not counted, where Chrome counts it. Any other `rowspan` is cut at the
+same place, the end of its row group, which is where Chrome 153 cuts it when it
+lays the table out (#1176).
+
+A pasted row is as wide as its spans add up to, as Chrome lays it out (#1244): a
+`colspan` is cut only at 1000 and a `rowspan` only at the end of its row group. (From
+#1176 until #1244 the import also cut a row at 1000 columns and gave a cell that found
+its row full a rowspan of 1; a load did not, so the same table read differently by
+paste and by load.) A very wide table is bounded where it is mapped instead: a
+`TableMap` holds at most `tables::grid_slot_budget` slots, so a 57 KB paste that asks
+for a 1,000,000-column grid gets a map of 2^22 slots, and the cells past its edge are
+in no slot (no command acts on them, and the view lays them out as bands across the
+grid).
+
+A loaded document is read the same way (#1214, #1244, Chrome's limits):
+`tables::cap_spans` cuts every `colspan` past `tables::MAX_COLSPAN` (1000) and every
+`rowspan` past `tables::MAX_ROWSPAN` (65534), and `Schema::node_from_doc`,
+`EditorHandle::new` and `EditorHandle::load_doc` call it. A paste and a load of the
+same table give the same spans, except that a paste also cuts a `rowspan` at the end
+of its row group, as above. Edits are not capped — an app's own transaction, a peer's
+change (and the shared document a collaboration guest adopts on joining), or a command
+(`addColumnAfter` across a 1000-wide cell makes it 1001) — so `node_from_doc` is not a
+lossless inverse of `to_doc` for a cell that went past a limit that way. Nothing caps
+a row's width: a row of 2,100 `colspan = 1000` cells is 2,100,000 columns wide, mapped
+at the slot budget's 2,097,152. `addRowBefore` / `addRowAfter` copy the spans of the
+row beside the new one (see the guide to using the editor), so a row added there is
+about 2,100 cells, not 2 million.
+
+Whatever route a table takes into the model — paste, `load_doc`, an app's own
+transaction, the table commands — the grid `TableMap` builds over it is bounded:
+`tables::column_count` caps `width × rows` at `tables::grid_slot_budget`, twice the
+table's cells and never less than 2^22 slots (32 MB of map). A rectangular table with
+no spans fills exactly `width × rows` slots with as many cells, so it is never cut;
+what can be cut is a grid of more than 2^22 slots and more than twice its cells, as
+spans or ragged rows make one. Past the cap a cell is cut at the grid's right edge,
+and one that starts past it is in no slot, so the table commands do nothing there.
+
+A slot no cell covers — the tail of a row shorter than the grid, or what the cap cut —
+is a hole, and the table commands treat it as no cell (#1184): `deleteRow` and
+`deleteColumn` pass over it, `addColumnBefore`/`addColumnAfter` give a row with a
+hole at that column a new cell at its end, a row added by `addRowBefore`/`addRowAfter`
+gets a cell in a hole's column (one per column, or up to 1000 columns wide once the
+holes outnumber both 1000 and the table's cells, #1244), and `mergeCells` grows the top-left cell over the holes
+in its rectangle. Every span a command writes is the cell's extent in the grid ± 1,
+never the attribute's own value ± 1: a `colspan` of `i64::MAX` in a two-row table
+(which an app's own transaction can still write; a load or paste caps it at 1000),
+which the grid cuts to 2^21 columns, is 2^21 + 1 after `addColumnAfter` across it.
+
+The view lays a table out as that same grid (#1182): `<table>` is a CSS grid of
+`tables::column_count` columns and each cell is placed by its rectangle in the map
+(`tables::cell_rects`), not by its raw attributes — so a `rowspan` of `i64::MAX` in a
+two-row table spans two grid rows. The columns are written as definite grid lines,
+`grid-column: <left + 1> / <right + 1>` (#1209). The rows are written as
+`grid-row: span <bottom - top>` (`auto` for one row) when CSS auto-placement, with
+every cell locked to its columns, puts each cell in the row the map gives it — which
+it does for every table without a hole a later cell could rise into (#1226,
+`auto_rows_match_map`). A span names no row index, so a row added or deleted at the
+top of a 200-row table writes and restyles only that row's cells, not the 796 below
+it. Otherwise (a row a rowspan leaves short with a cell after the hole, a ragged row
+the next row's cells would move up into, a cell outside the grid) every cell is
+written at its row lines too, `grid-row: <top + 1> / <bottom + 1>`, because
+auto-placement knows no rows and would pack such a cell into the row before it,
+where the map has it below; a table that switches between the two forms rewrites
+every cell once. A cell the map has
+no slot for is laid out as a band across the whole grid (`grid-column: 1 / -1`) on a
+row of its own (the first the grid leaves empty, normally after its last),
+so its text stays visible and adds no column.
+Written raw, a few cells of huge spans stacked past the 32767 grid lines Taffy 0.12
+numbered a grid with, and desktop layout panicked; Taffy 0.14 (#1236) clamps a grid
+axis at 10000 tracks instead and overlaps whatever lands past them. Two limits remain, both from the desktop's
+Stylo clamping a grid line, a template and every span to 10000: a table wider than
+that is drawn 10000 columns wide; and an axis past 9999 tracks, whose lines would be
+clamped onto one, is placed by `span <n>` and auto-placement instead. A table past
+9999 rows keeps its column lines, so a cell is still placed below the one before it
+in its column. On the desktop such a table still meets Taffy's own clamp:
+a table of more than 10000 rows overlaps its rows from the 10000th on (they lay out
+in the last grid track), where Taffy 0.12 laid out up to 32767 lines correctly. A table past 9999 columns loses its row lines too, because cells
+locked to their row with auto-placed columns can grow the grid past what Taffy
+numbers (on Taffy 0.12 a row of four `colspan = 20000` cells panicked; 0.14 clamps
+the axis at 10000 tracks); there a short row's cells are still lifted into the row
+before it, on the web as well as the desktop.
+
+### Markdown
+
+Under the `markdown` feature, `serialize::doc_to_markdown(&doc)` writes a document
+as Markdown and `doc_from_markdown(&schema, md)` / `doc_from_markdown_strict(&schema,
+md)` read it back. Markdown is for people and language models to read and write; the
+durable format is still the `DocNode` shape above.
+
+The dialect is CommonMark with GFM strikethrough and pipe tables (read by
+pulldown-cmark), plus a small, exact set of inline HTML for what Markdown has no
+syntax for:
+
+| model | written as | also read |
+| --- | --- | --- |
+| `bold`, `italic`, `strike` | `**…**`, `*…*`, `~~…~~`; `<strong>`, `<em>`, `<s>` where a delimiter would not flank | `<b>`, `<i>`, `<del>` |
+| `underline` | `<u>…</u>` | |
+| `highlight` | `<mark>…</mark>`, `<mark style="background-color:C">…</mark>` | |
+| `text_color` | `<span style="color:C">…</span>` | |
+| `subscript`, `superscript` | `<sub>…</sub>`, `<sup>…</sup>` | |
+| `link`, `image`, `code`, `hard_break` | Markdown syntax; a hard break is `<br>` at a textblock's end and in a heading | `<br>`, `<br/>` |
+| `table` | a GFM pipe table when it has one header row, no merged cells and one inline paragraph per cell; otherwise an HTML `<table>` block | |
+| `task_list` > `task_item` | GFM's `- [ ] …` / `- [x] …`; in a table written as HTML, `<ul data-type="taskList">` > `<li data-type="taskItem" data-checked="true">` | `[X]` |
+
+`C` is a colour `is_safe_css_color` accepts (the HTML paste path's check). The writer
+writes a colour only when it passes: a `highlight` with any other colour is written as
+a bare `<mark>`, and a `text_color` with one is not written at all, so a colour that
+arrived unchecked (a `DocNode`, a collaboration peer) never reaches the output. HTML
+copy-out (`node_to_html`) applies the same check, so it no longer writes a colour like
+`var(--x)` or `oklch(…)`. Tag
+names are case-insensitive; the `style` attribute must be lowercase and quoted (either
+quote) and hold that one declaration.
+
+**Task lists** (#1365). An item's marker starts its first paragraph, and the item's
+other blocks are indented under it like any list item's. An item that starts with
+another block (a heading, a quote, a list, …) is written with the marker alone on its
+line, `- [ ] ` with a trailing space, and the block on the next line: written after the
+marker, pulldown-cmark misreads a quote's or a nested list's later lines. A rule in that
+position is written `***`, because `---` under the marker's line is a setext heading to
+GitHub. An empty item is the marker and its trailing space; GFM itself has no empty task
+item, and GitHub shows one as the text `[ ]`. A bullet or task list that directly
+follows another is written with `*` instead of `-` (and back), because CommonMark
+continues a list across blank lines when the bullet is the same, which would turn a
+bullet list and the task list after it into one list.
+
+On reading, a bullet list whose items all start with a marker is a `task_list`. The
+reader finds a marker in the item's source rather than trusting pulldown-cmark's event
+for it, which arrives inside whatever paragraph comes first or, before a heading (`- [ ]
+# Heading`), not at all. A marker with nothing after it on its line (`- [ ]`, the
+writer's empty item once an editor or an LLM strips trailing whitespace) is text to
+pulldown-cmark; both readers take it as an empty item's marker when it is the item's
+whole first paragraph. A bullet item whose text is `[ ]` is written `- \[ \]`, so it
+stays a bullet. A marker on an item of an **ordered** list, or of a list where some
+items have none, has no place in the model: the strict reader refuses it
+(`Construct::TaskList`) and the lenient one gives it back as text at the start of the
+item (`[ ] todo`; before another block, a paragraph of its own).
+
+HTML copy-out (`node_to_html`, `slice_to_html`) writes a task list with the same
+`data-type` / `data-checked` markup (TipTap's), and `slice_from_html` parses it, a run
+of bare `<li data-type="taskItem">` (a selection inside one list) included, as a
+`task_list`. A pasted task list is fitted like any list
+([Fitting a slice](#fitting-a-slice-replace_range)): on an empty line or an empty item
+it keeps every checkbox; inside text its first item's text continues the line (that
+item's checkbox goes with the item) and the rest stays a task list. In a collaborating
+editor a pasted task list stalls outbound like any other (A22).
+
+**What round-trips.** A document of the starter kit's marks and nodes written with
+`doc_to_markdown` reads back with `doc_from_markdown_strict` as the same document, and
+writing it again changes nothing — except for the losses below.
+`tests/markdown_round_trip_fuzz.rs` holds the writer to that over seeded random
+documents. Text is escaped so it reads back as text: Markdown punctuation, a block
+marker at a line's start, `<` (a tag or an autolink), an entity-shaped `&`, a trailing
+`#` run in a heading, and a line break inside text (written `&#10;`).
+
+**Strict reading.** `doc_from_markdown` is lenient: what it cannot represent (other raw
+HTML, unsafe URLs, footnotes, a task-list marker in an ordered or mixed list) it drops
+or keeps as text. `doc_from_markdown_strict` parses the same way but fails with
+`MarkdownError::Unsupported { construct, line, source }` on the first construct the
+lenient read would drop or degrade, naming it with a `Construct` (`InlineHtml`,
+`HtmlBlock`, `UnmatchedTag`, `Footnote`, `TaskList`, `UnsafeLink`, `UnsafeImage`,
+`UnsupportedMark`, `Other`; the enum is `#[non_exhaustive]`) and its 1-based line.
+`MarkdownError::Invalid` carries a schema validation error. Strict accepts everything
+the writer writes (`strict_reads_everything_the_writer_writes` in the fuzz holds it to
+that, losses included): a textblock of only hard breaks, written `<br>` alone on a line
+— which CommonMark reads as an HTML block — reads back as one. Inside an HTML `<table>`
+block strict refuses another tag, stray text, an unsafe `href` or `src` (`UnsafeLink` /
+`UnsafeImage`), and any attribute the import does not keep — a `style` other than a safe
+colour or `text-align`, a `colspan` above 1000, a `class`, an event handler, a
+`data-type` other than `taskList` on a `<ul>`, a `data-checked` other than
+`true`/`false` or outside a task list (`HtmlBlock`). What strict accepts, it parses
+exactly as the lenient reader does.
+
+**Known losses.**
+- Whitespace at the start or end of a textblock or line is stripped (CommonMark;
+  not in a table written as HTML, where it round-trips), and
+  whitespace at the edge of a bold, italic, strike or link run is written outside the
+  run: the text round-trips and that whitespace leaves the mark.
+- A code block's language is lost in a table written as HTML; two adjacent ordered
+  lists, or two adjacent blockquotes, merge; empty paragraphs are dropped; a link `href`
+  containing `\` before punctuation or an entity is decoded on read (#1366).
+- A line break inside inline code becomes a space (a code span is literal), and one
+  inside a link `href` reads back as text.
+- An ordered list numbered past nine digits is not a list to CommonMark.
+- A `colspan` above 1000 or a `rowspan` above 65534 is written clamped to those limits,
+  which the HTML import applies anyway.
+- A paragraph's or heading's `indent` is not written, and a link's `target` and a
+  textblock's `text_align` only in a table cell.
 
 ## The transform engine
 
@@ -149,9 +530,37 @@ gestures map onto it:
 | `RemoveMarkStep { from, to, mark }` | Remove a mark across an inline range. |
 | `SetNodeAttrStep { pos, attr, value }` | Change one node attr (heading level, image alt, list start). |
 | `SetDocAttrStep { attr, value }` | A document-level attr. |
+| `BatchStep` (`Transaction::batch(Vec<BatchEdit>)`) | Many disjoint replaces and node-attr changes, stated in the coordinates of the document it applies to, as **one** step. |
 
-Tables and collaboration add **no new step kinds** — table edits are `Replace` /
-`ReplaceAround` / `SetNodeAttr` over the table, row, and cell nodes.
+`BatchStep` is the one step kind that exists for cost rather than expressiveness. It
+means its edits applied one at a time from the last position to the first (two
+changes of one node's attribute: the last given wins): it builds the document they
+build, and its step map maps every position as those `ReplaceStep`s did. It differs
+in three places. Each rebuilt node's content is checked once, on the result, so it
+accepts a batch whose sequence would pass through an invalid intermediate state.
+Mapped over another change (`Step::map`, a rebase), each *range* maps as one
+`ReplaceStep` of it would — and inserts at one point, and deletions that meet, are one
+range from construction, so a concurrent insert between two such deletions is deleted
+with them where two separate deletions would keep it. Two kept ranges the change brings
+to meet end to end become one replace of both — the same document — unless one
+carries an open slice: then the later edit is dropped and **its content is lost**,
+where separate steps would apply it. An attribute change the change puts inside a kept
+range is dropped as well. No table command builds an open slice. And a selection a command
+does not set is mapped once through the step and resolved in its result, where a
+step per row mapped it after every step: in about 0.6% of the commands the table
+differential compares, the selection lands somewhere else (the old one was placed in an intermediate document). It rebuilds
+each node on the way to an edit once and keeps one document in the transaction
+rather than one per edit. Every table command is one `BatchStep`
+(#1200): as a step per row, a column into 16,000 rows rebuilt and kept the row list
+16,000 times (6.4 s, 2.1 GB; 29 ms as one step). The one exception is `deleteRow` /
+`deleteColumn` on a table whose cells overlap (or, past the slot budget, a table with
+cells in no slot), which still removes one row or column per step on a recomputed
+map — but only while the maps that takes come to at most 2^22 slots in all (#1874).
+Past that it removes them in one pass over the one map, as on any other table, and
+its result can differ from the one-at-a-time removal where cells overlap. Without
+that bound, deleting a 1000-column cell of a 2,097,152-column table rebuilt a
+2^22-slot map 999 times (10 s), and deleting a whole row of it took hours; it takes
+under 0.2 s now. Collaboration adds no step kinds.
 
 A few gesture → step mappings:
 
@@ -163,7 +572,92 @@ A few gesture → step mappings:
 | Toggle bold over a range | `AddMarkStep` / `RemoveMarkStep` over `from..to` |
 | Toggle bold at a cursor | **no step** — set `stored_marks` (applied to the next typed text) |
 | Wrap in blockquote | `wrap(range, [(blockquote, {})])` → `ReplaceAroundStep` |
-| Paste | parse to a `Slice`, then `ReplaceStep(from, to, slice)` |
+| Paste | parse to a `Slice`, then `replace_range(from, to, slice)`: one `ReplaceStep`, or a `ReplaceAroundStep` when the text after the caret moves into the pasted content |
+
+### Fitting a slice: `replace_range`
+
+`ReplaceStep` is strict: the slice's open depths must line up with the range, and
+every node it rebuilds must be valid. Content that comes from somewhere else rarely
+lines up — a list has no place inside the paragraph the caret is in — so paste goes
+through `Transform::replace_range(from, to, slice)` (`Transaction::replace_range`, and
+`Transaction::replace_selection(slice)`, which also places the caret). It is
+ProseMirror's `replaceRange` and `Fitter` (`transform/fit.rs`), and it adds **one**
+step or fails with nothing changed.
+
+The rules, with `|` the caret and a pasted `<ul><li>A</li><li>B</li></ul>`:
+
+| Where | Result | Why |
+|-------|--------|-----|
+| `<p>a|bc</p>` | `<p>aA</p><ul><li>Bbc</li></ul>` | Content open at the slice's start continues the textblock; the rest keeps its structure; the text after the caret joins the textblock the slice ends in |
+| `<p>|</p>` (an empty line) | the list | The range covers a whole textblock and the slice starts in a *defining* node (`list_item`), so that node is kept and replaces the textblock |
+| `<ul><li>x|y</li></ul>` | `<ul><li>xA</li><li>By</li></ul>` | Open nodes join the nodes of compatible content around the caret: items become sibling items, and the target list keeps its kind |
+| an empty item | the pasted items, in its place | as the empty line |
+| `<p>a|bc</p>`, pasting `<hr>` or a table | `<p>a</p><hr><p>bc</p>` | A closed block closes the textblock and goes in beside it; at a textblock's edge no empty block is left |
+| a table cell | as above, inside the cell | A fit never leaves the isolating node the range starts in |
+| `<ul><li>x|y</li></ul>`, pasting a **task** list | `<ul><li>xA<ul data-type="taskList"><li>By</li></ul></li></ul>` | `task_item` and `list_item` are different nodes: nothing joins, so the rest of the list goes in the item. ProseMirror nests there too |
+
+`NodeSpec::defining` (ProseMirror's) marks the nodes that are kept on an empty line:
+`list_item`, `task_item`, `heading`, `blockquote` and `code_block` in the starter kit.
+A pasted `<h2>` on an empty line is therefore a heading (it was a paragraph with the
+heading's text before #1382), and in the middle of a paragraph it is its text.
+
+`slice_from_html` decides the open depths, since markup has none: each edge is open
+down to the textblock there, and closed when it reaches none (a rule, a table). So a
+list is open through its first and last items, as a selection inside it is.
+
+What it does not do, where ProseMirror does:
+
+- It never **creates** a node to make content valid (`fillBefore`) and never **wraps**
+  content in a node it was not in (`findWrapping`): the content matcher cannot be
+  asked for either. A fit that would need one fails, and a paste then falls back to
+  its plain text.
+- A range whose two ends are in different isolating nodes (from text in a table cell
+  to text outside its table) is fitted like any other, as ProseMirror fits it (#1930;
+  it used to get the plain `replace` only, which refused it). The fit can take cells
+  out of a row; the selection gestures repair a table it left ragged (see
+  `Transaction::delete_selection`), a transaction built from positions does not. Two
+  cells of one table never reach it from a selection: `EditorState::apply` holds that
+  range as a cell selection (`Selection::normalized`, #1847).
+- A **cell selection** is not a range: its `from()..to()` are the positions before
+  its two corner cells. `Transaction::replace_selection` refuses one, and so do
+  `delete_selection`, `insert_text`, `replace_selection_with` and `insert_block`
+  (#1847; `splitBlock` and Enter therefore refuse one too). The paste
+  (`EditorHandle`) clears the selected cells (`commands::table_ops::clear_cells`) and
+  fits the content in the top-left cell, in one transaction — what ProseMirror's
+  `CellSelection.replace` does with content that is not cells. `replace_range` itself
+  takes positions and will fit whatever range it is given.
+- A slice holding an invalid node (the nodes open at its edges aside) is refused.
+  The HTML reader never makes one: a `<td>` or `<tr>` with no table around it is read
+  as a table (#1392).
+
+The fitter keeps, per open node, how far its children have got through the content
+expression (`ContentMatch::start` / `advance` / `accepts_end`) and steps it once per
+node placed, so a paste costs in proportion to its size
+(`a_fit_is_linear_in_what_it_places` counts the steps at n and 2n).
+
+`tests/replace_range_fuzz.rs` pastes random slices over random ranges of random
+documents: no panic, no invalid document, every step undoes exactly, and the content
+the HTML reader makes of the fuzz's markup (every starter-kit block, nested) always
+fits at a caret or a selection inside one textblock.
+
+**A delete is fitted the same way.** `Transform::delete(from, to)` is the plain
+`replace` when the range's ends are at the same depth. When they are not (from a list
+item into the item nested under it, from a paragraph into a list), it fits the empty
+slice: what is left of the textblock the range ends in joins the one it starts in, as
+ProseMirror's `Transform.delete` does, in one step. `deleteSelection`, Backspace and
+Delete over a selection, Enter, `insertHorizontalRule`, the word deletes and typing
+over a selection (`EditorHandle::insert_text`, which deletes the selection and then
+inserts; `Transaction::insert_text` alone is the plain replace) all go through it, and leave a caret where the range began. A range
+that leaves or enters a table cell (an isolating node) is fitted too (#1930): from "a|b"
+in a cell to "z|w" after the table, the "w" joins the cell's paragraph and the rest of
+the table after the cell goes, and the selection gestures pad any row that left short.
+Select-all then Delete in a blockquote holding a paragraph and a table leaves the quote
+with an empty paragraph (#1945). Still refused: a range that
+holds only the boundary between two textblocks that cannot join (the end of a code
+block and the start of marked text), and `insertHardBreak` or an image insert over a
+selection whose ends are at different depths (#1460). A selected list item is emptied,
+not removed (#1460). `tests/review_1422.rs` checks every range of random nested
+documents against those rules.
 
 `Step::apply` is where **schema enforcement** lives: a `ReplaceStep` whose slice
 would violate the parent's ContentMatch returns an error and the whole transaction is
@@ -191,7 +685,10 @@ EditorState { doc, selection, stored_marks, schema, plugins, plugin_state }
 ```
 
 `state.apply(tr)` runs the transaction's steps, then folds each plugin's state
-forward (history pushes inverted steps, decoration sets remap through the mapping).
+forward (history pushes inverted steps). Decorations are **not** stored and
+remapped by the core: `state.decorations()` asks every plugin afresh for the
+state being rendered, so a plugin that caches decoration ranges maps them through
+`tr.mapping()` in its own `apply`.
 It returns a brand-new state; nothing is mutated in place, no DOM is touched.
 
 **Selection** is part of state and is mapped forward by every transaction. It is one
@@ -212,6 +709,43 @@ model.
 
 Toggling a mark at a *collapsed cursor* sets `stored_marks`; toggling over a *range*
 emits an `AddMark`/`RemoveMark` step.
+
+**Inherited marks and `inclusive`.** With no stored marks, typed text takes the marks
+of its position (`ResolvedPos::marks`, ProseMirror's `$pos.marks()`):
+
+- inside a text run: that run's marks;
+- at a boundary between two runs: the marks of the run *before* it;
+- at the start of a textblock: the marks of the run after it.
+
+A mark spec's `inclusive` flag (`MarkSpec::inclusive`, default `true`, builder
+`.inclusive(false)`) decides what happens at a mark's **end**. An inclusive mark
+(`bold`) carries on: type right after a bold word and the new text is bold. A
+non-inclusive mark does not: at a boundary it is dropped unless the run after the
+position carries a mark of the same type too, and at a textblock's start it is
+dropped. The starter kit's `link` is the one non-inclusive mark, as in ProseMirror's
+example schema and tiptap, so for a link:
+
+| Caret | Typed text | `active_link_href()` |
+|---|---|---|
+| inside the link | linked | the link's `href` |
+| at the link's start | not linked (the text before decides) | `None` |
+| right after its last character | not linked | `None` |
+| right after its last character, with a *different* link right after | in the first link | the first link's `href` |
+
+That last row departs from ProseMirror, where the typed text is plain. With
+collaboration on, plain text between two links cannot be written to the CRDT
+without a formatting marker that brings a link back onto text nobody linked when a
+peer removes the second link at the same moment; text that continues the first link
+needs no marker at all.
+
+`is_mark_active`, `marks_at` and `Transaction::add_stored_mark` read the same rule.
+With collaboration on, the typed character is written to the CRDT outside the link
+as well, in a way that leaves the link's own formatting untouched, so a peer's
+concurrent change to the link — a new `href`, removing it, extending it over the
+text after it — survives. What such a concurrent change *can* do is take the typed
+character with it: when the peer re-writes the link or links the text after it at
+the same moment, the character may end up inside the peer's link (#923). Both editors
+still end up with the same document.
 
 ## Commands, keymap, input rules
 
@@ -251,21 +785,64 @@ just-typed character can complete a shortcut and rewrite the text instead of bei
 inserted verbatim (ProseMirror's `inputRules` plugin). They only fire at a collapsed
 cursor; paste and IME preedit don't reach this path (an IME *commit* does).
 
+**Structural commands keep tables rectangular** (#1232). A table cell is an
+*isolating* node, and no command cuts one: `Transform::split` refuses a split that
+would (`rinch_editor_core::transform::can_split` asks first, the isolating half of
+ProseMirror's `canSplit`), a lift stops at the cell, and a join neither merges two
+tables nor wraps the block after a table into a new row of it (ProseMirror's
+`deleteBarrier` treats both as isolated; rinch's `table` is not marked isolating, so
+the join names the table parts). `splitBlock` splits only a textblock: at a caret that
+sits between two blocks (between a rule and a paragraph in a cell) it refuses, and
+Enter there puts an empty paragraph at the gap instead (`create_paragraph_near`,
+ProseMirror's `createParagraphNear`, in Enter's chain after the list-item split);
+`insertHorizontalRule` and the other block inserts go in at such a gap without
+splitting the cell around it. Backspace at the start of a block right after a table
+(at the top level, or inside a list item or a quote) neither joins, wraps nor lifts:
+an empty paragraph there is deleted and the caret goes to the end of the table's last
+textblock, and any other block **selects the table**, so a second Backspace deletes
+it (ProseMirror's `joinBackward` empty-block branch and `selectNodeBackward`; the
+select-first rule rinch keeps beside a rule or an embed). A selection that crosses cells as a text range, or a
+node selection of a cell or a row, is not covered (#1847).
+
 ## History
 
 There is **one** history, implemented as a plugin. It stores **inverted steps** (not
 byte positions), groups them by transaction boundary, and **merges consecutive typing
-transactions** within a time/affinity window, so a burst of typing undoes as one
-step. On undo it pops a group, rebases its inverted steps over any intervening
-mappings, applies them as a transaction that doesn't re-enter history, and restores
-the recorded selection. `undo` / `redo` are the only history entry points.
+transactions** less than 500 ms apart, so a burst of typing undoes as one step and a
+pause starts the next. "Typing" is any transaction made only of non-structural replace
+steps: text inserts and deletes, Backspace and the word deletes, and also an inline
+picture or a plain-text paste, which therefore join a run they land in. Anything else
+— a split, a mark, a block change — is a step of its own, and an explicit caret move,
+a stored-mark toggle (cursor Bold), an undo and a redo each end the group, so the next
+keystroke starts a new one. The time is `Transaction::time`, which the core never reads
+a clock for: `EditorHandle` stamps every local edit it dispatches (`update`, the input
+paths, `command`, `insert_image`, `toggle_link`) with a millisecond clock (`web_time`,
+so `performance.now()` in a browser) unless its builder called `set_time` itself
+(#940; before, nothing stamped it and all typing merged into one step). A builder that
+does must read the same clock, `history_now_ms()`: a time on another clock (epoch
+milliseconds) stops the next keystroke from merging. On undo it pops a group, applies
+its inverted steps as a transaction that doesn't re-enter history, and restores the
+recorded selection. A change the history does not record (a collaboration peer's, any
+transaction with `add_to_history(false)`) is kept as its step maps, and an undo maps each
+inverted step through everything after it before applying it (ProseMirror's
+`Branch.addMaps` / `popEvent`, #1249): it lands on the text where it now is. The maps of
+such a change are reconstructed from the documents before and after it, diffed position by
+position (marks and block types ignored), so where identical content makes that ambiguous an
+undo can land on the wrong copy (#1895). A step that no longer maps (its text was deleted)
+or no longer applies is skipped, and the undo is still used up; an undo of typing a peer has
+since typed inside deletes only the typed text, around theirs. `undo` / `redo` are the only
+history entry points.
 
 ## Plugins
 
 History, tables, links, input rules, and (later) collaboration and accessibility are
 **all plugins** — none is special-cased in the core. A plugin can contribute schema
 nodes/marks, commands, keymap bindings, input rules, per-document state, decorations
-(preedit overlay, selection rectangle, search highlight), and node-views. This is how
+(a widget such as the placeholder, or an inline class over a document range — a
+spellcheck squiggle, a search highlight), node-views, and a claim on a paste
+(`handle_paste`: the transaction to apply instead of the default paste, asked in
+plugin order through `EditorState::handle_paste`). An app adds its own with
+`EditorHandle::add_plugin`. This is how
 features compose without bloating the core.
 
 ## The view seam
@@ -281,8 +858,10 @@ The view, on each transaction:
 
 1. **Diffs** the new document against the descriptor tree it retained from the previous
    one. Because the model is persistent, `Node::same_ref` (an `Rc::ptr_eq`) makes the
-   diff cheap — unchanged subtrees are skipped entirely. The diff is positional, and a
-   node whose tag or mark set changed is rebuilt rather than patched.
+   diff cheap — unchanged subtrees are skipped entirely. Siblings unchanged at the start
+   and the end of a child list are matched first, so a new or removed block leaves the
+   blocks after it on their own host nodes; the stretch between is diffed positionally,
+   and a node whose tag or mark set changed is rebuilt rather than patched.
 2. **Patches** the host for the changed regions via the standard `DomDocument`
    primitives (`create_element` / `create_text` / `append_child` / `insert_before` /
    `remove` / `set_text` / `set_attribute` / `set_style`), choosing tags from the
@@ -291,6 +870,19 @@ The view, on each transaction:
 3. **Renders the caret and selection from `state.selection`** (after layout, in the
    second phase), converting the model's char `Pos` to a byte offset for the platform's
    text layout only at this render edge.
+
+**Node views** (an app's component drawn for a leaf node: an `embed`, or an
+`image` a spec claims) ride on the same diff. A node a registered spec may draw
+gets a *slot* on its descriptor; the diff only queues work for it, and the view
+mounts, updates and disposes components after the transaction, with no editor
+state borrowed. A slot keeps its mount only while its node is the same node: the
+same `Rc`, or one a `SetNodeAttrStep` of the transaction changed (the editor
+proves which, from the steps). A claimed image's host is an inline-block `<span>`
+swapped in for its `<img>` while a component is mounted in it; to the caret map
+it is still the image — one position, no text bytes. A collaborator's change
+arrives as `SetNodeAttrStep`s when the shared document proves the atom is the same
+one (a block atom by its CRDT block, an inline atom by its identity), and as a
+replace otherwise. See [the guide](contenteditable.md#node-views-your-component-in-the-document).
 
 Around that, the platform crates own block virtualization (skipping layout for
 off-screen blocks while keeping their real height), IME positioning, and — under the

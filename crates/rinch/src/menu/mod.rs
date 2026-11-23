@@ -1,44 +1,53 @@
 //! Unified menu system for native window menus, the in-app DOM menu bar, and
 //! system tray context menus.
 //!
-//! Provides [`Menu`] and [`MenuItem`] builder types that work with native menu
-//! bars (via `muda`), the DOM menu bar ([`render_with_menu_bar`]) and tray
+//! Provides `Menu` and `MenuItem` builder types that work with native menu
+//! bars (via `muda`), the DOM menu bar (`render_with_menu_bar`) and tray
 //! context menus (via `tray-icon`). Callbacks are `Rc<dyn Fn()>` — no
 //! `Send`/`Sync` burden on users. The runtime wires push-based event delivery
 //! so callbacks always run on the main thread.
 //!
 //! # What is platform-independent, and why
 //!
-//! Everything an app *declares* — [`Menu`], [`MenuItem`], shortcuts as plain
+//! Everything an app *declares* — `Menu`, `MenuItem`, shortcuts as plain
 //! strings, `on_click`, `enabled`, separators, submenus — and everything that
-//! *renders* a menu out of DOM nodes ([`render_with_menu_bar`],
-//! [`render_menu_bar_standalone`]) builds with `default-features = false`: no
+//! *renders* a menu out of DOM nodes (`render_with_menu_bar`,
+//! `render_menu_bar_standalone`) builds with `default-features = false`: no
 //! `muda`, no `winit`, no windowing at all. That is what lets a `rinch-web` app
 //! declare the same menus as its desktop build and get the same bar in the
 //! browser (`rinch_web::mount_with_menu_bar`).
 //!
-//! Behind `#[cfg(feature = "desktop")]` sit only the pieces that need a native
-//! toolkit: the `muda` builders (`build_native_menu_bar`, `build_muda_menu`),
-//! the accelerator conversion, the muda event handler, window attachment, and
+//! Behind `#[cfg(feature = "native-menus")]` sit only the pieces that need a
+//! native toolkit: the `muda` builders (`build_native_menu_bar`,
+//! `build_muda_menu`), the accelerator conversion, the muda event handler and
+//! window attachment. On Linux muda links GTK 3 and libxdo, so a build without
+//! `native-menus` (`windowing` alone, #2435) links neither; its window's
+//! [`Menu`](crate::menu::Menu) is the DOM bar on every platform, with its
+//! chords armed through
+//! [`register_menu_shortcuts`](crate::menu::register_menu_shortcuts) as on
+//! the web, and its `NativeMenuBar` is a type with no values. Behind `#[cfg(feature = "windowing")]` sits
 //! `match_shortcut`, which takes a `winit::keyboard::KeyCode`. Chord matching
-//! itself is not desktop-only — it lives in [`match_shortcut_code`], keyed by
+//! itself is not desktop-only — it lives in `match_shortcut_code`, keyed by
 //! the W3C `KeyboardEvent.code` name that both winit's `KeyCode` variants and a
 //! browser keydown are named after.
 //!
 //! # Lifetime
 //!
 //! A menu callback belongs to the component that *created* it — the scope that
-//! was rendering when [`MenuItem::on_click`] was called, which is where the
+//! was rendering when `MenuItem::on_click` was called, which is where the
 //! closure captured its `Signal`s. Once that component unmounts its signals are
 //! freed, and a read of a freed signal panics (issue #183, #141 PR4), so the
 //! callback stops being dispatched. It also runs *inside* that owner, so a
 //! `Signal` it creates belongs to the menu's component rather than to whatever
-//! the event loop happened to be doing.
+//! the event loop happened to be doing, and under the document and in the
+//! context root that were current there (issue #1032, the item's
+//! `callback_frame`), so what it registers or reads is its maker's, wherever
+//! it is fired.
 //!
 //! Every path that can fire an item applies that rule through one function,
 //! `invoke_menu_callback`: the registry (`dispatch_menu_event`, which muda, ksni
 //! and `match_shortcut_code` all route through) and the DOM menu bar, which
-//! renders items straight out of the [`Menu`] and holds the `Rc<dyn Fn()>`
+//! renders items straight out of the `Menu` and holds the `Rc<dyn Fn()>`
 //! itself rather than a registry id.
 //!
 //! Ownership is recorded per **item**, not per menu build. One `Menu` may be
@@ -114,16 +123,17 @@ pub(crate) mod app_menu_bar;
 
 pub use app_menu_bar::{MENU_BAR_HEIGHT, render_menu_bar_standalone, render_with_menu_bar};
 
-#[cfg(feature = "desktop")]
+#[cfg(feature = "native-menus")]
 use muda::accelerator::Accelerator;
+use rinch_core::CallbackFrame;
 use rinch_core::reactive::{Owner, current_owner, unowned};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::rc::Rc;
-#[cfg(feature = "desktop")]
+#[cfg(feature = "native-menus")]
 use std::str::FromStr;
-#[cfg(feature = "desktop")]
+#[cfg(feature = "windowing")]
 use winit::keyboard::KeyCode;
 
 // ── Public API ──────────────────────────────────────────────────────────────
@@ -151,6 +161,40 @@ pub struct MenuItem {
     /// `None` means the item was created outside any render and has app
     /// lifetime. `Owner` is a `Weak`, so this keeps nothing alive.
     callback_owner: Option<Owner>,
+    /// The document and context root current where the callback was made,
+    /// captured beside [`callback_owner`](Self::callback_owner) and entered
+    /// around every activation (issue #1032): a native click, a chord, a tray
+    /// click or a DOM bar click arrives outside any dispatch or inside another
+    /// document's, and the callback is still its maker's code.
+    callback_frame: CallbackFrame,
+    /// A checkbox or radio item's state, if this is one (issue #1520).
+    toggle: Option<Toggle>,
+}
+
+/// Whether a toggle item is a checkbox or one option of a radio group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToggleKind {
+    /// [`MenuItem::checkbox`]: activating it flips its own state.
+    Check,
+    /// [`MenuItem::radio`]: activating it selects it within its group. `group`
+    /// tells adjacent radio items apart from each other's groups (the group
+    /// signal's slot id and generation, so a freed group's options never merge
+    /// with a group that reused its slot); backends that draw a group as one
+    /// widget (ksni's `RadioGroup`) gather a run of adjacent items with one
+    /// `group`.
+    Radio { group: (u32, u32) },
+}
+
+/// The state of a checkbox or radio [`MenuItem`].
+///
+/// Type-erased over the signal it reads, so every backend handles one shape:
+/// `is_on` reads the state (tracked, so a backend can watch it from an effect;
+/// `None` once the signal is freed) and `activate` is what a click does to it.
+#[derive(Clone)]
+pub(crate) struct Toggle {
+    pub(crate) kind: ToggleKind,
+    pub(crate) is_on: Rc<dyn Fn() -> Option<bool>>,
+    pub(crate) activate: Rc<dyn Fn()>,
 }
 
 #[derive(Clone)]
@@ -184,7 +228,96 @@ impl MenuItem {
             enabled: true,
             callback: None,
             callback_owner: None,
+            callback_frame: CallbackFrame::default(),
+            toggle: None,
         }
+    }
+
+    /// A **checkbox** item whose checked state is `checked` (issue #1520).
+    ///
+    /// The signal *is* the state, in both directions: activating the item (a
+    /// click, its shortcut, a tray menu) flips it before any
+    /// [`on_click`](MenuItem::on_click) callback runs, so the callback reads the
+    /// new value; and writing it from anywhere (`checked.set(true)`) moves the
+    /// check mark in every menu built from this item — the native window bar,
+    /// a tray menu, the DOM menu bar. Read it back with `checked.get()`.
+    ///
+    /// The item belongs to the component rendering here, like an `on_click`
+    /// callback (see the [module docs](self)): once that component unmounts
+    /// and frees the signal, the item stops toggling it.
+    pub fn checkbox(label: impl Into<String>, checked: rinch_core::reactive::Signal<bool>) -> Self {
+        let mut item = Self::new(label);
+        item.callback_owner = current_owner();
+        item.callback_frame = CallbackFrame::current();
+        item.toggle = Some(Toggle {
+            kind: ToggleKind::Check,
+            is_on: Rc::new(move || checked.try_get()),
+            activate: Rc::new(move || {
+                if let Some(on) = rinch_core::reactive::untracked(|| checked.try_get()) {
+                    checked.set(!on);
+                }
+            }),
+        });
+        item
+    }
+
+    /// One option of a **radio group**: checked while `selected` holds `value`
+    /// (issue #1520).
+    ///
+    /// Every item built over the same `selected` signal is one group, and at
+    /// most one of them is checked. Activating an item writes its `value` to
+    /// `selected` before any [`on_click`](MenuItem::on_click) callback runs;
+    /// writing `selected` from anywhere moves the mark. Activating the option
+    /// that is already selected leaves it selected. Keep a group's items next to
+    /// each other in one menu: the Linux tray draws a run of adjacent options of
+    /// one group as a single radio group.
+    pub fn radio<T: Clone + PartialEq + 'static>(
+        label: impl Into<String>,
+        selected: rinch_core::reactive::Signal<T>,
+        value: T,
+    ) -> Self {
+        let mut item = Self::new(label);
+        item.callback_owner = current_owner();
+        item.callback_frame = CallbackFrame::current();
+        let mine = value.clone();
+        item.toggle = Some(Toggle {
+            kind: ToggleKind::Radio {
+                group: selected.identity(),
+            },
+            is_on: Rc::new(move || selected.try_with(|v| *v == mine)),
+            activate: Rc::new(move || {
+                if selected.is_alive() {
+                    selected.set(value.clone());
+                }
+            }),
+        });
+        item
+    }
+
+    /// What activating this item runs: the toggle's state change, then the
+    /// [`on_click`](MenuItem::on_click) callback. `None` when it does neither.
+    pub(crate) fn activation(&self) -> Option<Rc<dyn Fn()>> {
+        match (&self.toggle, &self.callback) {
+            (None, None) => None,
+            (None, Some(cb)) => Some(Rc::clone(cb)),
+            (Some(t), cb) => {
+                let toggle = Rc::clone(&t.activate);
+                let cb = cb.clone();
+                Some(Rc::new(move || {
+                    toggle();
+                    if let Some(cb) = &cb {
+                        cb();
+                    }
+                }))
+            }
+        }
+    }
+
+    /// Whether this item is checked now, read without subscribing anything.
+    /// `None` for an item that is not a checkbox or radio item.
+    pub(crate) fn checked_now(&self) -> Option<bool> {
+        let t = self.toggle.as_ref()?;
+        Some(rinch_core::reactive::untracked(|| (t.is_on)()).unwrap_or(false))
     }
 
     /// Set the keyboard shortcut (e.g., `"Ctrl+N"`, `"Cmd+Shift+S"`).
@@ -208,7 +341,17 @@ impl MenuItem {
     pub fn on_click(mut self, cb: impl Fn() + 'static) -> Self {
         self.callback = Some(Rc::new(cb));
         self.callback_owner = current_owner();
+        self.callback_frame = CallbackFrame::current();
         self
+    }
+
+    /// Whether this is a checkbox or radio item, and if so whether it is
+    /// checked now. `None` for a plain item.
+    ///
+    /// Reads the item's signal untracked; to react to changes, read the signal
+    /// you built the item with.
+    pub fn checked(&self) -> Option<bool> {
+        self.checked_now()
     }
 }
 
@@ -274,6 +417,10 @@ pub(crate) enum MenuEntryKind {
         /// Carried through so the tray backend registers the item under the
         /// scope that created its callback, not the one that built the tray.
         callback_owner: Option<Owner>,
+        /// And the frame it was made in (issue #1032).
+        callback_frame: CallbackFrame,
+        /// A checkbox or radio item's state.
+        toggle: Option<Toggle>,
     },
     Separator,
     Submenu {
@@ -290,10 +437,12 @@ impl Menu {
             .into_iter()
             .map(|entry| match entry {
                 MenuEntryInner::Item(item) => MenuEntryKind::Item {
+                    callback: item.activation(),
                     label: item.label,
                     enabled: item.enabled,
-                    callback: item.callback,
                     callback_owner: item.callback_owner,
+                    callback_frame: item.callback_frame,
+                    toggle: item.toggle,
                 },
                 MenuEntryInner::Separator => MenuEntryKind::Separator,
                 MenuEntryInner::Submenu { label, menu } => MenuEntryKind::Submenu { label, menu },
@@ -314,6 +463,8 @@ impl Menu {
 struct MenuCallback {
     /// See [`MenuItem::callback_owner`]. `None` means app lifetime.
     owner: Option<Owner>,
+    /// See [`MenuItem::callback_frame`].
+    frame: CallbackFrame,
     cb: Rc<dyn Fn()>,
 }
 
@@ -336,6 +487,12 @@ struct ShortcutEntry {
     serial: u64,
     shortcut: ParsedShortcut,
     menu_id: String,
+    /// Whether this chord was registered for a **window menu bar** item
+    /// (`true` only from `build_muda_item`'s `native_bar` parameter — never
+    /// from a tray item or the DOM bar). Read by [`skips_rinch_chord`] at
+    /// match time, alongside [`native_accelerator_attached`], to decide
+    /// whether this entry should fire at all (issue #1170, "B").
+    native_bar: bool,
 }
 
 thread_local! {
@@ -379,6 +536,66 @@ thread_local! {
     /// is what [`MenuBarChords`] closes, and why the slot has to be able to say
     /// *which* build it is holding.
     static MENU_BAR_REGISTRATION: RefCell<Option<MenuRegistration>> = const { RefCell::new(None) };
+
+    /// Whether a window menu bar's native accelerator table has actually
+    /// attached to a window — set by [`mark_native_accelerator_attached`],
+    /// read by [`native_accelerator_attached`] (issue #1170, "B", review
+    /// finding 2). Not a `target_os` guess: `attach_menu_to_window` sets this
+    /// only on the success path it already has — Windows only inside the
+    /// `Ok(Win32(..))` branch, after `init_for_hwnd` itself returns `Ok`; a
+    /// non-Win32 handle, a failed `init_for_hwnd`, or a target with no window
+    /// (a headless host, a borderless window whose chrome is the DOM bar
+    /// instead) leaves this `false`, and a `false`-marked window-bar item's
+    /// chord keeps matching through rinch's own registry rather than going
+    /// silently unreachable. Reset on Windows when the bar leaves its window
+    /// (`detach_menu_from_window`, at `hide_current_window`, which destroys
+    /// the HWND) and set again only if the re-created window's attach
+    /// succeeds (#1533).
+    static NATIVE_ACCELERATOR_ATTACHED: Cell<bool> = const { Cell::new(false) };
+
+    /// Whether the window's menu bar is drawn in its document rather than
+    /// attached to the window (Windows: a borderless window, which has no
+    /// frame for a Win32 bar). Set once at startup by
+    /// [`set_menu_bar_in_document`]; `attach_menu_to_window` then attaches
+    /// nothing, so the bar's chords match through rinch's own registry.
+    #[cfg(all(feature = "native-menus", target_os = "windows"))]
+    static MENU_BAR_IN_DOCUMENT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The window's menu bar is drawn in its document: never attach the native
+/// one to the window (see [`MENU_BAR_IN_DOCUMENT`]).
+#[cfg(all(feature = "native-menus", target_os = "windows"))]
+pub(crate) fn set_menu_bar_in_document() {
+    MENU_BAR_IN_DOCUMENT.with(|f| f.set(true));
+}
+
+/// See [`NATIVE_ACCELERATOR_ATTACHED`].
+///
+/// Only `attach_menu_to_window`'s macOS and Windows arms call this in
+/// production, so a normal (non-test) Linux build never reaches it — the
+/// `#[allow]` is for that, not because it is genuinely unused: this crate's
+/// own test suite calls it from every platform to exercise
+/// `skips_rinch_chord`'s fact-based half without needing a macOS or Windows
+/// host (review of #1304).
+#[cfg(feature = "native-menus")]
+#[allow(dead_code)]
+pub(crate) fn mark_native_accelerator_attached() {
+    NATIVE_ACCELERATOR_ATTACHED.with(|f| f.set(true));
+}
+
+/// See [`NATIVE_ACCELERATOR_ATTACHED`]: the window it was attached to is gone.
+#[cfg(all(feature = "native-menus", target_os = "windows"))]
+fn clear_native_accelerator_attached() {
+    NATIVE_ACCELERATOR_ATTACHED.with(|f| f.set(false));
+}
+
+/// Whether this thread's window menu bar actually has a native accelerator
+/// attached. `false` on every non-desktop build and on Linux (where
+/// `attach_menu_to_window` is a no-op) — which is exactly the set of cases
+/// where nothing but rinch's own chord registry can ever fire the item, so
+/// [`skips_rinch_chord`] must answer `false` for them.
+fn native_accelerator_attached() -> bool {
+    NATIVE_ACCELERATOR_ATTACHED.with(Cell::get)
 }
 
 /// A build number no previous [`register_menu_shortcuts`] call has used.
@@ -403,8 +620,9 @@ fn register_callback_owned(
     menu_id: &str,
     cb: Rc<dyn Fn()>,
     owner: Option<Owner>,
+    frame: CallbackFrame,
 ) -> Rc<MenuCallback> {
-    let entry = Rc::new(MenuCallback { owner, cb });
+    let entry = Rc::new(MenuCallback { owner, frame, cb });
     // Bound outside the borrow: a displaced entry is user code whose `Drop` may
     // re-enter the registry.
     let _previous =
@@ -420,7 +638,21 @@ fn register_callback_owned(
 /// meantime: [`match_shortcut`] answers `true` only when a callback actually
 /// ran, and [`dispatch_menu_event`] takes a dead item's chords out with it.
 fn register_shortcut(shortcut_str: &str, menu_id: &str) -> Option<u64> {
-    let parsed = parse_shortcut_for_matching(shortcut_str)?;
+    register_shortcut_with_native_bar(shortcut_str, menu_id, false)
+}
+
+/// As [`register_shortcut`], but also records whether this chord belongs to
+/// a **window menu bar** item (`native_bar`) — the one extra fact
+/// [`skips_rinch_chord`] needs at match time. Every caller but
+/// `build_muda_item` passes `false`, so [`register_shortcut`] is the
+/// shorthand every other registration path (the DOM bar, the registry's own
+/// tests) keeps using unchanged.
+fn register_shortcut_with_native_bar(
+    shortcut_str: &str,
+    menu_id: &str,
+    native_bar: bool,
+) -> Option<u64> {
+    let parsed = parse_shortcut_or_warn(shortcut_str)?;
     let serial = NEXT_SHORTCUT_SERIAL.with(|next| {
         let serial = next.get();
         next.set(serial + 1);
@@ -431,6 +663,7 @@ fn register_shortcut(shortcut_str: &str, menu_id: &str) -> Option<u64> {
             serial,
             shortcut: parsed,
             menu_id: menu_id.to_string(),
+            native_bar,
         });
     });
     Some(serial)
@@ -448,16 +681,27 @@ fn register_shortcut(shortcut_str: &str, menu_id: &str) -> Option<u64> {
 /// reason: it has app lifetime, and what it allocates must not be handed to
 /// whatever scope the dispatch happened to be nested inside. A callback whose
 /// owner is gone is not run at all — its captured signals are freed, and reading
-/// one panics.
-pub(crate) fn invoke_menu_callback(cb: &Rc<dyn Fn()>, owner: Option<&Owner>) -> bool {
+/// one panics. Either way it runs under the document and in the context root
+/// `frame` names — the ones current where the item was made (issue #1032) —
+/// not the ones current where it happens to be fired.
+pub(crate) fn invoke_menu_callback(
+    cb: &Rc<dyn Fn()>,
+    owner: Option<&Owner>,
+    frame: CallbackFrame,
+) -> bool {
+    if owner.is_some_and(|owner| !owner.is_alive()) {
+        return false;
+    }
+    let _frame = frame.enter();
     match owner {
-        Some(owner) if !owner.is_alive() => false,
+        // One transaction per callback, like every event handler
+        // (`rinch_core::reactive::batch`).
         Some(owner) => {
-            owner.run(|| cb());
+            rinch_core::reactive::batch(|| owner.run(|| cb()));
             true
         }
         None => {
-            unowned(|| cb());
+            rinch_core::reactive::batch(|| unowned(|| cb()));
             true
         }
     }
@@ -486,7 +730,7 @@ pub(crate) fn dispatch_menu_event(menu_id: &str) -> bool {
         return false;
     }
 
-    invoke_menu_callback(&entry.cb, entry.owner.as_ref())
+    invoke_menu_callback(&entry.cb, entry.owner.as_ref(), entry.frame)
 }
 
 /// Take `menu_id` out of `map` if it is still `entry`.
@@ -539,12 +783,331 @@ fn prune_callback(menu_id: &str, entry: &Rc<MenuCallback>) {
 /// (pruned by [`dispatch_menu_event`]) must not shadow a live duplicate, and a
 /// chord registered for an item with no callback at all must fall through to the
 /// app instead of eating that key combination forever.
-#[cfg(feature = "desktop")]
-pub(crate) fn match_shortcut(ctrl: bool, meta: bool, alt: bool, shift: bool, key: KeyCode) -> bool {
+///
+/// `owner` says what kind of control holds the keyboard and `alt_graph_text`
+/// whether AltGr typed text with this press; a keystroke that
+/// [`chord_yields_to`] gives the control then matches nothing (#1169, #1290,
+/// #934/#1291).
+///
+/// `key_without_modifiers` is winit's layout-resolved, modifier-ignoring key
+/// for this physical press (issue #1170): a **letter** chord matches the
+/// *character* the layout types for the pressed key (so Ctrl+Z fires from the
+/// key labelled Z on a QWERTZ keyboard, which is physically `KeyY`), falling
+/// back to the physical code when the layout types no single Latin letter
+/// there (Cyrillic, Thai, …) — see [`chord_key_matches`]. Punctuation and
+/// digit chords are unaffected and keep matching by physical code alone, as
+/// before #1170.
+#[cfg(feature = "windowing")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn match_shortcut(
+    ctrl: bool,
+    meta: bool,
+    alt: bool,
+    shift: bool,
+    key: KeyCode,
+    key_without_modifiers: &winit::keyboard::Key,
+    owner: KeyOwner,
+    alt_graph_text: bool,
+) -> bool {
     let Some(code) = key_code_name(key) else {
         return false;
     };
-    match_shortcut_code(ctrl, meta, alt, shift, code)
+    if chord_yields_to(owner, ctrl, meta, alt, code, alt_graph_text) {
+        return false;
+    }
+    let typed_letter = winit_typed_letter(key_without_modifiers);
+    match_shortcut_code(ctrl, meta, alt, shift, code, typed_letter)
+}
+
+/// The single ASCII letter `key` types, lowercased — or `None` when it is
+/// anything else (a non-character key, a dead key, more than one character,
+/// or a character outside `a..=z`/`A..=Z`, which is what a non-Latin layout
+/// — Cyrillic, Thai, Armenian — produces for every letter position).
+///
+/// Feeds [`chord_key_matches`]'s layout-character branch; `None` is exactly
+/// the "this layout types no Latin letter here" case issue #1170 falls back
+/// from to the physical key.
+#[cfg(feature = "windowing")]
+fn winit_typed_letter(key: &winit::keyboard::Key) -> Option<char> {
+    let winit::keyboard::Key::Character(s) = key else {
+        return None;
+    };
+    let mut chars = s.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    c.is_ascii_alphabetic().then(|| c.to_ascii_lowercase())
+}
+
+/// Whether a keystroke belongs to a focused text field rather than to a menu
+/// chord (issue #1169).
+///
+/// A chord with no Ctrl, Cmd or Alt is the same keystroke a text field types
+/// or edits with: `"/"`, `"N"`, `"Shift+/"`, `"Space"`, `"Backspace"`,
+/// `"ArrowLeft"`. Matched first, it took that key from every field while its
+/// item was live — typing `/` into an `<input>` inserted nothing. So while a
+/// text target holds the keyboard such a keystroke is the field's: both
+/// backends ask this before matching, and the chord answers only when focus is
+/// elsewhere. Shift does not change the answer (it types `?` or extends a
+/// selection).
+///
+/// The keys that yield are the ones a field acts on: letters, digits,
+/// punctuation, `Space`, and the editing keys `Enter`, `Backspace`, `Delete`,
+/// `Home`, `End`, `PageUp`, `PageDown` and the arrows. `Escape`, `Tab` and
+/// `F1`–`F12` do not: a field types nothing with them, so a bare `"F5"` or
+/// `"Escape"` item still fires from inside one. A chord holding Ctrl, Cmd or
+/// Alt never yields here; [`chord_yields_to`] adds the AltGr case.
+///
+/// `code` is the W3C `KeyboardEvent.code` name, as [`match_shortcut_code`]
+/// takes it. The same as `chord_yields_to(KeyOwner::Text, …, false)`.
+pub fn chord_yields_to_text_input(ctrl: bool, meta: bool, alt: bool, code: &str) -> bool {
+    !(ctrl || meta || alt) && text_field_keeps(code)
+}
+
+/// The keys a focused text field acts on (see [`chord_yields_to_text_input`]).
+fn text_field_keeps(code: &str) -> bool {
+    is_letter_or_digit(code)
+        || matches!(
+            code,
+            "Space"
+                | "Equal"
+                | "Minus"
+                | "Backquote"
+                | "Backslash"
+                | "BracketLeft"
+                | "BracketRight"
+                | "Comma"
+                | "Period"
+                | "Quote"
+                | "Semicolon"
+                | "Slash"
+                | "IntlBackslash"
+                | "Enter"
+                | "Backspace"
+                | "Delete"
+                | "Home"
+                | "End"
+                | "PageUp"
+                | "PageDown"
+                | "ArrowUp"
+                | "ArrowDown"
+                | "ArrowLeft"
+                | "ArrowRight"
+        )
+}
+
+fn is_letter_or_digit(code: &str) -> bool {
+    code.strip_prefix("Key")
+        .or_else(|| code.strip_prefix("Digit"))
+        .is_some_and(|rest| rest.len() == 1)
+}
+
+/// What kind of control holds the keyboard when a menu chord is tried — the
+/// input to [`chord_yields_to`] (issues #1169, #1290).
+///
+/// Each backend classifies its own focus: the desktop from its focus arbiter
+/// (`FocusTarget`), the web from the keydown's target element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyOwner {
+    /// Nothing that acts on keys holds the keyboard; every chord may fire.
+    #[default]
+    None,
+    /// A widget that types text: a text `<input>`, `<textarea>`, the
+    /// rich-text editor, `contenteditable`, a target registered for IME.
+    Text,
+    /// A closed `<select>`: it moves its selection with the arrows, `Home`,
+    /// `End`, `PageUp`, `PageDown` and type-ahead letters and digits, and
+    /// opens with `Space` and `Enter` — the keys Chrome gives it.
+    Select,
+    /// A control that activates: a button, a link, a checkbox or radio, a
+    /// `tabindex` node — it keeps `Space` and `Enter`.
+    Activator,
+    /// A control that takes every key it is given: a focused `RenderSurface`
+    /// (a game's W, Space, Escape), an open `<select>` popup. It keeps every
+    /// key pressed without Ctrl, Cmd or Alt.
+    AllKeys,
+}
+
+/// Which focused controls a modifier-less menu chord leaves its key to — the
+/// app's choice, set with [`set_chord_yield`] (issue #1290).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChordYield {
+    /// The default: every focused control keeps the keys it acts on (see
+    /// [`KeyOwner`]) — a select its arrows and letters, a button Space and
+    /// Enter, a game surface every bare key — as a browser and a native app
+    /// leave them to it.
+    #[default]
+    FocusedControls,
+    /// Only a text target keeps its keys (rinch before #1290): a bare chord
+    /// fires from a focused select, button or surface. For an app whose bare
+    /// shortcuts are meant to work from anywhere but a text field.
+    TextOnly,
+}
+
+thread_local! {
+    static CHORD_YIELD: Cell<ChordYield> = const { Cell::new(ChordYield::FocusedControls) };
+}
+
+/// Set which focused controls a modifier-less chord yields to, for the rest
+/// of the session. See [`ChordYield`]. Thread-local like the chord registry.
+/// On the desktop, call it (or `App::chord_yield`) before the window menu is
+/// built: whether a window-bar item gets a native accelerator reads it then
+/// ([`native_accelerator_allowed`]).
+pub fn set_chord_yield(mode: ChordYield) {
+    CHORD_YIELD.with(|m| m.set(mode));
+}
+
+/// The active [`ChordYield`]. See [`set_chord_yield`].
+pub fn chord_yield() -> ChordYield {
+    CHORD_YIELD.with(Cell::get)
+}
+
+/// Whether a keystroke belongs to the focused control rather than to a menu
+/// chord (issues #1169, #934/#1291, #1290). Both backends ask this before
+/// matching; `true` means no chord runs and the key goes on to the control.
+///
+/// - A press holding Ctrl, Cmd or Alt is a chord — except when AltGr typed
+///   text into a text target (`alt_graph_text`, from
+///   [`rinch_platform::is_alt_graph_text`]): Windows reports AltGr as
+///   Ctrl+Alt, and a `Ctrl+Alt+Q` item must not eat the `@` a German layout
+///   types there.
+/// - A bare press yields to the keys `owner` acts on (see [`KeyOwner`]),
+///   under the active [`ChordYield`]: [`ChordYield::TextOnly`] treats every
+///   owner but [`KeyOwner::Text`] as [`KeyOwner::None`].
+///
+/// A pure function of its arguments and the [`ChordYield`] setting.
+pub fn chord_yields_to(
+    owner: KeyOwner,
+    ctrl: bool,
+    meta: bool,
+    alt: bool,
+    code: &str,
+    alt_graph_text: bool,
+) -> bool {
+    chord_yields_under(chord_yield(), owner, ctrl, meta, alt, code, alt_graph_text)
+}
+
+fn chord_yields_under(
+    mode: ChordYield,
+    owner: KeyOwner,
+    ctrl: bool,
+    meta: bool,
+    alt: bool,
+    code: &str,
+    alt_graph_text: bool,
+) -> bool {
+    let owner = match (mode, owner) {
+        (ChordYield::TextOnly, KeyOwner::Text) => KeyOwner::Text,
+        (ChordYield::TextOnly, _) => KeyOwner::None,
+        (ChordYield::FocusedControls, owner) => owner,
+    };
+    if ctrl || meta || alt {
+        return owner == KeyOwner::Text && alt_graph_text;
+    }
+    match owner {
+        KeyOwner::None => false,
+        KeyOwner::Text => text_field_keeps(code),
+        KeyOwner::Select => {
+            is_letter_or_digit(code)
+                || matches!(
+                    code,
+                    "Space"
+                        | "Enter"
+                        | "Home"
+                        | "End"
+                        | "PageUp"
+                        | "PageDown"
+                        | "ArrowUp"
+                        | "ArrowDown"
+                        | "ArrowLeft"
+                        | "ArrowRight"
+                )
+        }
+        KeyOwner::Activator => matches!(code, "Space" | "Enter"),
+        KeyOwner::AllKeys => true,
+    }
+}
+
+/// Whether a window-bar item's chord may be handed to the OS as a native
+/// accelerator (issues #1284, #1291).
+///
+/// On macOS and Windows the OS matches a menu bar's accelerators before the
+/// window sees the key (`TranslateAccelerator` ahead of `WM_KEYDOWN`; AppKit's
+/// key equivalents), so a native accelerator cannot yield to a focused
+/// control. A chord that *could* yield to one is therefore given no native
+/// accelerator and is matched by rinch's own registry, which asks
+/// [`chord_yields_to`] first:
+///
+/// - a modifier-less chord that any [`KeyOwner`] keeps under the active
+///   [`ChordYield`] (#1284);
+/// - on Windows, a Ctrl+Alt chord on a key AltGr can type with (letters,
+///   digits, punctuation): AltGr *is* Ctrl+Alt to the accelerator table, so a
+///   native `Ctrl+Alt+Q` would eat a German layout's `@` (#1291).
+///
+/// Every other chord keeps its native accelerator, and its label.
+pub fn native_accelerator_allowed(ctrl_or_cmd: bool, alt: bool, code: &str) -> bool {
+    native_accelerator_allowed_under(
+        chord_yield(),
+        cfg!(target_os = "windows"),
+        ctrl_or_cmd,
+        alt,
+        code,
+    )
+}
+
+/// [`native_accelerator_allowed`] with the setting and the platform's fact
+/// ("AltGr reaches the accelerator table as Ctrl+Alt": Windows) passed in, so
+/// every platform's answer is testable on any host.
+fn native_accelerator_allowed_under(
+    mode: ChordYield,
+    alt_graph_is_ctrl_alt: bool,
+    ctrl_or_cmd: bool,
+    alt: bool,
+    code: &str,
+) -> bool {
+    if alt_graph_is_ctrl_alt
+        && ctrl_or_cmd
+        && alt
+        && text_field_keeps(code)
+        && !matches!(
+            code,
+            "Enter" | "Backspace" | "Delete" | "Home" | "End" | "PageUp" | "PageDown"
+        )
+        && !code.starts_with("Arrow")
+    {
+        return false;
+    }
+    ![
+        KeyOwner::Text,
+        KeyOwner::Select,
+        KeyOwner::Activator,
+        KeyOwner::AllKeys,
+    ]
+    .into_iter()
+    .any(|owner| chord_yields_under(mode, owner, ctrl_or_cmd, false, alt, code, false))
+}
+
+/// Whether an `<input>` of this `type` takes typed text — the half of "is a
+/// text target focused" that [`chord_yields_to_text_input`]'s callers share
+/// (#1169). Every type does but the ones with no text to type into:
+/// `checkbox`, `radio`, `range`, `color`, `file`, `hidden`, `image` and the
+/// three buttons. Case-insensitive, as HTML reads the attribute; an absent or
+/// unknown type is `text`.
+pub fn input_type_takes_text(ty: &str) -> bool {
+    !matches!(
+        ty.to_ascii_lowercase().as_str(),
+        "checkbox"
+            | "radio"
+            | "range"
+            | "color"
+            | "file"
+            | "hidden"
+            | "image"
+            | "button"
+            | "submit"
+            | "reset"
+    )
 }
 
 /// Check whether a keyboard event matches a registered menu shortcut, keyed by
@@ -563,7 +1126,21 @@ pub(crate) fn match_shortcut(ctrl: bool, meta: bool, alt: bool, shift: bool, key
 /// creating component has since unmounted must not shadow a live duplicate, and
 /// a chord registered for an item with no callback at all must fall through to
 /// the app instead of eating that key combination forever.
-pub fn match_shortcut_code(ctrl: bool, meta: bool, alt: bool, shift: bool, code: &str) -> bool {
+///
+/// `typed_letter` is the single lowercase ASCII letter the layout types for
+/// this physical key, ignoring Shift/Caps — a browser gives `event.key`
+/// lowercased, desktop gives winit's `key_without_modifiers` through
+/// `match_shortcut` — or `None` when the layout types no such letter there
+/// (a digit, a punctuation mark, a non-Latin character, a dead key). See
+/// `chord_key_matches` for how it is used.
+pub fn match_shortcut_code(
+    ctrl: bool,
+    meta: bool,
+    alt: bool,
+    shift: bool,
+    code: &str,
+    typed_letter: Option<char>,
+) -> bool {
     let ctrl_or_cmd = ctrl || meta;
 
     // `collect` on an empty iterator does not allocate, so the overwhelmingly
@@ -576,13 +1153,107 @@ pub fn match_shortcut_code(ctrl: bool, meta: bool, alt: bool, shift: bool, code:
                 entry.shortcut.ctrl_or_cmd == ctrl_or_cmd
                     && entry.shortcut.alt == alt
                     && entry.shortcut.shift == shift
-                    && entry.shortcut.code == code
+                    && chord_key_matches(&entry.shortcut, code, typed_letter)
+                    && !skips_rinch_chord(entry.native_bar, native_accelerator_attached())
             })
             .map(|entry| entry.menu_id.clone())
             .collect()
     });
 
     matched.iter().any(|menu_id| dispatch_menu_event(menu_id))
+}
+
+/// How a letter chord's key is matched against a keystroke (issue #1170).
+///
+/// `LayoutAware` (the default) is **A** from the issue: a letter chord
+/// (`"Ctrl+Z"`) matches the character the active keyboard layout types for the
+/// pressed key — so Ctrl+Z fires from the key labelled Z wherever the layout
+/// put it (QWERTZ's Y/Z swap, AZERTY's A/Q) — falling back to the physical
+/// key when the layout types no Latin letter there (Cyrillic, Thai, …), which
+/// is what makes Ctrl+C/Ctrl+V reachable at all on those layouts. Punctuation
+/// and digit chords are never affected by this setting; they always match the
+/// physical key, as rinch has always done.
+///
+/// `Physical` forces every chord — letters included — back to matching the
+/// physical key alone, exactly as rinch matched before #1170: the escape
+/// hatch every framework that ships a user-facing override for this ships
+/// (VS Code's `keyboard.dispatch`, JetBrains' "use national layout for
+/// shortcuts") — for an app, or a user, who wants shortcut *positions* to stay
+/// put under a remapped or non-Latin layout rather than follow the character.
+///
+/// Set with [`set_shortcut_matching`] — `App::shortcut_matching` on desktop,
+/// or call it directly before mounting on the web.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShortcutMatching {
+    #[default]
+    LayoutAware,
+    Physical,
+}
+
+thread_local! {
+    /// The active [`ShortcutMatching`] mode. Thread-local like every other
+    /// piece of this module's state: the reactive system and the chord
+    /// registry are both per-thread, so the override is too.
+    static SHORTCUT_MATCHING: Cell<ShortcutMatching> = const { Cell::new(ShortcutMatching::LayoutAware) };
+}
+
+/// Set how letter chords are matched against a keystroke for the rest of the
+/// session (or until the next call). See [`ShortcutMatching`].
+///
+/// Global and thread-local, like the registry it governs — one app, one
+/// answer. Takes effect on the next keystroke; there is nothing to rebuild,
+/// since matching reads this at dispatch time, not at registration time.
+pub fn set_shortcut_matching(mode: ShortcutMatching) {
+    SHORTCUT_MATCHING.with(|m| m.set(mode));
+}
+
+/// The active [`ShortcutMatching`] mode. See [`set_shortcut_matching`].
+pub fn shortcut_matching() -> ShortcutMatching {
+    SHORTCUT_MATCHING.with(Cell::get)
+}
+
+/// The lowercase letter a `"KeyX"` physical-code name stands for, or `None`
+/// for anything else (`"Digit1"`, `"Slash"`, `"F5"`, …).
+///
+/// The one place that decides "is this chord's key a letter" — [`chord_key_matches`]
+/// only takes the layout-character branch for a chord this answers `Some` for,
+/// which is what keeps digit and punctuation chords on physical-only matching.
+fn letter_from_code(code: &str) -> Option<char> {
+    let rest = code.strip_prefix("Key")?;
+    let mut chars = rest.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    Some(c.to_ascii_lowercase())
+}
+
+/// Whether `shortcut`'s key matches this keystroke's physical `code` and/or
+/// its `typed_letter` — the matching rule issue #1170 adds.
+///
+/// [`ShortcutMatching::Physical`] (the override) short-circuits to the
+/// pre-#1170 rule: physical code only, whatever the chord's key.
+///
+/// Otherwise: a **non-letter** chord (digit, punctuation, navigation, …)
+/// still matches physical-only — Joe's decision keeps the existing,
+/// already-correct behaviour there. A **letter** chord matches `typed_letter`
+/// when the keystroke typed one (Latin a–z under the active layout,
+/// regardless of *which* physical key produced it — the QWERTZ/AZERTY case),
+/// and falls back to the physical code when it did not (the layout types no
+/// Latin letter for the pressed key at all — Cyrillic, Thai, Armenian — which
+/// is the GTK/GNOME bug class #1170's recon found: matching the physical
+/// position there is the only way Ctrl+C is reachable).
+fn chord_key_matches(shortcut: &ParsedShortcut, code: &str, typed_letter: Option<char>) -> bool {
+    if shortcut_matching() == ShortcutMatching::Physical {
+        return shortcut.code == code;
+    }
+    match letter_from_code(shortcut.code) {
+        Some(letter) => match typed_letter {
+            Some(typed) => typed == letter,
+            None => shortcut.code == code,
+        },
+        None => shortcut.code == code,
+    }
 }
 
 // ── Registration token ──────────────────────────────────────────────────────
@@ -618,24 +1289,70 @@ pub(crate) struct MenuRegistration {
     /// names this build", which is every registration but a
     /// [`register_menu_shortcuts`] one.
     build: u64,
+    /// The effects that keep a backend's check marks in step with the
+    /// checkbox and radio signals of this build ([`Self::watch`]). Created on
+    /// the first watch; disposed when this token drops, so a replaced menu stops
+    /// pushing state into widgets that are gone.
+    watchers: Option<rinch_core::reactive::Scope>,
 }
 
 impl MenuRegistration {
-    /// Register `cb` under `menu_id` on behalf of `owner`, and record the id so
-    /// dropping this token takes it back out.
+    /// Register `cb` under `menu_id` on behalf of `owner`, to run in `frame`
+    /// (issue #1032), and record the id so dropping this token takes it back
+    /// out.
     pub(crate) fn register_callback(
         &mut self,
         menu_id: &str,
         cb: Rc<dyn Fn()>,
         owner: Option<Owner>,
+        frame: CallbackFrame,
     ) {
-        let entry = register_callback_owned(menu_id, cb, owner);
+        let entry = register_callback_owned(menu_id, cb, owner, frame);
         self.callbacks.push((menu_id.to_string(), entry));
+    }
+
+    /// Run `sync` now and again whenever a signal it reads changes, for as long
+    /// as this token lives (issue #1520).
+    ///
+    /// This is how a backend follows a checkbox or radio item's signal: the
+    /// effect is owned by a scope of this registration's own, not by whatever
+    /// happens to be rendering, so it lives exactly as long as the menu it
+    /// serves.
+    #[cfg_attr(not(feature = "native-menus"), allow(dead_code))]
+    pub(crate) fn watch(&mut self, sync: impl FnMut() + 'static) {
+        let scope = self
+            .watchers
+            .get_or_insert_with(rinch_core::reactive::Scope::new);
+        scope.run(|| {
+            rinch_core::reactive::Effect::new(sync);
+        });
+    }
+
+    /// Whether this build watches any signal (test introspection).
+    #[cfg(test)]
+    pub(crate) fn watch_count(&self) -> usize {
+        self.watchers
+            .as_ref()
+            .map_or(0, |s| s.owned_counts().effects)
     }
 
     /// Register a chord dispatching `menu_id`, recording it for release.
     fn register_shortcut(&mut self, shortcut_str: &str, menu_id: &str) {
         if let Some(serial) = register_shortcut(shortcut_str, menu_id) {
+            self.shortcuts.push(serial);
+        }
+    }
+
+    /// As [`Self::register_shortcut`], but tagging the entry `native_bar` —
+    /// [`build_muda_item`]'s only caller.
+    #[cfg(feature = "native-menus")]
+    fn register_shortcut_native_bar(
+        &mut self,
+        shortcut_str: &str,
+        menu_id: &str,
+        native_bar: bool,
+    ) {
+        if let Some(serial) = register_shortcut_with_native_bar(shortcut_str, menu_id, native_bar) {
             self.shortcuts.push(serial);
         }
     }
@@ -659,6 +1376,10 @@ impl Drop for MenuRegistration {
                 take_callback_if_ours(&mut map, menu_id, entry);
             }
         });
+        // The watchers go with the menu. (Dropped from a `thread_local!` at
+        // thread exit, the scope skips disposal itself: see `ScopeInner`'s
+        // `Drop` in rinch-core.)
+        drop(self.watchers.take());
         // One pass over the chord list, not one per serial: releasing a menu bar
         // drops every chord it registered at once.
         if !self.shortcuts.is_empty() {
@@ -675,9 +1396,9 @@ impl Drop for MenuRegistration {
 /// The chords one [`register_menu_shortcuts`] call armed, released when this is
 /// dropped.
 ///
-/// [`MENU_BAR_REGISTRATION`] holds the build itself; this names it. Dropping the
+/// `MENU_BAR_REGISTRATION` holds the build itself; this names it. Dropping the
 /// token releases that build **only while the slot still holds it** — the
-/// [`take_callback_if_ours`] discipline one level up — so:
+/// `take_callback_if_ours` discipline one level up — so:
 ///
 /// * the island that armed the chords gives them back when it unmounts, instead
 ///   of leaving a removed widget eating a key combination from its host page for
@@ -691,7 +1412,7 @@ impl Drop for MenuRegistration {
 /// replaced, never taken away, so `build_native_menu_bar` leaves the build at
 /// `0` and nothing can name it.
 ///
-/// `!Send` like [`MenuRegistration`], and for the same reason: release touches
+/// `!Send` like `MenuRegistration`, and for the same reason: release touches
 /// thread-local state, so it has to happen on the thread that armed the chords.
 /// The token holds no `Rc` of its own, so the marker says it explicitly.
 #[must_use = "dropping the token immediately releases the chords it just armed; \
@@ -738,7 +1459,7 @@ impl Drop for MenuBarChords {
 /// (see [`match_shortcut_code`]), and an item with neither has nothing a chord
 /// could reach.
 ///
-/// The build's ids are held in [`MENU_BAR_REGISTRATION`], the same slot the
+/// The build's ids are held in `MENU_BAR_REGISTRATION`, the same slot the
 /// native bar uses, so re-arming a rebuilt menu bar releases the previous
 /// build's ids instead of growing the registry forever.
 ///
@@ -771,15 +1492,16 @@ fn register_menu_shortcuts_into(menu: &Menu, registration: &mut MenuRegistration
                 if !item.enabled {
                     continue;
                 }
-                let (Some(cb), Some(shortcut)) = (item.callback.as_ref(), item.shortcut.as_deref())
+                let (Some(cb), Some(shortcut)) = (item.activation(), item.shortcut.as_deref())
                 else {
                     continue;
                 };
                 let menu_id = next_menu_id();
                 registration.register_callback(
                     &menu_id,
-                    Rc::clone(cb),
+                    cb,
                     item.callback_owner.clone(),
+                    item.callback_frame,
                 );
                 registration.register_shortcut(shortcut, &menu_id);
             }
@@ -811,13 +1533,16 @@ fn next_menu_id() -> String {
 /// registered in the thread-local registry, and the ids are recorded in
 /// [`MENU_BAR_REGISTRATION`] — so building a new bar releases the previous
 /// build's, instead of leaving it in the registry forever.
-#[cfg(feature = "desktop")]
+#[cfg(feature = "native-menus")]
 pub(crate) fn build_native_menu_bar(menus: Vec<(&str, Menu)>) -> muda::Menu {
     let mut registration = MenuRegistration::default();
     let menu_bar = muda::Menu::new();
     for (label, menu) in menus {
         let submenu = muda::Submenu::new(label, true);
-        build_muda_entries(&submenu, menu, &mut registration);
+        // `true`: this bar is attached to the window (`attach_menu_to_window`)
+        // on macOS and Windows, so the OS already matches each item's
+        // accelerator — see `build_muda_item`'s `native_bar` param (#1170, B).
+        build_muda_entries(&submenu, menu, &mut registration, true);
         let _ = menu_bar.append(&submenu);
     }
     // Bound outside the borrow: dropping the displaced token drops user
@@ -830,23 +1555,34 @@ pub(crate) fn build_native_menu_bar(menus: Vec<(&str, Menu)>) -> muda::Menu {
 ///
 /// Returns the token holding this build's ids alongside the menu; the caller
 /// keeps it for as long as the menu is live (see [`MenuRegistration`]).
-#[cfg(feature = "desktop")]
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg(feature = "native-menus")]
+// Its callers are the tray (`system-tray`, not on Linux, which uses ksni) and
+// the tests.
+#[cfg_attr(
+    any(target_os = "linux", not(feature = "system-tray")),
+    allow(dead_code)
+)]
 pub(crate) fn build_muda_menu(menu: Menu) -> (muda::Menu, MenuRegistration) {
     let mut registration = MenuRegistration::default();
     let muda_menu = muda::Menu::new();
     for entry in menu.entries {
         match entry {
             MenuEntryInner::Item(item) => {
-                let muda_item = build_muda_item(&item, &mut registration);
-                let _ = muda_menu.append(&muda_item);
+                // `false`: a tray context menu is never attached to a window
+                // (`attach_menu_to_window`), so its accelerators are shown
+                // only while the menu is open and are not the OS-wide
+                // interception a window menu bar's are — rinch's own chord
+                // matching is the only thing that fires these from the
+                // keyboard (#1170, B).
+                let muda_item = build_muda_item(&item, &mut registration, false);
+                let _ = muda_menu.append(&*muda_item);
             }
             MenuEntryInner::Separator => {
                 let _ = muda_menu.append(&muda::PredefinedMenuItem::separator());
             }
             MenuEntryInner::Submenu { label, menu } => {
                 let submenu = muda::Submenu::new(&label, true);
-                build_muda_entries(&submenu, menu, &mut registration);
+                build_muda_entries(&submenu, menu, &mut registration, false);
                 let _ = muda_menu.append(&submenu);
             }
         }
@@ -855,20 +1591,30 @@ pub(crate) fn build_muda_menu(menu: Menu) -> (muda::Menu, MenuRegistration) {
 }
 
 /// Recursively populate a muda Submenu from a unified Menu.
-#[cfg(feature = "desktop")]
-fn build_muda_entries(submenu: &muda::Submenu, menu: Menu, registration: &mut MenuRegistration) {
+///
+/// `native_bar` says whether this submenu ends up in the window menu bar built
+/// by [`build_native_menu_bar`] (and so attached to the window with
+/// [`attach_menu_to_window`]) rather than a tray context menu's — see
+/// [`build_muda_item`].
+#[cfg(feature = "native-menus")]
+fn build_muda_entries(
+    submenu: &muda::Submenu,
+    menu: Menu,
+    registration: &mut MenuRegistration,
+    native_bar: bool,
+) {
     for entry in menu.entries {
         match entry {
             MenuEntryInner::Item(item) => {
-                let muda_item = build_muda_item(&item, registration);
-                let _ = submenu.append(&muda_item);
+                let muda_item = build_muda_item(&item, registration, native_bar);
+                let _ = submenu.append(&*muda_item);
             }
             MenuEntryInner::Separator => {
                 let _ = submenu.append(&muda::PredefinedMenuItem::separator());
             }
             MenuEntryInner::Submenu { label, menu } => {
                 let nested = muda::Submenu::new(&label, true);
-                build_muda_entries(&nested, menu, registration);
+                build_muda_entries(&nested, menu, registration, native_bar);
                 let _ = submenu.append(&nested);
             }
         }
@@ -876,10 +1622,85 @@ fn build_muda_entries(submenu: &muda::Submenu, menu: Menu, registration: &mut Me
 }
 
 /// Build a single muda MenuItem, register its callback and shortcut.
-#[cfg(feature = "desktop")]
-fn build_muda_item(item: &MenuItem, registration: &mut MenuRegistration) -> muda::MenuItem {
-    let accelerator = item.shortcut.as_ref().and_then(|s| parse_shortcut(s));
-    let muda_item = muda::MenuItem::new(&item.label, item.enabled, accelerator);
+///
+/// `native_bar` is issue #1170's "B": on macOS and Windows, a window menu bar
+/// is wired into the OS (`attach_menu_to_window` calls `init_for_nsapp` /
+/// `init_for_hwnd`), so the OS itself resolves and matches each item's
+/// `Accelerator` against the live keyboard layout before winit ever sees the
+/// key — matching muda's own accelerator through rinch's chord registry too
+/// would risk firing the callback twice for one keystroke on those platforms.
+///
+/// This item is tagged `native_bar` either way and **always** gets a
+/// [`MENU_SHORTCUTS`] entry — the skip is decided later, at match time, by
+/// [`skips_rinch_chord`] reading [`native_accelerator_attached`] (review of
+/// #1304: deciding it here from `target_os` alone would leave the chord
+/// unreachable by *either* path whenever the attach itself did not actually
+/// succeed — a non-Win32 window handle, a failed `init_for_hwnd`, a
+/// borderless window whose chrome is the DOM bar instead). So a `native_bar`
+/// item's chord fires through rinch's own registry right up until
+/// `attach_menu_to_window` records a real success, and is silent only from
+/// that point on — never unconditionally. Linux has no such integration
+/// (`attach_menu_to_window` is a no-op there — see the module's
+/// platform-attachment section) and never marks the flag, so its window bar,
+/// every tray menu item (`native_bar: false` — a tray's accelerator is shown
+/// only while the menu is open, not an OS-wide interception) and the DOM
+/// menu bar ([`register_menu_shortcuts_into`], unaffected by this parameter)
+/// all keep matching through the registry exactly as before #1170.
+#[cfg(feature = "native-menus")]
+fn build_muda_item(
+    item: &MenuItem,
+    registration: &mut MenuRegistration,
+    native_bar: bool,
+) -> Box<dyn muda::IsMenuItem> {
+    // A window-bar chord a focused control could keep gets no native
+    // accelerator: the OS would match it ahead of the control (#1284, #1291).
+    // rinch's registry matches it instead, and the label carries the key.
+    let native_ok = !native_bar
+        || item
+            .shortcut
+            .as_deref()
+            .and_then(parse_shortcut_for_matching)
+            .is_none_or(|p| native_accelerator_allowed(p.ctrl_or_cmd, p.alt, p.code));
+    let accelerator = if native_ok {
+        item.shortcut.as_ref().and_then(|s| parse_shortcut(s))
+    } else {
+        None
+    };
+    let label = native_item_label(
+        &item.label,
+        (!native_ok).then_some(item.shortcut.as_deref()).flatten(),
+    );
+    let label = label.as_str();
+    // A checkbox or radio item is a muda `CheckMenuItem` (muda has no radio
+    // item; a radio option is a check item whose mark the group's signal moves).
+    // Its mark follows the item's signal through a watcher, so a write from the
+    // app moves it, and so does the click: muda flips a check item's native
+    // state itself, and the watcher then puts it where the signal says — which
+    // is what keeps an already-selected radio option checked when clicked again.
+    let (muda_item, id): (Box<dyn muda::IsMenuItem>, String) = match &item.toggle {
+        Some(toggle) => {
+            let check = muda::CheckMenuItem::new(
+                label,
+                item.enabled,
+                item.checked_now().unwrap_or(false),
+                accelerator,
+            );
+            let id = check.id().0.clone();
+            let is_on = Rc::clone(&toggle.is_on);
+            let mark = check.clone();
+            registration.watch(move || {
+                if let Some(on) = is_on() {
+                    mark.set_checked(on);
+                }
+            });
+            (Box::new(check), id)
+        }
+        None => {
+            let plain = muda::MenuItem::new(label, item.enabled, accelerator);
+            let id = plain.id().0.clone();
+            (Box::new(plain), id)
+        }
+    };
 
     // A disabled item fires nothing. muda will not emit a `MenuEvent` for one,
     // and the in-app menu bar already skips its click handler — but registering
@@ -891,23 +1712,61 @@ fn build_muda_item(item: &MenuItem, registration: &mut MenuRegistration) -> muda
 
     // Register callback, owned by the scope that created it rather than by
     // whoever is building this menu.
-    if let Some(cb) = &item.callback {
-        registration.register_callback(&muda_item.id().0, cb.clone(), item.callback_owner.clone());
+    if let Some(cb) = item.activation() {
+        registration.register_callback(&id, cb, item.callback_owner.clone(), item.callback_frame);
     }
 
-    // Register shortcut for keyboard matching
+    // Register the shortcut unconditionally; whether it ever matches is
+    // decided at dispatch time by `skips_rinch_chord` — see this function's
+    // doc.
     if let Some(shortcut_str) = &item.shortcut {
-        registration.register_shortcut(shortcut_str, &muda_item.id().0);
+        registration.register_shortcut_native_bar(shortcut_str, &id, native_bar && native_ok);
     }
 
     muda_item
+}
+
+/// The text of a native menu item whose chord was kept off the OS
+/// accelerator table ([`native_accelerator_allowed`]): on Windows the label,
+/// a tab and the shortcut as written — the tab is how a Win32 menu right-aligns
+/// an accelerator's text, which is what muda writes for one it installs. macOS
+/// has no such column without a key equivalent, so the label stays bare there
+/// (and on Linux, whose window bar is never shown natively).
+#[cfg(feature = "native-menus")]
+fn native_item_label(label: &str, unbound_shortcut: Option<&str>) -> String {
+    native_item_label_for(cfg!(target_os = "windows"), label, unbound_shortcut)
+}
+
+#[cfg(feature = "native-menus")]
+fn native_item_label_for(windows: bool, label: &str, unbound_shortcut: Option<&str>) -> String {
+    match unbound_shortcut {
+        Some(shortcut) if windows => format!("{label}\t{shortcut}"),
+        _ => label.to_string(),
+    }
+}
+
+/// Whether a window-bar item's chord should be left to the OS alone rather
+/// than fire through [`MENU_SHORTCUTS`] too (issue #1170, "B").
+///
+/// A pure function of two facts, each already recorded for a reason of its
+/// own — `native_bar` on the [`ShortcutEntry`] (is this item even a
+/// candidate: a tray item and the DOM bar never are), and
+/// [`native_accelerator_attached`] (did the OS *actually* end up matching
+/// this window's accelerators: review of #1304 moved this off a `target_os`
+/// guess, so a window whose native bar failed to attach — a non-Win32
+/// handle, a failed `init_for_hwnd` — keeps rinch's own matching instead of
+/// losing the chord to neither side). Exhaustively testable on any host: the
+/// two bools are the whole input, and nothing about *why* either is true or
+/// false matters to this function.
+fn skips_rinch_chord(native_bar: bool, accelerator_attached: bool) -> bool {
+    native_bar && accelerator_attached
 }
 
 /// Set up the global muda event handler. Call once during app init.
 ///
 /// This single handler covers both native menu events and tray context
 /// menu events (same muda static after tray-icon 0.19 + muda 0.15).
-#[cfg(feature = "desktop")]
+#[cfg(feature = "native-menus")]
 pub(crate) fn install_menu_event_handler() {
     muda::MenuEvent::set_event_handler(Some(|event: muda::MenuEvent| {
         let id = event.id().0.clone();
@@ -920,30 +1779,101 @@ pub(crate) fn install_menu_event_handler() {
 // ── Platform-specific menu attachment ───────────────────────────────────────
 
 /// Attach a native menu bar to a window (Windows).
-#[cfg(all(feature = "desktop", target_os = "windows"))]
+///
+/// Marks [`NATIVE_ACCELERATOR_ATTACHED`] only on the success path this
+/// already has: `window.window_handle()` answering `Ok`, that handle being
+/// `Win32`, and `init_for_hwnd` itself returning `Ok` — not on `target_os`
+/// alone (review of #1304). Any other window never marks it, so
+/// `skips_rinch_chord` keeps matching a `native_bar` item's chord through
+/// rinch's own registry on one, rather than losing it to neither path.
+#[cfg(all(feature = "native-menus", target_os = "windows"))]
 pub(crate) fn attach_menu_to_window(menu: &muda::Menu, window: &dyn winit::window::Window) {
     use winit::raw_window_handle::HasWindowHandle;
+    if MENU_BAR_IN_DOCUMENT.with(|f| f.get()) {
+        return;
+    }
     if let Ok(handle) = window.window_handle() {
         if let winit::raw_window_handle::RawWindowHandle::Win32(win32) = handle.as_raw() {
-            let hwnd = win32.hwnd.get() as isize;
+            let hwnd = win32.hwnd.get();
             // Safety: hwnd is a valid window handle from winit, and we're on the main thread.
-            unsafe {
-                let _ = menu.init_for_hwnd(hwnd);
+            let attached = unsafe { menu.init_for_hwnd(hwnd) };
+            if attached.is_ok() {
+                mark_native_accelerator_attached();
+            } else {
+                clear_native_accelerator_attached();
             }
         }
     }
 }
 
+/// Take the native menu bar off a window that is about to be destroyed
+/// (Windows): muda keeps the HWNDs it serves and refuses one it already
+/// has, and Windows may hand the destroyed window's HWND to the next one.
+#[cfg(all(feature = "native-menus", target_os = "windows"))]
+pub(crate) fn detach_menu_from_window(menu: &muda::Menu, window: &dyn winit::window::Window) {
+    use winit::raw_window_handle::HasWindowHandle;
+    if let Ok(handle) = window.window_handle()
+        && let winit::raw_window_handle::RawWindowHandle::Win32(win32) = handle.as_raw()
+    {
+        // Safety: the HWND is still valid (the window is dropped after this),
+        // and we are on the main thread.
+        let _ = unsafe { menu.remove_for_hwnd(win32.hwnd.get()) };
+        clear_native_accelerator_attached();
+    }
+}
+
+/// Nothing to take off: on macOS the bar belongs to the application, and on
+/// Linux nothing was attached.
+#[cfg(all(
+    feature = "native-menus",
+    any(target_os = "macos", target_os = "linux")
+))]
+pub(crate) fn detach_menu_from_window(_menu: &muda::Menu, _window: &dyn winit::window::Window) {}
+
 /// Attach a native menu bar to the application (macOS).
-#[cfg(all(feature = "desktop", target_os = "macos"))]
-pub(crate) fn attach_menu_to_window(menu: &muda::Menu, _window: &winit::window::Window) {
+///
+/// `init_for_nsapp` reports no failure (it returns `()`), so this marks
+/// [`NATIVE_ACCELERATOR_ATTACHED`] right after calling it — still gated on
+/// this function actually running, which is what review of #1304 asked for
+/// in place of a bare `target_os` guess.
+#[cfg(all(feature = "native-menus", target_os = "macos"))]
+pub(crate) fn attach_menu_to_window(menu: &muda::Menu, _window: &dyn winit::window::Window) {
     menu.init_for_nsapp();
+    mark_native_accelerator_attached();
 }
 
 /// Attach a native menu bar to a window (Linux — not yet supported).
-#[cfg(all(feature = "desktop", target_os = "linux"))]
+#[cfg(all(feature = "native-menus", target_os = "linux"))]
 pub(crate) fn attach_menu_to_window(_menu: &muda::Menu, _window: &dyn winit::window::Window) {
     // Linux GTK menu integration not yet implemented.
+}
+
+/// The native menu bar a window wears: muda's, with `native-menus`.
+///
+/// The shell holds one as an `Option` and hands it to
+/// [`attach_menu_to_window`] and [`detach_menu_from_window`] as a window is
+/// made and taken down.
+#[cfg(feature = "native-menus")]
+pub(crate) type NativeMenuBar = muda::Menu;
+
+/// Without `native-menus` there is no native menu bar (#2435), and this type
+/// has no values: the shell's `Option<NativeMenuBar>` is always `None`, and
+/// the compiler, not a runtime check, is what says no attach or detach below
+/// can run. A window's [`Menu`] is the DOM bar instead, its chords armed by
+/// [`register_menu_shortcuts`].
+#[cfg(all(feature = "windowing", not(feature = "native-menus")))]
+pub(crate) enum NativeMenuBar {}
+
+/// No native menu bar exists to attach (see the uninhabited [`NativeMenuBar`]).
+#[cfg(all(feature = "windowing", not(feature = "native-menus")))]
+pub(crate) fn attach_menu_to_window(menu: &NativeMenuBar, _window: &dyn winit::window::Window) {
+    match *menu {}
+}
+
+/// No native menu bar exists to take off (see the uninhabited [`NativeMenuBar`]).
+#[cfg(all(feature = "windowing", not(feature = "native-menus")))]
+pub(crate) fn detach_menu_from_window(menu: &NativeMenuBar, _window: &dyn winit::window::Window) {
+    match *menu {}
 }
 
 // ── Shortcut parsing ────────────────────────────────────────────────────────
@@ -966,15 +1896,113 @@ pub(crate) struct ParsedShortcut {
     pub code: &'static str,
 }
 
-/// Parse a shortcut string like "Cmd+N" or "Ctrl+Shift+S" into a muda Accelerator.
-#[cfg(feature = "desktop")]
+/// The muda accelerator a shortcut string labels its native menu item with.
+///
+/// Derived from [`parse_shortcut_for_matching`] — the parse the chord itself is
+/// registered from — rather than handed to muda's own string parser, so the
+/// label and the chord cannot disagree. They used to: muda accepted `"Ctrl+/"`
+/// and labelled an item whose chord no keystroke could fire (#1160), and refused
+/// rinch's own `Plus`, `Return` and `Del` spellings, leaving a live chord with
+/// no label. `Ctrl`, `Cmd` and `Meta` all fold into one modifier on both sides,
+/// which muda spells `CmdOrCtrl`: Cmd on macOS, Ctrl elsewhere.
+#[cfg(feature = "native-menus")]
 fn parse_shortcut(shortcut: &str) -> Option<Accelerator> {
-    let normalized = shortcut
-        .replace("Cmd+", "CmdOrCtrl+")
-        .replace("Ctrl+", "CmdOrCtrl+")
-        .replace("Meta+", "CmdOrCtrl+");
+    use muda::accelerator::{Code, Modifiers};
+    let parsed = parse_shortcut_or_warn(shortcut)?;
+    let mut mods = Modifiers::empty();
+    if parsed.ctrl_or_cmd {
+        mods |= if cfg!(target_os = "macos") {
+            Modifiers::SUPER
+        } else {
+            Modifiers::CONTROL
+        };
+    }
+    if parsed.alt {
+        mods |= Modifiers::ALT;
+    }
+    if parsed.shift {
+        mods |= Modifiers::SHIFT;
+    }
+    // Every code the table produces is a W3C `code` name, which is what
+    // `Code`'s `FromStr` reads; `the_native_accelerator_names_the_key_the_chord_matches`
+    // walks all of them.
+    let key = Code::from_str(parsed.code).ok()?;
+    Some(Accelerator::new(Some(mods), key))
+}
 
-    Accelerator::from_str(&normalized).ok()
+thread_local! {
+    /// The shortcut strings [`parse_shortcut_or_warn`] has already warned
+    /// about, so a menu rebuilt on every render warns once, not once a frame.
+    static WARNED_SHORTCUTS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+}
+
+/// [`parse_shortcut_for_matching`], logging a warning the first time a string
+/// does not parse.
+///
+/// A shortcut that names no key registers no chord, and the DOM menu bar still
+/// prints the string beside its item — so without the warning the keystroke
+/// simply does nothing and nothing says why. Once per distinct string per
+/// thread.
+fn parse_shortcut_or_warn(shortcut: &str) -> Option<ParsedShortcut> {
+    let parsed = parse_shortcut_for_matching(shortcut);
+    if parsed.is_none() {
+        let first = WARNED_SHORTCUTS
+            .try_with(|warned| warned.borrow_mut().insert(shortcut.to_string()))
+            .unwrap_or(false);
+        if first {
+            #[cfg(test)]
+            WARNINGS_EMITTED.with(|n| n.set(n.get() + 1));
+            let key = shortcut.rsplit('+').next().unwrap_or(shortcut);
+            match shifted_key_hint(key) {
+                Some(base) => tracing::warn!(
+                    "menu shortcut {shortcut:?} registers no chord: {key:?} is a character, \
+                     not a key — spell it as the key and Shift (\"Shift+{base}\" on a US layout)"
+                ),
+                None => tracing::warn!(
+                    "menu shortcut {shortcut:?} registers no chord: it names no key rinch \
+                     can match (see the Menus guide for the accepted keys)"
+                ),
+            }
+        }
+    }
+    parsed
+}
+
+/// The unshifted key a US layout makes a shifted character with — `"?"` →
+/// `"/"` — for the warning [`parse_shortcut_or_warn`] gives when a shortcut is
+/// spelled with the character. A hint only: nothing *matches* through it,
+/// because which key makes `?` depends on the layout, and a chord is a key.
+///
+/// A slice of pairs rather than a `match`: `the_two_key_tables_name_the_same_codes`
+/// reads the key table out of this file by the shape of its arms, and this table
+/// must not look like it.
+pub(crate) fn shifted_key_hint(key: &str) -> Option<&'static str> {
+    const SHIFTED_ON_US_LAYOUT: [(&str, &str); 20] = [
+        ("~", "`"),
+        ("!", "1"),
+        ("@", "2"),
+        ("#", "3"),
+        ("$", "4"),
+        ("%", "5"),
+        ("^", "6"),
+        ("&", "7"),
+        ("*", "8"),
+        ("(", "9"),
+        (")", "0"),
+        ("_", "-"),
+        ("{", "["),
+        ("}", "]"),
+        ("|", "\\"),
+        (":", ";"),
+        ("\"", "'"),
+        ("<", ","),
+        (">", "."),
+        ("?", "/"),
+    ];
+    SHIFTED_ON_US_LAYOUT
+        .iter()
+        .find(|(shifted, _)| *shifted == key)
+        .map(|(_, base)| *base)
 }
 
 /// Parse a shortcut string into a ParsedShortcut for keyboard event matching.
@@ -990,16 +2018,49 @@ fn parse_shortcut_for_matching(shortcut: &str) -> Option<ParsedShortcut> {
     let mut key_str = "";
 
     for part in &parts {
+        // The key is the last token. Anything after it — a second key
+        // (`Ctrl+Shift+C+A`), a modifier written late (`Ctrl+N+Shift`), or an
+        // unknown modifier taken as a key (`Hyper+N`) — is not a shortcut, and
+        // [`parse_shortcut_or_warn`] says so. Taking the last key token instead
+        // made `Hyper+N` a *bare* N, which swallowed every n typed while the
+        // item was live.
+        if !key_str.is_empty() {
+            return None;
+        }
         let part_lower = part.to_lowercase();
         match part_lower.as_str() {
-            "cmd" | "ctrl" | "control" | "meta" | "cmdorctrl" => ctrl_or_cmd = true,
+            // One modifier on every platform: Ctrl or Command, whichever is held
+            // (`match_shortcut_code` folds `meta` into `ctrl`). Every spelling
+            // muda and Electron accept for either is taken here, so none of them
+            // falls through to be read as the key.
+            "cmd" | "command" | "ctrl" | "control" | "meta" | "super" | "cmdorctrl"
+            | "cmdorcontrol" | "commandorctrl" | "commandorcontrol" => ctrl_or_cmd = true,
             "alt" | "option" => alt = true,
             "shift" => shift = true,
             _ => key_str = part,
         }
     }
 
-    let code = match key_str.to_uppercase().as_str() {
+    let code = key_spelling_code(key_str)?;
+
+    Some(ParsedShortcut {
+        ctrl_or_cmd,
+        alt,
+        shift,
+        code,
+    })
+}
+
+/// The W3C `code` name a shortcut string's key token spells (`"k"` →
+/// `"KeyK"`, `"/"` → `"Slash"`, `"PageUp"` → `"PageUp"`), case-insensitively,
+/// or `None` for a token that names no key a chord can match.
+///
+/// The one key vocabulary of the crate: a menu shortcut ([`parse_shortcut_for_matching`])
+/// and a global hotkey (`crate::hotkey`, which adds its modifier keys and a few
+/// keys a menu has no use for on top) read their key token through it, so a
+/// key that works in one works in the other.
+pub(crate) fn key_spelling_code(key_str: &str) -> Option<&'static str> {
+    Some(match key_str.to_uppercase().as_str() {
         "A" => "KeyA",
         "B" => "KeyB",
         "C" => "KeyC",
@@ -1038,6 +2099,19 @@ fn parse_shortcut_for_matching(shortcut: &str) -> Option<ParsedShortcut> {
         "9" => "Digit9",
         "=" | "EQUAL" | "PLUS" => "Equal",
         "-" | "MINUS" => "Minus",
+        // Punctuation, by the key's unshifted character on a US layout or by
+        // its code name (#1160). A shifted character (`?`, `<`, `:` …) is not
+        // here on purpose: a chord is a key and modifiers, so `?` is spelled
+        // `Shift+/` — see `shifted_key_hint`.
+        "`" | "BACKQUOTE" => "Backquote",
+        "\\" | "BACKSLASH" => "Backslash",
+        "[" | "BRACKETLEFT" => "BracketLeft",
+        "]" | "BRACKETRIGHT" => "BracketRight",
+        "," | "COMMA" => "Comma",
+        "." | "PERIOD" => "Period",
+        "'" | "QUOTE" => "Quote",
+        ";" | "SEMICOLON" => "Semicolon",
+        "/" | "SLASH" => "Slash",
         "F1" => "F1",
         "F2" => "F2",
         "F3" => "F3",
@@ -1065,13 +2139,6 @@ fn parse_shortcut_for_matching(shortcut: &str) -> Option<ParsedShortcut> {
         "LEFT" | "ARROWLEFT" => "ArrowLeft",
         "RIGHT" | "ARROWRIGHT" => "ArrowRight",
         _ => return None,
-    };
-
-    Some(ParsedShortcut {
-        ctrl_or_cmd,
-        alt,
-        shift,
-        code,
     })
 }
 
@@ -1082,7 +2149,7 @@ fn parse_shortcut_for_matching(shortcut: &str) -> Option<ParsedShortcut> {
 /// place a `winit` type meets [`ParsedShortcut`]. Spelled out rather than
 /// derived from `Debug`: the two happen to agree today, and a rename upstream
 /// would silently unbind every shortcut in every app.
-#[cfg(feature = "desktop")]
+#[cfg(feature = "windowing")]
 fn key_code_name(key: KeyCode) -> Option<&'static str> {
     Some(match key {
         KeyCode::KeyA => "KeyA",
@@ -1135,6 +2202,15 @@ fn key_code_name(key: KeyCode) -> Option<&'static str> {
         KeyCode::F12 => "F12",
         KeyCode::Equal => "Equal",
         KeyCode::Minus => "Minus",
+        KeyCode::Backquote => "Backquote",
+        KeyCode::Backslash => "Backslash",
+        KeyCode::BracketLeft => "BracketLeft",
+        KeyCode::BracketRight => "BracketRight",
+        KeyCode::Comma => "Comma",
+        KeyCode::Period => "Period",
+        KeyCode::Quote => "Quote",
+        KeyCode::Semicolon => "Semicolon",
+        KeyCode::Slash => "Slash",
         KeyCode::Enter => "Enter",
         KeyCode::Escape => "Escape",
         KeyCode::Backspace => "Backspace",
@@ -1161,8 +2237,27 @@ fn key_code_name(key: KeyCode) -> Option<&'static str> {
 /// callback is inert, just never removed — so the tests below assert on the size
 /// of the registry directly.
 #[cfg(test)]
-fn callback_count() -> usize {
+pub(crate) fn callback_count() -> usize {
     MENU_CALLBACKS.with(|map| map.borrow().len())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many shortcut warnings this thread has actually emitted — what
+    /// "warns once" is a claim about, as opposed to the dedupe set's size.
+    static WARNINGS_EMITTED: Cell<usize> = const { Cell::new(0) };
+}
+
+/// How many shortcut warnings this thread has emitted. See [`WARNINGS_EMITTED`].
+#[cfg(test)]
+fn warnings_emitted() -> usize {
+    WARNINGS_EMITTED.with(Cell::get)
+}
+
+/// How many distinct shortcut strings have been warned about on this thread.
+#[cfg(test)]
+fn warned_shortcut_count() -> usize {
+    WARNED_SHORTCUTS.with(|warned| warned.borrow().len())
 }
 
 /// How many shortcuts the registry currently holds. See [`callback_count`].
@@ -1176,7 +2271,7 @@ mod tests {
     use super::*;
     use rinch_core::reactive::{Scope, Signal};
     use std::cell::Cell;
-    #[cfg(feature = "desktop")]
+    #[cfg(feature = "windowing")]
     use std::collections::BTreeSet;
 
     /// Every registry here is `thread_local!` and `cargo test` gives each test
@@ -1193,13 +2288,23 @@ mod tests {
         (fired, Rc::new(move || seen.set(seen.get() + 1)))
     }
 
+    /// A `key_without_modifiers` that types no Latin letter at all — the
+    /// `match_shortcut` tests below that predate #1170 pass this, which makes
+    /// `chord_key_matches` fall back to the physical key exactly as it always
+    /// matched, so none of them has to know what a US layout types for the
+    /// key under test.
+    #[cfg(feature = "windowing")]
+    fn no_latin_letter() -> winit::keyboard::Key {
+        winit::keyboard::Key::Unidentified(winit::keyboard::NativeKey::Unidentified)
+    }
+
     /// Register under the ambient owner, the way a caller that both creates and
     /// registers a callback in one place would. The builders instead carry the
     /// item's own owner, which is what
     /// [`the_owner_is_the_scope_that_created_the_callback_not_the_one_that_built_the_menu`]
     /// pins.
     fn register_callback(menu_id: &str, cb: Rc<dyn Fn()>) {
-        register_callback_owned(menu_id, cb, current_owner());
+        register_callback_owned(menu_id, cb, current_owner(), CallbackFrame::current());
     }
 
     /// The lifetime half.
@@ -1225,8 +2330,18 @@ mod tests {
         let mut registration = MenuRegistration::default();
         let scope = Scope::new();
         scope.run(|| {
-            registration.register_callback("scoped-dispatched", cb, current_owner());
-            registration.register_callback("scoped-untouched", Rc::new(|| {}), current_owner());
+            registration.register_callback(
+                "scoped-dispatched",
+                cb,
+                current_owner(),
+                CallbackFrame::current(),
+            );
+            registration.register_callback(
+                "scoped-untouched",
+                Rc::new(|| {}),
+                current_owner(),
+                CallbackFrame::current(),
+            );
         });
         assert_eq!(callback_count(), base + 2);
 
@@ -1354,7 +2469,7 @@ mod tests {
         );
         register_shortcut("Ctrl+Shift+J", "chord-1");
 
-        assert!(match_shortcut_code(true, false, false, true, "KeyJ"));
+        assert!(match_shortcut_code(true, false, false, true, "KeyJ", None));
     }
 
     /// `MENU_SHORTCUTS` leaks identically to `MENU_CALLBACKS` — the issue names
@@ -1380,14 +2495,14 @@ mod tests {
         let mut registration = MenuRegistration::default();
         let scope = Scope::new();
         let owner = scope.run(current_owner);
-        registration.register_callback("sc-1", Rc::new(|| {}), owner);
+        registration.register_callback("sc-1", Rc::new(|| {}), owner, CallbackFrame::current());
         registration.register_shortcut("Ctrl+Alt+Y", "sc-1");
         registration.register_shortcut("Ctrl+Alt+P", "sc-no-callback");
         assert_eq!(shortcut_count(), shortcuts + 2);
 
         scope.dispose();
         assert!(
-            !match_shortcut_code(true, false, true, false, "KeyY"),
+            !match_shortcut_code(true, false, true, false, "KeyY", None),
             "a disposed component's chord must fall through"
         );
         assert_eq!(
@@ -1414,7 +2529,7 @@ mod tests {
         register_shortcut("Ctrl+Alt+U", "no-callback-here");
 
         assert!(
-            !match_shortcut_code(true, false, true, false, "KeyU"),
+            !match_shortcut_code(true, false, true, false, "KeyU", None),
             "nothing ran, so the keystroke belongs to the app"
         );
     }
@@ -1429,7 +2544,12 @@ mod tests {
 
         let dead = Scope::new();
         let owner = dead.run(current_owner);
-        register_callback_owned("shadow-dead", Rc::new(|| {}), owner);
+        register_callback_owned(
+            "shadow-dead",
+            Rc::new(|| {}),
+            owner,
+            CallbackFrame::current(),
+        );
         register_shortcut("Ctrl+Alt+I", "shadow-dead");
 
         register_callback("shadow-live", cb);
@@ -1437,7 +2557,7 @@ mod tests {
 
         dead.dispose();
 
-        assert!(match_shortcut_code(true, false, true, false, "KeyI"));
+        assert!(match_shortcut_code(true, false, true, false, "KeyI", None));
         assert_eq!(
             fired.get(),
             1,
@@ -1484,7 +2604,7 @@ mod tests {
         let owner = creator.run(current_owner);
         let builder = Scope::new();
         builder.run(|| {
-            register_callback_owned("granular-1", cb, owner);
+            register_callback_owned("granular-1", cb, owner, CallbackFrame::current());
         });
 
         creator.dispose();
@@ -1527,8 +2647,8 @@ mod tests {
         let mut registration = MenuRegistration::default();
         let builder = Scope::new();
         builder.run(|| {
-            registration.register_callback("contrib-y", y_cb, y_owner);
-            registration.register_callback("contrib-z", z_cb, z_owner);
+            registration.register_callback("contrib-y", y_cb, y_owner, CallbackFrame::current());
+            registration.register_callback("contrib-z", z_cb, z_owner, CallbackFrame::current());
         });
 
         builder.dispose();
@@ -1585,8 +2705,8 @@ mod tests {
 
         {
             let mut registration = MenuRegistration::default();
-            registration.register_callback("tok-1", Rc::new(|| {}), None);
-            registration.register_callback("tok-2", Rc::new(|| {}), None);
+            registration.register_callback("tok-1", Rc::new(|| {}), None, CallbackFrame::current());
+            registration.register_callback("tok-2", Rc::new(|| {}), None, CallbackFrame::current());
             registration.register_shortcut("Ctrl+Alt+Q", "tok-1");
             assert_eq!(callback_count(), callbacks + 2);
             assert_eq!(shortcut_count(), shortcuts + 1);
@@ -1616,6 +2736,7 @@ mod tests {
                     &format!("ksni-{}", build * 4 + item),
                     Rc::new(|| {}),
                     None,
+                    CallbackFrame::current(),
                 );
             }
             // Assigning drops the previous build's token, exactly as replacing a
@@ -1634,7 +2755,7 @@ mod tests {
 
     // ── The DOM menu bar's own registration ──────────────────────────────
     //
-    // These run in *both* configurations — with `desktop` and without it — and
+    // These run in *both* configurations — with `windowing` and without it — and
     // that is the point: they are the half of the menu system a `rinch-web`
     // build gets, where there is no muda to arm a chord and no winit `KeyCode`
     // to match one with. A regression that re-coupled either to the desktop
@@ -1665,13 +2786,69 @@ mod tests {
 
         let _chords = register_menu_shortcuts(&[("File", &file)]);
 
-        assert!(match_shortcut_code(true, false, false, true, "KeyF"));
+        assert!(match_shortcut_code(true, false, false, true, "KeyF", None));
         assert_eq!(top_fired.get(), 1);
         assert!(
-            match_shortcut_code(true, false, false, true, "KeyT"),
+            match_shortcut_code(true, false, false, true, "KeyT", None),
             "a submenu's items declare chords like any other"
         );
         assert_eq!(nested_fired.get(), 1);
+    }
+
+    /// A menu callback runs under the document and in the context root its
+    /// item was made in (issue #1032), as a timer does (#963): a native menu
+    /// click and a chord arrive outside any dispatch, or inside another
+    /// document's, and an interceptor the callback registered or cleared
+    /// reached every document on the thread. Fired from inside root 4 /
+    /// document 2, off the fixed point; an item made outside any document
+    /// answers none, not the firing one. Both routes: the registry (a chord, a
+    /// muda click, a tray item) and the DOM bar's direct invocation.
+    #[test]
+    fn a_menu_callback_runs_under_the_document_and_root_its_item_was_made_in() {
+        type Seen = Rc<RefCell<Vec<(u64, Option<u64>)>>>;
+        use rinch_core::{
+            current_context_root, current_dispatching_doc, push_context_root, push_dispatching_doc,
+        };
+        let seen: Seen = Rc::default();
+        let record = |s: Seen| {
+            move || {
+                s.borrow_mut()
+                    .push((current_context_root(), current_dispatching_doc()))
+            }
+        };
+        let in_doc = {
+            let _root = push_context_root(9);
+            let _doc = push_dispatching_doc(7);
+            MenuItem::new("In a document")
+                .shortcut("Ctrl+Shift+F7")
+                .on_click(record(seen.clone()))
+        };
+        let outside = MenuItem::new("Outside")
+            .shortcut("Ctrl+Shift+F8")
+            .on_click(record(seen.clone()));
+        let in_doc_direct = in_doc.clone();
+        let menu = Menu::new().item(in_doc).item(outside);
+        let _chords = register_menu_shortcuts(&[("File", &menu)]);
+
+        {
+            let _root = push_context_root(4);
+            let _doc = push_dispatching_doc(2);
+            assert!(match_shortcut_code(true, false, false, true, "F7", None));
+            assert!(match_shortcut_code(true, false, false, true, "F8", None));
+            // The DOM bar invokes straight from the `Menu`, not the registry.
+            let cb = in_doc_direct.activation().expect("has a callback");
+            assert!(invoke_menu_callback(
+                &cb,
+                in_doc_direct.callback_owner.as_ref(),
+                in_doc_direct.callback_frame
+            ));
+            assert_eq!(
+                (current_context_root(), current_dispatching_doc()),
+                (4, Some(2)),
+                "the firing root and document are restored"
+            );
+        }
+        assert_eq!(*seen.borrow(), [(9, Some(7)), (0, None), (9, Some(7))]);
     }
 
     /// A disabled item fires nothing, so its chord must not be armed — else the
@@ -1699,10 +2876,10 @@ mod tests {
             shortcuts,
             "neither item may arm a chord: one is disabled, the other runs nothing"
         );
-        assert!(!match_shortcut_code(true, false, true, false, "KeyB"));
+        assert!(!match_shortcut_code(true, false, true, false, "KeyB", None));
         assert_eq!(fired.get(), 0);
         assert!(
-            !match_shortcut_code(true, false, true, false, "KeyM"),
+            !match_shortcut_code(true, false, true, false, "KeyM", None),
             "an item with no on_click must not eat its key combination"
         );
     }
@@ -1754,7 +2931,7 @@ mod tests {
 
         let chords = register_menu_shortcuts(&[("View", &menu)]);
         assert!(
-            match_shortcut_code(true, false, true, false, "KeyK"),
+            match_shortcut_code(true, false, true, false, "KeyK", None),
             "control: armed while the bar is up"
         );
         assert_eq!(fired.get(), 1);
@@ -1762,7 +2939,7 @@ mod tests {
         drop(chords);
 
         assert!(
-            !match_shortcut_code(true, false, true, false, "KeyK"),
+            !match_shortcut_code(true, false, true, false, "KeyK", None),
             "an unmounted bar must not go on eating its chord"
         );
         assert_eq!(fired.get(), 1, "nor go on running its item");
@@ -1794,19 +2971,19 @@ mod tests {
         drop(first);
 
         assert!(
-            match_shortcut_code(true, false, true, false, "KeyZ"),
+            match_shortcut_code(true, false, true, false, "KeyZ", None),
             "the second build is the one the slot holds; a stale token must not take it"
         );
         assert_eq!(second_fired.get(), 1);
         assert!(
-            !match_shortcut_code(true, false, true, false, "KeyY"),
+            !match_shortcut_code(true, false, true, false, "KeyY", None),
             "the first build was released by the replacement, not by its token"
         );
         assert_eq!(first_fired.get(), 0);
 
         drop(second);
         assert!(
-            !match_shortcut_code(true, false, true, false, "KeyZ"),
+            !match_shortcut_code(true, false, true, false, "KeyZ", None),
             "and the live token still disarms its own"
         );
     }
@@ -1815,7 +2992,7 @@ mod tests {
     /// on. This pins that agreement: the desktop matches by winit `KeyCode`, the
     /// browser by `KeyboardEvent.code`, and one registration must answer to
     /// both.
-    #[cfg(feature = "desktop")]
+    #[cfg(feature = "windowing")]
     #[test]
     fn the_winit_keycode_and_the_web_code_name_reach_the_same_callback() {
         for (chord, key, code) in [
@@ -1859,7 +3036,7 @@ mod tests {
     ///
     /// Together they pin the bijection the two tables are: a code reachable from
     /// a `KeyCode` is reachable from a shortcut string, and names the same key.
-    #[cfg(feature = "desktop")]
+    #[cfg(feature = "windowing")]
     #[test]
     fn every_arm_of_the_key_table_round_trips() {
         let mut seen: Vec<&'static str> = Vec::new();
@@ -1905,8 +3082,8 @@ mod tests {
     /// source table is spelled out; a variant **added** to the table without
     /// being added here is caught by
     /// [`the_two_key_tables_name_the_same_codes`], which counts the arms.
-    #[cfg(feature = "desktop")]
-    const NAMED_KEYS: [KeyCode; 64] = [
+    #[cfg(feature = "windowing")]
+    const NAMED_KEYS: [KeyCode; 73] = [
         KeyCode::KeyA,
         KeyCode::KeyB,
         KeyCode::KeyC,
@@ -1971,7 +3148,260 @@ mod tests {
         KeyCode::ArrowDown,
         KeyCode::ArrowLeft,
         KeyCode::ArrowRight,
+        KeyCode::Backquote,
+        KeyCode::Backslash,
+        KeyCode::BracketLeft,
+        KeyCode::BracketRight,
+        KeyCode::Comma,
+        KeyCode::Period,
+        KeyCode::Quote,
+        KeyCode::Semicolon,
+        KeyCode::Slash,
     ];
+
+    /// Every punctuation key a shortcut string can name, by its character, with
+    /// the winit key and the W3C `code` a keystroke on it carries (#1160).
+    ///
+    /// Each one used to register **no chord at all**, silently, on both
+    /// backends: the forward table had no row for the character and
+    /// `key_code_name` no arm for the key, so neither the desktop nor the
+    /// browser could fire the item from the keyboard — while the native menu,
+    /// whose accelerator muda parses on its own, still *labelled* it.
+    #[cfg(feature = "windowing")]
+    const PUNCTUATION: [(&str, KeyCode, &str); 9] = [
+        ("`", KeyCode::Backquote, "Backquote"),
+        ("\\", KeyCode::Backslash, "Backslash"),
+        ("[", KeyCode::BracketLeft, "BracketLeft"),
+        ("]", KeyCode::BracketRight, "BracketRight"),
+        (",", KeyCode::Comma, "Comma"),
+        (".", KeyCode::Period, "Period"),
+        ("'", KeyCode::Quote, "Quote"),
+        (";", KeyCode::Semicolon, "Semicolon"),
+        ("/", KeyCode::Slash, "Slash"),
+    ];
+
+    /// `Ctrl+/`, `Ctrl+,`, `Ctrl+[` … fire their item from the keyboard on
+    /// **both** backends — every row, not a sample (#807's lesson): the desktop
+    /// through winit's `KeyCode`, the browser through `KeyboardEvent.code`.
+    /// Alt rides along so no other test's chord on this thread can answer.
+    #[cfg(feature = "windowing")]
+    #[test]
+    fn every_punctuation_shortcut_fires_on_the_desktop_and_the_web() {
+        for (ch, key, code) in PUNCTUATION {
+            let chord = format!("Ctrl+Alt+{ch}");
+            let (fired, cb) = probe();
+            let id = format!("punct-{code}");
+            let mut registration = MenuRegistration::default();
+            registration.register_callback(&id, cb, None, CallbackFrame::current());
+            registration.register_shortcut(&chord, &id);
+
+            assert!(
+                match_shortcut(
+                    true,
+                    false,
+                    true,
+                    false,
+                    key,
+                    &no_latin_letter(),
+                    KeyOwner::None,
+                    false
+                ),
+                "{chord}: the desktop keystroke ({key:?}) must fire the item"
+            );
+            assert!(
+                match_shortcut_code(true, false, true, false, code, None),
+                "{chord}: the browser keystroke (code {code}) must fire the item"
+            );
+            assert_eq!(fired.get(), 2, "{chord}");
+            assert!(
+                !match_shortcut_code(true, false, true, true, code, None),
+                "{chord}: Shift is part of the chord, so Ctrl+Alt+Shift+{ch} is another one"
+            );
+            drop(registration);
+        }
+    }
+
+    /// `Ctrl+Space` is matched on the key's **code**, which is `"Space"` on
+    /// both backends; the spacebar's `key` changing to `" "` on desktop
+    /// (#1161) is invisible here. Pinned so a future move to key-based
+    /// matching has to keep it: Alt rides along so no other test's chord on
+    /// this thread can answer.
+    #[cfg(feature = "windowing")]
+    #[test]
+    fn a_space_chord_fires_on_the_desktop_and_the_web() {
+        let (fired, cb) = probe();
+        let mut registration = MenuRegistration::default();
+        registration.register_callback("space-chord", cb, None, CallbackFrame::current());
+        registration.register_shortcut("Ctrl+Alt+Space", "space-chord");
+        assert!(match_shortcut(
+            true,
+            false,
+            true,
+            false,
+            KeyCode::Space,
+            &no_latin_letter(),
+            KeyOwner::None,
+            false
+        ));
+        assert!(match_shortcut_code(true, false, true, false, "Space", None));
+        assert_eq!(fired.get(), 2);
+        assert!(!match_shortcut_code(true, false, true, false, " ", None));
+    }
+
+    /// A shortcut string's key is a **key**, not the character Shift makes of
+    /// it. The browser reports Ctrl+Shift+/ on a US layout as `code: "Slash"`,
+    /// `key: "?"`, `shiftKey: true` (measured, Chrome 153), and rinch matches
+    /// on `code` + modifiers, so the chord is spelled `"Ctrl+Shift+/"`. `"?"`
+    /// names no key — which one makes it depends on the layout — so
+    /// `"Ctrl+?"` registers nothing, and says so once.
+    #[cfg(feature = "windowing")]
+    #[test]
+    fn a_shifted_character_is_spelled_as_its_key_and_shift() {
+        let (fired, cb) = probe();
+        let mut registration = MenuRegistration::default();
+        registration.register_callback("help", cb, None, CallbackFrame::current());
+        registration.register_shortcut("Ctrl+Shift+/", "help");
+        assert!(match_shortcut(
+            true,
+            false,
+            false,
+            true,
+            KeyCode::Slash,
+            &no_latin_letter(),
+            KeyOwner::None,
+            false
+        ));
+        assert!(match_shortcut_code(true, false, false, true, "Slash", None));
+        assert_eq!(fired.get(), 2);
+
+        assert!(
+            parse_shortcut_for_matching("Ctrl+?").is_none(),
+            "\"?\" is a character, not a key"
+        );
+    }
+
+    /// A shortcut string that names no key used to vanish without a word — the
+    /// item showed its label and the keystroke did nothing. It now warns, once
+    /// per string, however many times a menu is rebuilt with it.
+    #[test]
+    fn an_unparseable_shortcut_warns_once_and_registers_nothing() {
+        let shortcuts = shortcut_count();
+        let warned = warned_shortcut_count();
+        let emitted = warnings_emitted();
+        let mut registration = MenuRegistration::default();
+        registration.register_shortcut("Ctrl+?", "unparseable-1");
+        registration.register_shortcut("Ctrl+?", "unparseable-2");
+        registration.register_shortcut("Ctrl+Nope", "unparseable-3");
+        assert_eq!(shortcut_count(), shortcuts, "no chord registered");
+        assert_eq!(
+            warned_shortcut_count(),
+            warned + 2,
+            "one warning per distinct string, not per registration"
+        );
+        assert_eq!(
+            warnings_emitted(),
+            emitted + 2,
+            "and one warning *emitted* per distinct string: three registrations, two strings"
+        );
+        assert_eq!(
+            shifted_key_hint("?"),
+            Some("/"),
+            "the warning names the key a US layout makes it with"
+        );
+        assert_eq!(shifted_key_hint("/"), None);
+
+        // Positive control: a string that parses warns about nothing.
+        registration.register_shortcut("Ctrl+Alt+/", "parseable");
+        assert_eq!(shortcut_count(), shortcuts + 1);
+        assert_eq!(warned_shortcut_count(), warned + 2);
+        assert_eq!(warnings_emitted(), emitted + 2);
+    }
+
+    /// The native menu's accelerator is derived from the **same** parse the
+    /// chord is, for every key the table knows — so the label muda shows and
+    /// the chord that fires cannot disagree. They used to be two parsers:
+    /// muda's accepted `"Ctrl+/"` (a label over a dead chord, #1160) and
+    /// refused rinch's own `Plus`, `Return` and `Del` spellings (a live chord
+    /// with no label).
+    #[cfg(feature = "native-menus")]
+    #[test]
+    fn the_native_accelerator_names_the_key_the_chord_matches() {
+        use muda::accelerator::{Code, Modifiers};
+        let ctrl = if cfg!(target_os = "macos") {
+            Modifiers::SUPER
+        } else {
+            Modifiers::CONTROL
+        };
+        for key in NAMED_KEYS {
+            let code = key_code_name(key).expect("every named key has a code");
+            let spelling = code
+                .strip_prefix("Key")
+                .or_else(|| code.strip_prefix("Digit"))
+                .unwrap_or(code);
+            let expected = Accelerator::new(
+                Some(ctrl | Modifiers::SHIFT),
+                Code::from_str(code).expect("a W3C code muda knows"),
+            );
+            assert_eq!(
+                parse_shortcut(&format!("Ctrl+Shift+{spelling}")),
+                Some(expected),
+                "{code}"
+            );
+        }
+        for (ch, _, code) in PUNCTUATION {
+            assert_eq!(
+                parse_shortcut(&format!("Alt+{ch}")),
+                Some(Accelerator::new(
+                    Some(Modifiers::ALT),
+                    Code::from_str(code).unwrap()
+                )),
+                "{ch}"
+            );
+        }
+        for (alias, code) in [
+            ("Plus", Code::Equal),
+            ("Return", Code::Enter),
+            ("Del", Code::Delete),
+        ] {
+            assert_eq!(
+                parse_shortcut(&format!("Ctrl+{alias}")),
+                Some(Accelerator::new(Some(ctrl), code)),
+                "{alias} arms a chord, so it must label one"
+            );
+        }
+        // Keys muda's own parser knows and the chord table does not: with the
+        // label taken from muda, each of these labelled a dead chord.
+        for unchorded in ["Ctrl+?", "Ctrl+Insert", "F13", "Ctrl+NumpadAdd"] {
+            assert!(
+                parse_shortcut_for_matching(unchorded).is_none(),
+                "control: {unchorded} arms no chord"
+            );
+            assert_eq!(
+                parse_shortcut(unchorded),
+                None,
+                "{unchorded}: no chord, no label"
+            );
+        }
+        // muda's and Electron's modifier spellings are the one Ctrl-or-Cmd
+        // modifier too, on the label and on the chord alike.
+        for spelling in [
+            "Command",
+            "CommandOrControl",
+            "CommandOrCtrl",
+            "CmdOrControl",
+            "Super",
+        ] {
+            assert_eq!(
+                parse_shortcut(&format!("{spelling}+N")),
+                Some(Accelerator::new(Some(ctrl), Code::KeyN)),
+                "{spelling}+N"
+            );
+        }
+        // A second key, or anything after the key, is not a shortcut: no label.
+        for malformed in ["Hyper+N", "Ctrl+Shift+C+A", "Ctrl+N+Shift"] {
+            assert_eq!(parse_shortcut(malformed), None, "{malformed}");
+        }
+    }
 
     /// The two tables name the **same set** of codes — the other direction, and
     /// the one a per-arm walk cannot reach.
@@ -2000,7 +3430,7 @@ mod tests {
     /// where the inverse side fails loud through the count. The length
     /// assertions are the positive control: a parse that matched nothing would
     /// otherwise compare two empty sets and pass.
-    #[cfg(feature = "desktop")]
+    #[cfg(feature = "windowing")]
     #[test]
     fn the_two_key_tables_name_the_same_codes() {
         let source = include_str!("mod.rs");
@@ -2069,9 +3499,9 @@ mod tests {
         let (second_fired, second_cb) = probe();
 
         let mut first = MenuRegistration::default();
-        first.register_callback("shared-1", first_cb, None);
+        first.register_callback("shared-1", first_cb, None, CallbackFrame::current());
         let mut second = MenuRegistration::default();
-        second.register_callback("shared-1", second_cb, None);
+        second.register_callback("shared-1", second_cb, None, CallbackFrame::current());
 
         drop(first);
         dispatch_menu_event("shared-1");
@@ -2081,6 +3511,1064 @@ mod tests {
             second_fired.get(),
             1,
             "the later build still owns the id it registered"
+        );
+    }
+
+    // ── Issue #1170: letter chords match the layout's character ───────────
+
+    /// Reset the override after a test that touches it, so a later test on
+    /// this same thread (and `cargo test` gives each test its own thread, but
+    /// a future runner change must not make this test order-dependent) sees
+    /// the documented default.
+    struct RestoreMatching;
+    impl Drop for RestoreMatching {
+        fn drop(&mut self) {
+            set_shortcut_matching(ShortcutMatching::LayoutAware);
+        }
+    }
+
+    /// QWERTZ's Y/Z swap (#1170, option A): a chord declared `"Ctrl+Z"` is
+    /// stored under the *US* physical code `"KeyZ"`, but on a German layout
+    /// the key labelled Z sits where a US keyboard has Y — physical `"KeyY"`,
+    /// typing the character `'z'`. The chord must fire from that physical key,
+    /// not from the US-position `"KeyZ"` (which German labels Y and types
+    /// `'y'`).
+    ///
+    /// Mutant this kills: matching only `shortcut.code == code` (the pre-#1170
+    /// rule, or `chord_key_matches` with the layout-character branch deleted)
+    /// never fires here, since `code` is `"KeyY"`, not `"KeyZ"`.
+    #[test]
+    fn a_letter_chord_matches_the_layouts_character_on_a_qwertz_keyboard() {
+        let (fired, cb) = probe();
+        let mut registration = MenuRegistration::default();
+        registration.register_callback("qwertz-undo", cb, None, CallbackFrame::current());
+        registration.register_shortcut("Ctrl+Z", "qwertz-undo");
+
+        // The physical key labelled Z on German QWERTZ is `KeyY`, typing 'z'.
+        assert!(
+            match_shortcut_code(true, false, false, false, "KeyY", Some('z')),
+            "the key labelled Z (physical KeyY, typing 'z') must fire Ctrl+Z"
+        );
+        assert_eq!(fired.get(), 1);
+
+        // The US physical position of Z types 'y' on German QWERTZ and must
+        // not fire Ctrl+Z — it is labelled Y there.
+        assert!(
+            !match_shortcut_code(true, false, false, false, "KeyZ", Some('y')),
+            "the key labelled Y (physical KeyZ, typing 'y') must not fire Ctrl+Z"
+        );
+        assert_eq!(fired.get(), 1);
+    }
+
+    /// AZERTY's A/Q swap, the other direction from the QWERTZ case above: the
+    /// key labelled Q on a French keyboard is physical `KeyA` (US position),
+    /// typing `'q'`.
+    ///
+    /// Mutant this kills: comparing `typed_letter` against `code`'s own US
+    /// letter by physical position instead of by [`letter_from_code`] of the
+    /// *chord's* key would get this backwards — this chord is declared `"Q"`,
+    /// not `"A"`.
+    #[test]
+    fn a_letter_chord_matches_the_layouts_character_on_an_azerty_keyboard() {
+        let (fired, cb) = probe();
+        let mut registration = MenuRegistration::default();
+        registration.register_callback("azerty-quit", cb, None, CallbackFrame::current());
+        registration.register_shortcut("Ctrl+Q", "azerty-quit");
+
+        assert!(
+            match_shortcut_code(true, false, false, false, "KeyA", Some('q')),
+            "the key labelled Q (physical KeyA, typing 'q') must fire Ctrl+Q"
+        );
+        assert_eq!(fired.get(), 1);
+
+        assert!(
+            !match_shortcut_code(true, false, false, false, "KeyQ", Some('a')),
+            "the key labelled A (physical KeyQ, typing 'a') must not fire Ctrl+Q"
+        );
+        assert_eq!(fired.get(), 1);
+    }
+
+    /// A Cyrillic (or Thai, Armenian, …) layout types no Latin letter at all
+    /// for the physical `Ctrl+C`/`Ctrl+V` position — the GTK/GNOME/Firefox bug
+    /// class #1170's recon found. `typed_letter` is then `None`, and the
+    /// chord must fall back to matching the physical key, or Ctrl+C would be
+    /// unreachable on such a layout exactly as it is in those toolkits today.
+    ///
+    /// Mutant this kills: a layout-character branch with no `None` fallback
+    /// (`typed_letter.is_some_and(|t| t == letter)`, dropping the `None` arm
+    /// that falls back to `shortcut.code == code`) never fires here.
+    #[test]
+    fn a_letter_chord_falls_back_to_the_physical_key_when_the_layout_types_no_latin_letter() {
+        let (fired, cb) = probe();
+        let mut registration = MenuRegistration::default();
+        registration.register_callback("cyrillic-copy", cb, None, CallbackFrame::current());
+        registration.register_shortcut("Ctrl+C", "cyrillic-copy");
+
+        assert!(
+            match_shortcut_code(true, false, false, false, "KeyC", None),
+            "with no Latin letter typed, the physical key must still fire the chord"
+        );
+        assert_eq!(fired.get(), 1);
+
+        // A different physical key, still no Latin letter: must not fire.
+        assert!(!match_shortcut_code(
+            true, false, false, false, "KeyV", None
+        ));
+        assert_eq!(fired.get(), 1);
+    }
+
+    /// Digit and punctuation chords are untouched by #1170: they match the
+    /// physical key alone whatever `typed_letter` says, because
+    /// [`chord_key_matches`] only reads it for a chord whose key
+    /// [`letter_from_code`] answers `Some` for.
+    ///
+    /// Mutant this kills: applying the layout-character branch to every
+    /// chord (dropping the `letter_from_code` guard) would make `"Ctrl+1"`
+    /// match `typed_letter == Some('q')` on `"Digit1"` and refuse to match a
+    /// physical `"Digit1"` press reporting `typed_letter: None` — neither of
+    /// which this test allows.
+    #[test]
+    fn a_digit_chord_matches_the_physical_key_regardless_of_typed_letter() {
+        let (fired, cb) = probe();
+        let mut registration = MenuRegistration::default();
+        registration.register_callback("digit-one", cb, None, CallbackFrame::current());
+        registration.register_shortcut("Ctrl+1", "digit-one");
+
+        // No Latin letter at all — the ordinary case for a digit key — still
+        // matches by physical code.
+        assert!(match_shortcut_code(
+            true, false, false, false, "Digit1", None
+        ));
+        assert_eq!(fired.get(), 1);
+
+        // The wrong physical key, even carrying a letter that happens to equal
+        // nothing of this chord's, must not fire.
+        assert!(!match_shortcut_code(
+            true,
+            false,
+            false,
+            false,
+            "Digit2",
+            Some('q')
+        ));
+        assert_eq!(fired.get(), 1);
+    }
+
+    /// [`ShortcutMatching::Physical`] turns the layout-character branch off
+    /// entirely: every chord, letters included, matches physical-only — the
+    /// pre-#1170 rule, and the override's whole point (a user who wants
+    /// shortcut *positions* to stay fixed under a remapped layout).
+    ///
+    /// Mutant this kills: `chord_key_matches` not checking
+    /// `shortcut_matching()` at all (always taking the layout-aware branch)
+    /// would fire on `"KeyA"` below and refuse `"KeyQ"`, the opposite of what
+    /// this test asserts.
+    #[test]
+    fn the_physical_override_matches_every_chord_by_physical_key_only() {
+        let _restore = RestoreMatching;
+        let (fired, cb) = probe();
+        let mut registration = MenuRegistration::default();
+        registration.register_callback("azerty-quit-physical", cb, None, CallbackFrame::current());
+        registration.register_shortcut("Ctrl+Q", "azerty-quit-physical");
+
+        set_shortcut_matching(ShortcutMatching::Physical);
+
+        // Under the override, the AZERTY character match from
+        // `a_letter_chord_matches_the_layouts_character_on_an_azerty_keyboard`
+        // must NOT fire: the override cares only about the physical code.
+        assert!(!match_shortcut_code(
+            true,
+            false,
+            false,
+            false,
+            "KeyA",
+            Some('q')
+        ));
+        assert_eq!(fired.get(), 0);
+
+        // The chord's own physical key still fires, whatever character it
+        // types under the override.
+        assert!(match_shortcut_code(
+            true,
+            false,
+            false,
+            false,
+            "KeyQ",
+            Some('a')
+        ));
+        assert_eq!(fired.get(), 1);
+    }
+
+    /// The default is layout-aware — [`ShortcutMatching::default`] and
+    /// [`shortcut_matching`] agree with no override ever having been set.
+    #[test]
+    fn shortcut_matching_defaults_to_layout_aware() {
+        assert_eq!(ShortcutMatching::default(), ShortcutMatching::LayoutAware);
+    }
+
+    /// The desktop half of #1170's character matching, exercised directly
+    /// (review of #1304, finding 1 — every other fixture hand-fed an
+    /// `Option<char>` straight into `match_shortcut_code`, so a mutant that
+    /// deleted `.to_ascii_lowercase()` here survived the whole suite).
+    ///
+    /// Mutant this kills: that exact deletion — `Character("Z".into())`
+    /// would then answer `Some('Z')`, which disagrees with the lowercase
+    /// `Some('z')` asserted below.
+    #[cfg(feature = "windowing")]
+    #[test]
+    fn winit_typed_letter_lowercases_a_shifted_character_and_rejects_everything_else() {
+        use winit::keyboard::{Key, NativeKey};
+
+        assert_eq!(winit_typed_letter(&Key::Character("Z".into())), Some('z'));
+        assert_eq!(winit_typed_letter(&Key::Character("z".into())), Some('z'));
+        assert_eq!(winit_typed_letter(&Key::Character("1".into())), None);
+        // Cyrillic С (U+0421) — not ASCII, so no Latin letter.
+        assert_eq!(winit_typed_letter(&Key::Character("С".into())), None);
+        // More than one character: not a single key's letter.
+        assert_eq!(winit_typed_letter(&Key::Character("ab".into())), None);
+        assert_eq!(
+            winit_typed_letter(&Key::Unidentified(NativeKey::Unidentified)),
+            None
+        );
+    }
+
+    // ── Issue #1170, "B": a window-bar item on macOS/Windows skips rinch's
+    //    own chord, leaving it to the OS alone ──────────────────────────────
+
+    /// The pure decision [`skips_rinch_chord`] makes, exhaustively: only a
+    /// window-bar item (`native_bar: true`) whose native accelerator has
+    /// actually attached (`accelerator_attached: true`) skips rinch's own
+    /// chord. A tray item, or a window-bar item whose attach did not happen
+    /// or did not succeed, always keeps matching through the registry.
+    ///
+    /// This is the host-independent half of "B" — see
+    /// [`attach_menu_to_window`]'s Windows/macOS docs for where the second
+    /// bool is actually recorded, which this (Linux) host's test suite
+    /// cannot exercise directly — only this boolean rule can. A macOS and a
+    /// Windows host both still need a manual check that an item's native
+    /// accelerator fires its callback exactly once, not twice.
+    #[test]
+    fn skips_rinch_chord_is_true_only_for_a_native_bar_item_whose_accelerator_attached() {
+        assert!(skips_rinch_chord(true, true), "native bar + attached");
+        assert!(
+            !skips_rinch_chord(true, false),
+            "native bar, but the attach did not happen or did not succeed \
+             (Linux, a non-Win32 handle, a failed init_for_hwnd) — rinch must still match"
+        );
+        assert!(
+            !skips_rinch_chord(false, true),
+            "a tray item is never attached to a window at all"
+        );
+        assert!(!skips_rinch_chord(false, false));
+    }
+
+    /// The fact-based half, end to end (review of #1304, finding 2): a
+    /// `native_bar` chord fires through rinch's own registry right up until
+    /// the native accelerator actually attaches, and only then goes silent —
+    /// never unconditionally from `target_os` alone. This is exactly the
+    /// case a window whose attach failed (a non-Win32 handle, a failed
+    /// `init_for_hwnd`) depends on: without it, such a window's shortcut
+    /// would be unreachable by any path.
+    ///
+    /// Mutant this kills: deciding the skip from `native_bar` alone (ignoring
+    /// [`native_accelerator_attached`]) fires neither assertion below.
+    #[cfg(feature = "native-menus")]
+    #[test]
+    fn a_native_bar_chord_fires_until_the_accelerator_actually_attaches_then_goes_silent() {
+        let (fired, cb) = probe();
+        let mut registration = MenuRegistration::default();
+        registration.register_callback("mac-quit-1304", cb, None, CallbackFrame::current());
+        registration.register_shortcut_native_bar("Ctrl+Q", "mac-quit-1304", true);
+
+        // Before `attach_menu_to_window` ever records success — the Linux
+        // default, and a Windows window whose handle was not `Win32` — the
+        // chord fires: nothing else is going to.
+        assert!(match_shortcut_code(true, false, false, false, "KeyQ", None));
+        assert_eq!(fired.get(), 1);
+
+        // Once the native accelerator actually attaches, the OS owns this
+        // item and rinch stops matching it.
+        mark_native_accelerator_attached();
+        assert!(!match_shortcut_code(
+            true, false, false, false, "KeyQ", None
+        ));
+        assert_eq!(fired.get(), 1);
+    }
+
+    /// The same attached flag must not silence a non-`native_bar` chord — a
+    /// tray item or the DOM bar's, neither of which `attach_menu_to_window`
+    /// ever touches.
+    ///
+    /// Mutant this kills: reading only `accelerator_attached` in
+    /// `skips_rinch_chord` (dropping the `native_bar &&`) silences this too.
+    #[cfg(feature = "native-menus")]
+    #[test]
+    fn a_non_native_bar_chord_keeps_matching_after_the_accelerator_attaches() {
+        let (fired, cb) = probe();
+        let mut registration = MenuRegistration::default();
+        registration.register_callback("tray-quit-1304", cb, None, CallbackFrame::current());
+        registration.register_shortcut("Ctrl+Alt+Shift+F9", "tray-quit-1304");
+
+        mark_native_accelerator_attached();
+        assert!(match_shortcut_code(true, false, true, true, "F9", None));
+        assert_eq!(fired.get(), 1);
+    }
+}
+
+#[cfg(all(test, feature = "windowing"))]
+mod modifier_spelling_tests {
+    use super::*;
+    fn probe() -> (Rc<Cell<u32>>, Rc<dyn Fn()>) {
+        let fired = Rc::new(Cell::new(0));
+        let f = fired.clone();
+        (fired, Rc::new(move || f.set(f.get() + 1)))
+    }
+    /// muda's (and Electron's) modifier spellings used to be read as the key,
+    /// which the real key then overwrote: `CommandOrControl+S` was a *bare* S
+    /// chord that swallowed every s typed while the item was live, and — once
+    /// the native label came from the same parse (#1166) — a bare S label too.
+    /// They are the Ctrl-or-Cmd modifier now; an unknown one (`Hyper`) makes
+    /// the string unparseable. Neither fires on a plain S, and the known ones
+    /// fire on Ctrl+S.
+    #[test]
+    fn muda_modifier_spellings_are_the_ctrl_or_cmd_modifier_not_a_bare_key() {
+        for s in ["CommandOrControl+S", "Command+S", "Super+S", "Hyper+S"] {
+            let (fired, cb) = probe();
+            let mut reg = MenuRegistration::default();
+            let id = format!("r1166-{s}");
+            reg.register_callback(&id, cb, None, CallbackFrame::current());
+            reg.register_shortcut(s, &id);
+            let bare = match_shortcut_code(false, false, false, false, "KeyS", None);
+            let with_ctrl = match_shortcut_code(true, false, false, false, "KeyS", None);
+            drop(reg);
+            assert_eq!(with_ctrl, s != "Hyper+S", "{s}: Ctrl+S");
+            assert!(
+                !bare,
+                "{s}: a plain S keystroke fired the item ({})",
+                fired.get()
+            );
+        }
+    }
+    #[test]
+    fn two_keys_are_not_a_shortcut() {
+        assert!(
+            parse_shortcut_for_matching("Ctrl+Shift+C+A").is_none(),
+            "two keys"
+        );
+    }
+
+    /// Every code a modifier-less chord leaves to a focused text field
+    /// (#1169), bare and with Shift — and none of them with Ctrl, Cmd or Alt
+    /// held alone. Each is listed, not sampled: a code dropped from the list
+    /// would take its key from every field again.
+    #[test]
+    fn every_text_key_yields_bare_and_shifted_and_never_with_a_modifier() {
+        let mut yielding: Vec<String> = Vec::new();
+        yielding.extend(('A'..='Z').map(|c| format!("Key{c}")));
+        yielding.extend(('0'..='9').map(|c| format!("Digit{c}")));
+        yielding.extend(
+            [
+                "Equal",
+                "Minus",
+                "Backquote",
+                "Backslash",
+                "BracketLeft",
+                "BracketRight",
+                "Comma",
+                "Period",
+                "Quote",
+                "Semicolon",
+                "Slash",
+                "IntlBackslash",
+                "Space",
+                "Enter",
+                "Backspace",
+                "Delete",
+                "Home",
+                "End",
+                "PageUp",
+                "PageDown",
+                "ArrowUp",
+                "ArrowDown",
+                "ArrowLeft",
+                "ArrowRight",
+            ]
+            .map(String::from),
+        );
+        for code in &yielding {
+            // Shift is not an argument: it never changes the answer.
+            assert!(
+                chord_yields_to_text_input(false, false, false, code),
+                "{code}"
+            );
+            assert!(
+                !chord_yields_to_text_input(true, false, false, code),
+                "Ctrl+{code}"
+            );
+            assert!(
+                !chord_yields_to_text_input(false, true, false, code),
+                "Cmd+{code}"
+            );
+            assert!(
+                !chord_yields_to_text_input(false, false, true, code),
+                "Alt+{code}"
+            );
+        }
+        for code in [
+            "Escape", "Tab", "F1", "F5", "F12", "KeyAB", "Digit10", "Key", "",
+        ] {
+            assert!(
+                !chord_yields_to_text_input(false, false, false, code),
+                "{code}"
+            );
+        }
+    }
+
+    /// Each [`KeyOwner`] keeps exactly its keys bare (#1290), and only a text
+    /// target keeps a modified press — and then only AltGr text (#934/#1291).
+    #[test]
+    fn each_owner_keeps_its_own_bare_keys_and_only_text_keeps_altgr_text() {
+        let m = ChordYield::FocusedControls;
+        let y = |owner, code| chord_yields_under(m, owner, false, false, false, code, false);
+        // Select: arrows, paging, letters, digits, Space, Enter.
+        for code in [
+            "ArrowDown",
+            "ArrowUp",
+            "ArrowLeft",
+            "Home",
+            "PageDown",
+            "KeyN",
+            "Digit3",
+            "Space",
+            "Enter",
+        ] {
+            assert!(y(KeyOwner::Select, code), "select keeps {code}");
+        }
+        for code in ["Slash", "Backspace", "Delete", "Escape", "Tab", "F5"] {
+            assert!(!y(KeyOwner::Select, code), "select leaves {code}");
+        }
+        // Activator: Space and Enter only.
+        for code in ["Space", "Enter"] {
+            assert!(y(KeyOwner::Activator, code), "button keeps {code}");
+        }
+        for code in ["KeyN", "ArrowDown", "Slash", "Escape", "F5"] {
+            assert!(!y(KeyOwner::Activator, code), "button leaves {code}");
+        }
+        // AllKeys: every bare key, Escape and F-keys too.
+        for code in ["KeyW", "Space", "Escape", "Tab", "F5", "ArrowUp"] {
+            assert!(y(KeyOwner::AllKeys, code), "surface keeps {code}");
+        }
+        // Text: Escape and F5 are not its (#1169).
+        assert!(y(KeyOwner::Text, "Slash"));
+        assert!(!y(KeyOwner::Text, "Escape"));
+        // Nothing focused: nothing yields.
+        for code in ["KeyN", "Space", "Escape"] {
+            assert!(!y(KeyOwner::None, code), "{code}");
+        }
+        // A modified press yields to no owner — except AltGr text to Text.
+        for owner in [
+            KeyOwner::None,
+            KeyOwner::Select,
+            KeyOwner::Activator,
+            KeyOwner::AllKeys,
+        ] {
+            assert!(
+                !chord_yields_under(m, owner, true, false, true, "KeyQ", true),
+                "{owner:?}"
+            );
+            assert!(
+                !chord_yields_under(m, owner, true, false, false, "KeyW", false),
+                "{owner:?}"
+            );
+        }
+        assert!(chord_yields_under(
+            m,
+            KeyOwner::Text,
+            true,
+            false,
+            true,
+            "KeyQ",
+            true
+        ));
+        assert!(!chord_yields_under(
+            m,
+            KeyOwner::Text,
+            true,
+            false,
+            true,
+            "KeyQ",
+            false
+        ));
+    }
+
+    /// [`ChordYield::TextOnly`] — the escape hatch — keeps only a text
+    /// target's keys; every other owner is "nothing focused".
+    #[test]
+    fn text_only_mode_keeps_only_a_text_targets_keys() {
+        let m = ChordYield::TextOnly;
+        let y = |owner, code| chord_yields_under(m, owner, false, false, false, code, false);
+        assert!(y(KeyOwner::Text, "Slash"));
+        assert!(!y(KeyOwner::Select, "ArrowDown"));
+        assert!(!y(KeyOwner::Activator, "Space"));
+        assert!(!y(KeyOwner::AllKeys, "KeyW"));
+        assert!(chord_yields_under(
+            m,
+            KeyOwner::Text,
+            true,
+            false,
+            true,
+            "KeyQ",
+            true
+        ));
+    }
+
+    /// Which window-bar chords keep a native accelerator (#1284, #1291): none
+    /// that a focused control could keep. By default that is every bare chord
+    /// (a surface keeps them all); under `TextOnly`, only the text keys. On
+    /// Windows a Ctrl+Alt chord on a key AltGr types with loses it too; a
+    /// Ctrl+Alt chord on a non-typing key, and every Ctrl chord, keep theirs.
+    #[test]
+    fn native_accelerators_are_withheld_from_chords_a_control_could_keep() {
+        let f = ChordYield::FocusedControls;
+        let t = ChordYield::TextOnly;
+        let ok = native_accelerator_allowed_under;
+        for code in ["Slash", "KeyN", "Delete", "Space", "F5", "Escape"] {
+            assert!(!ok(f, false, false, false, code), "bare {code}");
+        }
+        assert!(!ok(t, false, false, false, "Slash"));
+        assert!(!ok(t, false, false, false, "Delete"));
+        assert!(ok(t, false, false, false, "F5"), "F5 types nothing");
+        assert!(ok(t, false, false, false, "Escape"));
+        for code in ["KeyN", "Slash", "Delete", "F5"] {
+            assert!(ok(f, true, true, false, code), "Ctrl+{code}");
+            assert!(ok(f, false, true, false, code), "Ctrl+{code}, not Windows");
+        }
+        assert!(
+            ok(f, false, false, true, "KeyQ"),
+            "Alt+Q is no AltGr anywhere"
+        );
+        assert!(ok(f, false, true, true, "KeyQ"), "Ctrl+Alt+Q off Windows");
+        assert!(
+            !ok(f, true, true, true, "KeyQ"),
+            "Ctrl+Alt+Q on Windows: AltGr+Q"
+        );
+        assert!(!ok(f, true, true, true, "Digit7"), "Ctrl+Alt+7: AltGr+7");
+        assert!(
+            ok(f, true, true, true, "Delete"),
+            "Ctrl+Alt+Delete types nothing"
+        );
+        assert!(ok(f, true, true, true, "ArrowLeft"));
+        assert!(ok(f, true, true, true, "F5"));
+    }
+
+    /// #1284: a window-bar item with a bare chord gets no native accelerator,
+    /// so once the bar's accelerators attach it still fires through rinch's
+    /// registry (which yields it to a focused control first); a Ctrl chord in
+    /// the same bar goes to the OS alone, as before.
+    #[cfg(feature = "native-menus")]
+    #[test]
+    fn a_bare_window_bar_chord_stays_in_rinchs_registry_after_the_bar_attaches() {
+        let (slash, slash_cb) = probe();
+        let (quit, quit_cb) = probe();
+        let menu = Menu::new()
+            .item(
+                MenuItem::new("Find")
+                    .shortcut("/")
+                    .on_click(move || slash_cb()),
+            )
+            .item(
+                MenuItem::new("Quit")
+                    .shortcut("Ctrl+Q")
+                    .on_click(move || quit_cb()),
+            );
+        let _bar = build_native_menu_bar(vec![("File", menu)]);
+        mark_native_accelerator_attached();
+        assert!(match_shortcut_code(
+            false, false, false, false, "Slash", None
+        ));
+        assert_eq!(slash.get(), 1, "the bare chord is rinch's to match");
+        assert!(!match_shortcut_code(
+            true, false, false, false, "KeyQ", None
+        ));
+        assert_eq!(quit.get(), 0, "the Ctrl chord is the OS accelerator's");
+    }
+
+    /// The label of an item kept off the accelerator table carries its key
+    /// after a tab on Windows (the Win32 accelerator column), and stays bare
+    /// elsewhere and for an item that kept its accelerator.
+    #[cfg(feature = "native-menus")]
+    #[test]
+    fn an_unbound_window_bar_item_shows_its_key_after_a_tab_on_windows() {
+        assert_eq!(native_item_label_for(true, "Find", Some("/")), "Find\t/");
+        assert_eq!(native_item_label_for(false, "Find", Some("/")), "Find");
+        assert_eq!(native_item_label_for(true, "Find", None), "Find");
+    }
+
+    /// The `<input>` types with no text to type into, in any case, and the
+    /// ones that do take text — an absent or unknown type is `text` (#1169).
+    #[test]
+    fn input_type_takes_text_refuses_exactly_the_non_text_types_in_any_case() {
+        for ty in [
+            "checkbox", "radio", "range", "color", "file", "hidden", "image", "button", "submit",
+            "reset",
+        ] {
+            assert!(!input_type_takes_text(ty), "{ty}");
+            assert!(
+                !input_type_takes_text(&ty.to_ascii_uppercase()),
+                "{ty} upper"
+            );
+            let mixed: String = ty
+                .chars()
+                .enumerate()
+                .map(|(i, c)| {
+                    if i % 2 == 0 {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            assert!(!input_type_takes_text(&mixed), "{mixed}");
+        }
+        for ty in [
+            "", "text", "TEXT", "search", "number", "email", "password", "url", "tel", "date",
+            "bogus",
+        ] {
+            assert!(input_type_takes_text(ty), "{ty:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod key_table_refactor_differential {
+    use super::*;
+    // `parse_shortcut_for_matching` as it was before #1521 moved its key table
+    // into `key_spelling_code` (base 2ae35772), kept as the differential oracle.
+    fn old_parse_shortcut_for_matching(shortcut: &str) -> Option<ParsedShortcut> {
+        let parts: Vec<&str> = shortcut.split('+').collect();
+        if parts.is_empty() {
+            return None;
+        }
+
+        let mut ctrl_or_cmd = false;
+        let mut alt = false;
+        let mut shift = false;
+        let mut key_str = "";
+
+        for part in &parts {
+            // The key is the last token. Anything after it — a second key
+            // (`Ctrl+Shift+C+A`), a modifier written late (`Ctrl+N+Shift`), or an
+            // unknown modifier taken as a key (`Hyper+N`) — is not a shortcut, and
+            // [`parse_shortcut_or_warn`] says so. Taking the last key token instead
+            // made `Hyper+N` a *bare* N, which swallowed every n typed while the
+            // item was live.
+            if !key_str.is_empty() {
+                return None;
+            }
+            let part_lower = part.to_lowercase();
+            match part_lower.as_str() {
+                // One modifier on every platform: Ctrl or Command, whichever is held
+                // (`match_shortcut_code` folds `meta` into `ctrl`). Every spelling
+                // muda and Electron accept for either is taken here, so none of them
+                // falls through to be read as the key.
+                "cmd" | "command" | "ctrl" | "control" | "meta" | "super" | "cmdorctrl"
+                | "cmdorcontrol" | "commandorctrl" | "commandorcontrol" => ctrl_or_cmd = true,
+                "alt" | "option" => alt = true,
+                "shift" => shift = true,
+                _ => key_str = part,
+            }
+        }
+
+        let code = match key_str.to_uppercase().as_str() {
+            "A" => "KeyA",
+            "B" => "KeyB",
+            "C" => "KeyC",
+            "D" => "KeyD",
+            "E" => "KeyE",
+            "F" => "KeyF",
+            "G" => "KeyG",
+            "H" => "KeyH",
+            "I" => "KeyI",
+            "J" => "KeyJ",
+            "K" => "KeyK",
+            "L" => "KeyL",
+            "M" => "KeyM",
+            "N" => "KeyN",
+            "O" => "KeyO",
+            "P" => "KeyP",
+            "Q" => "KeyQ",
+            "R" => "KeyR",
+            "S" => "KeyS",
+            "T" => "KeyT",
+            "U" => "KeyU",
+            "V" => "KeyV",
+            "W" => "KeyW",
+            "X" => "KeyX",
+            "Y" => "KeyY",
+            "Z" => "KeyZ",
+            "0" => "Digit0",
+            "1" => "Digit1",
+            "2" => "Digit2",
+            "3" => "Digit3",
+            "4" => "Digit4",
+            "5" => "Digit5",
+            "6" => "Digit6",
+            "7" => "Digit7",
+            "8" => "Digit8",
+            "9" => "Digit9",
+            "=" | "EQUAL" | "PLUS" => "Equal",
+            "-" | "MINUS" => "Minus",
+            // Punctuation, by the key's unshifted character on a US layout or by
+            // its code name (#1160). A shifted character (`?`, `<`, `:` …) is not
+            // here on purpose: a chord is a key and modifiers, so `?` is spelled
+            // `Shift+/` — see `shifted_key_hint`.
+            "`" | "BACKQUOTE" => "Backquote",
+            "\\" | "BACKSLASH" => "Backslash",
+            "[" | "BRACKETLEFT" => "BracketLeft",
+            "]" | "BRACKETRIGHT" => "BracketRight",
+            "," | "COMMA" => "Comma",
+            "." | "PERIOD" => "Period",
+            "'" | "QUOTE" => "Quote",
+            ";" | "SEMICOLON" => "Semicolon",
+            "/" | "SLASH" => "Slash",
+            "F1" => "F1",
+            "F2" => "F2",
+            "F3" => "F3",
+            "F4" => "F4",
+            "F5" => "F5",
+            "F6" => "F6",
+            "F7" => "F7",
+            "F8" => "F8",
+            "F9" => "F9",
+            "F10" => "F10",
+            "F11" => "F11",
+            "F12" => "F12",
+            "ENTER" | "RETURN" => "Enter",
+            "ESCAPE" | "ESC" => "Escape",
+            "BACKSPACE" => "Backspace",
+            "TAB" => "Tab",
+            "SPACE" => "Space",
+            "DELETE" | "DEL" => "Delete",
+            "HOME" => "Home",
+            "END" => "End",
+            "PAGEUP" => "PageUp",
+            "PAGEDOWN" => "PageDown",
+            "UP" | "ARROWUP" => "ArrowUp",
+            "DOWN" | "ARROWDOWN" => "ArrowDown",
+            "LEFT" | "ARROWLEFT" => "ArrowLeft",
+            "RIGHT" | "ARROWRIGHT" => "ArrowRight",
+            _ => return None,
+        };
+
+        Some(ParsedShortcut {
+            ctrl_or_cmd,
+            alt,
+            shift,
+            code,
+        })
+    }
+
+    fn key(p: &Option<ParsedShortcut>) -> Option<(bool, bool, bool, String)> {
+        p.as_ref()
+            .map(|p| (p.ctrl_or_cmd, p.alt, p.shift, p.code.to_string()))
+    }
+
+    #[test]
+    fn menu_parsing_is_unchanged_by_the_key_table_refactor() {
+        let src = include_str!("mod.rs");
+        let mut toks: Vec<String> = Vec::new();
+        for line in src.lines() {
+            let mut rest = line;
+            while let Some(i) = rest.find('"') {
+                rest = &rest[i + 1..];
+                if let Some(j) = rest.find('"') {
+                    toks.push(rest[..j].to_string());
+                    rest = &rest[j + 1..];
+                } else {
+                    break;
+                }
+            }
+        }
+        toks.extend(
+            [
+                "", "+", "++", "a", "z", "?", "é", "ß", "Ä", "f13", "F24", "numpad1", "Hyper", "€",
+                "ǅ", "ﬀ", "İ", "ı", "ss",
+            ]
+            .map(String::from),
+        );
+        toks.sort();
+        toks.dedup();
+        let prefixes = [
+            "",
+            "Ctrl+",
+            "ctrl+shift+",
+            "Alt+",
+            "Cmd+Alt+Shift+",
+            "Hyper+",
+            "Ctrl+A+",
+            "super+",
+        ];
+        let mut n = 0;
+        let mut seen_some = 0;
+        for p in prefixes {
+            for t in &toks {
+                for s in [
+                    format!("{p}{t}"),
+                    format!("{p}{}", t.to_lowercase()),
+                    format!("{p}{}", t.to_uppercase()),
+                    format!("{p}{t}+Shift"),
+                ] {
+                    let a = key(&old_parse_shortcut_for_matching(&s));
+                    let b = key(&parse_shortcut_for_matching(&s));
+                    assert_eq!(a, b, "{s:?}");
+                    if a.is_some() {
+                        seen_some += 1;
+                    }
+                    n += 1;
+                }
+            }
+        }
+        assert!(n > 2000 && seen_some > 500, "n={n} some={seen_some}");
+        eprintln!("menu differential: {n} strings, {seen_some} parsed");
+    }
+}
+
+/// Issue #1520: checkbox and radio items. The signal is the state, both ways:
+/// activating an item writes it, and a write from the app is what every
+/// backend's mark follows.
+#[cfg(test)]
+mod toggle_tests {
+    use super::*;
+    use rinch_core::reactive::{Scope, Signal};
+    use std::cell::Cell;
+
+    fn activate(item: &MenuItem) {
+        let cb = item.activation().expect("a toggle item always activates");
+        invoke_menu_callback(&cb, item.callback_owner.as_ref(), item.callback_frame);
+    }
+
+    /// Activating a checkbox flips its signal, and does so *before* the
+    /// item's own `on_click` runs, which therefore reads the new state.
+    /// Sampled from `true` as well as `false`, so a mutant that only sets
+    /// (`set(true)`) instead of flipping fails the second half.
+    #[test]
+    fn a_checkbox_flips_its_signal_before_on_click_runs() {
+        let on = Signal::new(false);
+        let seen = Rc::new(Cell::new(None));
+        let s = seen.clone();
+        let item = MenuItem::checkbox("Mute", on).on_click(move || s.set(Some(on.get())));
+        assert_eq!(item.checked(), Some(false));
+        activate(&item);
+        assert!(on.get());
+        assert_eq!(seen.get(), Some(true), "on_click saw the new state");
+        assert_eq!(item.checked(), Some(true));
+        activate(&item);
+        assert!(!on.get(), "a second activation unchecks it");
+        assert_eq!(seen.get(), Some(false));
+    }
+
+    /// A radio option writes its value; the option already selected stays
+    /// selected when activated again (a flip would deselect it).
+    #[test]
+    fn a_radio_option_selects_its_value_and_stays_selected() {
+        let model = Signal::new("small".to_string());
+        let small = MenuItem::radio("Small", model, "small".to_string());
+        let large = MenuItem::radio("Large", model, "large".to_string());
+        assert_eq!(
+            (small.checked(), large.checked()),
+            (Some(true), Some(false))
+        );
+        activate(&large);
+        assert_eq!(model.get(), "large");
+        assert_eq!(
+            (small.checked(), large.checked()),
+            (Some(false), Some(true))
+        );
+        activate(&large);
+        assert_eq!(model.get(), "large", "re-selecting keeps the selection");
+        // An app write moves the mark.
+        model.set("small".into());
+        assert_eq!(
+            (small.checked(), large.checked()),
+            (Some(true), Some(false))
+        );
+        assert_eq!(MenuItem::new("plain").checked(), None);
+    }
+
+    /// The #183 rule reaches a toggle: a checkbox built in a component whose
+    /// scope has gone (and freed its signal) neither runs nor panics, and its
+    /// reader answers "unknown" instead of reading a freed signal.
+    #[test]
+    fn a_checkbox_whose_component_unmounted_does_nothing() {
+        let scope = Scope::new();
+        let item = scope.run(|| MenuItem::checkbox("Mute", Signal::new(false)));
+        scope.dispose();
+        let cb = item.activation().unwrap();
+        assert!(
+            !invoke_menu_callback(&cb, item.callback_owner.as_ref(), item.callback_frame),
+            "a dead owner's item does not run"
+        );
+        let toggle = item.toggle.as_ref().unwrap();
+        assert_eq!(
+            (toggle.is_on)(),
+            None,
+            "the reader does not read a freed signal"
+        );
+        // Even invoked directly, the toggle checks before it writes.
+        (toggle.activate)();
+    }
+
+    /// A registration's watcher runs on every write of what it reads, and
+    /// stops the moment the registration drops — so a replaced menu stops
+    /// pushing marks into widgets that are gone.
+    #[test]
+    fn a_watcher_lives_exactly_as_long_as_its_registration() {
+        let on = Signal::new(false);
+        let runs = Rc::new(Cell::new(0));
+        let mut registration = MenuRegistration::default();
+        let r = runs.clone();
+        registration.watch(move || {
+            on.get();
+            r.set(r.get() + 1);
+        });
+        assert_eq!(registration.watch_count(), 1);
+        assert_eq!(runs.get(), 1, "a watcher runs once on creation");
+        on.set(true);
+        assert_eq!(runs.get(), 2, "and again on a write");
+        drop(registration);
+        on.set(false);
+        assert_eq!(runs.get(), 2, "not after its registration dropped");
+    }
+
+    /// A registration with watchers dropped from a `thread_local!` at thread
+    /// exit, after the reactive runtime's own locals are gone, must not panic
+    /// in the TLS destructor (which aborts the whole process). Found live: the
+    /// tray-only example keeps its `TrayIcon` in a `thread_local!`, the
+    /// documented place for one. The holder's key is created first, so it is
+    /// destroyed last; the dispose context is created after it, by a dispose.
+    #[test]
+    fn a_registration_dropped_at_thread_exit_does_not_abort() {
+        std::thread::spawn(|| {
+            thread_local! {
+                static HOLD: RefCell<Option<MenuRegistration>> = const { RefCell::new(None) };
+            }
+            HOLD.with(|_| ());
+            let on = Signal::new(false);
+            let mut registration = MenuRegistration::default();
+            registration.watch(move || {
+                on.get();
+            });
+            // First dispose on this thread: its context is created now, after
+            // `HOLD`, and so destroyed before it.
+            Scope::new().dispose();
+            HOLD.with(|h| *h.borrow_mut() = Some(registration));
+        })
+        .join()
+        .expect("the thread ends cleanly");
+    }
+
+    /// A chord on a checkbox toggles it, like a click (the DOM bar's chords go
+    /// through `register_menu_shortcuts`).
+    #[test]
+    fn a_checkbox_chord_toggles_it() {
+        let on = Signal::new(false);
+        let menu = Menu::new().item(MenuItem::checkbox("Mute", on).shortcut("Ctrl+M"));
+        let _chords = register_menu_shortcuts(&[("Edit", &menu)]);
+        assert!(match_shortcut_code(true, false, false, false, "KeyM", None));
+        assert!(on.get());
+    }
+
+    /// muda: a checkbox is a `CheckMenuItem` whose mark follows the signal on
+    /// an app write, and goes back to the signal's state when muda's own click
+    /// handling flipped it (an already-selected radio option clicked again).
+    #[cfg(feature = "native-menus")]
+    #[test]
+    fn a_muda_item_runs_under_the_document_and_root_it_was_made_in() {
+        // Issue #1032 (review of #1663, F2): `build_muda_item` registers the
+        // item's own frame, not the builder's. Made in root 9 / document 7,
+        // built in root 3 / document 5, clicked from root 4 / document 2.
+        use rinch_core::{
+            current_context_root, current_dispatching_doc, push_context_root, push_dispatching_doc,
+        };
+        type Seen = Rc<RefCell<Vec<(u64, Option<u64>)>>>;
+        let seen: Seen = Rc::default();
+        let s = seen.clone();
+        let menu = {
+            let _root = push_context_root(9);
+            let _doc = push_dispatching_doc(7);
+            Menu::new().item(MenuItem::new("Item").on_click(move || {
+                s.borrow_mut()
+                    .push((current_context_root(), current_dispatching_doc()))
+            }))
+        };
+        let (muda_menu, _registration) = {
+            let _root = push_context_root(3);
+            let _doc = push_dispatching_doc(5);
+            build_muda_menu(menu)
+        };
+        let ids: Vec<String> = muda_menu
+            .items()
+            .into_iter()
+            .filter_map(|k| match k {
+                muda::MenuItemKind::MenuItem(m) => Some(m.id().0.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 1, "control: one plain item");
+        {
+            let _root = push_context_root(4);
+            let _doc = push_dispatching_doc(2);
+            assert!(dispatch_menu_event(&ids[0]));
+        }
+        assert_eq!(*seen.borrow(), [(9, Some(7))]);
+    }
+
+    #[cfg(feature = "native-menus")]
+    #[test]
+    fn a_muda_check_item_follows_its_signal() {
+        let on = Signal::new(true);
+        let model = Signal::new(1u8);
+        let menu = Menu::new()
+            .item(MenuItem::checkbox("Mute", on))
+            .item(MenuItem::radio("One", model, 1))
+            .item(MenuItem::radio("Two", model, 2));
+        let (muda_menu, registration) = build_muda_menu(menu);
+        let checks: Vec<muda::CheckMenuItem> = muda_menu
+            .items()
+            .into_iter()
+            .filter_map(|k| match k {
+                muda::MenuItemKind::Check(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(checks.len(), 3, "every toggle item is a check item");
+        let marks = || checks.iter().map(|c| c.is_checked()).collect::<Vec<_>>();
+        assert_eq!(
+            marks(),
+            [true, true, false],
+            "built with the signals' state"
+        );
+
+        on.set(false);
+        model.set(2);
+        assert_eq!(
+            marks(),
+            [false, false, true],
+            "an app write moves the marks"
+        );
+
+        // muda unchecks a selected check item when it is clicked; the
+        // dispatch that follows writes the same value back, which re-asserts.
+        checks[2].set_checked(false);
+        assert!(dispatch_menu_event(&checks[2].id().0));
+        assert_eq!(model.get(), 2);
+        assert!(checks[2].is_checked(), "the selected option stays marked");
+
+        drop(registration);
+        on.set(true);
+        assert!(
+            !checks[0].is_checked(),
+            "a released menu is no longer synced"
         );
     }
 }

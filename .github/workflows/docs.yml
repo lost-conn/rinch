@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Called by `base-changed.yml` when a PR's base branch becomes `main` (#448):
+  # a base change fires only `edited`, which is not listed above on purpose.
+  workflow_call:
 
 # Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
 permissions:
@@ -19,32 +22,100 @@ permissions:
 # still supersedes older runs of the *same* branch (the useful behaviour) while
 # letting main and each PR build independently. Only `deploy` touches Pages, and it
 # runs on main pushes alone, so per-ref groups cannot produce concurrent deploys.
+#
+# A run in progress is cancelled on a pull request only: a `main` run (the one
+# that deploys) is never cancelled mid-way. A `main` run still WAITING behind
+# another one is replaced by a newer `main` push, as any concurrency group
+# does, and that newer run deploys the newer docs.
 concurrency:
   group: pages-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Batched merges (docs/internals/ci.md). The full `build` (rustdoc for the whole
+# workspace, the mdBook, the UI Zoo wasm build, the Pages artifact) runs on a
+# pull request whose head branch starts with `batch/` and on a push to `main`.
+# An ordinary component PR into `main` skips it and gets `book` instead: the
+# mdBook alone, and only when the PR changes `docs/` (or this file). Both are
+# job-level `if`s rather than trigger path filters, so a skipped check reports
+# as skipped and never sits pending (a path-filtered required check stays
+# pending for ever on a PR it filtered out). Rustdoc and the UI Zoo build follow
+# every Rust change, so they are batch-only rather than path-gated.
+#
+# `github.head_ref` is the caller's inside a call from `base-changed.yml`, so a
+# retargeted PR is classified the same way as its own runs.
 
 jobs:
+  # Which docs paths the component PR changes: the merge commit GitHub builds
+  # for the PR (what `actions/checkout` checks out on `pull_request`) against
+  # its first parent, the `main` tip it was merged onto, as `perf.yml` reads it.
+  changes:
+    if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'batch/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      book: ${{ steps.diff.outputs.book }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: List the changed paths
+        id: diff
+        run: |
+          changed=$(git diff --name-only HEAD^1 HEAD)
+          printf '%s\n' "$changed"
+          # The book is `docs/src` (`docs/book.toml`); it includes nothing from
+          # outside `docs/`.
+          if printf '%s\n' "$changed" | grep -qE '^docs/|^\.github/workflows/docs\.yml$'; then
+            echo "book=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "book=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # The mdBook alone, for a component PR that changes it: a broken SUMMARY.md
+  # or a missing page fails here rather than in the next batch.
+  book:
+    needs: changes
+    if: needs.changes.outputs.book == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
+      # `--locked`: see the same step in `build`.
+      - name: Install mdbook
+        run: cargo install mdbook --locked --no-default-features
+
+      - name: Build mdbook
+        run: |
+          cd docs && mdbook build
+
   build:
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'batch/')
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
       - name: Install system dependencies
-        run: |
-          # The runner image ships a Google Chrome apt source no rinch build
-          # uses. Its CDN intermittently serves a `Packages.gz` whose hash does
-          # not match the index it advertises, and `apt-get update` treats one
-          # bad repo as a fatal error — so the step fails, every step after it
-          # is **skipped**, and the job reports a red `clippy`/`test`/`build`
-          # that never ran a line of Rust. Three re-runs did not clear it.
-          # Drop the source rather than make a Rust build depend on Google's CDN.
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*.list \
-                     /etc/apt/sources.list.d/google-chrome*.sources
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libglib2.0-dev libatk1.0-dev libcairo2-dev libpango1.0-dev libgdk-pixbuf2.0-dev libasound2-dev libxdo-dev libmpv-dev
+        # Cached .debs, and the Google Chrome apt source dropped first
+        # (.github/actions/apt-install explains both, #1792).
+        uses: ./.github/actions/apt-install
+        with:
+          packages: >-
+            libgtk-3-dev libglib2.0-dev libatk1.0-dev libcairo2-dev
+            libpango1.0-dev libgdk-pixbuf-2.0-dev libasound2-dev libxdo-dev
+            libmpv-dev
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/rust-toolchain
         with:
           targets: wasm32-unknown-unknown
 
@@ -58,18 +129,32 @@ jobs:
       - name: Install trunk
         run: cargo install trunk --locked
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      # Dependency artifacts only, never the workspace crates' (#1836). This
+      # was an `actions/cache` of the whole `target/`, and cargo decides a
+      # workspace crate is fresh by comparing its source mtimes (the checkout
+      # time) with its fingerprint's mtimes (the time they were built, kept by
+      # tar). When another run built and saved the cache AFTER this job's
+      # checkout (a main push finishing while a batch was installing trunk),
+      # every restored fingerprint was newer than the sources: cargo printed
+      # no `Checking rinch-core`, documented `rinch` against the cached
+      # rinch-core metadata from an older main, and failed with E0432 on any
+      # item the PR had just added. A re-run, checked out after that save,
+      # rebuilt and passed. `Swatinem/rust-cache` prunes the workspace crates'
+      # artifacts before saving, so they are always built from this checkout;
+      # it is what ci.yml's `test` and perf.yml use. Only a push to `main`
+      # writes the entry, as for `test`, so a PR or batch cannot evict it.
+      - name: Cache cargo (dependencies)
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-docs-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-docs-
+          shared-key: docs
+          save-if: ${{ github.event_name == 'push' }}
 
+      # Rustdoc warnings are errors (#2551): a broken intra-doc link, a link
+      # from public docs to a private item, or a stray HTML tag fails here
+      # rather than shipping as a warning nobody reads.
       - name: Build API documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
         run: |
           cargo doc --no-deps --workspace --document-private-items
 
@@ -108,7 +193,7 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: build
     steps:
       - name: Deploy to GitHub Pages

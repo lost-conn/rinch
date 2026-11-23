@@ -1,3 +1,4 @@
+use super::key_names::*;
 use super::*;
 
 fn parse_button(s: &Option<String>) -> MouseButton {
@@ -8,82 +9,41 @@ fn parse_button(s: &Option<String>) -> MouseButton {
     }
 }
 
-/// Map a printable character to a physical `KeyCode` for synthesizing keystrokes
-/// (the `text` field carries the actual character). Characters without a
-/// dedicated keycode map to `KeyCode::Other` — exactly how real hardware
-/// delivers punctuation (`shell/rinch_runtime.rs` translates unlisted winit
-/// keys to `Other`) — so the keyboard hook's key string falls through to the
-/// `text` field instead of masquerading as a named key. Space keeps its
-/// explicit arm: an injected `' '` must still read as `key = "Space"`, matching
-/// a physical spacebar press (issue #151).
-fn char_to_keycode(c: char) -> KeyCode {
-    match c.to_ascii_lowercase() {
-        ' ' => KeyCode::Space,
-        'a' => KeyCode::KeyA,
-        'b' => KeyCode::KeyB,
-        'c' => KeyCode::KeyC,
-        'd' => KeyCode::KeyD,
-        'e' => KeyCode::KeyE,
-        'f' => KeyCode::KeyF,
-        'g' => KeyCode::KeyG,
-        'h' => KeyCode::KeyH,
-        'i' => KeyCode::KeyI,
-        'j' => KeyCode::KeyJ,
-        'k' => KeyCode::KeyK,
-        'l' => KeyCode::KeyL,
-        'm' => KeyCode::KeyM,
-        'n' => KeyCode::KeyN,
-        'o' => KeyCode::KeyO,
-        'p' => KeyCode::KeyP,
-        'q' => KeyCode::KeyQ,
-        'r' => KeyCode::KeyR,
-        's' => KeyCode::KeyS,
-        't' => KeyCode::KeyT,
-        'u' => KeyCode::KeyU,
-        'v' => KeyCode::KeyV,
-        'w' => KeyCode::KeyW,
-        'x' => KeyCode::KeyX,
-        'y' => KeyCode::KeyY,
-        'z' => KeyCode::KeyZ,
-        '0' => KeyCode::Digit0,
-        '1' => KeyCode::Digit1,
-        '2' => KeyCode::Digit2,
-        '3' => KeyCode::Digit3,
-        '4' => KeyCode::Digit4,
-        '5' => KeyCode::Digit5,
-        '6' => KeyCode::Digit6,
-        '7' => KeyCode::Digit7,
-        '8' => KeyCode::Digit8,
-        '9' => KeyCode::Digit9,
-        _ => KeyCode::Other,
+/// The error a `modifiers` array with a name `fold_modifier_names` does not
+/// know answers with — the same sentence for `key_press` and the pointer
+/// commands.
+fn unknown_modifier(name: &str) -> DebugResult {
+    DebugResult::Error {
+        message: format!(
+            "Unknown modifier name: {name:?} (expected ctrl/control, shift, alt/option, meta/cmd/super)"
+        ),
     }
 }
 
-/// Map a debug `key_press` key-name string to a `KeyCode`. Single-character
-/// names go through [`char_to_keycode`] (punctuation → `KeyCode::Other`, with
-/// the character delivered via the event's `text` field); unknown multi-char
-/// names return `None` so the caller can fail loud instead of synthesizing a
-/// silent no-text `Other` press.
-fn keyname_to_keycode(key: &str) -> Option<KeyCode> {
-    Some(match key {
-        "ArrowLeft" => KeyCode::ArrowLeft,
-        "ArrowRight" => KeyCode::ArrowRight,
-        "ArrowUp" => KeyCode::ArrowUp,
-        "ArrowDown" => KeyCode::ArrowDown,
-        "Home" => KeyCode::Home,
-        "End" => KeyCode::End,
-        "PageUp" => KeyCode::PageUp,
-        "PageDown" => KeyCode::PageDown,
-        "Enter" => KeyCode::Enter,
-        "Backspace" => KeyCode::Backspace,
-        "Delete" => KeyCode::Delete,
-        "Tab" => KeyCode::Tab,
-        "Escape" => KeyCode::Escape,
-        "Space" => KeyCode::Space,
-        "F12" => KeyCode::F12,
-        k if k.chars().count() == 1 => char_to_keycode(k.chars().next().unwrap()),
-        _ => return None,
-    })
+/// A pointer command's `modifiers` array as the exact modifier state to hold:
+/// `Ok(None)` when the field was absent, the named modifiers (and no others)
+/// when present, an error naming the first unknown name.
+fn pointer_modifiers(names: &Option<Vec<String>>) -> Result<Option<Modifiers>, DebugResult> {
+    let Some(names) = names else {
+        return Ok(None);
+    };
+    let mut m = Modifiers::default();
+    rinch_debug::fold_modifier_names(names, &mut m.shift, &mut m.ctrl, &mut m.alt, &mut m.meta)
+        .map_err(|name| unknown_modifier(&name))?;
+    Ok(Some(m))
+}
+
+/// The key name and flat/array modifiers a debug `key_press`/`key_down`
+/// command carries, bundled so [`RinchApp::dispatch_debug_key_down`] takes a
+/// window-size/scale-factor pair plus one struct rather than nine loose
+/// arguments (clippy's `too_many_arguments`, issue #485).
+#[cfg(feature = "debug")]
+struct DebugKeyDownRequest<'a> {
+    key: &'a str,
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+    modifiers: &'a [String],
 }
 
 #[cfg(feature = "debug")]
@@ -106,6 +66,84 @@ impl RinchApp {
         }
 
         self.debug_cmd_rx = Some(rx);
+    }
+
+    /// A `ModifiersChanged` a debug command synthesizes. A *real* one clears
+    /// `debug_modifiers_to_restore` (it supersedes what a modified
+    /// `mouse_down` remembered); a synthesized one is part of the debug
+    /// sequence itself, so the remembered state is kept across it.
+    fn debug_modifiers_changed(
+        &mut self,
+        m: Modifiers,
+        window_size: (u32, u32),
+        scale_factor: f64,
+    ) -> Vec<AppAction> {
+        let remembered = self.debug_modifiers_to_restore;
+        let actions = self.handle_event(
+            PlatformEvent::ModifiersChanged(m),
+            window_size,
+            scale_factor,
+        );
+        self.debug_modifiers_to_restore = remembered;
+        actions
+    }
+
+    /// The press half shared by `key_press` and `key_down` (issue #485):
+    /// fold `modifiers`, resolve the key name, check menu shortcuts first
+    /// (issue #533, same as a real `WindowEvent::KeyboardInput`) and dispatch
+    /// a `PlatformEvent::KeyDown` through `handle_event`.
+    ///
+    /// `Ok(Some((key_code, logical_key, modifiers)))` is what the caller owes
+    /// a release — `key_press` uses it to synthesize the matching `KeyUp`
+    /// right away; `key_down` keeps it implicit and leaves the release to a
+    /// later `key_up`. `Ok(None)` means a menu shortcut consumed the press
+    /// outright: no `PlatformEvent::KeyDown` was ever dispatched, so nothing
+    /// was armed and nothing needs releasing — exactly as a real keystroke a
+    /// menu owns outright never reaches the app either. `Err` is a
+    /// `DebugResult::Error` for the caller to return verbatim.
+    fn dispatch_debug_key_down(
+        &mut self,
+        req: DebugKeyDownRequest<'_>,
+        actions: &mut Vec<AppAction>,
+        scale_factor: f64,
+        window_size: (u32, u32),
+    ) -> Result<Option<(KeyCode, Option<String>, Modifiers)>, DebugResult> {
+        let DebugKeyDownRequest {
+            key,
+            mut shift,
+            mut ctrl,
+            mut alt,
+            modifiers,
+        } = req;
+        // Fold the optional `modifiers` name array into the flat booleans
+        // (issue #152) — the only path that can request `meta`. An unknown
+        // name fails loud instead of silently altering the simulated input.
+        let mut meta = false;
+        if let Err(name) =
+            rinch_debug::fold_modifier_names(modifiers, &mut shift, &mut ctrl, &mut alt, &mut meta)
+        {
+            return Err(unknown_modifier(&name));
+        }
+        // The rest — the key name, the menu shortcuts first (issue #533),
+        // the `KeyDown` — is the press the test harness makes too
+        // (`key_names.rs`).
+        let modifiers = rinch_platform::Modifiers {
+            shift,
+            ctrl,
+            alt,
+            meta,
+        };
+        match self.dispatch_named_key_down(key, modifiers, actions, window_size, scale_factor) {
+            NamedKeyDown::Dispatched {
+                key,
+                logical_key,
+                modifiers,
+            } => Ok(Some((key, logical_key, modifiers))),
+            NamedKeyDown::MenuShortcut => Ok(None),
+            NamedKeyDown::UnknownKey => Err(DebugResult::Error {
+                message: format!("Unknown key name: {key:?}"),
+            }),
+        }
     }
 
     pub(crate) fn execute_debug_command(
@@ -183,13 +221,30 @@ impl RinchApp {
                     data: json!(rinch_dom::testing::get_text_content(&d.tree, id)),
                 }
             }
-            DebugCommandKind::Click { x, y, ref button } => {
+            DebugCommandKind::Click {
+                x,
+                y,
+                ref button,
+                ref modifiers,
+            } => {
                 // Route through the REAL input path (press + release) so MCP
                 // exercises exactly what a real mouse does — `handle_event` owns all
                 // the click logic (contextmenu, focus, editor, drag). Injecting via a
                 // parallel path here is what hid the dual-arm MouseDown bug.
+                //
+                // Requested modifiers arrive the way a keyboard delivers them:
+                // a `ModifiersChanged` before the press, and another after the
+                // release putting back what was held before.
+                let requested = match pointer_modifiers(modifiers) {
+                    Ok(m) => m,
+                    Err(e) => return e,
+                };
                 let mouse_button = parse_button(button);
                 self.cursor_pos = Some((x, y));
+                let before = self.modifiers;
+                if let Some(m) = requested {
+                    actions.extend(self.debug_modifiers_changed(m, window_size, scale_factor));
+                }
                 actions.extend(self.handle_event(
                     PlatformEvent::MouseDown {
                         x,
@@ -208,13 +263,41 @@ impl RinchApp {
                     window_size,
                     scale_factor,
                 ));
+                if requested.is_some() {
+                    actions.extend(self.debug_modifiers_changed(before, window_size, scale_factor));
+                }
                 actions.push(AppAction::RequestRedraw);
                 DebugResult::Json { data: json!(null) }
             }
-            DebugCommandKind::MouseDown { x, y, ref button } => {
+            DebugCommandKind::MouseDown {
+                x,
+                y,
+                ref button,
+                ref modifiers,
+            } => {
                 // Route through the real input path so MCP matches a real press.
+                //
+                // Requested modifiers stay held after the press (a Shift- or
+                // Alt-drag goes on through `mouse_move`s); the next `mouse_up`
+                // restores the state remembered here. A second modified press
+                // before that release keeps the first remembered state, so the
+                // release still returns to what was held before either.
+                let requested = match pointer_modifiers(modifiers) {
+                    Ok(m) => m,
+                    Err(e) => return e,
+                };
                 let mouse_button = parse_button(button);
                 self.cursor_pos = Some((x, y));
+                if let Some(m) = requested {
+                    // Read before the change, remembered after it: the change
+                    // itself clears the remembered state (a real modifier
+                    // change supersedes it — see `handle_event`), and the
+                    // helper keeps that clear from reaching a save made by an
+                    // earlier press.
+                    let prev = self.modifiers;
+                    actions.extend(self.debug_modifiers_changed(m, window_size, scale_factor));
+                    self.debug_modifiers_to_restore.get_or_insert(prev);
+                }
                 actions.extend(self.handle_event(
                     PlatformEvent::MouseDown {
                         x,
@@ -227,16 +310,75 @@ impl RinchApp {
                 actions.push(AppAction::RequestRedraw);
                 DebugResult::Json { data: json!(null) }
             }
-            DebugCommandKind::MouseUp { x, y, ref button } => {
+            DebugCommandKind::MouseUp {
+                x,
+                y,
+                ref button,
+                ref modifiers,
+            } => {
                 // Route through the real input path so MCP matches a real release.
+                //
+                // Its own `modifiers` are held for the release; afterwards the
+                // state from before this release (or, if a modified
+                // `mouse_down` came first, from before that press) comes back.
+                let requested = match pointer_modifiers(modifiers) {
+                    Ok(m) => m,
+                    Err(e) => return e,
+                };
                 let mouse_button = parse_button(button);
                 self.cursor_pos = Some((x, y));
+                let restore = self
+                    .debug_modifiers_to_restore
+                    .take()
+                    .or(requested.map(|_| self.modifiers));
+                if let Some(m) = requested {
+                    actions.extend(self.debug_modifiers_changed(m, window_size, scale_factor));
+                }
                 actions.extend(self.handle_event(
                     PlatformEvent::MouseUp {
                         x,
                         y,
                         button: mouse_button,
                     },
+                    window_size,
+                    scale_factor,
+                ));
+                if let Some(m) = restore {
+                    actions.extend(self.debug_modifiers_changed(m, window_size, scale_factor));
+                }
+                actions.push(AppAction::RequestRedraw);
+                DebugResult::Json { data: json!(null) }
+            }
+            DebugCommandKind::DropFiles { x, y, paths } => {
+                // An OS file drop, as the shell translates winit's (#1806,
+                // #1962): the drag's URI list is one `FileHoverEnter` per
+                // path at the point once it is read, and `DragDropped` is one
+                // `FileDropped`. Through
+                // `handle_event`, so the drag-enter/leave attributes, the
+                // editor's drop caret and picture claim, and the drop
+                // handlers under the point all run as for a real drop. The
+                // paths go over verbatim: a missing file is the app's to
+                // find, as one deleted between a drop and its read is.
+                if paths.is_empty() {
+                    return DebugResult::Error {
+                        message: "drop_files needs at least one path".into(),
+                    };
+                }
+                let position = (x as f64, y as f64);
+                let paths: Vec<std::path::PathBuf> =
+                    paths.into_iter().map(std::path::PathBuf::from).collect();
+                for path in &paths {
+                    actions.extend(self.handle_event(
+                        PlatformEvent::FileHoverEnter {
+                            path: path.clone(),
+                            position,
+                        },
+                        window_size,
+                        scale_factor,
+                    ));
+                }
+                actions.extend(self.handle_event(
+                    PlatformEvent::FileDropped { paths, position },
                     window_size,
                     scale_factor,
                 ));
@@ -260,6 +402,7 @@ impl RinchApp {
                 y,
                 delta_x,
                 delta_y,
+                unit,
             } => {
                 // Route through the real input path so MCP matches a real
                 // wheel, exactly as `Click`/`MouseDown`/`MouseUp`/`MouseMove`/
@@ -286,16 +429,28 @@ impl RinchApp {
                 // scroll offset). Negating makes both the document and any
                 // render surface see what the physical gesture would produce.
                 self.cursor_pos = Some((x, y));
-                actions.extend(self.handle_event(
-                    PlatformEvent::MouseWheel {
+                // A `line` scroll is a mouse wheel's notches (#2303): the
+                // `MouseWheelLines` event `shell::rinch_runtime::
+                // wheel_platform_event` makes of a winit `LineDelta`, so it
+                // glides (#2290) exactly like a notch from a real wheel. It is
+                // built here rather than through that function because `debug`
+                // does not imply `windowing` (no winit on Android). A pixel one
+                // is a trackpad's delta and scrolls directly.
+                let event = match unit {
+                    rinch_debug::ScrollUnit::Line => PlatformEvent::MouseWheelLines {
+                        x,
+                        y,
+                        lines_x: -delta_x,
+                        lines_y: -delta_y,
+                    },
+                    rinch_debug::ScrollUnit::Pixel => PlatformEvent::MouseWheel {
                         x,
                         y,
                         delta_x: -delta_x,
                         delta_y: -delta_y,
                     },
-                    window_size,
-                    scale_factor,
-                ));
+                };
+                actions.extend(self.handle_event(event, window_size, scale_factor));
                 actions.push(AppAction::RequestRedraw);
                 DebugResult::Json { data: json!(null) }
             }
@@ -335,6 +490,46 @@ impl RinchApp {
                 actions.push(AppAction::RequestRedraw);
                 DebugResult::Json { data: json!(null) }
             }
+            DebugCommandKind::PerfStats { reset } => {
+                // Every window's counters (#2657), beside this document's at
+                // the top level as before. A windowless app's root has no
+                // document of its own to report, only its windows.
+                #[cfg(feature = "windowing")]
+                let windows = crate::window_perf::windows_json();
+                #[cfg(not(feature = "windowing"))]
+                let windows = json!([]);
+                let mut data = match &self.doc {
+                    Some(doc) => {
+                        let d = doc.borrow();
+                        let perf = &d.tree.perf;
+                        json!({
+                            "frames": perf.frames(),
+                            "prepared_frames": perf.prepared(),
+                            "last_frame": perf.last_frame().to_json(),
+                            "current_frame": perf.frame().to_json(),
+                            "total": perf.total().to_json(),
+                        })
+                    }
+                    None if windows.as_array().is_some_and(|w| !w.is_empty()) => json!({}),
+                    None => {
+                        return DebugResult::Error {
+                            message: "No document".into(),
+                        };
+                    }
+                };
+                data["windows"] = windows;
+                // The work of no window, when there are several (#2798).
+                #[cfg(feature = "windowing")]
+                {
+                    data["pass"] = crate::window_perf::pass_json();
+                }
+                if reset {
+                    self.reset_perf();
+                    #[cfg(feature = "windowing")]
+                    crate::perf::reset_windows();
+                }
+                DebugResult::Json { data }
+            }
             DebugCommandKind::WaitFrame => {
                 // Layout is resolved at the logical viewport, not the physical
                 // surface size (see `RinchApp::layout_viewport`).
@@ -366,63 +561,115 @@ impl RinchApp {
             }
             DebugCommandKind::KeyPress {
                 key,
+                shift,
+                ctrl,
+                alt,
+                modifiers,
+            } => {
+                // A real keystroke is always a press followed by a release —
+                // issue #485. Before this, `key_press` synthesized only the
+                // `KeyDown` half, so Enter/Space's activation latch
+                // (`node_activation_held`, armed on the way down and cleared
+                // only by a matching `KeyUp`) stayed armed for the rest of the
+                // session: a second `key_press` of the same focused node
+                // silently did nothing, and no release-keyed app behaviour
+                // ("is W still held", a chord that ends on release) could be
+                // driven over MCP at all. `key_down`/`key_up` below are the
+                // two halves for a caller that wants to hold a key across
+                // other commands, mirroring `mouse_down`/`mouse_up`.
+                let resolved = match self.dispatch_debug_key_down(
+                    DebugKeyDownRequest {
+                        key: &key,
+                        shift,
+                        ctrl,
+                        alt,
+                        modifiers: &modifiers,
+                    },
+                    actions,
+                    scale_factor,
+                    window_size,
+                ) {
+                    Ok(r) => r,
+                    Err(e) => return e,
+                };
+                if let Some((key_code, logical_key, resolved_modifiers)) = resolved {
+                    // Nothing to release when a menu shortcut consumed the
+                    // press (`resolved` is `None`): no `PlatformEvent::KeyDown`
+                    // was ever dispatched, so nothing was armed either —
+                    // exactly like a real keystroke a menu owns outright.
+                    actions.extend(self.handle_event(
+                        PlatformEvent::KeyUp {
+                            key: key_code,
+                            logical_key,
+                            modifiers: resolved_modifiers,
+                        },
+                        window_size,
+                        scale_factor,
+                    ));
+                }
+                actions.push(AppAction::RequestRedraw);
+                DebugResult::Json { data: json!(null) }
+            }
+            DebugCommandKind::KeyDown {
+                key,
+                shift,
+                ctrl,
+                alt,
+                modifiers,
+            } => {
+                // The held half of #485's pair: synthesizes only the press,
+                // so a caller can drive other commands (or just wait) before
+                // releasing with `key_up`.
+                if let Err(e) = self.dispatch_debug_key_down(
+                    DebugKeyDownRequest {
+                        key: &key,
+                        shift,
+                        ctrl,
+                        alt,
+                        modifiers: &modifiers,
+                    },
+                    actions,
+                    scale_factor,
+                    window_size,
+                ) {
+                    return e;
+                }
+                actions.push(AppAction::RequestRedraw);
+                DebugResult::Json { data: json!(null) }
+            }
+            DebugCommandKind::KeyUp {
+                key,
                 mut shift,
                 mut ctrl,
                 mut alt,
                 modifiers,
             } => {
-                // Synthesize a real KeyDown and route through `handle_event` (which
-                // owns Escape/F12/inspect/editor/CE handling) so MCP `key_press`
-                // matches a physical keystroke.
-                //
-                // Fold the optional `modifiers` name array into the flat booleans
-                // (issue #152) — the only path that can request `meta`. An unknown
-                // name fails loud instead of silently altering the simulated input.
+                // The release half of #485's pair. No menu-shortcut check —
+                // a real release never fires one either — and the same
+                // `logical_key` resolution `key_down`/`key_press` use, so a
+                // consumer pairing a press with its release by that string
+                // (issue #337) sees them match.
                 let mut meta = false;
                 if let Err(name) = rinch_debug::fold_modifier_names(
                     &modifiers, &mut shift, &mut ctrl, &mut alt, &mut meta,
                 ) {
-                    return DebugResult::Error {
-                        message: format!(
-                            "Unknown modifier name: {name:?} (expected ctrl/control, shift, alt/option, meta/cmd/super)"
-                        ),
-                    };
+                    return unknown_modifier(&name);
                 }
-                // Unknown multi-char key names fail loud too — a silent no-text
-                // `Other` press would be indistinguishable from a dead key (#151).
                 let Some(key_code) = keyname_to_keycode(&key) else {
                     return DebugResult::Error {
                         message: format!("Unknown key name: {key:?}"),
                     };
                 };
-                let text = match key.as_str() {
-                    "Enter" => Some("\n".to_string()),
-                    k if k.chars().count() == 1 => Some(k.to_string()),
-                    _ => None,
-                };
-                // A single-character key name is its own key value, case and
-                // all (MCP has no layout to consult). Named keys stay `None`:
-                // their `KeyCode` spells them, and fabricating the name here
-                // would just shadow that table.
-                let logical_key = {
-                    let mut it = key.chars();
-                    match (it.next(), it.next()) {
-                        (Some(c), None) if !c.is_control() => Some(c.to_string()),
-                        _ => None,
-                    }
-                };
                 actions.extend(self.handle_event(
-                    PlatformEvent::KeyDown {
+                    PlatformEvent::KeyUp {
                         key: key_code,
-                        logical_key,
-                        text,
+                        logical_key: named_logical_key(&key, shift),
                         modifiers: rinch_platform::Modifiers {
                             shift,
                             ctrl,
                             alt,
                             meta,
                         },
-                        repeat: rinch_platform::KeyRepeat::Fresh,
                     },
                     window_size,
                     scale_factor,
@@ -469,77 +716,43 @@ impl RinchApp {
                         message: "No document".into(),
                     };
                 };
-
-                let scale = scale_factor as f32;
-
-                let d = doc.borrow();
+                // Logical (CSS) px at every scale factor, like `absolute` and
+                // the input tools (#421). Both answers are the app's own
+                // painter-matched geometry, never a copy of it (#1136): a
+                // field's caret is where `paint_input_value` draws it (its
+                // text column, a single-line field's scroll and centring,
+                // password bullets, the placeholder rule; `painted_caret_rect`,
+                // #1678, which `NodeHandle::caret_rect` asks too), and IFC
+                // text's is the caret the editor overlays and `caret_rect`
+                // draw, in the content box (`text_caret_window_rect`).
+                let mut d = doc.borrow_mut();
+                let d = &mut *d;
                 let Some(node) = d.tree.get(node_id) else {
                     return DebugResult::Error {
                         message: format!("Node {} not found", node_id),
                     };
                 };
-
-                // The node's painted frame. Every coordinate reported below is a
-                // position *inside* the box, so it is pushed forward through the
-                // composed transform rather than added to an origin — under a
-                // `scale()` container the two differ (#203). Copied out before
-                // the document borrow is released for the Parley rebuild.
-                let (box_x, box_y, node_transform) =
-                    rinch_dom::paint::compute_absolute_position_and_transform(
-                        &d.tree, node_id, 1.0,
-                    );
-                let fwd = move |lx: f64, ly: f64| -> (f64, f64) {
-                    let p = node_transform * peniko::kurbo::Point::new(box_x + lx, box_y + ly);
-                    (p.x, p.y)
+                let rect = if matches!(node.tag(), Some("input" | "textarea")) {
+                    rinch_dom::form_control::painted_caret_rect(
+                        &d.tree,
+                        &mut d.font_cx,
+                        &mut d.layout_cx,
+                        node_id,
+                        byte_offset,
+                        rinch_core::dom::CaretAffinity::Downstream,
+                    )
+                    .ok_or("Node has no caret")
+                } else {
+                    d.text_caret_window_rect(node_id, byte_offset)
+                        .ok_or("Node does not have text layout")
                 };
-
-                let tag = node.tag();
-                if matches!(tag, Some("input" | "textarea")) {
-                    let value = node.attributes.get("value").cloned().unwrap_or_default();
-                    if value.is_empty() {
-                        let padding_left =
-                            node.computed_style.padding_left.to_px() as f64 * scale as f64;
-                        let padding_top =
-                            node.computed_style.padding_top.to_px() as f64 * scale as f64;
-                        let (cx, cy) = fwd(padding_left, padding_top);
-                        return DebugResult::Json {
-                            data: json!({ "x": cx, "y": cy }),
-                        };
-                    }
-
-                    let computed_style = node.computed_style.clone();
-                    let input_width = node.layout.width;
-                    drop(d);
-
-                    let layout = computed_style.build_parley_layout(
-                        &value,
-                        scale,
-                        &mut self.hit_test_font_cx,
-                        &mut self.paint_layout_cx,
-                        Some(input_width),
-                    );
-
-                    let (x, y) = caret_position_for_offset_layout(&layout, byte_offset);
-                    let padding_left = computed_style.padding_left.to_px() as f64 * scale as f64;
-                    let padding_top = computed_style.padding_top.to_px() as f64 * scale as f64;
-
-                    let (cx, cy) = fwd(padding_left + x as f64, padding_top + y as f64);
-                    return DebugResult::Json {
-                        data: json!({ "x": cx, "y": cy }),
-                    };
-                }
-
-                if let Some(ref inline_layout) = node.text_layout {
-                    let (x, y) =
-                        caret_position_for_offset_layout(&inline_layout.layout, byte_offset);
-                    let (cx, cy) = fwd(x as f64, y as f64);
-                    return DebugResult::Json {
-                        data: json!({ "x": cx, "y": cy }),
-                    };
-                }
-
-                DebugResult::Error {
-                    message: "Node does not have text layout".into(),
+                match rect {
+                    Ok((x, y, _)) => DebugResult::Json {
+                        data: json!({ "x": x as f64, "y": y as f64 }),
+                    },
+                    Err(message) => DebugResult::Error {
+                        message: message.into(),
+                    },
                 }
             }
             DebugCommandKind::GetGlyphBounds {
@@ -551,101 +764,48 @@ impl RinchApp {
                         message: "No document".into(),
                     };
                 };
-
-                let scale = scale_factor as f32;
-
+                // Logical px, the app's own geometry (#421, #1136): a field's
+                // glyph over the layout it is painted and hit-tested with
+                // (`input_glyph_rect`), IFC text's from the document's glyph
+                // query, in the content box (`text_glyph_window_rect`).
                 let d = doc.borrow();
                 let Some(node) = d.tree.get(node_id) else {
                     return DebugResult::Error {
                         message: format!("Node {} not found", node_id),
                     };
                 };
-
-                // The node's painted frame. Every coordinate reported below is a
-                // position *inside* the box, so it is pushed forward through the
-                // composed transform rather than added to an origin — under a
-                // `scale()` container the two differ (#203). Copied out before
-                // the document borrow is released for the Parley rebuild.
-                let (box_x, box_y, node_transform) =
-                    rinch_dom::paint::compute_absolute_position_and_transform(
-                        &d.tree, node_id, 1.0,
-                    );
-                let fwd = move |lx: f64, ly: f64| -> (f64, f64) {
-                    let p = node_transform * peniko::kurbo::Point::new(box_x + lx, box_y + ly);
-                    (p.x, p.y)
-                };
-
-                let tag = node.tag();
-                if matches!(tag, Some("input" | "textarea")) {
-                    let value = node.attributes.get("value").cloned().unwrap_or_default();
-                    if value.is_empty() {
+                let rect = if matches!(node.tag(), Some("input" | "textarea")) {
+                    let empty = rinch_dom::form_control::control_value(&d.tree.nodes, node_id)
+                        .is_none_or(|v| v.is_empty());
+                    if empty {
                         return DebugResult::Error {
                             message: "No text content".into(),
                         };
                     }
-
-                    let computed_style = node.computed_style.clone();
-                    let input_width = node.layout.width;
-                    drop(d);
-
-                    let layout = computed_style.build_parley_layout(
-                        &value,
-                        scale,
+                    Self::input_glyph_rect(
+                        &d.tree,
                         &mut self.hit_test_font_cx,
-                        &mut self.paint_layout_cx,
-                        Some(input_width),
-                    );
-
-                    match glyph_bounds_for_offset_layout(&layout, byte_offset) {
-                        Some(bounds) => {
-                            let padding_left =
-                                computed_style.padding_left.to_px() as f64 * scale as f64;
-                            let padding_top =
-                                computed_style.padding_top.to_px() as f64 * scale as f64;
-                            let (gx, gy) = fwd(
-                                padding_left + bounds.x as f64,
-                                padding_top + bounds.y as f64,
-                            );
-                            return DebugResult::Json {
-                                data: json!({
-                                    "x": gx,
-                                    "y": gy,
-                                    "width": bounds.width,
-                                    "height": bounds.height,
-                                }),
-                            };
-                        }
-                        None => {
-                            return DebugResult::Error {
-                                message: "Byte offset out of bounds".into(),
-                            };
-                        }
-                    }
-                }
-
-                if let Some(ref inline_layout) = node.text_layout {
-                    match glyph_bounds_for_offset_layout(&inline_layout.layout, byte_offset) {
-                        Some(bounds) => {
-                            let (gx, gy) = fwd(bounds.x as f64, bounds.y as f64);
-                            return DebugResult::Json {
-                                data: json!({
-                                    "x": gx,
-                                    "y": gy,
-                                    "width": bounds.width,
-                                    "height": bounds.height,
-                                }),
-                            };
-                        }
-                        None => {
-                            return DebugResult::Error {
-                                message: "Byte offset out of bounds".into(),
-                            };
-                        }
-                    }
-                }
-
-                DebugResult::Error {
-                    message: "Node does not have text layout".into(),
+                        &mut self.hit_test_layout_cx,
+                        node_id,
+                        byte_offset,
+                    )
+                    .ok_or("Byte offset out of bounds")
+                } else {
+                    d.text_glyph_window_rect(node_id, byte_offset)
+                        .ok_or("No glyph at this offset (no text layout, or past the text; for text in a block, query the block element)")
+                };
+                match rect {
+                    Ok((x, y, width, height)) => DebugResult::Json {
+                        data: json!({
+                            "x": x as f64,
+                            "y": y as f64,
+                            "width": width,
+                            "height": height,
+                        }),
+                    },
+                    Err(message) => DebugResult::Error {
+                        message: message.into(),
+                    },
                 }
             }
         }
@@ -666,8 +826,8 @@ mod keycode_mapping_tests {
 
     #[test]
     fn space_char_keeps_its_named_keycode() {
-        // Space-parity gotcha: an injected ' ' must still read as
-        // `key = "Space"`, exactly like a physical spacebar press.
+        // Space-parity gotcha: an injected ' ' must still read as the
+        // spacebar (`code = "Space"`), exactly like a physical press.
         assert_eq!(char_to_keycode(' '), KeyCode::Space);
     }
 
@@ -699,7 +859,7 @@ mod tests {
     //! nothing whenever `debug` is off.
 
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     /// Physical == logical; every other test in this crate mounts at 800x600.
     const VIEWPORT: (u32, u32) = (800, 600);
@@ -710,7 +870,7 @@ mod tests {
     /// region computed from it alone cannot reach the scroller.
     ///
     /// Returns `(scroller, bystander)`.
-    fn app_with_scroller(ids: Rc<Cell<Option<(usize, usize)>>>) -> RinchApp {
+    fn app_with_scroller(ids: Rc<Cell<Option<(u64, u64)>>>) -> RinchApp {
         let mut app = RinchApp::new(move |scope: &mut RenderScope| {
             let root = scope.create_element("div");
             root.set_attribute("style", "position: relative; width: 800px; height: 600px");
@@ -741,6 +901,17 @@ mod tests {
     }
 
     fn mcp_scroll(app: &mut RinchApp, x: f32, y: f32, delta_x: f64, delta_y: f64) {
+        mcp_scroll_in(app, x, y, delta_x, delta_y, rinch_debug::ScrollUnit::Pixel);
+    }
+
+    fn mcp_scroll_in(
+        app: &mut RinchApp,
+        x: f32,
+        y: f32,
+        delta_x: f64,
+        delta_y: f64,
+        unit: rinch_debug::ScrollUnit,
+    ) {
         let mut actions = Vec::new();
         app.execute_debug_command(
             DebugCommandKind::Scroll {
@@ -748,6 +919,7 @@ mod tests {
                 y,
                 delta_x,
                 delta_y,
+                unit,
             },
             &mut actions,
             1.0,
@@ -755,8 +927,72 @@ mod tests {
         );
     }
 
-    fn offsets(app: &RinchApp, id: usize) -> (f64, f64) {
+    fn offsets(app: &RinchApp, id: u64) -> (f64, f64) {
         app.doc.as_ref().unwrap().borrow().tree.nodes[id].scroll_offset
+    }
+
+    /// A `line` debug scroll is a mouse wheel's notch (#2303): it starts the
+    /// wheel glide (#2290) and moves nothing until the frames run, where a
+    /// `pixel` one lands at once and starts no glide. Offsets are sampled off
+    /// 0, mid-curve, and the glide must end at the same place a real one-notch
+    /// `LineDelta` ends (40px per notch, positive `delta_y` = down).
+    #[test]
+    fn a_line_mcp_scroll_glides_and_a_pixel_one_does_not() {
+        let ids: Rc<Cell<Option<(u64, u64)>>> = Rc::new(Cell::new(None));
+        let mut app = app_with_scroller(ids.clone());
+        let (sc, _) = ids.get().expect("the node ids");
+        // Pin the animation clock so the frames below are exact 10 ms steps.
+        app.doc
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .set_animation_clock_ms(Some(1_000_000.0));
+
+        mcp_scroll_in(
+            &mut app,
+            100.0,
+            50.0,
+            0.0,
+            1.0,
+            rinch_debug::ScrollUnit::Line,
+        );
+        assert!(app.wheel_scroll_animating(), "a line scroll starts a glide");
+        assert_eq!(
+            offsets(&app, sc),
+            (0.0, 0.0),
+            "the notch moves nothing itself"
+        );
+        let mut mid = None;
+        for i in 0..40 {
+            app.doc
+                .as_ref()
+                .unwrap()
+                .borrow_mut()
+                .advance_animation_clock_ms(10.0);
+            app.handle_event(PlatformEvent::AboutToWait, VIEWPORT, 1.0);
+            if i == 5 {
+                mid = Some(offsets(&app, sc).1);
+            }
+        }
+        let mid = mid.unwrap();
+        assert!(mid > 0.0 && mid < 40.0, "mid-glide offset {mid}");
+        assert!(!app.wheel_scroll_animating());
+        assert_eq!(offsets(&app, sc), (0.0, 40.0));
+
+        // A pixel scroll of 30px lands at once and glides nothing.
+        mcp_scroll_in(
+            &mut app,
+            100.0,
+            50.0,
+            0.0,
+            30.0,
+            rinch_debug::ScrollUnit::Pixel,
+        );
+        assert!(
+            !app.wheel_scroll_animating(),
+            "a pixel scroll starts no glide"
+        );
+        assert_eq!(offsets(&app, sc), (0.0, 70.0));
     }
 
     /// The bug itself: `push_dirty` is what fills `paint_dirty_nodes`, which is
@@ -766,13 +1002,13 @@ mod tests {
     /// nothing later re-dirties it.
     ///
     /// Asserting on `paint_dirty_nodes` rather than on a rasterised frame is
-    /// deliberate: the frame is only wrong when the region is *non-empty and
-    /// too small* (an empty `paint_dirty_nodes` makes `compute_dirty_region`
-    /// return `None`, which means a full repaint and a correct frame), so the
-    /// missing entry is the defect and a screenshot is a lossy view of it.
+    /// deliberate: the missing entry is the defect, and a screenshot is a lossy
+    /// view of it. (Since #886 an empty damage repaints nothing, so without the
+    /// entry the scrolled container keeps its pre-scroll pixels even when
+    /// nothing else is dirty.)
     #[test]
     fn an_mcp_scroll_pushes_the_container_paint_dirty() {
-        let ids: Rc<Cell<Option<(usize, usize)>>> = Rc::new(Cell::new(None));
+        let ids: Rc<Cell<Option<(u64, u64)>>> = Rc::new(Cell::new(None));
         let mut app = app_with_scroller(ids.clone());
         let (sc, _bystander) = ids.get().expect("the node ids");
 
@@ -801,15 +1037,15 @@ mod tests {
         );
     }
 
-    /// The live failure mode, reproduced: an *empty* `paint_dirty_nodes` makes
-    /// `compute_dirty_region` return `None`, which means a full repaint and a
-    /// correct frame — so the corruption only appears when something *else* was
-    /// already dirty (in the report, a drawer that had just closed). Seed one
-    /// unrelated dirty node and the region has to grow to cover the container
-    /// anyway.
+    /// The live failure mode, reproduced: when this was reported, an *empty*
+    /// `paint_dirty_nodes` meant a full repaint and a correct frame, so the
+    /// corruption only appeared when something *else* was already dirty (in
+    /// the report, a drawer that had just closed). Seed one unrelated dirty
+    /// node and the damage has to cover the container anyway. (Since #886 an
+    /// empty damage repaints nothing, so the entry is needed either way.)
     #[test]
     fn an_mcp_scroll_widens_a_dirty_region_that_already_has_other_nodes_in_it() {
-        let ids: Rc<Cell<Option<(usize, usize)>>> = Rc::new(Cell::new(None));
+        let ids: Rc<Cell<Option<(u64, u64)>>> = Rc::new(Cell::new(None));
         let mut app = app_with_scroller(ids.clone());
         let (_sc, bystander) = ids.get().expect("the node ids");
 
@@ -857,7 +1093,7 @@ mod tests {
     /// hand-written arm ignored `delta_x` for document scrolling entirely.
     #[test]
     fn an_mcp_scroll_moves_both_axes_in_the_documented_direction() {
-        let ids: Rc<Cell<Option<(usize, usize)>>> = Rc::new(Cell::new(None));
+        let ids: Rc<Cell<Option<(u64, u64)>>> = Rc::new(Cell::new(None));
         let mut app = app_with_scroller(ids.clone());
         let (sc, _bystander) = ids.get().expect("the node ids");
         assert_eq!(offsets(&app, sc), (0.0, 0.0));
@@ -874,5 +1110,1432 @@ mod tests {
             (0.0, 0.0),
             "a negative delta must undo it"
         );
+    }
+
+    /// `perf_stats` answers the document's counters as JSON keyed by counter
+    /// name, and `reset: true` zeroes them after the read.
+    #[test]
+    fn perf_stats_reports_and_resets_the_counters() {
+        let ids: Rc<Cell<Option<(u64, u64)>>> = Rc::new(Cell::new(None));
+        let mut app = app_with_scroller(ids);
+        app.end_perf_frame();
+        let mut actions = Vec::new();
+        let DebugResult::Json { data } = app.execute_debug_command(
+            DebugCommandKind::PerfStats { reset: true },
+            &mut actions,
+            1.0,
+            VIEWPORT,
+        ) else {
+            panic!("perf_stats answers JSON");
+        };
+        assert_eq!(data["frames"], 1);
+        assert!(
+            data["last_frame"]["layout_resolves"].as_u64().unwrap() > 0,
+            "the mount's layout is in the frame it ended: {data}"
+        );
+        assert!(data["total"]["elements_cascaded"].as_u64().unwrap() > 0);
+        assert!(data["current_frame"].is_object());
+        assert_eq!(
+            data["last_frame"].as_object().unwrap().len(),
+            rinch_dom::perf::Counter::COUNT
+        );
+
+        let DebugResult::Json { data } = app.execute_debug_command(
+            DebugCommandKind::PerfStats { reset: false },
+            &mut actions,
+            1.0,
+            VIEWPORT,
+        ) else {
+            panic!("perf_stats answers JSON");
+        };
+        assert_eq!(data["frames"], 0, "reset zeroed the frame count: {data}");
+        assert_eq!(data["total"]["elements_cascaded"], 0);
+    }
+
+    // ── Modified clicks: `click` / `mouse_down` / `mouse_up` `modifiers` ──
+
+    /// `(shift, ctrl, alt, meta)`, as a handler read it from its
+    /// `ClickContext`, or as `RinchApp::modifiers` holds it.
+    type Mods = (bool, bool, bool, bool);
+
+    /// What each handler saw: `("down" | "up" | "click", modifiers)`.
+    type Seen = Rc<RefCell<Vec<(&'static str, Mods)>>>;
+
+    fn mods(m: Modifiers) -> Mods {
+        (m.shift, m.ctrl, m.alt, m.meta)
+    }
+
+    const NONE: Mods = (false, false, false, false);
+    const SHIFT: Mods = (true, false, false, false);
+    const CTRL: Mods = (false, true, false, false);
+    const ALT: Mods = (false, false, true, false);
+
+    /// A 200x100 box at the origin with a click handler (`data-rid`) and
+    /// `data-onmousedown`/`data-onmouseup` handlers, each recording the
+    /// modifiers its `ClickContext` carries.
+    fn app_with_button(seen: Seen) -> RinchApp {
+        let mut app = RinchApp::new(move |scope: &mut RenderScope| {
+            let root = scope.create_element("div");
+            let button = scope.create_element("div");
+            button.set_attribute("style", "width: 200px; height: 100px");
+            for (attr, name) in [
+                ("data-rid", "click"),
+                ("data-onmousedown", "down"),
+                ("data-onmouseup", "up"),
+            ] {
+                let seen = seen.clone();
+                let id = scope.register_handler(move || {
+                    let m = events::get_click_context().modifiers;
+                    seen.borrow_mut()
+                        .push((name, (m.shift, m.ctrl, m.alt, m.meta)));
+                });
+                button.set_attribute(attr, &id.0.to_string());
+            }
+            root.append_child(&button);
+            root
+        });
+        app.mount_component(800.0, 600.0);
+        app.resolve_and_repaint(800.0, 600.0);
+        app
+    }
+
+    fn run(app: &mut RinchApp, kind: DebugCommandKind) -> DebugResult {
+        let mut actions = Vec::new();
+        app.execute_debug_command(kind, &mut actions, 1.0, VIEWPORT)
+    }
+
+    fn names(names: &[&str]) -> Option<Vec<String>> {
+        Some(names.iter().map(|n| n.to_string()).collect())
+    }
+
+    fn click(modifiers: Option<Vec<String>>) -> DebugCommandKind {
+        DebugCommandKind::Click {
+            x: 50.0,
+            y: 50.0,
+            button: None,
+            modifiers,
+        }
+    }
+
+    fn hold(app: &mut RinchApp, m: Modifiers) {
+        app.handle_event(PlatformEvent::ModifiersChanged(m), VIEWPORT, 1.0);
+    }
+
+    /// The feature: a click with `["ctrl"]` reaches every handler with Ctrl
+    /// held, and afterwards the app holds no modifier again.
+    #[test]
+    fn a_ctrl_click_reaches_the_app_with_ctrl_held_and_then_releases_it() {
+        let seen: Seen = Rc::default();
+        let mut app = app_with_button(seen.clone());
+        assert!(matches!(
+            run(&mut app, click(names(&["ctrl"]))),
+            DebugResult::Json { .. }
+        ));
+        assert_eq!(
+            *seen.borrow(),
+            vec![("down", CTRL), ("click", CTRL), ("up", CTRL)]
+        );
+        assert_eq!(mods(app.modifiers), NONE, "released after the click");
+    }
+
+    /// The requested set is exact for the click (a held Shift is not added
+    /// to `["ctrl"]`), and what was held before comes back afterwards.
+    #[test]
+    fn a_modified_click_restores_the_state_held_before_it() {
+        let seen: Seen = Rc::default();
+        let mut app = app_with_button(seen.clone());
+        hold(
+            &mut app,
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        run(&mut app, click(names(&["Control"])));
+        assert_eq!(
+            *seen.borrow(),
+            vec![("down", CTRL), ("click", CTRL), ("up", CTRL)]
+        );
+        assert_eq!(mods(app.modifiers), SHIFT, "the held Shift is back");
+    }
+
+    /// Every alias `key_press` takes, folded the same way.
+    #[test]
+    fn the_modifier_names_are_key_press_names() {
+        let seen: Seen = Rc::default();
+        let mut app = app_with_button(seen.clone());
+        run(&mut app, click(names(&["shift", "option", "cmd"])));
+        assert_eq!(seen.borrow()[1], ("click", (true, false, true, true)));
+        seen.borrow_mut().clear();
+        run(&mut app, click(names(&["SUPER", "alt", "meta"])));
+        assert_eq!(seen.borrow()[1], ("click", (false, false, true, true)));
+    }
+
+    /// An unknown name fails loud, with `key_press`'s sentence, before any
+    /// input reaches the app — on all three commands.
+    #[test]
+    fn an_unknown_modifier_name_is_rejected_and_nothing_is_pressed() {
+        let seen: Seen = Rc::default();
+        let mut app = app_with_button(seen.clone());
+        let commands = [
+            click(names(&["ctrl", "hyper"])),
+            DebugCommandKind::MouseDown {
+                x: 50.0,
+                y: 50.0,
+                button: None,
+                modifiers: names(&["hyper"]),
+            },
+            DebugCommandKind::MouseUp {
+                x: 50.0,
+                y: 50.0,
+                button: None,
+                modifiers: names(&["hyper"]),
+            },
+        ];
+        for command in commands {
+            let DebugResult::Error { message } = run(&mut app, command) else {
+                panic!("an unknown modifier name is an error");
+            };
+            assert_eq!(
+                message,
+                "Unknown modifier name: \"hyper\" (expected ctrl/control, shift, alt/option, meta/cmd/super)"
+            );
+        }
+        assert!(seen.borrow().is_empty(), "nothing was pressed or released");
+        assert_eq!(mods(app.modifiers), NONE);
+        assert_eq!(app.debug_modifiers_to_restore, None);
+    }
+
+    /// Without the field, a click is what it always was: it sees the
+    /// modifiers the app holds and leaves them held.
+    #[test]
+    fn without_modifiers_a_click_sees_and_keeps_the_held_state() {
+        let seen: Seen = Rc::default();
+        let mut app = app_with_button(seen.clone());
+        run(&mut app, click(None));
+        assert_eq!(
+            *seen.borrow(),
+            vec![("down", NONE), ("click", NONE), ("up", NONE)]
+        );
+        seen.borrow_mut().clear();
+        hold(
+            &mut app,
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        run(&mut app, click(None));
+        assert_eq!(
+            *seen.borrow(),
+            vec![("down", SHIFT), ("click", SHIFT), ("up", SHIFT)]
+        );
+        assert_eq!(mods(app.modifiers), SHIFT, "still held: nothing restored");
+    }
+
+    /// An empty array is not an absent field: it asks for no modifier, and
+    /// what was held comes back afterwards.
+    #[test]
+    fn an_empty_array_clicks_with_no_modifier() {
+        let seen: Seen = Rc::default();
+        let mut app = app_with_button(seen.clone());
+        hold(
+            &mut app,
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        run(&mut app, click(names(&[])));
+        assert_eq!(seen.borrow()[1], ("click", NONE));
+        assert_eq!(mods(app.modifiers), SHIFT);
+    }
+
+    /// Separate press and release: the press sets the modifiers and they stay
+    /// held (through a move) for a release that names none; that release
+    /// restores the state from before the press.
+    #[test]
+    fn mouse_down_holds_its_modifiers_until_mouse_up_restores_them() {
+        let seen: Seen = Rc::default();
+        let mut app = app_with_button(seen.clone());
+        run(
+            &mut app,
+            DebugCommandKind::MouseDown {
+                x: 50.0,
+                y: 50.0,
+                button: None,
+                modifiers: names(&["shift"]),
+            },
+        );
+        assert_eq!(mods(app.modifiers), SHIFT, "held after the press");
+        run(&mut app, DebugCommandKind::MouseMove { x: 60.0, y: 50.0 });
+        assert_eq!(mods(app.modifiers), SHIFT, "held through a move");
+        run(
+            &mut app,
+            DebugCommandKind::MouseUp {
+                x: 60.0,
+                y: 50.0,
+                button: None,
+                modifiers: None,
+            },
+        );
+        assert_eq!(
+            *seen.borrow(),
+            vec![("down", SHIFT), ("click", SHIFT), ("up", SHIFT)]
+        );
+        assert_eq!(mods(app.modifiers), NONE, "the release restored them");
+        assert_eq!(app.debug_modifiers_to_restore, None);
+    }
+
+    /// A release that names its own modifiers holds them for the release, and
+    /// still returns to the state from before the modified press.
+    #[test]
+    fn mouse_up_with_its_own_modifiers_returns_to_the_state_before_the_press() {
+        let seen: Seen = Rc::default();
+        let mut app = app_with_button(seen.clone());
+        hold(
+            &mut app,
+            Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+        run(
+            &mut app,
+            DebugCommandKind::MouseDown {
+                x: 50.0,
+                y: 50.0,
+                button: None,
+                modifiers: names(&["shift"]),
+            },
+        );
+        run(
+            &mut app,
+            DebugCommandKind::MouseUp {
+                x: 50.0,
+                y: 50.0,
+                button: None,
+                modifiers: names(&["alt"]),
+            },
+        );
+        assert_eq!(
+            *seen.borrow(),
+            vec![("down", SHIFT), ("click", SHIFT), ("up", ALT)]
+        );
+        assert_eq!(mods(app.modifiers), CTRL, "the state before the press");
+
+        // A lone modified release restores its own prior state.
+        seen.borrow_mut().clear();
+        run(
+            &mut app,
+            DebugCommandKind::MouseUp {
+                x: 50.0,
+                y: 50.0,
+                button: None,
+                modifiers: names(&["alt"]),
+            },
+        );
+        assert_eq!(seen.borrow()[0], ("up", ALT));
+        assert_eq!(mods(app.modifiers), CTRL);
+    }
+
+    /// Two modified presses before one release: the release goes back to
+    /// what was held before the first, not to the first press's modifiers.
+    #[test]
+    fn a_second_modified_press_keeps_the_first_remembered_state() {
+        let seen: Seen = Rc::default();
+        let mut app = app_with_button(seen.clone());
+        for m in [&["shift"], &["alt"]] {
+            run(
+                &mut app,
+                DebugCommandKind::MouseDown {
+                    x: 50.0,
+                    y: 50.0,
+                    button: None,
+                    modifiers: names(m),
+                },
+            );
+        }
+        assert_eq!(mods(app.modifiers), ALT);
+        run(
+            &mut app,
+            DebugCommandKind::MouseUp {
+                x: 50.0,
+                y: 50.0,
+                button: None,
+                modifiers: None,
+            },
+        );
+        assert_eq!(mods(app.modifiers), NONE);
+    }
+
+    /// Unmodified press and release are what they always were: nothing is
+    /// remembered, nothing restored.
+    #[test]
+    fn unmodified_mouse_down_and_up_leave_the_held_state_alone() {
+        let seen: Seen = Rc::default();
+        let mut app = app_with_button(seen.clone());
+        hold(
+            &mut app,
+            Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+        );
+        for kind in [
+            DebugCommandKind::MouseDown {
+                x: 50.0,
+                y: 50.0,
+                button: None,
+                modifiers: None,
+            },
+            DebugCommandKind::MouseUp {
+                x: 50.0,
+                y: 50.0,
+                button: None,
+                modifiers: None,
+            },
+        ] {
+            run(&mut app, kind);
+            assert_eq!(app.debug_modifiers_to_restore, None);
+            assert_eq!(mods(app.modifiers), ALT);
+        }
+        assert_eq!(
+            *seen.borrow(),
+            vec![("down", ALT), ("click", ALT), ("up", ALT)]
+        );
+    }
+
+    fn press_ctrl(app: &mut RinchApp) {
+        run(
+            app,
+            DebugCommandKind::MouseDown {
+                x: 50.0,
+                y: 50.0,
+                button: None,
+                modifiers: names(&["ctrl"]),
+            },
+        );
+        assert_eq!(mods(app.modifiers), CTRL);
+    }
+
+    /// A modified `mouse_down` whose `mouse_up` never comes (the client went
+    /// away): a real modifier change supersedes it, so a real click is not
+    /// modified, and a later debug `mouse_up` does not resurrect the ctrl
+    /// the press remembered.
+    #[test]
+    fn a_real_modifier_change_supersedes_a_stranded_modified_press() {
+        let seen: Seen = Rc::default();
+        let mut app = app_with_button(seen.clone());
+        press_ctrl(&mut app);
+        // The release is lost; the user then presses and releases a real key.
+        app.handle_event(
+            PlatformEvent::MouseUp {
+                x: 50.0,
+                y: 50.0,
+                button: MouseButton::Left,
+            },
+            VIEWPORT,
+            1.0,
+        );
+        hold(&mut app, Modifiers::default());
+        assert_eq!(app.debug_modifiers_to_restore, None);
+        seen.borrow_mut().clear();
+        for event in [
+            PlatformEvent::MouseDown {
+                x: 50.0,
+                y: 50.0,
+                button: MouseButton::Left,
+            },
+            PlatformEvent::MouseUp {
+                x: 50.0,
+                y: 50.0,
+                button: MouseButton::Left,
+            },
+        ] {
+            app.handle_event(event, VIEWPORT, 1.0);
+        }
+        assert_eq!(
+            *seen.borrow(),
+            vec![("down", NONE), ("click", NONE), ("up", NONE)]
+        );
+
+        // Hold alt for real; a later unmodified debug release keeps it.
+        hold(
+            &mut app,
+            Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+        );
+        run(
+            &mut app,
+            DebugCommandKind::MouseUp {
+                x: 50.0,
+                y: 50.0,
+                button: None,
+                modifiers: None,
+            },
+        );
+        assert_eq!(mods(app.modifiers), ALT, "ctrl is not resurrected");
+    }
+
+    /// A modified click between a modified press and its release is part of
+    /// the debug sequence, not a real change: the release still restores.
+    #[test]
+    fn a_modified_click_inside_a_held_press_keeps_the_remembered_state() {
+        let seen: Seen = Rc::default();
+        let mut app = app_with_button(seen.clone());
+        press_ctrl(&mut app);
+        run(&mut app, click(names(&["shift"])));
+        assert_eq!(
+            mods(app.modifiers),
+            CTRL,
+            "the click put back the press's ctrl"
+        );
+        run(
+            &mut app,
+            DebugCommandKind::MouseUp {
+                x: 50.0,
+                y: 50.0,
+                button: None,
+                modifiers: None,
+            },
+        );
+        assert_eq!(mods(app.modifiers), NONE);
+    }
+
+    /// Losing the window's keyboard releases what a debug press is holding.
+    #[test]
+    fn window_blur_releases_a_debug_press_s_modifiers() {
+        let seen: Seen = Rc::default();
+        let mut app = app_with_button(seen.clone());
+        hold(
+            &mut app,
+            Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+        );
+        press_ctrl(&mut app);
+        app.handle_event(PlatformEvent::WindowFocus(false), VIEWPORT, 1.0);
+        assert_eq!(
+            mods(app.modifiers),
+            ALT,
+            "back to the state before the press"
+        );
+        assert_eq!(app.debug_modifiers_to_restore, None);
+    }
+}
+
+#[cfg(test)]
+mod text_geometry_units_tests {
+    //! `get_caret_position` / `get_glyph_bounds` answer in **logical** px at
+    //! every scale factor (#421), like `absolute` and the input tools.
+    //!
+    //! Before #421 the two handlers took the node's box at scale 1.0 and the
+    //! offset inside it (paddings, the probe Parley layout's font size) at the
+    //! window's scale factor, so at scale 2 the answer was the box's logical
+    //! origin plus a doubled intra-box offset — and the probe layout paired a
+    //! doubled font with the logical `max_width`, wrapping at the wrong width.
+    //! Every fixture compares scale 2 against scale 1: at scale 1 the two units
+    //! coincide, which is the fixed point that hid the bug.
+
+    use super::*;
+    use std::cell::Cell;
+
+    /// `(input, textarea, paragraph)` node ids.
+    type Ids = Rc<Cell<Option<(u64, u64, u64)>>>;
+
+    /// An `<input>` and a `<textarea>` with off-zero paddings, placed off the
+    /// origin, and a `<p>` holding IFC text. Fonts and line heights are
+    /// declared; the textarea's text fits its 300px width at 14px but not at
+    /// 28px, so a probe layout built with a doubled font wraps it.
+    fn app_with_text_fields(ids: Ids) -> RinchApp {
+        let mut app = RinchApp::new(move |scope: &mut RenderScope| {
+            let root = scope.create_element("div");
+            root.set_attribute(
+                "style",
+                "position: relative; width: 800px; height: 600px; \
+                 font-family: sans-serif; font-size: 14px; line-height: 20px",
+            );
+            let input = scope.create_element("input");
+            input.set_attribute(
+                "style",
+                "position: absolute; left: 40px; top: 30px; width: 300px; height: 28px; \
+                 padding: 5px 0 0 13px; font-size: 14px; line-height: 20px",
+            );
+            input.set_attribute("value", "hello world");
+            root.append_child(&input);
+
+            let textarea = scope.create_element("textarea");
+            textarea.set_attribute(
+                "style",
+                "position: absolute; left: 40px; top: 100px; width: 300px; height: 120px; \
+                 padding: 7px 0 0 11px; font-size: 14px; line-height: 20px",
+            );
+            textarea.set_attribute("value", "one two three four five six");
+            root.append_child(&textarea);
+
+            let p = scope.create_element("p");
+            p.set_attribute(
+                "style",
+                "position: absolute; left: 40px; top: 300px; width: 300px; margin: 0; \
+                 font-size: 14px; line-height: 20px",
+            );
+            let text = scope.create_text("hello paragraph");
+            p.append_child(&text);
+            root.append_child(&p);
+
+            ids.set(Some((
+                input.node_id().0,
+                textarea.node_id().0,
+                p.node_id().0,
+            )));
+            root
+        });
+        app.mount_component(800.0, 600.0);
+        app.resolve_and_repaint(800.0, 600.0);
+        app
+    }
+
+    fn query(app: &mut RinchApp, kind: DebugCommandKind, scale: f64) -> serde_json::Value {
+        let mut actions = Vec::new();
+        let size = ((800.0 * scale) as u32, (600.0 * scale) as u32);
+        match app.execute_debug_command(kind, &mut actions, scale, size) {
+            DebugResult::Json { data } => data,
+            other => panic!("expected JSON, got {other:?}"),
+        }
+    }
+
+    fn caret(app: &mut RinchApp, node_id: u64, byte_offset: usize, scale: f64) -> (f64, f64) {
+        let v = query(
+            app,
+            DebugCommandKind::GetCaretPosition {
+                node_id,
+                byte_offset,
+            },
+            scale,
+        );
+        (v["x"].as_f64().unwrap(), v["y"].as_f64().unwrap())
+    }
+
+    fn glyph(app: &mut RinchApp, node_id: u64, byte_offset: usize, scale: f64) -> [f64; 4] {
+        let v = query(
+            app,
+            DebugCommandKind::GetGlyphBounds {
+                node_id,
+                byte_offset,
+            },
+            scale,
+        );
+        ["x", "y", "width", "height"].map(|k| v[k].as_f64().unwrap())
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 0.01
+    }
+
+    /// The top-left of the caret **painted** in field `input` with its caret
+    /// at byte `byte`, in logical px, read from the pixels of a scale-2 paint:
+    /// the field marked focused with its caret at `byte`, and the caret found as the dark ink in the column the engine's
+    /// caret rect names (only the caret is drawn there: its x is at a glyph
+    /// edge, and an empty field draws no glyph at all).
+    fn painted_caret_top_left(app: &mut RinchApp, input: u64, byte: usize) -> (f64, f64) {
+        let (_, by, _, bh) = {
+            let d = app.doc.as_ref().unwrap().borrow();
+            crate::app::hit_testing::painted_element_box(&d.tree, input)
+        };
+        // The field unfocused first: no caret. Glyphs are drawn at their
+        // quarter-pixel positions (#2286), so the last glyph's edge can reach
+        // into the caret's column; ink this paint already has is not the caret.
+        {
+            let doc = app.doc.clone().unwrap();
+            let mut d = doc.borrow_mut();
+            let n = d.tree.nodes.get_mut(input).unwrap();
+            n.attributes.remove("data-focused");
+            d.tree.mark_paint_dirty(input);
+        }
+        app.resolve_and_repaint(800.0, 600.0);
+        app.scene_dirty = true;
+        app.has_previous_frame = false;
+        let (without, _, _) = app.build_pixels(2.0, (1600, 1200), true);
+        let dark = |p: &[u8; 4]| p[3] > 200 && p[0] < 100 && p[1] < 100 && p[2] < 100;
+        let without: Vec<bool> = without.as_chunks::<4>().0.iter().map(dark).collect();
+        // Focused with its caret at `byte`, as the runtime's caret sync
+        // writes it (the attributes paint, the scroll and MCP all read).
+        {
+            let doc = app.doc.clone().unwrap();
+            let mut d = doc.borrow_mut();
+            let n = d.tree.nodes.get_mut(input).unwrap();
+            n.attributes.insert("data-focused".into(), "true".into());
+            n.attributes
+                .insert("data-cursor-pos".into(), byte.to_string());
+            n.attributes
+                .insert("data-selection-start".into(), byte.to_string());
+            d.tree.mark_paint_dirty(input);
+        }
+        app.resolve_and_repaint(800.0, 600.0);
+        app.scene_dirty = true;
+        app.has_previous_frame = false;
+        // The column: the caret paint draws is 3 device px wide from its x.
+        let rect = {
+            let doc = app.doc.clone().unwrap();
+            let mut d = doc.borrow_mut();
+            let d = &mut *d;
+            rinch_dom::form_control::painted_caret_rect(
+                &d.tree,
+                &mut d.font_cx,
+                &mut d.layout_cx,
+                input,
+                byte,
+                rinch_core::dom::CaretAffinity::Downstream,
+            )
+            .unwrap()
+        };
+        let (px, w, _) = app.build_pixels(2.0, (1600, 1200), true);
+        let w = w as usize;
+        let (cx0, cx1) = (
+            ((rect.0 - 1.0) * 2.0) as usize,
+            ((rect.0 + 3.0) * 2.0) as usize,
+        );
+        let (mut left, mut top) = (usize::MAX, usize::MAX);
+        for (i, p) in px.as_chunks::<4>().0.iter().enumerate() {
+            let (x, y) = (i % w, i / w);
+            let inside = x >= cx0
+                && x < cx1
+                && (y as f32) > (by + 2.5) * 2.0
+                && (y as f32) < (by + bh - 2.5) * 2.0;
+            if inside && dark(p) && !without[i] {
+                left = left.min(x);
+                top = top.min(y);
+            }
+        }
+        assert!(left != usize::MAX, "positive control: a caret is painted");
+        (left as f64 / 2.0, top as f64 / 2.0)
+    }
+
+    /// MCP `get_caret_position` answers the caret paint draws, at scale 2
+    /// (#1721): pixel oracle for the two fixtures above, at byte 0 and at the
+    /// end of a value.
+    #[test]
+    fn painted_caret_matches_mcp_at_scale_two() {
+        let ids: Ids = Rc::default();
+        let mut app = app_with_text_fields(ids.clone());
+        let (input, _, _) = ids.get().unwrap();
+        for byte in [0, 11] {
+            let painted = painted_caret_top_left(&mut app, input, byte);
+            let mcp = caret(&mut app, input, byte, 2.0);
+            assert!(
+                (mcp.0 - painted.0).abs() <= 0.5 && (mcp.1 - painted.1).abs() <= 0.5,
+                "byte {byte}: MCP {mcp:?} vs painted {painted:?}"
+            );
+        }
+        // And emptied: the early-return branch, the caret at the column start.
+        {
+            let doc = app.doc.clone().unwrap();
+            doc.borrow_mut()
+                .set_attribute(rinch_core::dom::NodeId(input), "value", "");
+        }
+        app.resolve_and_repaint(800.0, 600.0);
+        let painted = painted_caret_top_left(&mut app, input, 0);
+        let mcp = caret(&mut app, input, 0, 2.0);
+        assert!(
+            (mcp.0 - painted.0).abs() <= 0.5 && (mcp.1 - painted.1).abs() <= 0.5,
+            "empty: MCP {mcp:?} vs painted {painted:?}"
+        );
+    }
+
+    /// The input's caret at scale 2 is where it is at scale 1, and at byte 0
+    /// it is the box's logical origin plus its logical paddings.
+    #[test]
+    fn an_input_caret_is_logical_at_scale_two() {
+        let ids: Ids = Rc::default();
+        let mut app = app_with_text_fields(ids.clone());
+        let (input, _, _) = ids.get().unwrap();
+
+        // Byte 0 is where paint draws the caret (#1721): x at the content
+        // box — the UA input's 2px border plus the 13px padding — and y where
+        // paint centres the line in the 28px box, not at the top padding.
+        // `painted_caret_matches_mcp_at_scale_two` checks this against the
+        // painted pixels.
+        let (x0, y0) = caret(&mut app, input, 0, 1.0);
+        let painted = painted_caret_top_left(&mut app, input, 0);
+        assert!(
+            close(x0, 40.0 + 2.0 + 13.0) && (y0 - painted.1).abs() < 0.5,
+            "byte 0 sits at the painted caret, x 55 (border + padding) and y {}, got ({x0}, {y0})",
+            painted.1
+        );
+        for byte in [0, 5, 11] {
+            let one = caret(&mut app, input, byte, 1.0);
+            let two = caret(&mut app, input, byte, 2.0);
+            assert!(
+                close(one.0, two.0) && close(one.1, two.1),
+                "byte {byte}: scale 2 must answer the scale-1 (logical) caret {one:?}, got {two:?}"
+            );
+        }
+    }
+
+    /// The same for an input's glyph box, width and height included.
+    #[test]
+    fn an_input_glyph_box_is_logical_at_scale_two() {
+        let ids: Ids = Rc::default();
+        let mut app = app_with_text_fields(ids.clone());
+        let (input, _, _) = ids.get().unwrap();
+        for byte in [0, 6] {
+            let one = glyph(&mut app, input, byte, 1.0);
+            let two = glyph(&mut app, input, byte, 2.0);
+            assert!(
+                one.iter().zip(two).all(|(a, b)| close(*a, b)),
+                "byte {byte}: scale 2 must answer the scale-1 (logical) box {one:?}, got {two:?}"
+            );
+        }
+    }
+
+    /// A textarea's probe layout wraps at the logical width: its last caret
+    /// stays on the first line at scale 2, where a doubled font wrapped it.
+    #[test]
+    fn a_textarea_caret_wraps_at_the_logical_width_at_scale_two() {
+        let ids: Ids = Rc::default();
+        let mut app = app_with_text_fields(ids.clone());
+        let (_, textarea, _) = ids.get().unwrap();
+        let end = "one two three four five six".len();
+        let one = caret(&mut app, textarea, end, 1.0);
+        let two = caret(&mut app, textarea, end, 2.0);
+        // One line, at the content box's top (#827): the textarea's top 100,
+        // the UA textarea's 1px border, then its 7px top padding — Chrome's
+        // text origin. Before #827 the column started at the padding alone.
+        // The caret stands over the glyphs (#320, as Chrome), so it is the
+        // line's half-leading below that line top: under 3px for 14px text
+        // on a 20px line, and the same as the caret at the line's start. A
+        // second line would put it 20px lower.
+        let start = caret(&mut app, textarea, 0, 1.0);
+        let line_top = 100.0 + 1.0 + 7.0;
+        assert!(
+            close(one.1, start.1) && one.1 > line_top && one.1 < line_top + 3.0,
+            "at scale 1 the text fits one line, got {one:?} (line start {start:?})"
+        );
+        assert!(
+            close(one.0, two.0) && close(one.1, two.1),
+            "scale 2 must answer the scale-1 (logical) caret {one:?}, got {two:?}"
+        );
+    }
+
+    /// An `<input>` with an empty value takes its own early return (its
+    /// caret is the content origin, no layout built), with its own paddings:
+    /// logical at scale 2 too. From the PR #1133 review, which found this
+    /// branch unpinned by the fixtures above.
+    #[test]
+    fn an_empty_input_caret_is_logical_at_scale_two() {
+        let id: Rc<Cell<u64>> = Rc::default();
+        let id2 = id.clone();
+        let mut app = RinchApp::new(move |scope: &mut RenderScope| {
+            let root = scope.create_element("div");
+            root.set_attribute(
+                "style",
+                "width: 800px; height: 600px; font-family: sans-serif; \
+                 font-size: 14px; line-height: 20px",
+            );
+            let input = scope.create_element("input");
+            input.set_attribute(
+                "style",
+                "position: absolute; left: 40px; top: 30px; width: 300px; height: 20px; \
+                 padding: 3px 0 0 13px; font-size: 14px; line-height: 20px; \
+                 box-sizing: border-box",
+            );
+            input.set_attribute("value", "");
+            root.append_child(&input);
+            id2.set(input.node_id().0);
+            root
+        });
+        app.mount_component(800.0, 600.0);
+        app.resolve_and_repaint(800.0, 600.0);
+        let input = id.get();
+
+        // Where paint draws the empty field's caret (#1721): x at the content
+        // box (the UA 2px border plus the 13px padding), y with the line
+        // centred in the 20px box as paint centres it, not at the top padding
+        // (33). The empty case is checked against the pixels in the taller
+        // field of `painted_caret_matches_mcp_at_scale_two`; this 20px one is
+        // shorter than its line (a border box, its padding and border inside
+        // the 20px: a text input is `content-box` by default, #1278), so its
+        // caret runs over the border.
+        let one = caret(&mut app, input, 0, 1.0);
+        assert!(
+            close(one.0, 40.0 + 2.0 + 13.0) && one.1 > 30.0 && one.1 < 33.0,
+            "the empty input's caret: x 55 (border + padding), y centred above the 33 top padding, got {one:?}"
+        );
+        let two = caret(&mut app, input, 0, 2.0);
+        assert!(
+            close(one.0, two.0) && close(one.1, two.1),
+            "scale 2 must answer the scale-1 (logical) caret {one:?}, got {two:?}"
+        );
+    }
+
+    /// IFC text was already logical; pinned so it stays that way.
+    #[test]
+    fn a_paragraph_caret_and_glyph_are_the_same_at_both_scales() {
+        let ids: Ids = Rc::default();
+        let mut app = app_with_text_fields(ids.clone());
+        let (_, _, p) = ids.get().unwrap();
+        assert_eq!(caret(&mut app, p, 6, 1.0), caret(&mut app, p, 6, 2.0));
+        assert_eq!(glyph(&mut app, p, 6, 1.0), glyph(&mut app, p, 6, 2.0));
+        let (x, y) = caret(&mut app, p, 0, 1.0);
+        assert!(close(x, 40.0) && close(y, 300.0), "got ({x}, {y})");
+    }
+}
+
+#[cfg(test)]
+mod key_press_menu_shortcut_533_tests {
+    //! Issue #533: the real winit `WindowEvent::KeyboardInput` arm in
+    //! `shell/rinch_runtime.rs` checks menu shortcuts *before* ever building a
+    //! `PlatformEvent::KeyDown`, but the debug `KeyPress` command used to build
+    //! one directly and hand it to `handle_event`, entering the pipeline
+    //! downstream of that check. A debug-injected `key_press` for a registered
+    //! menu chord therefore never ran the menu's callback, whether or not the
+    //! app's real shortcut worked (the issue's own repro:
+    //! `key_press(key: "d", ctrl: true)` for a "Ctrl+D" menu item did nothing
+    //! through MCP while the same item fired correctly when clicked).
+    //!
+    //! `crate::menu::register_menu_shortcuts` is the platform-independent entry
+    //! point rinch-web's own keydown listener drives through
+    //! `match_shortcut_code` — no muda/winit/window needed — so these fixtures
+    //! exercise `execute_debug_command` directly with no live app or mount.
+
+    use super::*;
+    use crate::menu::{Menu, MenuItem, register_menu_shortcuts};
+    use std::cell::Cell;
+
+    fn counting_menu(shortcut: &str) -> (Rc<Cell<u32>>, crate::menu::MenuBarChords) {
+        let fired = Rc::new(Cell::new(0));
+        let fired_cb = fired.clone();
+        let menu = Menu::new().item(
+            MenuItem::new("Probe")
+                .shortcut(shortcut)
+                .on_click(move || fired_cb.set(fired_cb.get() + 1)),
+        );
+        let chords = register_menu_shortcuts(&[("Test", &menu)]);
+        (fired, chords)
+    }
+
+    fn key_press(app: &mut RinchApp, key: &str, shift: bool, ctrl: bool, alt: bool) -> DebugResult {
+        let mut actions = Vec::new();
+        app.execute_debug_command(
+            DebugCommandKind::KeyPress {
+                key: key.to_string(),
+                shift,
+                ctrl,
+                alt,
+                modifiers: Vec::new(),
+            },
+            &mut actions,
+            1.0,
+            (800, 600),
+        )
+    }
+
+    /// The bug itself, at the `execute_debug_command` level: a debug
+    /// `key_press` for a letter chord must fire the menu callback, not just
+    /// synthesize a `PlatformEvent::KeyDown` nothing is listening for.
+    ///
+    /// Kills reverting the `KeyPress` arm to its pre-#533 shape (straight to
+    /// `handle_event`, no `match_shortcut_code` call): `fired` stays `0`.
+    #[test]
+    fn a_debug_key_press_fires_a_registered_letter_chord() {
+        let (fired, _chords) = counting_menu("Ctrl+D");
+        let mut app = RinchApp::new(|scope| scope.create_element("div"));
+        key_press(&mut app, "d", false, true, false);
+        assert_eq!(fired.get(), 1, "Ctrl+D must fire the menu callback once");
+    }
+
+    /// The issue's second repro: a non-letter chord (`Alt+ArrowRight`) must
+    /// also route through the matcher — pinned separately from the letter case
+    /// because #1170's layout-character branch only applies to `"Key*"` codes,
+    /// so this exercises `keyname_to_w3c_code`'s named-key arm instead of its
+    /// single-character one.
+    #[test]
+    fn a_debug_key_press_fires_a_registered_named_key_chord() {
+        let (fired, _chords) = counting_menu("Alt+ArrowRight");
+        let mut app = RinchApp::new(|scope| scope.create_element("div"));
+        key_press(&mut app, "ArrowRight", false, false, true);
+        assert_eq!(
+            fired.get(),
+            1,
+            "Alt+ArrowRight must fire the menu callback once"
+        );
+    }
+
+    /// A debug `key_press` with no matching chord still falls through to a
+    /// plain keystroke dispatch (unchanged behaviour) — not a universal
+    /// "shortcuts always win" regression. Fixed-point guard: without this, a
+    /// mutant that made `match_shortcut_code` (or the new `KeyPress` wiring)
+    /// unconditionally consume every press would pass the two tests above but
+    /// break ordinary typing.
+    #[test]
+    fn a_debug_key_press_with_no_matching_chord_still_dispatches_a_keydown() {
+        let clicks: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+        let clicks_in = clicks.clone();
+        let id: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        let id_in = id.clone();
+        let mut app = RinchApp::new(move |scope: &mut RenderScope| {
+            let root = scope.create_element("div");
+            let div = scope.create_element("div");
+            div.set_attribute("style", "width: 200px; height: 40px");
+            div.set_attribute("tabindex", "0");
+            let rid = scope.register_handler({
+                let clicks = clicks_in.clone();
+                move || clicks.set(clicks.get() + 1)
+            });
+            div.set_attribute("data-rid", &rid.0.to_string());
+            id_in.set(div.node_id().0);
+            root.append_child(&div);
+            root
+        });
+        app.mount_component(800.0, 600.0);
+        app.resolve_and_repaint(800.0, 600.0);
+        app.set_focus_target(FocusTarget::Node(id.get()));
+
+        key_press(&mut app, "Enter", false, false, false);
+        assert_eq!(
+            clicks.get(),
+            1,
+            "an unclaimed Enter must still activate the focused node"
+        );
+    }
+
+    /// Issue #1169: a modifier-less chord yields to a focused text field, on
+    /// the debug path exactly as it does on a real keystroke — a `key_press`
+    /// of a bare letter chord with a text input focused must type the letter,
+    /// not fire the menu.
+    #[test]
+    fn a_debug_key_press_yields_a_bare_chord_to_a_focused_text_input() {
+        let (fired, _chords) = counting_menu("N");
+        let id: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        let id_in = id.clone();
+        let mut app = RinchApp::new(move |scope: &mut RenderScope| {
+            let root = scope.create_element("div");
+            let input = scope.create_element("input");
+            input.set_attribute("value", "");
+            id_in.set(input.node_id().0);
+            root.append_child(&input);
+            root
+        });
+        app.mount_component(800.0, 600.0);
+        app.resolve_and_repaint(800.0, 600.0);
+        app.set_focus_target(FocusTarget::Input(id.get()));
+
+        key_press(&mut app, "n", false, false, false);
+        assert_eq!(
+            fired.get(),
+            0,
+            "a bare N must be the focused input's to type, not the menu's"
+        );
+    }
+}
+
+#[cfg(test)]
+mod key_release_485_tests {
+    //! Issue #485: the debug/MCP input channel could only inject
+    //! `PlatformEvent::KeyDown` — there was no way to send a release at all.
+    //!
+    //! The issue named two consequences. (1) a release-aware app (a
+    //! document-level interceptor or a registered node's `on_key`, issue
+    //! #337) had no way to be exercised over MCP at all, since no release
+    //! ever arrived — this is the live bug the fix below addresses. (2)
+    //! `node_activation_held` — the Enter/Space latch a focused
+    //! `FocusTarget::Node` arms on the way down and clears only on a
+    //! matching `KeyUp` (issue #228) or a backend reporting
+    //! `KeyRepeat::Unknown` — was *also* said to be stranded forever by a
+    //! debug `key_press`. That no longer reproduces: #463 (PR #796, merged
+    //! after #485 was filed) made every debug-synthesized press report
+    //! `KeyRepeat::Fresh`, which `press_is_fresh` treats as unconditionally
+    //! fresh regardless of the latch — so a second bare `key_press` of the
+    //! same node already activated again before this fix. See the test
+    //! below for the probe that confirmed this against a pristine checkout
+    //! of this file.
+    //!
+    //! The fix: `key_press` now synthesizes a matching `KeyUp` right after its
+    //! `KeyDown` (one physical keystroke, like `Click` is press+release for
+    //! the mouse — harmless for the activation latch per the above, and what
+    //! makes a release-aware consumer finally observable over MCP), and
+    //! `key_down`/`key_up` are new primitives for holding a key across other
+    //! commands — mirroring `mouse_down`/`mouse_up`.
+
+    use super::*;
+    use crate::focus_registry::{FocusEntry, register_focus_target};
+    use rinch_core::events::KeyEventData;
+    use std::cell::{Cell, RefCell};
+
+    /// A focused, focusable `<div>` that counts how many times it is
+    /// activated (Enter/Space through `FocusTarget::Node`), plus the node's
+    /// id for the caller to focus it.
+    fn activation_counting_app() -> (RinchApp, Rc<Cell<usize>>, u64) {
+        let clicks: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+        let clicks_in = clicks.clone();
+        let id: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        let id_in = id.clone();
+        let mut app = RinchApp::new(move |scope: &mut RenderScope| {
+            let root = scope.create_element("div");
+            let div = scope.create_element("div");
+            div.set_attribute("style", "width: 200px; height: 40px");
+            div.set_attribute("tabindex", "0");
+            let rid = scope.register_handler({
+                let clicks = clicks_in.clone();
+                move || clicks.set(clicks.get() + 1)
+            });
+            div.set_attribute("data-rid", &rid.0.to_string());
+            id_in.set(div.node_id().0);
+            root.append_child(&div);
+            root
+        });
+        app.mount_component(800.0, 600.0);
+        app.resolve_and_repaint(800.0, 600.0);
+        let node_id = id.get();
+        app.set_focus_target(FocusTarget::Node(node_id));
+        (app, clicks, node_id)
+    }
+
+    fn key_press(app: &mut RinchApp, key: &str) -> DebugResult {
+        let mut actions = Vec::new();
+        app.execute_debug_command(
+            DebugCommandKind::KeyPress {
+                key: key.to_string(),
+                shift: false,
+                ctrl: false,
+                alt: false,
+                modifiers: Vec::new(),
+            },
+            &mut actions,
+            1.0,
+            (800, 600),
+        )
+    }
+
+    fn key_down(app: &mut RinchApp, key: &str) -> DebugResult {
+        let mut actions = Vec::new();
+        app.execute_debug_command(
+            DebugCommandKind::KeyDown {
+                key: key.to_string(),
+                shift: false,
+                ctrl: false,
+                alt: false,
+                modifiers: Vec::new(),
+            },
+            &mut actions,
+            1.0,
+            (800, 600),
+        )
+    }
+
+    fn key_up(app: &mut RinchApp, key: &str) -> DebugResult {
+        let mut actions = Vec::new();
+        app.execute_debug_command(
+            DebugCommandKind::KeyUp {
+                key: key.to_string(),
+                shift: false,
+                ctrl: false,
+                alt: false,
+                modifiers: Vec::new(),
+            },
+            &mut actions,
+            1.0,
+            (800, 600),
+        )
+    }
+
+    /// A focused, focusable `<div>` whose registered `on_key` records every
+    /// `KeyEventData` it is offered (consuming none), plus the sink to read
+    /// them back from.
+    fn key_recording_app() -> (RinchApp, Rc<RefCell<Vec<KeyEventData>>>) {
+        let seen: Rc<RefCell<Vec<KeyEventData>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = seen.clone();
+        let id: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        let id_in = id.clone();
+
+        let mut app = RinchApp::new(move |scope: &mut RenderScope| {
+            let root = scope.create_element("div");
+            let div = scope.create_element("div");
+            div.set_attribute("style", "width: 200px; height: 40px");
+            div.set_attribute("tabindex", "0");
+            let sink = sink.clone();
+            register_focus_target(
+                &div,
+                FocusEntry::new().on_key(move |k| {
+                    sink.borrow_mut().push(k.clone());
+                    false
+                }),
+            );
+            id_in.set(div.node_id().0);
+            root.append_child(&div);
+            root
+        });
+        app.mount_component(800.0, 600.0);
+        app.resolve_and_repaint(800.0, 600.0);
+        app.set_focus_target(FocusTarget::Node(id.get()));
+        (app, seen)
+    }
+
+    /// Issue #485 point 2's claim — that `key_press` leaves
+    /// `node_activation_held` armed forever because MCP never sends a
+    /// `KeyUp` — no longer reproduces as filed: #463 (PR #796, merged after
+    /// #485 was filed) already made every debug-synthesized `KeyDown` report
+    /// `KeyRepeat::Fresh`, and `press_is_fresh` treats `Fresh` as
+    /// unconditionally fresh regardless of the latch
+    /// (`event_dispatch.rs::press_is_fresh`) — so a second bare `key_press`
+    /// of Enter already activated again before this fix. This is now a
+    /// regression guard, not the bug's reproduction: it protects the real
+    /// fix below (`key_press` sending a matching `KeyUp`) from accidentally
+    /// breaking repeated activation some other way.
+    ///
+    /// Mutant this kills: `dispatch_debug_key_down` reporting
+    /// `KeyRepeat::Unknown` instead of `Fresh` while still never releasing —
+    /// `clicks` would stay at `1` after the second press.
+    #[test]
+    fn a_second_debug_key_press_activates_a_focused_node_again() {
+        let (mut app, clicks, _id) = activation_counting_app();
+
+        key_press(&mut app, "Enter");
+        assert_eq!(clicks.get(), 1, "the first press must activate once");
+
+        key_press(&mut app, "Enter");
+        assert_eq!(
+            clicks.get(),
+            2,
+            "the latch must have cleared, so the second press activates again"
+        );
+    }
+
+    /// `key_down` alone (with no `key_up`) must not itself dispatch a
+    /// release — this is the fixed-point control for the pairing tests
+    /// below: it proves `key_down` is genuinely half of a pair and not
+    /// `key_press` under another name.
+    ///
+    /// Mutant this kills: a `key_down` arm that (wrongly) also dispatches a
+    /// matching `KeyUp` the way `key_press` does — `seen.len()` after the
+    /// bare `key_down` would be `2`, not `1`.
+    #[test]
+    fn key_down_alone_sends_no_release() {
+        let (mut app, seen) = key_recording_app();
+
+        key_down(&mut app, "w");
+
+        let seen = seen.borrow();
+        assert_eq!(
+            seen.len(),
+            1,
+            "key_down alone must send only a Down: {seen:?}"
+        );
+        assert!(seen[0].is_down());
+    }
+
+    /// Issue #485, point 1: a release-aware consumer — here, a registered
+    /// node's `on_key` (issue #337) — can now be exercised over the debug
+    /// channel at all. `key_press` must deliver exactly one `Down` and one
+    /// `Up`, pairing by the same `key` string (as a real press/release do).
+    ///
+    /// Mutant this kills: the `KeyUp` the `KeyPress` arm sends spelling a
+    /// different `key` than the `KeyDown` did (e.g. forgetting the shared
+    /// `named_logical_key` resolution) — `seen[1].key` would not equal
+    /// `seen[0].key`, breaking exactly the pairing a "is this key still held"
+    /// consumer relies on.
+    #[test]
+    fn a_debug_key_press_delivers_a_down_and_a_matching_up_to_a_registered_on_key() {
+        let (mut app, seen) = key_recording_app();
+
+        key_press(&mut app, "w");
+
+        let seen = seen.borrow();
+        assert_eq!(
+            seen.len(),
+            2,
+            "one press, one release must reach the registered node: {seen:?}"
+        );
+        assert!(seen[0].is_down(), "{:?}", seen[0]);
+        assert!(seen[1].is_up(), "{:?}", seen[1]);
+        assert_eq!(
+            seen[0].key, seen[1].key,
+            "a release must spell the same key string as its press"
+        );
+    }
+
+    /// `key_down`/`key_up` as two independent commands, released well after
+    /// the press — the shape a held key (a game's "W" movement) needs and
+    /// `key_press` cannot provide.
+    #[test]
+    fn key_down_and_a_later_key_up_deliver_one_down_and_one_up() {
+        let (mut app, seen) = key_recording_app();
+
+        key_down(&mut app, "w");
+        {
+            let seen = seen.borrow();
+            assert_eq!(seen.len(), 1, "key_down alone: {seen:?}");
+            assert!(seen[0].is_down());
+        }
+
+        key_up(&mut app, "w");
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 2, "key_down then key_up: {seen:?}");
+        assert!(seen[1].is_up(), "{:?}", seen[1]);
+        assert_eq!(seen[0].key, seen[1].key);
+    }
+
+    /// `key_up` of an unknown key name fails loud, like `key_press`/`key_down`
+    /// already do (issue #151) — a silent no-op would be indistinguishable
+    /// from a dead key.
+    #[test]
+    fn key_up_of_an_unknown_key_name_errors() {
+        let mut app = RinchApp::new(|scope| scope.create_element("div"));
+        let result = key_up(&mut app, "NotAKey");
+        match result {
+            DebugResult::Error { message } => {
+                assert!(message.contains("NotAKey"), "{message}");
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod drop_files_1806_tests {
+    //! MCP `drop_files` (#1806) delivers a file drop the way the OS does:
+    //! `data-onfiledragenter` on the target under the point, then the drop's
+    //! handlers there (`data-onfiledrop` with the paths, `data-ondropfiles`
+    //! with the files that exist) with the drop point in the click context,
+    //! then `data-onfiledragleave`.
+
+    use super::*;
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    const VIEWPORT: (u32, u32) = (800, 600);
+
+    /// What each handler saw, in order.
+    #[derive(Debug, Clone, PartialEq)]
+    enum Seen {
+        Enter,
+        Leave,
+        Paths(Vec<PathBuf>, (f32, f32), (f32, f32, f32, f32)),
+        Files(Vec<String>),
+    }
+
+    type Log = Rc<RefCell<Vec<Seen>>>;
+
+    /// An 800x600 root holding, 150px down, a 300x100 drop target at
+    /// x = 40 with all four file-drop handlers.
+    fn app(log: Log) -> RinchApp {
+        let mut app = RinchApp::new(move |scope: &mut RenderScope| {
+            let root = scope.create_element("div");
+            root.set_attribute("style", "width: 800px; height: 600px");
+            let spacer = scope.create_element("div");
+            spacer.set_attribute("style", "height: 150px");
+            root.append_child(&spacer);
+            let target = scope.create_element("div");
+            target.set_attribute("style", "margin-left: 40px; width: 300px; height: 100px");
+            let l = log.clone();
+            let id = scope.register_handler(move || l.borrow_mut().push(Seen::Enter));
+            target.set_attribute("data-onfiledragenter", &id.0.to_string());
+            let l = log.clone();
+            let id = scope.register_handler(move || l.borrow_mut().push(Seen::Leave));
+            target.set_attribute("data-onfiledragleave", &id.0.to_string());
+            let l = log.clone();
+            let id = scope.register_file_drop_handler(move |paths| {
+                let c = events::get_click_context();
+                l.borrow_mut().push(Seen::Paths(
+                    paths,
+                    (c.mouse_x, c.mouse_y),
+                    (c.element_x, c.element_y, c.element_width, c.element_height),
+                ));
+            });
+            target.set_attribute("data-onfiledrop", &id.0.to_string());
+            let l = log.clone();
+            let id = scope.register_files_drop_handler(move |files| {
+                l.borrow_mut().push(Seen::Files(
+                    files.iter().map(|f| f.name().to_string()).collect(),
+                ));
+            });
+            target.set_attribute("data-ondropfiles", &id.0.to_string());
+            root.append_child(&target);
+            root
+        });
+        app.mount_component(800.0, 600.0);
+        app.resolve_and_repaint(800.0, 600.0);
+        app
+    }
+
+    fn drop_files(app: &mut RinchApp, x: f32, y: f32, paths: &[&str]) -> DebugResult {
+        let mut actions = Vec::new();
+        app.execute_debug_command(
+            DebugCommandKind::DropFiles {
+                x,
+                y,
+                paths: paths.iter().map(|p| p.to_string()).collect(),
+            },
+            &mut actions,
+            1.0,
+            VIEWPORT,
+        )
+    }
+
+    /// The feature: the target under the point hears the drag enter, then
+    /// the drop with every path verbatim — a missing one included — and the
+    /// drop point and its own box in the click context, then the files that
+    /// exist, then the drag leave. The point is off the target's origin, so
+    /// a context that reported (0, 0) or the box's corner would fail.
+    #[test]
+    fn a_drop_reaches_the_target_under_the_point_as_an_os_drop_does() {
+        let dir =
+            std::env::temp_dir().join(format!("rinch-drop-files-1806-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("model.glb");
+        std::fs::write(&real, b"glTF").unwrap();
+        let missing = dir.join("gone.png");
+        let log: Log = Rc::default();
+        let mut app = app(log.clone());
+
+        let result = drop_files(
+            &mut app,
+            123.0,
+            187.0,
+            &[real.to_str().unwrap(), missing.to_str().unwrap()],
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(result, DebugResult::Json { .. }), "{result:?}");
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                Seen::Enter,
+                Seen::Paths(
+                    vec![real.clone(), missing.clone()],
+                    (123.0, 187.0),
+                    (40.0, 150.0, 300.0, 100.0),
+                ),
+                Seen::Files(vec!["model.glb".into()]),
+                Seen::Leave,
+            ]
+        );
+    }
+
+    /// A drop beside the target reaches none of its handlers: what is
+    /// dispatched follows the point, as for a real drop.
+    #[test]
+    fn a_drop_beside_the_target_reaches_none_of_it() {
+        let log: Log = Rc::default();
+        let mut app = app(log.clone());
+        let result = drop_files(&mut app, 500.0, 187.0, &["/tmp/x.txt"]);
+        assert!(matches!(result, DebugResult::Json { .. }), "{result:?}");
+        assert!(log.borrow().is_empty(), "{:?}", log.borrow());
+        // Positive control: the same app takes a drop on the target.
+        drop_files(&mut app, 100.0, 160.0, &["/tmp/x.txt"]);
+        assert!(log.borrow().contains(&Seen::Enter), "{:?}", log.borrow());
+    }
+
+    /// No OS drop is empty: an empty list is an error and dispatches nothing.
+    #[test]
+    fn an_empty_drop_is_an_error_and_dispatches_nothing() {
+        let log: Log = Rc::default();
+        let mut app = app(log.clone());
+        let result = drop_files(&mut app, 123.0, 187.0, &[]);
+        assert!(matches!(result, DebugResult::Error { .. }), "{result:?}");
+        assert!(log.borrow().is_empty(), "{:?}", log.borrow());
     }
 }

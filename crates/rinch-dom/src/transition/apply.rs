@@ -2,7 +2,7 @@
 
 use crate::computed_style::{BackgroundValue, ComputedStyle};
 
-use super::types::{AnimatableTransform, AnimatableValue, TransitionProperty, compose_matrices};
+use super::types::{AnimatableValue, TransitionProperty};
 
 /// Write an interpolated AnimatableValue into the correct ComputedStyle field.
 pub fn apply_value_to_style(
@@ -74,38 +74,36 @@ pub fn apply_value_to_style(
         (TransitionProperty::BorderLeftWidth, AnimatableValue::LengthPercentage(lp)) => {
             style.border_left_width = *lp;
         }
-        (TransitionProperty::BorderRadiusTopLeft, AnimatableValue::LengthPercentage(lp)) => {
-            style.border_radius_top_left = *lp;
+        (TransitionProperty::BorderRadiusTopLeft, AnimatableValue::CornerRadius(x, y)) => {
+            style.border_radius_top_left = *x;
+            style.border_radius_top_left_y = *y;
         }
-        (TransitionProperty::BorderRadiusTopRight, AnimatableValue::LengthPercentage(lp)) => {
-            style.border_radius_top_right = *lp;
+        (TransitionProperty::BorderRadiusTopRight, AnimatableValue::CornerRadius(x, y)) => {
+            style.border_radius_top_right = *x;
+            style.border_radius_top_right_y = *y;
         }
-        (TransitionProperty::BorderRadiusBottomRight, AnimatableValue::LengthPercentage(lp)) => {
-            style.border_radius_bottom_right = *lp;
+        (TransitionProperty::BorderRadiusBottomRight, AnimatableValue::CornerRadius(x, y)) => {
+            style.border_radius_bottom_right = *x;
+            style.border_radius_bottom_right_y = *y;
         }
-        (TransitionProperty::BorderRadiusBottomLeft, AnimatableValue::LengthPercentage(lp)) => {
-            style.border_radius_bottom_left = *lp;
+        (TransitionProperty::BorderRadiusBottomLeft, AnimatableValue::CornerRadius(x, y)) => {
+            style.border_radius_bottom_left = *x;
+            style.border_radius_bottom_left_y = *y;
         }
         (TransitionProperty::FontSize, AnimatableValue::Float(v)) => {
             style.font_size = *v;
         }
         (TransitionProperty::Transform, AnimatableValue::Transform(tf)) => {
-            style.transform = tf.to_style();
+            style.transform = tf.to_style(style.transform_origin_z as f64);
         }
-        (
-            TransitionProperty::Transform,
-            AnimatableValue::TransformComponents {
-                ops,
-                pct_translate_w,
-                pct_translate_h,
-            },
-        ) => {
-            style.transform = AnimatableTransform {
-                matrix: compose_matrices(ops),
-                pct_translate_w: *pct_translate_w,
-                pct_translate_h: *pct_translate_h,
-            }
-            .to_style();
+        (TransitionProperty::Visibility, AnimatableValue::Visibility(v)) => {
+            style.visibility = *v;
+        }
+        (TransitionProperty::BackgroundPositionX, AnimatableValue::LengthPercentage(lp)) => {
+            style.background_position_x = *lp;
+        }
+        (TransitionProperty::BackgroundPositionY, AnimatableValue::LengthPercentage(lp)) => {
+            style.background_position_y = *lp;
         }
         _ => {}
     }

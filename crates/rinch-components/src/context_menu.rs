@@ -21,7 +21,9 @@
 use rinch_core::dom::{NodeHandle, RenderScope};
 use rinch_core::{Component, Signal};
 
-use crate::dropdown_menu::set_menu_close_signal;
+use crate::dropdown_menu::{
+    MENU_CLOSE_ID_ATTR, register_menu_close_signal, unregister_menu_close_signal,
+};
 
 /// A context menu component that shows on right-click.
 ///
@@ -32,6 +34,22 @@ pub struct ContextMenu {
     /// Internal opened state — set automatically, not a user prop.
     #[doc(hidden)]
     pub opened: Signal<bool>,
+    /// Escape closes the menu and returns the focus to the element that held
+    /// it when the menu opened (#2170). An open `DropdownMenuSub` takes
+    /// Escape first and closes only itself.
+    pub close_on_escape: bool,
+    /// ArrowUp/ArrowDown/Home/End and type-ahead move the focus among the
+    /// items while the menu is open (#2170); with the focus outside the menu,
+    /// ArrowDown picks the first item and ArrowUp the last.
+    pub keyboard_nav: bool,
+    /// The arrows wrap at the ends (Chrome: `arrow_key_selection_wraps`).
+    pub loop_focus: bool,
+    /// A letter or digit moves to the next item whose label starts with it;
+    /// a single match is activated (Chrome's `SelectByChar`).
+    pub typeahead: bool,
+    /// Escape hatch: offered every key the open menu would see, before it;
+    /// `true` consumes the key.
+    pub on_key: Option<crate::menu_nav::MenuKeyHook>,
 }
 
 impl std::fmt::Debug for ContextMenu {
@@ -43,19 +61,148 @@ impl std::fmt::Debug for ContextMenu {
 impl Default for ContextMenu {
     fn default() -> Self {
         let opened = Signal::new(false);
-        // Set thread-local so DropdownMenuItem children (rendered after this
-        // struct is constructed but before Component::render) can capture it.
-        set_menu_close_signal(opened);
-        Self { opened }
+        Self {
+            opened,
+            close_on_escape: true,
+            keyboard_nav: true,
+            loop_focus: true,
+            typeahead: true,
+            on_key: None,
+        }
+    }
+}
+
+/// Space kept between the menu and the viewport's edges.
+const EDGE_MARGIN: f32 = 4.0;
+
+/// The menu's `min-width` in CSS, the width it is assumed to need.
+const MENU_MIN_WIDTH: f32 = 180.0;
+
+/// Below this much room under the pointer the menu opens upward instead,
+/// when there is more room above.
+const PREFERRED_ROOM_BELOW: f32 = 320.0;
+
+/// The styles of the four spacers that place the dropdown (#1761).
+///
+/// The dropdown is not positioned by `top`/`left`. It sits in a *frame* that
+/// covers the viewport less [`EDGE_MARGIN`] ([`FRAME_STYLE`]): a flex column holding `v_head`, a *line*, and `v_tail`,
+/// where the line is a flex row holding `h_head`, the dropdown, and `h_tail`.
+/// On each axis one spacer has the pointer's distance from that edge of the
+/// frame as its size and may shrink (`flex: 0 1 auto`); the other is a filler
+/// (`flex: 1 1 0px`) that takes whatever is left; the dropdown neither grows
+/// nor shrinks. So:
+///
+/// - When the menu fits, it hangs from the pointer (or stands on it, or ends
+///   at it horizontally) exactly as a `top`/`left` (`bottom`/`right`) anchor
+///   would put it.
+/// - When it does not, the free space is negative, only the sized spacer can
+///   shrink, and it shrinks by exactly the overflow: the menu is shifted back
+///   inside the frame, ending [`EDGE_MARGIN`] from the edge, as Chrome and
+///   native menus shift theirs. It never goes past the frame's start: the
+///   spacer stops at 0.
+/// - When it is taller than the whole frame, both vertical spacers are 0, the
+///   line overflows the frame's end, and the frame scrolls (`overflow-y:
+///   auto`); the menu starts [`EDGE_MARGIN`] from the top.
+///
+/// This is layout, not a measurement: there is no effect reading the menu's
+/// size, no second layout and no frame clock, and it is the same CSS on the
+/// desktop and in a browser. The frame is the scroll container, not the
+/// dropdown, so a `DropdownMenu` nested in the dropdown is clipped only at the
+/// viewport's edge, where it would be off-screen anyway.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Placement {
+    pub v_head: String,
+    pub v_tail: String,
+    pub h_head: String,
+    pub h_tail: String,
+}
+
+/// The frame the dropdown is shifted inside of: the viewport less
+/// [`EDGE_MARGIN`] on every side (as padding, so its clip is the viewport's
+/// edge). It takes no pointer events, so a press beside the menu reaches the
+/// overlay under it; the dropdown takes them back. It is a scroll container
+/// outside any overlay's root, so it is exempt from a `lock_scroll` overlay's
+/// lock (`data-scroll-lock-exempt`, set in `render`).
+const FRAME_STYLE: &str = "position: absolute; top: 0; left: 0; right: 0; bottom: 0; \
+     padding: 4px; display: flex; flex-direction: column; \
+     overflow-x: hidden; overflow-y: auto; pointer-events: none;";
+
+/// The row holding the dropdown between its two horizontal spacers.
+///
+/// The spacers are physical (`h_head` is the left one), so on a right-to-left
+/// page the row must not be mirrored: the component stylesheet gives the line
+/// `direction: ltr` and the dropdown `direction: rtl` back under `:dir(rtl)`
+/// (a `dir` attribute on an ancestor). A page made right-to-left by the CSS
+/// `direction` property alone is not seen by `:dir()`, and its row is
+/// mirrored. rinch-dom does not parse `:dir()` and does not mirror a flex row.
+const LINE_STYLE: &str = "display: flex; flex-direction: row; flex: none;";
+
+/// The dropdown itself: its own size, wherever the spacers leave it.
+const DROPDOWN_STYLE: &str = "flex: none; pointer-events: auto;";
+
+fn sized(axis: &str, px: f32) -> String {
+    let min = if axis == "height" {
+        "min-height"
+    } else {
+        "min-width"
+    };
+    format!("flex: 0 1 auto; {axis}: {}px; {min}: 0;", px.max(0.0))
+}
+
+fn filler(axis: &str) -> String {
+    let min = if axis == "height" {
+        "min-height"
+    } else {
+        "min-width"
+    };
+    format!("flex: 1 1 0px; {min}: 0;")
+}
+
+/// Where the dropdown goes for a press at `(x, y)` in a `vw` by `vh` viewport.
+///
+/// The menu hangs from the pointer when there is room below, and otherwise
+/// stands on it (its bottom at the pointer). Horizontally it starts at the
+/// pointer, or ends there when its minimum width does not fit to the right
+/// and there is more room to the left. Then, once laid out, it is kept inside
+/// the viewport by the frame described on [`Placement`]. A zero viewport (no
+/// click context) hangs it from the pointer.
+pub(crate) fn dropdown_placement(x: f32, y: f32, vw: f32, vh: f32) -> Placement {
+    if vw <= 0.0 || vh <= 0.0 {
+        return Placement {
+            v_head: sized("height", y - EDGE_MARGIN),
+            v_tail: filler("height"),
+            h_head: sized("width", x - EDGE_MARGIN),
+            h_tail: filler("width"),
+        };
+    }
+    let x = x.clamp(0.0, vw);
+    let y = y.clamp(0.0, vh);
+
+    let (h_head, h_tail) = if x + MENU_MIN_WIDTH + EDGE_MARGIN > vw && x > vw - x {
+        (filler("width"), sized("width", vw - x - EDGE_MARGIN))
+    } else {
+        (sized("width", x - EDGE_MARGIN), filler("width"))
+    };
+
+    let below = vh - y - EDGE_MARGIN;
+    let above = y - EDGE_MARGIN;
+    let (v_head, v_tail) = if below >= PREFERRED_ROOM_BELOW || below >= above {
+        (sized("height", y - EDGE_MARGIN), filler("height"))
+    } else {
+        (filler("height"), sized("height", vh - y - EDGE_MARGIN))
+    };
+
+    Placement {
+        v_head,
+        v_tail,
+        h_head,
+        h_tail,
     }
 }
 
 impl Component for ContextMenu {
     fn render(&self, __scope: &mut RenderScope, children: &[NodeHandle]) -> NodeHandle {
         let opened = self.opened;
-        // Children have already been rendered and captured the close signal.
-        // Clear it so nested menus don't leak.
-        crate::dropdown_menu::clear_menu_close_signal();
         let pos_x = Signal::new(0.0f32);
         let pos_y = Signal::new(0.0f32);
         let vp_w = Signal::new(0.0f32);
@@ -80,9 +227,8 @@ impl Component for ContextMenu {
             root.append_child(target);
         }
 
-        // Portal — appended to body so position:fixed works correctly.
-        // Taffy treats fixed as absolute, so the portal must be a direct child
-        // of body for top:0/left:0 to mean viewport origin.
+        // Portal — appended to body, outside every clip and stacking
+        // context of the trigger.
         let body = __scope.body_handle();
         let portal = rinch_macros::rsx! { div { class: "rinch-context-menu__portal" } };
 
@@ -95,51 +241,70 @@ impl Component for ContextMenu {
             }
         });
         overlay.set_attribute("data-rid", &close_handler_id.0.to_string());
+        // A press of any button outside dismisses, not only a left one (#1093).
+        overlay.set_attribute(rinch_core::events::BACKDROP_ATTRIBUTE, "");
 
         // Dropdown container — sibling of overlay so clicks inside it
         // don't bubble to the overlay's close handler
         let dropdown = rinch_macros::rsx! { div { class: "rinch-context-menu__dropdown" } };
+        dropdown.set_attribute("role", "menu");
+
+        // Stamped for this menu's whole lifetime (issue #714): a
+        // `DropdownMenuItem` closes its menu by walking up from the clicked
+        // button to the nearest ancestor carrying this attribute, resolved at
+        // CLICK time rather than at the item's own render time. That is what
+        // lets an item inside a reactive block nested in the dropdown —
+        // rendered again, long after this `render` returns, whenever that
+        // block's own condition changes — still close this menu: the
+        // attribute is still here on `dropdown` when the click happens,
+        // whatever rendered when the item itself was built. See
+        // `dropdown_menu::register_menu_close_signal`'s doc comment.
+        let menu_close_id = register_menu_close_signal(opened);
+        dropdown.set_attribute(MENU_CLOSE_ID_ATTR, &menu_close_id.to_string());
 
         // Append remaining children (ContextMenuDropdown contents) into the dropdown
         for child in children.iter().skip(1) {
             dropdown.append_child(child);
         }
 
+        // The frame and spacers that keep the dropdown inside the viewport
+        // (#1761, see `Placement`).
+        let frame = rinch_macros::rsx! { div { class: "rinch-context-menu__frame" } };
+        frame.set_attribute(rinch_core::events::SCROLL_LOCK_EXEMPT_ATTRIBUTE, "");
+        let spacer = |scope: &mut RenderScope| {
+            let s = scope.create_element("div");
+            s.set_attribute("class", "rinch-context-menu__spacer");
+            s
+        };
+        let v_head = spacer(__scope);
+        let v_tail = spacer(__scope);
+        let h_head = spacer(__scope);
+        let h_tail = spacer(__scope);
+        let line = __scope.create_element("div");
+        line.set_attribute("class", "rinch-context-menu__line");
+        line.set_attribute("style", LINE_STYLE);
+        line.append_child(&h_head);
+        line.append_child(&dropdown);
+        line.append_child(&h_tail);
+        frame.append_child(&v_head);
+        frame.append_child(&line);
+        frame.append_child(&v_tail);
+
         portal.append_child(&overlay);
-        portal.append_child(&dropdown);
+        portal.append_child(&frame);
 
         // Show/hide portal and position dropdown reactively
         {
             let portal_clone = portal.clone();
             let overlay_clone = overlay.clone();
             let dropdown_clone = dropdown.clone();
+            let frame = frame.clone();
             __scope.create_effect(move || {
                 if opened.get() {
                     let x = pos_x.get();
                     let y = pos_y.get();
                     let vw = vp_w.get();
                     let vh = vp_h.get();
-
-                    // Estimated dropdown size for viewport-aware positioning.
-                    // The dropdown min-width is 180px in CSS; height ~200px is a
-                    // conservative estimate for a typical context menu.
-                    let menu_w = 180.0f32;
-                    let menu_h = 200.0f32;
-                    let margin = 4.0f32;
-
-                    // Flip horizontally if menu would overflow right edge
-                    let final_x = if x + menu_w + margin > vw && x > menu_w {
-                        x - menu_w
-                    } else {
-                        x
-                    };
-
-                    // Flip vertically if menu would overflow bottom edge
-                    let final_y = if y + menu_h + margin > vh && y > menu_h {
-                        y - menu_h
-                    } else {
-                        y
-                    };
 
                     portal_clone.set_attribute(
                         "style",
@@ -149,21 +314,51 @@ impl Component for ContextMenu {
                         "style",
                         "position: absolute; top: 0; left: 0; right: 0; bottom: 0;",
                     );
-                    dropdown_clone.set_attribute(
-                        "style",
-                        &format!(
-                            "position: absolute; left: {}px; top: {}px;",
-                            final_x, final_y,
-                        ),
-                    );
+                    let placement = dropdown_placement(x, y, vw, vh);
+                    // Each open starts from the top of the frame, whatever an
+                    // earlier open of a taller menu scrolled it to.
+                    frame.set_scroll_top(0.0);
+                    frame.set_attribute("style", FRAME_STYLE);
+                    v_head.set_attribute("style", &placement.v_head);
+                    v_tail.set_attribute("style", &placement.v_tail);
+                    h_head.set_attribute("style", &placement.h_head);
+                    h_tail.set_attribute("style", &placement.h_tail);
+                    dropdown_clone.set_attribute("style", DROPDOWN_STYLE);
                 } else {
+                    // A closing menu closes every submenu open in it (#2214).
+                    crate::dropdown_menu_sub::close_subs_within(&dropdown_clone);
                     portal_clone.set_attribute("style", "display: none;");
                     overlay_clone.set_attribute("style", "display: none;");
+                    frame.set_attribute("style", "display: none;");
                     dropdown_clone.set_attribute("style", "display: none;");
                 }
             });
         }
         body.append_child(&portal);
+
+        // Keys and Escape while open (#2170): `menu_nav::arm_menu_keys`.
+        {
+            let panel = dropdown.clone();
+            crate::menu_nav::arm_menu_keys(
+                __scope,
+                dropdown.clone(),
+                std::rc::Rc::new(move || Some(panel.clone())),
+                std::rc::Rc::new(move || opened.get()),
+                crate::menu_nav::MenuKeyOptions {
+                    close_on_escape: self.close_on_escape,
+                    keyboard_nav: self.keyboard_nav,
+                    loop_focus: self.loop_focus,
+                    typeahead: self.typeahead,
+                    on_key: self.on_key.clone(),
+                    close_on_focus_leave: false,
+                },
+                Some(std::rc::Rc::new(move || {
+                    if opened.is_alive() {
+                        opened.set(false);
+                    }
+                })),
+            );
+        }
 
         // Take the portal down with whatever built this menu.
         //
@@ -185,16 +380,25 @@ impl Component for ContextMenu {
         // straight at the root, outside any reactive block), and the root scope
         // is the right home for that case.
         //
-        // The cleanup removes the node and touches no signal. `opened` is freed
-        // by the same disposal, so a "close it on the way out" write here would
-        // be dropped and would warn — see the `is_alive` guard on
-        // `DropdownMenuItem`'s close write. Removing the node is the whole job.
+        // The cleanup removes the node and drops the registry entry above —
+        // it touches no signal. `opened` is freed by the same disposal, so a
+        // "close it on the way out" write here would be dropped and would
+        // warn — see `close_menu_signal`'s freed-signal no-op.
+        // `unregister_menu_close_signal` is what keeps a menu built and torn
+        // down many times (a reactive block rebuilding its row) from growing
+        // the registry by one dead entry per rebuild.
         {
             let portal_for_owner = portal.clone();
-            let registered = rinch_core::reactive::on_cleanup(move || portal_for_owner.discard());
+            let registered = rinch_core::reactive::on_cleanup(move || {
+                unregister_menu_close_signal(menu_close_id);
+                portal_for_owner.discard();
+            });
             if !registered {
                 let portal_for_root = portal.clone();
-                __scope.on_cleanup(move || portal_for_root.discard());
+                __scope.on_cleanup(move || {
+                    unregister_menu_close_signal(menu_close_id);
+                    portal_for_root.discard();
+                });
             }
         }
 
@@ -238,11 +442,58 @@ impl Component for ContextMenuDropdown {
 
 #[cfg(test)]
 mod tests {
+    use super::{dropdown_placement, filler, sized};
+
+    #[test]
+    fn a_press_near_the_bottom_stands_on_the_pointer() {
+        // 100px above the bottom of an 800px window: the tail spacer holds the
+        // menu's end at the pointer (100 - EDGE_MARGIN below it).
+        let p = dropdown_placement(50.0, 700.0, 1200.0, 800.0);
+        assert_eq!(p.v_head, filler("height"));
+        assert_eq!(p.v_tail, sized("height", 96.0));
+        assert_eq!(p.h_head, sized("width", 46.0));
+        assert_eq!(p.h_tail, filler("width"));
+    }
+
+    #[test]
+    fn a_press_with_room_below_hangs_from_the_pointer() {
+        let p = dropdown_placement(50.0, 100.0, 1200.0, 800.0);
+        assert_eq!(p.v_head, sized("height", 96.0));
+        assert_eq!(p.v_tail, filler("height"));
+        // Enough room below is enough, even with more above.
+        let p = dropdown_placement(50.0, 450.0, 1200.0, 800.0);
+        assert_eq!(p.v_head, sized("height", 446.0));
+    }
+
+    #[test]
+    fn a_press_near_the_right_edge_ends_at_the_pointer() {
+        let p = dropdown_placement(1150.0, 100.0, 1200.0, 800.0);
+        assert_eq!(p.h_head, filler("width"));
+        assert_eq!(p.h_tail, sized("width", 46.0));
+    }
+
+    #[test]
+    fn no_viewport_hangs_it_from_the_pointer() {
+        let p = dropdown_placement(10.0, 20.0, 0.0, 0.0);
+        assert_eq!(p.v_head, sized("height", 16.0));
+        assert_eq!(p.h_head, sized("width", 6.0));
+    }
+
+    #[test]
+    fn a_spacer_is_never_negative() {
+        assert_eq!(sized("height", -3.0), sized("height", 0.0));
+        assert_eq!(
+            sized("width", 2.5),
+            "flex: 0 1 auto; width: 2.5px; min-width: 0;"
+        );
+    }
+
     use super::*;
     use rinch_core::dom::mock::MockDomDocument;
-    use rinch_core::dom::{DomDocument, NodeHandle};
+    use rinch_core::dom::{DomDocument, NodeHandle, NodeId};
+    use rinch_core::events::{EventHandlerId, dispatch_event};
     use rinch_core::reactive::Scope;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     /// Direct children of `body` carrying `class`.
@@ -256,6 +507,24 @@ mod tests {
                     .is_some_and(|c| c.split_whitespace().any(|c| c == class))
             })
             .count()
+    }
+
+    /// The `data-rid` of the (one) descendant of `body` carrying
+    /// `rinch-dropdown-menu__item` — the item a reactive block rendered.
+    fn item_rid(doc: &Rc<RefCell<dyn DomDocument>>) -> Option<usize> {
+        fn walk(d: &dyn DomDocument, node: NodeId) -> Option<usize> {
+            if d.get_attribute(node, "class").is_some_and(|c| {
+                c.split_whitespace()
+                    .any(|c| c == "rinch-dropdown-menu__item")
+            }) {
+                return d
+                    .get_attribute(node, "data-rid")
+                    .and_then(|s| s.parse().ok());
+            }
+            d.get_children(node).into_iter().find_map(|c| walk(d, c))
+        }
+        let d = doc.borrow();
+        walk(&*d, d.body())
     }
 
     fn render_menu(scope: &mut RenderScope) -> NodeHandle {
@@ -291,6 +560,30 @@ mod tests {
             portals_on_body(&doc, "rinch-context-menu__portal"),
             0,
             "and the rebuild that disposed its owner must not orphan it there"
+        );
+    }
+
+    /// Disposing a menu's owner releases its close-signal registration too, so
+    /// rebuilding a menu does not grow the registry (#714's review).
+    #[test]
+    fn disposing_the_owning_scope_releases_the_close_registration() {
+        let doc: Rc<RefCell<dyn DomDocument>> = Rc::new(RefCell::new(MockDomDocument::new()));
+        let body = doc.borrow().body();
+        let mut scope = RenderScope::new(doc.clone(), body);
+
+        let before = crate::dropdown_menu::registered_menu_count();
+        for _ in 0..3 {
+            let owner = Scope::new();
+            owner.run(|| {
+                let _ = render_menu(&mut scope);
+            });
+            assert_eq!(crate::dropdown_menu::registered_menu_count(), before + 1);
+            owner.dispose();
+        }
+        assert_eq!(
+            crate::dropdown_menu::registered_menu_count(),
+            before,
+            "every disposed menu released its entry"
         );
     }
 
@@ -342,5 +635,261 @@ mod tests {
             0,
             "an unmounting root must reclaim its portal too"
         );
+    }
+
+    /// Issue #714 (bug 1): `ContextMenuDropdown { DropdownMenuItem {..} if
+    /// clipboard.get().is_some() { DropdownMenuItem {..} } }` — the second
+    /// item renders again every time `clipboard` changes, long after
+    /// `ContextMenu::render` has already returned. Simulated here with
+    /// `show_dom`, which is exactly what that `if` desugars to: the item
+    /// does not exist at all while `show_item` is `false`, and is rendered
+    /// for the first time only after `ContextMenu::render` below has fully
+    /// run and returned.
+    ///
+    /// Clicking that item must still close the menu. The old mechanism
+    /// resolved the close signal through a thread-local the container
+    /// cleared the moment its own `render` ran — which is before this item
+    /// is ever built — so the click ran the item's own `onclick` and left
+    /// `opened` untouched.
+    #[test]
+    fn an_item_rendered_by_a_reactive_block_still_closes_the_menu() {
+        let doc: Rc<RefCell<dyn DomDocument>> = Rc::new(RefCell::new(MockDomDocument::new()));
+        let body = doc.borrow().body();
+        let mut scope = RenderScope::new(doc.clone(), body);
+
+        let show_item = rinch_core::Signal::new(false);
+        let clicked = Rc::new(Cell::new(false));
+        let clicked_for_item = clicked.clone();
+
+        let target = scope.create_element("div");
+        let items = scope.create_element("div");
+        // Nothing renders here yet — `show_item` is false — mirroring an
+        // `if` branch that has not fired.
+        rinch_core::show_dom(
+            &mut scope,
+            &items,
+            move || show_item.get(),
+            move |s: &mut RenderScope| {
+                crate::dropdown_menu::DropdownMenuItem {
+                    onclick: Some(rinch_core::Callback::new({
+                        let clicked = clicked_for_item.clone();
+                        move || clicked.set(true)
+                    })),
+                    ..Default::default()
+                }
+                .render(s, &[])
+            },
+            None::<fn(&mut RenderScope) -> NodeHandle>,
+        );
+
+        let menu = ContextMenu::default();
+        let opened = menu.opened;
+        let _root = menu.render(&mut scope, &[target, items]);
+
+        // `ContextMenu::render` has now fully returned. Only now does the
+        // reactive block fire, rendering the item for the first time.
+        opened.set(true);
+        show_item.set(true);
+
+        let rid = item_rid(&doc).expect("the late-rendered item carries a handler");
+        dispatch_event(EventHandlerId(rid));
+
+        assert!(clicked.get(), "the item's own onclick still runs");
+        assert_eq!(
+            opened.try_get(),
+            Some(false),
+            "and the menu it was built inside of closes, even though it \
+             rendered after ContextMenu::render had already returned"
+        );
+    }
+
+    /// An item whose own action hides it (a "Paste" that consumes the
+    /// clipboard its `if` reads) still closes the menu. A lookup run *after*
+    /// the callback starts with a `NodeHandle` access, which flushes the
+    /// queued `show_dom` effect and detaches the button before the walk can
+    /// climb past it — so the item resolves its menu before the callback runs
+    /// (#714's review).
+    #[test]
+    fn an_item_that_hides_itself_on_click_still_closes_the_menu() {
+        let doc: Rc<RefCell<dyn DomDocument>> = Rc::new(RefCell::new(MockDomDocument::new()));
+        let body = doc.borrow().body();
+        let mut scope = RenderScope::new(doc.clone(), body);
+
+        let show_item = rinch_core::Signal::new(false);
+        let clicked = Rc::new(Cell::new(false));
+        let clicked_for_item = clicked.clone();
+        let show_item_for_item = show_item;
+
+        let target = scope.create_element("div");
+        let items = scope.create_element("div");
+        rinch_core::show_dom(
+            &mut scope,
+            &items,
+            move || show_item.get(),
+            move |s: &mut RenderScope| {
+                crate::dropdown_menu::DropdownMenuItem {
+                    onclick: Some(rinch_core::Callback::new({
+                        let clicked = clicked_for_item.clone();
+                        move || {
+                            clicked.set(true);
+                            // the item's own action hides itself, same as a
+                            // "Paste" item consuming the clipboard it was
+                            // conditioned on.
+                            show_item_for_item.set(false);
+                        }
+                    })),
+                    ..Default::default()
+                }
+                .render(s, &[])
+            },
+            None::<fn(&mut RenderScope) -> NodeHandle>,
+        );
+
+        let menu = ContextMenu::default();
+        let opened = menu.opened;
+        let _root = menu.render(&mut scope, &[target, items]);
+
+        opened.set(true);
+        show_item.set(true);
+
+        let rid = item_rid(&doc).expect("the late-rendered item carries a handler");
+        dispatch_event(EventHandlerId(rid));
+
+        assert!(clicked.get(), "the item's own onclick still runs");
+        assert_eq!(
+            opened.try_get(),
+            Some(false),
+            "the menu must still close even though the item's own click hid itself"
+        );
+    }
+
+    /// Coverage gap probe (not in the PR): two independent ContextMenus open
+    /// at once must not cross-wire their close signals via id collision.
+    #[test]
+    fn two_simultaneous_menus_do_not_cross_close() {
+        let doc: Rc<RefCell<dyn DomDocument>> = Rc::new(RefCell::new(MockDomDocument::new()));
+        let body = doc.borrow().body();
+        let mut scope = RenderScope::new(doc.clone(), body);
+
+        let target_a = scope.create_element("div");
+        let items_a = scope.create_element("div");
+        let item_a = crate::dropdown_menu::DropdownMenuItem {
+            onclick: Some(rinch_core::Callback::new(|| {})),
+            ..Default::default()
+        };
+        let item_a_node = item_a.render(&mut scope, &[]);
+        items_a.append_child(&item_a_node);
+        let menu_a = ContextMenu::default();
+        let opened_a = menu_a.opened;
+        let _root_a = menu_a.render(&mut scope, &[target_a, items_a]);
+        opened_a.set(true);
+
+        let target_b = scope.create_element("div");
+        let items_b = scope.create_element("div");
+        let item_b = crate::dropdown_menu::DropdownMenuItem {
+            onclick: Some(rinch_core::Callback::new(|| {})),
+            ..Default::default()
+        };
+        let item_b_node = item_b.render(&mut scope, &[]);
+        items_b.append_child(&item_b_node);
+        let menu_b = ContextMenu::default();
+        let opened_b = menu_b.opened;
+        let _root_b = menu_b.render(&mut scope, &[target_b, items_b]);
+        opened_b.set(true);
+
+        let rid_a: usize = item_a_node
+            .get_attribute("data-rid")
+            .unwrap()
+            .parse()
+            .unwrap();
+        dispatch_event(EventHandlerId(rid_a));
+
+        assert_eq!(opened_a.try_get(), Some(false), "menu A closes");
+        assert_eq!(opened_b.try_get(), Some(true), "menu B must stay open");
+    }
+
+    /// Nested menu attack: a `DropdownMenu` (submenu) rendered inside a
+    /// `ContextMenu`'s dropdown. Clicking an item inside the inner
+    /// `DropdownMenu` must close the INNER menu (nearest ancestor), not the
+    /// outer `ContextMenu`.
+    #[test]
+    fn nested_menu_closes_the_nearest_one() {
+        let doc: Rc<RefCell<dyn DomDocument>> = Rc::new(RefCell::new(MockDomDocument::new()));
+        let body = doc.borrow().body();
+        let mut scope = RenderScope::new(doc.clone(), body);
+
+        // Build the inner DropdownMenu with one item.
+        let inner_item = crate::dropdown_menu::DropdownMenuItem {
+            onclick: Some(rinch_core::Callback::new(|| {})),
+            ..Default::default()
+        };
+        let inner_item_node = inner_item.render(&mut scope, &[]);
+        let inner_menu = crate::dropdown_menu::DropdownMenu::default();
+        let inner_opened_signal = inner_menu._close_signal;
+        let inner_root = inner_menu.render(&mut scope, std::slice::from_ref(&inner_item_node));
+
+        // Outer ContextMenu, with the inner DropdownMenu's root as one of its
+        // dropdown's children.
+        let target = scope.create_element("div");
+        let items = scope.create_element("div");
+        items.append_child(&inner_root);
+        let outer_menu = ContextMenu::default();
+        let outer_opened = outer_menu.opened;
+        let _outer_root = outer_menu.render(&mut scope, &[target, items]);
+
+        outer_opened.set(true);
+        // inner_opened_signal: DropdownMenu::_close_signal starts true; a
+        // click sets it false (its own "closed" marker), unrelated to the
+        // outer `opened` signal.
+        assert_eq!(inner_opened_signal.try_get(), Some(true));
+
+        let rid: usize = inner_item_node
+            .get_attribute("data-rid")
+            .unwrap()
+            .parse()
+            .unwrap();
+        dispatch_event(EventHandlerId(rid));
+
+        assert_eq!(
+            inner_opened_signal.try_get(),
+            Some(false),
+            "the inner (nearest) menu's close signal fires"
+        );
+        assert_eq!(
+            outer_opened.try_get(),
+            Some(true),
+            "the outer ContextMenu must NOT be closed by an inner submenu's item"
+        );
+    }
+}
+
+#[cfg(test)]
+mod review_1641_placement {
+    use super::{dropdown_placement, filler, sized};
+
+    #[test]
+    fn a_narrow_window_with_more_room_right_keeps_the_left_anchor() {
+        // 184px do not fit right of x = 100 in a 200px window, but there is no
+        // more room to the left either: anchored by its end it would run off
+        // the left edge.
+        let p = dropdown_placement(100.0, 10.0, 200.0, 800.0);
+        assert_eq!(p.h_head, sized("width", 96.0));
+        assert_eq!(p.v_head, sized("height", 6.0));
+    }
+
+    #[test]
+    fn a_pointer_past_the_viewport_is_clamped_into_it() {
+        let p = dropdown_placement(1300.0, 900.0, 1200.0, 800.0);
+        assert_eq!(p.h_head, filler("width"));
+        assert_eq!(p.h_tail, sized("width", 0.0));
+        assert_eq!(p.v_head, filler("height"));
+        assert_eq!(p.v_tail, sized("height", 0.0));
+    }
+
+    #[test]
+    fn one_zero_dimension_is_no_viewport() {
+        let p = dropdown_placement(1150.0, 700.0, 1200.0, 0.0);
+        assert_eq!(p.h_head, sized("width", 1146.0));
+        assert_eq!(p.v_head, sized("height", 696.0));
     }
 }

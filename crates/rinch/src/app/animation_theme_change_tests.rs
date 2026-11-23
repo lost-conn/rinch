@@ -25,10 +25,10 @@ const VIEWPORT: (f32, f32) = (800.0, 600.0);
 const OVAL: &str = "rinch-loader__oval";
 
 /// The one node carrying `class` exactly, as a raw node id.
-fn node_with_class(app: &RinchApp, class: &str) -> usize {
+fn node_with_class(app: &RinchApp, class: &str) -> u64 {
     let doc = app.doc.as_ref().unwrap();
     let d = doc.borrow();
-    let matches: Vec<usize> = d
+    let matches: Vec<u64> = d
         .tree
         .nodes
         .iter()
@@ -48,13 +48,13 @@ fn node_with_class(app: &RinchApp, class: &str) -> usize {
     matches[0]
 }
 
-fn running(app: &RinchApp, node: usize) -> usize {
+fn running(app: &RinchApp, node: u64) -> usize {
     let doc = app.doc.as_ref().unwrap();
     let d = doc.borrow();
     d.tree.active_animations.get(&node).map_or(0, |a| a.len())
 }
 
-fn start_time(app: &RinchApp, node: usize) -> f64 {
+fn start_time(app: &RinchApp, node: u64) -> f64 {
     let doc = app.doc.as_ref().unwrap();
     let d = doc.borrow();
     d.tree
@@ -68,7 +68,7 @@ fn start_time(app: &RinchApp, node: usize) -> f64 {
 /// A restart writes the wall clock of the restyle, which is ~`ms` later — far
 /// enough apart that the assertion cannot be satisfied by two registrations
 /// microseconds apart.
-fn backdate(app: &mut RinchApp, node: usize, ms: f64) -> f64 {
+fn backdate(app: &mut RinchApp, node: u64, ms: f64) -> f64 {
     let doc = app.doc.as_ref().unwrap();
     let mut d = doc.borrow_mut();
     let anim = &mut d
@@ -211,8 +211,10 @@ fn a_real_dark_mode_toggle_keeps_the_loader_spinning() {
     let mut app = mount_loader();
     // Take the document's theme off the thread-global slot, so this test cannot
     // be perturbed by (or perturb) anything else on the thread.
-    app.owned_theme_css = Some(":root { --rinch-primary-color: #4dabf7; }".to_string());
-    app.last_theme_css = Some(app.effective_theme_css());
+    app.set_owned_theme_css(Some(
+        ":root { --rinch-primary-color: #4dabf7; }".to_string(),
+    ));
+    app.last_theme_key = Some(app.theme_key());
 
     let oval = node_with_class(&app, OVAL);
     assert_eq!(
@@ -223,13 +225,17 @@ fn a_real_dark_mode_toggle_keeps_the_loader_spinning() {
     let expected_start = backdate(&mut app, oval, 400.0);
 
     // "Dark mode on": a different theme sheet. `resolve_and_repaint` compares it
-    // against `last_theme_css` and takes the full-restyle branch by itself.
-    app.owned_theme_css = Some(":root { --rinch-primary-color: #1864ab; }".to_string());
+    // against `last_theme_key` and takes the full-restyle branch by itself.
+    let light = app.theme_key();
+    app.set_owned_theme_css(Some(
+        ":root { --rinch-primary-color: #1864ab; }".to_string(),
+    ));
+    assert_ne!(app.theme_key(), light, "precondition: the theme key moved");
     app.resolve_and_repaint(VIEWPORT.0, VIEWPORT.1);
 
     assert_eq!(
-        app.last_theme_css.as_deref(),
-        Some(":root { --rinch-primary-color: #1864ab; }"),
+        app.last_theme_key,
+        Some(app.theme_key()),
         "precondition: `resolve_and_repaint` really did take the theme-change branch"
     );
     assert_eq!(
@@ -238,4 +244,46 @@ fn a_real_dark_mode_toggle_keeps_the_loader_spinning() {
         "toggling dark mode must not kill every animation in the app"
     );
     assert_eq!(start_time(&app, oval), expected_start, "…nor restart them");
+}
+
+/// The **thread-global** theme path: a document that follows the global slot
+/// (desktop, web, Android — anything that is not an embed context) restyles
+/// when `set_current_theme_css` changes it, which is what a `ThemeProvider`
+/// dark-mode toggle does. `resolve_and_repaint` notices through the slot's
+/// generation (`ThemeKey::Global`), not a string compare; the fixture above
+/// covers only the owned (embed) arm.
+#[cfg(feature = "theme")]
+#[test]
+fn a_thread_global_theme_change_restyles_a_document_that_follows_it() {
+    // Thread-local slot: this test's thread owns it for the duration.
+    rinch_core::set_current_theme_css(Some(":root { --probe-c: rgb(255, 0, 0); }".into()));
+    let mut app = RinchApp::new(move |scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        let probe = scope.create_element("div");
+        probe.set_attribute("class", "theme-probe");
+        probe.set_attribute("style", "color: var(--probe-c)");
+        root.append_child(&probe);
+        root
+    });
+    app.mount_component(VIEWPORT.0, VIEWPORT.1);
+    app.resolve_and_repaint(VIEWPORT.0, VIEWPORT.1);
+    let probe = node_with_class(&app, "theme-probe");
+    let color = |app: &RinchApp| {
+        let doc = app.doc.as_ref().unwrap();
+        let d = doc.borrow();
+        d.tree
+            .get(probe)
+            .unwrap()
+            .computed_style
+            .color
+            .map(|c| c.to_rgba8())
+            .map(|c| (c.r, c.g, c.b))
+    };
+    assert_eq!(color(&app), Some((255, 0, 0)), "precondition");
+
+    rinch_core::set_current_theme_css(Some(":root { --probe-c: rgb(0, 0, 255); }".into()));
+    app.resolve_and_repaint(VIEWPORT.0, VIEWPORT.1);
+    assert_eq!(color(&app), Some((0, 0, 255)));
+
+    rinch_core::set_current_theme_css(None);
 }

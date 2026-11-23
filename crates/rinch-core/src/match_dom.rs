@@ -53,6 +53,45 @@ pub fn match_dom<D>(
 where
     D: Fn() -> usize + 'static,
 {
+    match_dom_impl(scope, parent, discriminant, branches, Vec::new())
+}
+
+/// [`match_dom`] for arms that read a value out of the scrutinee: the target
+/// of an rsx `match` (issue #2105).
+///
+/// `rebinding[i]` says whether arm `i` binds a name. While the discriminant
+/// keeps choosing such an arm, every re-run of `discriminant` — every change
+/// to a reactive value it read — **rebuilds** that arm, because the arm
+/// re-reads the value its pattern bound and the markup it built from the old
+/// one is stale. An arm that binds nothing (a literal, a path, `_`) is built
+/// once per selection, exactly as [`match_dom`] builds every arm. A missing
+/// entry counts as `false`.
+///
+/// No value is compared; a [`Memo`](crate::reactive::Memo) scrutinee is the
+/// equality cut-off. See [`show_dom_rebinding`](crate::show_dom_rebinding).
+pub fn match_dom_rebinding<D>(
+    scope: &mut RenderScope,
+    parent: &NodeHandle,
+    discriminant: D,
+    branches: Vec<BranchFn>,
+    rebinding: Vec<bool>,
+) -> NodeHandle
+where
+    D: Fn() -> usize + 'static,
+{
+    match_dom_impl(scope, parent, discriminant, branches, rebinding)
+}
+
+fn match_dom_impl<D>(
+    scope: &mut RenderScope,
+    parent: &NodeHandle,
+    discriminant: D,
+    branches: Vec<BranchFn>,
+    rebinding: Vec<bool>,
+) -> NodeHandle
+where
+    D: Fn() -> usize + 'static,
+{
     // Create comment marker and insert into parent
     let marker = scope.create_comment("match");
     parent.append_child(&marker);
@@ -60,6 +99,10 @@ where
     let parent_id = parent.node_id();
     let doc_weak = scope.doc_weak();
     let branches = Rc::new(branches);
+
+    // Every arm scope names the scope `match_dom` was called from as its
+    // parent (issue #732) — see the matching note in `show_dom`.
+    let creator_scope_id = scope.id();
 
     // Track current state
     let current_index: Rc<RefCell<usize>> = Rc::new(RefCell::new(usize::MAX)); // sentinel
@@ -76,9 +119,10 @@ where
         branch_fn: &dyn Fn(&mut RenderScope) -> NodeHandle,
         current_content: &Rc<RefCell<Vec<NodeHandle>>>,
         current_scope: &Rc<RefCell<Option<RenderScope>>>,
+        creator_scope_id: crate::dom::ScopeId,
     ) {
         if let Some(doc) = doc_weak.upgrade() {
-            let mut child_scope = RenderScope::new(doc, parent_id);
+            let mut child_scope = RenderScope::with_parent(doc, parent_id, Some(creator_scope_id));
             // Attribute the branch's resources to the branch's own scope
             // (issue #141). Covers the initial render and the arm swap alike.
             let content = {
@@ -91,33 +135,45 @@ where
         }
     }
 
-    // Initial render
-    let initial_idx = discriminant();
-    if initial_idx < branches.len() {
-        *current_index.borrow_mut() = initial_idx;
-        render_branch(
-            &doc_weak,
-            parent_id,
-            &marker,
-            branches[initial_idx].as_ref(),
-            &current_content,
-            &current_scope,
-        );
-    }
-
     // Create Effect that swaps branches when discriminant changes
     let idx_clone = current_index.clone();
     let content_clone = current_content.clone();
     let scope_clone = current_scope.clone();
     let doc_weak_clone = doc_weak.clone();
+    let branches_init = branches.clone();
     let branches_clone = branches;
     let marker_effect = marker_clone;
+    // The effect's first run only subscribes: the arm was built above.
+    let first_run = std::cell::Cell::new(true);
+
+    // Created before the initial arm is built, for the same reason and with
+    // the same `pending` replay as `show_dom` (issue #2105).
+    let building = Rc::new(std::cell::Cell::new(true));
+    let pending = Rc::new(std::cell::Cell::new(false));
+    let building_effect = building.clone();
+    let pending_effect = pending.clone();
 
     let effect = Effect::new(move || {
         let new_idx = discriminant();
+        let first = first_run.replace(false);
+        if first {
+            // Subscribe and record the arm; the initial build follows below.
+            *idx_clone.borrow_mut() = new_idx;
+            return;
+        }
+        if building_effect.get() {
+            pending_effect.set(true);
+            return;
+        }
         let old_idx = *idx_clone.borrow();
 
-        if new_idx != old_idx {
+        // Swap when the arm changed. An arm that binds a name is also rebuilt
+        // when the discriminant re-ran and chose it again: a value the
+        // scrutinee read changed, and the arm destructured the old one
+        // (issue #2105).
+        let rebind =
+            new_idx == old_idx && !first && rebinding.get(new_idx).copied().unwrap_or(false);
+        if new_idx != old_idx || rebind {
             *idx_clone.borrow_mut() = new_idx;
 
             // Dispose old scope BEFORE removing DOM nodes.
@@ -130,7 +186,10 @@ where
             // #719): an arm's own markup is `discard`ed so the backend can let
             // go of it, a *captured* `NodeHandle` the arm merely returned is
             // detached so switching back puts the same subtree in place. Read
-            // before the dispose — see the matching note in `show_dom`.
+            // before the dispose — see the matching note in `show_dom`. A
+            // *nested* captured handle (issue #732) must be found the same
+            // way, while `old_scope` can still answer `created`.
+            let mut captured: Vec<NodeHandle> = Vec::new();
             let doomed: Vec<(NodeHandle, bool)> = content_clone
                 .borrow_mut()
                 .drain(..)
@@ -138,6 +197,9 @@ where
                     let owned = old_scope
                         .as_ref()
                         .is_some_and(|s| s.created(node.node_id()));
+                    if owned && let Some(s) = old_scope.as_ref() {
+                        crate::dom::sweep_for_discard(&node, Some(s.id()), &mut captured);
+                    }
                     (node, owned)
                 })
                 .collect();
@@ -146,12 +208,18 @@ where
                 old_scope.dispose();
             }
 
+            // Detach every captured descendant before any discard below can
+            // reach it (issue #732).
+            for node in captured {
+                node.remove();
+            }
+
             // Removal of either kind cancels the subtree's transitions and
             // animations in the document implementation (#699); stamping inline
             // `transition: none` here disarmed it permanently (#704).
             for (node, owned) in doomed {
                 if owned {
-                    node.discard();
+                    node.discard_swept();
                 } else {
                     node.remove();
                 }
@@ -168,11 +236,31 @@ where
                         branches_clone[new_idx].as_ref(),
                         &content_clone,
                         &scope_clone,
+                        creator_scope_id,
                     );
                 });
             }
         }
     });
+
+    // Initial render, after the effect exists (see `building` above).
+    let initial_idx = *current_index.borrow();
+    if initial_idx < branches_init.len() {
+        render_branch(
+            &doc_weak,
+            parent_id,
+            &marker,
+            branches_init[initial_idx].as_ref(),
+            &current_content,
+            &current_scope,
+            creator_scope_id,
+        );
+    }
+
+    building.set(false);
+    if pending.replace(false) {
+        effect.run();
+    }
 
     scope.create_effect_from(effect);
 

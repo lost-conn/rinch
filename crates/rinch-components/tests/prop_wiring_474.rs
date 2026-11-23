@@ -24,6 +24,7 @@ use std::rc::Rc;
 use rinch_components::badge::Badge;
 use rinch_components::class_utils::RADIUS_SCALE;
 use rinch_components::close_button::CloseButton;
+use rinch_components::color_input::ColorInput;
 use rinch_components::drawer::Drawer;
 use rinch_components::dropdown_menu::DropdownMenu;
 use rinch_components::modal::Modal;
@@ -36,6 +37,9 @@ use rinch_components::text_input::TextInput;
 use rinch_core::Component;
 use rinch_core::dom::traits::DomDocument;
 use rinch_core::dom::{NodeHandle, RenderScope, mock::MockDomDocument};
+
+mod common;
+use common::{find_by_class, sheet};
 
 /// A rendered component, with its document and scope kept alive around it.
 struct Mounted {
@@ -86,21 +90,6 @@ impl Mounted {
     fn find(&self, class: &str) -> Option<NodeHandle> {
         find_by_class(&self.root, class)
     }
-}
-
-fn find_by_class(node: &NodeHandle, class: &str) -> Option<NodeHandle> {
-    let matches = node
-        .get_attribute("class")
-        .is_some_and(|attr| attr.split_whitespace().any(|c| c == class));
-    if matches {
-        return Some(node.clone());
-    }
-    node.children().iter().find_map(|c| find_by_class(c, class))
-}
-
-/// Every component's CSS, as the runtime loads it.
-fn sheet() -> String {
-    rinch_components::styles::generate_all_component_styles()
 }
 
 // ------------------------------------------------------------------ radius
@@ -433,9 +422,17 @@ const Z_CASES: &[ZCase] = &[
         base: "z-index: var(--rinch-notification-z-index, 300);",
         derived: None,
     },
+    // #801: the open picker's panel, with its dismiss backdrop one under it
+    // (the field's `+ 1` lift is the third layer, counted by the hard-code scan).
+    ZCase {
+        component: "ColorInput",
+        property: "--rinch-color-input-z-index",
+        base: "z-index: var(--rinch-color-input-z-index, 100);",
+        derived: Some("z-index: calc(var(--rinch-color-input-z-index, 100) - 1);"),
+    },
 ];
 
-/// Render one of the five overlays with `z_index` set (or not).
+/// Render one of the six overlays with `z_index` set (or not).
 fn mount_with_z_index(component: &str, z_index: Option<i32>) -> Mounted {
     match component {
         "Modal" => Mounted::new(Modal {
@@ -455,6 +452,10 @@ fn mount_with_z_index(component: &str, z_index: Option<i32>) -> Mounted {
             ..Default::default()
         }),
         "Notification" => Mounted::new(Notification {
+            z_index,
+            ..Default::default()
+        }),
+        "ColorInput" => Mounted::new(ColorInput {
             z_index,
             ..Default::default()
         }),
@@ -522,7 +523,7 @@ fn the_stylesheet_spends_every_published_z_index() {
 /// cannot move, which is how a backdrop ends up above the panel it guards.
 #[test]
 fn the_wired_overlays_hard_code_no_z_index() {
-    // Every selector these five own. Each is a prefix of its own modifiers and
+    // Every selector these six own. Each is a prefix of its own modifiers and
     // elements (`.rinch-dropdown-menu__backdrop`) and of nothing else's.
     const OWNED: &[&str] = &[
         ".rinch-modal",
@@ -530,6 +531,7 @@ fn the_wired_overlays_hard_code_no_z_index() {
         ".rinch-popover",
         ".rinch-dropdown-menu",
         ".rinch-notification",
+        ".rinch-color-input",
     ];
 
     let css = sheet();
@@ -559,9 +561,10 @@ fn the_wired_overlays_hard_code_no_z_index() {
     // Positive control: a selector tracker that matched nothing would pass the
     // loop above without looking at a single declaration.
     assert_eq!(
-        checked, 9,
-        "expected the nine z-index declarations these five own (2 Modal, \
-         2 Drawer, 2 Popover, 2 DropdownMenu, 1 Notification), saw {checked}"
+        checked, 13,
+        "expected the thirteen z-index declarations these six own (2 Modal, \
+         2 Drawer, 2 Popover, 3 DropdownMenu — panel, backdrop and a \
+         submenu's flyout (#2214) — 1 Notification, 3 ColorInput), saw {checked}"
     );
 }
 

@@ -1,4 +1,5 @@
-//! Escape-to-dismiss, shared by `Modal`, `Drawer` and `Popover` (issue #474).
+//! Escape-to-dismiss, shared by `Modal`, `Drawer` and `Popover` (issue #474),
+//! plus the open-time policies `ColorInput` (#465) and `Select` (#434) use.
 //!
 //! The three declared `close_on_escape` and did nothing with it. They all need
 //! the same wiring, and getting any of them subtly different is the bug this
@@ -9,7 +10,9 @@
 //! stays mounted with its handler in place. Deciding "register only when open"
 //! would arm the handler forever the first time the overlay opened, and Escape
 //! would go on being swallowed by an invisible dialog. So the handler is armed
-//! at mount and asked, afresh, on every Escape.
+//! at mount and asked, afresh, on every Escape. It is anchored at the overlay's
+//! root, so an overlay written *inside* this one, which rendered and registered
+//! first, is still asked first (#803).
 //!
 //! See [`rinch_core::push_dismiss_handler`] for the stack itself — why it is a
 //! stack rather than the single-slot keyboard interceptor, and how nesting,
@@ -53,7 +56,9 @@ pub fn arm_close_on_escape(
         None => Rc::new(move || opened),
     };
 
-    let handle = rinch_core::push_dismiss_handler(root.doc_key(), move || {
+    // Anchored at `root`, so an overlay written *inside* this one is asked
+    // first even though it rendered — and registered — earlier (#803).
+    let handle = rinch_core::push_dismiss_handler_within(root, move || {
         if is_open() {
             cb.invoke();
             true
@@ -72,25 +77,34 @@ pub fn arm_close_on_escape(
 /// pushing its entry when it opens and releasing it when it closes.
 ///
 /// The other policy in this file — [`arm_close_on_escape`] — registers once, at
-/// mount, and asks `opened_fn` at dispatch. That is right for an overlay whose
-/// open state is a *prop*, and it is wrong the moment such an overlay is
-/// **statically nested inside another one**, because the stack is LIFO and a
-/// component renders *after* its children: `Modal { ColorInput { … } }` pushes
-/// the input's entry first and the modal's on top of it, so the modal answers
-/// Escape even while the input's picker is the thing the user is looking at.
+/// mount, and asks `opened_fn` at dispatch. A component renders *after* its
+/// children, so `Modal { ColorInput { … } }` pushes the input's entry first and
+/// the modal's on top of it; plain LIFO would let the modal answer Escape while
+/// the input's picker is the thing the user is looking at. Both policies anchor
+/// their entry at `root` ([`rinch_core::push_dismiss_handler_within`]), and the
+/// stack asks an entry nested inside another first (#803), which settles that
+/// case for either policy.
 ///
-/// Pushing at *open* time is the fix, and it is not a new idea — it is exactly
+/// Pushing at *open* time is what this one adds, and it is not a new idea — it is exactly
 /// what the desktop runtime's open-`<select>` entry does (issue #671,
 /// `open_select_popup`): the popup opens after the modal mounted, so LIFO puts
-/// it on top by the same rule that makes nested modals work, with no precedence
-/// special case anywhere. It is available here because `is_open` is a signal
+/// it on top by the same rule that makes nested modals work, and the stack
+/// holds only open overlays. It is available here because `is_open` is a signal
 /// this component owns and writes, so the falling edge is observable; the three
-/// prop-driven overlays have no such edge to hang a release on and keep the
-/// simpler policy.
+/// prop-driven overlays keep the simpler policy, and the anchor orders them.
 ///
-/// `onclose` is invoked and the key is **consumed unconditionally**: the entry
-/// exists only while the overlay is open, so there is no closed state for it to
-/// decline in. The effect is idempotent — a `Signal::set` notifies on every
+/// `onclose` is invoked and the key is consumed **while `root` is rendered**
+/// ([`NodeHandle::is_rendered`]). The entry exists only while the overlay is
+/// open, so there is no closed state for it to decline in — but an ancestor
+/// can stop rendering the overlay without touching its open state: a `Modal`
+/// the app closes is `display: none` with its subtree still mounted, a closed
+/// `Drawer` or `Popover` is `visibility: hidden`. Such an entry declines, and
+/// the Escape reaches what is on screen (issue #802). It does not close the
+/// hidden overlay: the overlay is still open when its ancestor shows it again,
+/// and Escape closes it then. On desktop "rendered" is read from the styles of
+/// the last resolve, so a hide not yet laid out still consumes one Escape.
+///
+/// The effect is idempotent — a `Signal::set` notifies on every
 /// write, equal value or not — so a redundant `true` does not push a second
 /// entry.
 ///
@@ -105,7 +119,7 @@ pub fn arm_close_on_escape_while_open(
     is_open: ReactiveBool,
     onclose: Callback,
 ) {
-    let doc_key = root.doc_key();
+    let root = root.clone();
     let slot: Rc<RefCell<Option<DismissHandle>>> = Rc::new(RefCell::new(None));
 
     let slot_effect = slot.clone();
@@ -118,10 +132,64 @@ pub fn arm_close_on_escape_while_open(
         // line.
         if open && !held {
             let cb = onclose.clone();
-            let handle = rinch_core::push_dismiss_handler(doc_key, move || {
+            let shown = root.clone();
+            let handle = rinch_core::push_dismiss_handler_within(&root, move || {
+                // Open but not on screen: an ancestor stopped rendering the
+                // overlay without closing it (#802). Decline, so the key
+                // reaches what the user can see.
+                if !shown.is_rendered() {
+                    return false;
+                }
                 cb.invoke();
                 true
             });
+            *slot_effect.borrow_mut() = Some(handle);
+        } else if !open && held {
+            let released = slot_effect.borrow_mut().take();
+            drop(released);
+        }
+    });
+
+    scope.on_cleanup(move || {
+        let released = slot.borrow_mut().take();
+        drop(released);
+    });
+}
+
+/// Hand every key press to `on_key` **while `is_open`**, pushing a
+/// [`rinch_core::push_key_handler`] entry when the popup opens and releasing it
+/// when it closes — [`arm_close_on_escape_while_open`]'s policy, for a popup
+/// that owns the whole keyboard while it is open rather than only Escape
+/// (issue #434, the `Select` option list).
+///
+/// Two things keep the entry from swallowing keys that are not its own: it
+/// exists only while the popup is on screen, and it is offered a key only while
+/// the focus is inside `owner` (see [`rinch_core::push_key_handler`]). When
+/// focus leaves `owner`, `on_focus_leave` runs — a listbox closes there.
+///
+/// `on_key` answers `true` to consume. It should decline Escape and leave it
+/// to an [`arm_close_on_escape_while_open`] entry, so that "which overlay is on
+/// top" stays one question for the dismiss stack.
+pub fn arm_keys_while_open(
+    scope: &mut RenderScope,
+    owner: &NodeHandle,
+    is_open: ReactiveBool,
+    on_key: Rc<dyn Fn(&rinch_core::KeyEventData) -> bool>,
+    on_focus_leave: Rc<dyn Fn()>,
+) {
+    let owner = owner.clone();
+    let slot: Rc<RefCell<Option<DismissHandle>>> = Rc::new(RefCell::new(None));
+
+    let slot_effect = slot.clone();
+    scope.create_effect(move || {
+        let open = is_open();
+        let held = slot_effect.borrow().is_some();
+        // Every borrow ends on its own line — see
+        // `arm_close_on_escape_while_open`.
+        if open && !held {
+            let f = on_key.clone();
+            let leave = on_focus_leave.clone();
+            let handle = rinch_core::push_key_handler(&owner, move |k| f(k), move || leave());
             *slot_effect.borrow_mut() = Some(handle);
         } else if !open && held {
             let released = slot_effect.borrow_mut().take();

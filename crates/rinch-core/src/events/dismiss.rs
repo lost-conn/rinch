@@ -13,6 +13,17 @@
 //! open — pass it on), and the first `true` wins. Nesting then works by
 //! construction: the most recently mounted overlay is asked first.
 //!
+//! **Except where the DOM says otherwise** (issue #803). An entry may name the
+//! overlay's root ([`push_dismiss_handler_within`]; a key entry's owner counts
+//! too), and an entry whose root lies **inside** another entry's root is asked
+//! before it, wherever the two sit on the stack. Registration order alone is
+//! wrong for an overlay *written inside* another: a component renders after its
+//! children, so `Modal { Popover { … } }` pushes the popover's entry first and
+//! the modal's on top of it, and LIFO would close the whole dialog when the user
+//! pressed Escape at the popover. The DOM nesting is the truth about which one
+//! is in front; LIFO still orders everything the DOM does not relate (two
+//! sibling modals, a runtime popup, an entry with no root).
+//!
 //! ## The three rules, and why each is here
 //!
 //! - **The open check happens at dispatch, not at registration.** `Modal::render`
@@ -42,15 +53,67 @@
 //! interceptor and only for an Escape **press**. That placement is what makes
 //! this backend-agnostic: desktop and rinch-web both already call that function,
 //! and neither needed a line changed.
+//!
+//! ## Key handlers: a popup that owns the keyboard while it is open (#434)
+//!
+//! [`push_key_handler`] puts a second kind of entry on the **same** stack: one
+//! offered *every* key press, not only Escape. It is for a popup that owns the
+//! keyboard while it is open — the `Select` component's option list, whose
+//! arrows, Home/End, Enter and type-ahead arrive while the focus stays on the
+//! combobox trigger rather than moving into the list. It is pushed when the
+//! popup opens and released when it closes, so an entry is only ever on the
+//! stack while its popup is on screen.
+//!
+//! **Focus is part of the contract.** An entry names an *owner* node, and is
+//! offered a key only while the document's focused element
+//! ([`NodeHandle::active_element`]) is the owner or inside it. Focus can move
+//! while a popup is open — a "/" shortcut focusing a search box, a script, an
+//! `autofocus` — and the keys typed there belong to that field, not to the
+//! popup. An unknown focus (`None`: nothing focused, a backend that does not
+//! model focus, or, on rinch-web, an element outside the mounted root) is
+//! *not* inside any owner, so a key typed into a page `<input>` around a rinch
+//! island is never touched. And each backend calls [`notify_focus_moved`]
+//! after focus moves, which calls an entry's `on_focus_leave` once focus is
+//! no longer inside its owner — so the popup closes when focus leaves it, as a
+//! native `<select>` does, rather than at the next key. The window losing the
+//! keyboard is told apart ([`notify_window_blurred`], #1171): the focused
+//! element stays focused then, but a native `<select>`'s popup still closes,
+//! so every key entry's `on_focus_leave` runs.
+//!
+//! One stack rather than two because the two kinds share every rule above —
+//! liveness, the document check, LIFO — and a popup's own Escape is still a
+//! dismiss entry pushed beside it, so "which popup is on top" is answered once.
+//! Key handlers are asked **before** the dismiss scan, for presses only, and a
+//! key one declines goes on to the dismiss scan (for Escape) and then to the
+//! backend exactly as before.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::context::{current_dispatching_doc, doc_identity, doc_matches};
+use crate::dom::NodeHandle;
 use crate::reactive::{Owner, current_owner};
 
 /// A registered dismiss handler: `true` means "I consumed the key".
 type DismissFn = Rc<dyn Fn() -> bool>;
+
+/// A registered key handler ([`push_key_handler`]): `true` means "I consumed
+/// the key".
+type KeyFn = Rc<dyn Fn(&super::KeyEventData) -> bool>;
+
+/// A key entry's focus-leave callback ([`push_key_handler`]).
+type LeaveFn = Rc<dyn Fn()>;
+
+/// What an entry answers: Escape alone, or every key press.
+#[derive(Clone)]
+enum Handler {
+    Dismiss(DismissFn),
+    Keys {
+        owner: NodeHandle,
+        on_key: KeyFn,
+        on_focus_leave: LeaveFn,
+    },
+}
 
 struct Entry {
     id: u64,
@@ -59,12 +122,20 @@ struct Entry {
     doc: Option<u64>,
     /// The scope that was rendering when this was registered, if any.
     owner: Option<Owner>,
-    handler: DismissFn,
+    /// The overlay's root, when the registration named one: an entry whose
+    /// anchor is inside another's is asked first (#803). A key entry's owner.
+    anchor: Option<NodeHandle>,
+    handler: Handler,
+}
+
+crate::doc_keyed! {
+    /// Registration order, oldest first. Dispatch reads it backwards. A list,
+    /// swept by its entries' documents (#2797), because the order is the
+    /// order handlers are asked in.
+    static STACK: crate::DocList<Entry> = crate::DocList::new(|e| e.doc);
 }
 
 thread_local! {
-    /// Registration order, oldest first. Dispatch reads it backwards.
-    static STACK: RefCell<Vec<Entry>> = const { RefCell::new(Vec::new()) };
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
 }
 
@@ -77,7 +148,7 @@ thread_local! {
 /// usual home:
 ///
 /// ```ignore
-/// let handle = push_dismiss_handler(root.doc_key(), move || { … });
+/// let handle = push_dismiss_handler(root.doc_key(), move || { /* ... */ });
 /// __scope.on_cleanup(move || drop(handle));
 /// ```
 #[must_use = "the handler is released the instant this handle drops — store it for as long as \
@@ -113,6 +184,132 @@ impl Drop for DismissHandle {
 /// runs *inside* that scope (so a signal it creates belongs to the component)
 /// and stops being offered the key once the scope is disposed.
 pub fn push_dismiss_handler(doc_key: u64, f: impl Fn() -> bool + 'static) -> DismissHandle {
+    push(doc_key, None, Handler::Dismiss(Rc::new(f)))
+}
+
+/// [`push_dismiss_handler`] for an overlay whose root is `anchor`, in
+/// `anchor`'s document.
+///
+/// The anchor orders the entry by the DOM as well as by registration (issue
+/// #803): at dispatch, an entry whose anchor is a descendant of this one's is
+/// asked **before** this one, even when it was pushed earlier. That is what an
+/// overlay written inside another needs — `Modal { Popover { … } }` renders the
+/// popover first, so its entry sits *below* the modal's, and without the anchor
+/// the modal would answer the Escape meant for the popover in front of it.
+/// Entries the DOM does not relate keep the LIFO order.
+pub fn push_dismiss_handler_within(
+    anchor: &NodeHandle,
+    f: impl Fn() -> bool + 'static,
+) -> DismissHandle {
+    push(
+        anchor.doc_key(),
+        Some(anchor.clone()),
+        Handler::Dismiss(Rc::new(f)),
+    )
+}
+
+/// Push a **key** handler onto the top of the stack, for the document `owner`
+/// belongs to: one offered every key *press* (auto-repeat included, releases
+/// never) **while the focused element is `owner` or inside it**, ahead of the
+/// dismiss scan and of the backend's own key handling. `on_key` answers `true`
+/// to consume the key — on rinch-web that also `preventDefault`s it, so a
+/// consumed ArrowDown does not scroll the page.
+///
+/// This is for a popup that owns the keyboard **while it is open** (issue
+/// #434, the `Select` option list, whose focus stays on its trigger). Push it
+/// when the popup opens and drop the handle when it closes (and on unmount); an
+/// entry is never offered a key while focus is outside `owner`, so a key typed
+/// into another field goes to that field.
+///
+/// `on_focus_leave` is called when focus moves and is no longer inside
+/// `owner` — see [`notify_focus_moved`] — and when the window loses the
+/// keyboard, wherever the focus is — see [`notify_window_blurred`] (#1171). A
+/// popup that should close when focus leaves it (a listbox) closes there; pass
+/// `|| {}` for one that should not.
+///
+/// It is offered Escape like any key; a popup whose Escape is a dismiss entry
+/// should decline it and let the dismiss scan run.
+///
+/// Document, owner-scope and liveness rules are exactly
+/// [`push_dismiss_handler`]'s; the document is `owner`'s.
+pub fn push_key_handler(
+    owner: &NodeHandle,
+    on_key: impl Fn(&super::KeyEventData) -> bool + 'static,
+    on_focus_leave: impl Fn() + 'static,
+) -> DismissHandle {
+    push(
+        owner.doc_key(),
+        Some(owner.clone()),
+        Handler::Keys {
+            owner: owner.clone(),
+            on_key: Rc::new(on_key),
+            on_focus_leave: Rc::new(on_focus_leave),
+        },
+    )
+}
+
+/// Whether the focused element of `owner`'s document is `owner` or inside it.
+/// An unknown focus (`None`) is inside nothing.
+fn focus_within(owner: &NodeHandle) -> bool {
+    let Some(mut node) = owner.active_element() else {
+        return false;
+    };
+    loop {
+        if node.node_id() == owner.node_id() {
+            return true;
+        }
+        match node.parent_node() {
+            Some(parent) => node = parent,
+            None => return false,
+        }
+    }
+}
+
+/// Whether `node` is a strict descendant of `ancestor` (same document).
+fn strictly_inside(node: &NodeHandle, ancestor: &NodeHandle) -> bool {
+    if node.doc_key() != ancestor.doc_key() || node.node_id() == ancestor.node_id() {
+        return false;
+    }
+    let mut cur = node.parent_node();
+    while let Some(n) = cur {
+        if n.node_id() == ancestor.node_id() {
+            return true;
+        }
+        cur = n.parent_node();
+    }
+    false
+}
+
+/// Reorder a topmost-first list of anchors so that every entry comes after
+/// the entries whose anchors lie inside its own (#803), keeping the LIFO order
+/// otherwise. Returns indices into `anchors`.
+fn dom_order(anchors: &[Option<NodeHandle>]) -> Vec<usize> {
+    fn visit(i: usize, anchors: &[Option<NodeHandle>], seen: &mut [bool], out: &mut Vec<usize>) {
+        seen[i] = true;
+        if let Some(outer) = &anchors[i] {
+            for j in 0..anchors.len() {
+                if !seen[j]
+                    && anchors[j]
+                        .as_ref()
+                        .is_some_and(|a| strictly_inside(a, outer))
+                {
+                    visit(j, anchors, seen, out);
+                }
+            }
+        }
+        out.push(i);
+    }
+    let mut seen = vec![false; anchors.len()];
+    let mut out = Vec::with_capacity(anchors.len());
+    for i in 0..anchors.len() {
+        if !seen[i] {
+            visit(i, anchors, &mut seen, &mut out);
+        }
+    }
+    out
+}
+
+fn push(doc_key: u64, anchor: Option<NodeHandle>, handler: Handler) -> DismissHandle {
     let id = NEXT_ID.with(|n| {
         let id = n.get();
         n.set(id + 1);
@@ -122,9 +319,10 @@ pub fn push_dismiss_handler(doc_key: u64, f: impl Fn() -> bool + 'static) -> Dis
         id,
         doc: doc_identity(doc_key),
         owner: current_owner(),
-        handler: Rc::new(f),
+        anchor,
+        handler,
     };
-    STACK.with(|s| s.borrow_mut().push(entry));
+    STACK.with_mut(|s| s.push(entry));
     DismissHandle(id)
 }
 
@@ -155,34 +353,131 @@ pub fn push_dismiss_handler(doc_key: u64, f: impl Fn() -> bool + 'static) -> Dis
 /// the scan — but a handler that does real work on its `false` path should know
 /// the snapshot is not revalidated.
 pub fn dispatch_dismiss() -> bool {
-    let caller = current_dispatching_doc();
+    scan(false, None, |handler| match handler {
+        Handler::Dismiss(f) => f(),
+        Handler::Keys { .. } => false,
+    })
+}
+
+/// Offer a key press to the key handlers ([`push_key_handler`]), topmost first.
+/// Returns whether one consumed it. Dismiss entries, and key entries whose
+/// owner does not hold the focus, are passed over.
+pub(crate) fn dispatch_key_handlers(key: &super::KeyEventData) -> bool {
+    scan(true, None, |handler| match handler {
+        Handler::Keys { owner, on_key, .. } => focus_within(owner) && on_key(key),
+        Handler::Dismiss(_) => false,
+    })
+}
+
+/// Tell the key handlers ([`push_key_handler`]) that focus has moved in the
+/// document `doc_key` names: every live key entry of that document whose owner
+/// no longer holds the focus has its `on_focus_leave` called.
+///
+/// Called by each backend after a focus transition has completed — the
+/// desktop runtime after the focus arbiter's transition (with its blur work),
+/// rinch-web from its document `focusin`/`focusout` listeners — so that a popup
+/// closes when focus leaves it rather than at the next key. Every entry is
+/// visited (it is not a consume-and-stop scan), with no borrow of the stack
+/// held, since a callback typically closes its popup and so releases its entry.
+pub fn notify_focus_moved(doc_key: u64) {
+    scan(true, Some(doc_identity(doc_key)), |handler| {
+        if let Handler::Keys {
+            owner,
+            on_focus_leave,
+            ..
+        } = handler
+            && !focus_within(owner)
+        {
+            on_focus_leave();
+        }
+        false
+    });
+}
+
+/// Tell the key handlers ([`push_key_handler`]) of the document `doc_key`
+/// names that the **window** has lost the keyboard: every live key entry of
+/// that document has its `on_focus_leave` called, whether or not its owner
+/// still holds the document's focus (issue #1171).
+///
+/// A window blur is not a focus move inside the document: the focused element
+/// stays focused (desktop keeps the arbiter's claim, #147/#226; a browser
+/// leaves `document.activeElement` alone), so [`notify_focus_moved`] closes
+/// nothing for it. But a popup that owns the keyboard while it is open — a
+/// native `<select>`'s list, Mantine's `Select` dropdown — closes when the
+/// window loses focus, and so does one built on a key entry. Called by the
+/// desktop runtime from `PlatformEvent::WindowFocus(false)` and by rinch-web
+/// from a `window` `blur`. Nothing is called when the window comes back.
+pub fn notify_window_blurred(doc_key: u64) {
+    scan(true, Some(doc_identity(doc_key)), |handler| {
+        if let Handler::Keys { on_focus_leave, .. } = handler {
+            on_focus_leave();
+        }
+        false
+    });
+}
+
+/// The scan both dispatches share: topmost first, dead owners pruned, other
+/// documents skipped, and only entries of one kind (`keys`) asked. `doc`
+/// overrides the dispatching document the entries are matched against.
+fn scan(keys: bool, doc: Option<Option<u64>>, ask: impl Fn(&Handler) -> bool) -> bool {
+    let caller = doc.unwrap_or_else(current_dispatching_doc);
 
     // Snapshot topmost-first. Cloning the `Rc`s is what lets user code run
     // outside the borrow; the ids let us prune afterwards even though the stack
-    // may have been rearranged in the meantime.
-    let candidates: Vec<(u64, Option<u64>, Option<Owner>, DismissFn)> = STACK.with(|s| {
-        s.borrow()
-            .iter()
-            .rev()
-            .map(|e| (e.id, e.doc, e.owner.clone(), e.handler.clone()))
-            .collect()
-    });
-
+    // may have been rearranged in the meantime. Only the entries this scan can
+    // ask are kept — the right kind, this document, a live owner — so the
+    // reorder below runs over those alone; dead ones are noted for the prune.
+    type Candidate = (u64, Option<Owner>, Handler);
     let mut dead: Vec<u64> = Vec::new();
+    let (snapshot, anchors): (Vec<Candidate>, Vec<Option<NodeHandle>>) = STACK.with(|s| {
+        s.iter()
+            .rev()
+            .filter(|e| {
+                // A disposed component's handler reads freed signals — never
+                // run it.
+                if e.owner.as_ref().is_some_and(|o| !o.is_alive()) {
+                    dead.push(e.id);
+                    return false;
+                }
+                // An entry of the other kind, or of another document, is not
+                // asked.
+                doc_matches(e.doc, caller) && matches!(e.handler, Handler::Keys { .. }) == keys
+            })
+            .map(|e| ((e.id, e.owner.clone(), e.handler.clone()), e.anchor.clone()))
+            .unzip()
+    });
+    // The DOM nesting goes ahead of the registration order (#803). Read before
+    // any handler runs: a handler may close and detach its overlay. One entry
+    // has nothing to reorder (the common case: the walk is O(n² × depth)).
+    let candidates: Vec<Candidate> = if snapshot.len() <= 1 {
+        snapshot
+    } else {
+        let mut snapshot: Vec<Option<Candidate>> = snapshot.into_iter().map(Some).collect();
+        dom_order(&anchors)
+            .into_iter()
+            .filter_map(|i| snapshot[i].take())
+            .collect()
+    };
+
     let mut consumed = false;
-    for (id, doc, owner, handler) in candidates {
-        // A disposed component's handler reads freed signals — never run it.
+    for (id, owner, handler) in candidates {
+        // An earlier handler of this scan may have disposed this one's owner.
         if owner.as_ref().is_some_and(|o| !o.is_alive()) {
             dead.push(id);
             continue;
         }
-        if !doc_matches(doc, caller) {
-            continue;
-        }
-        let took = match &owner {
-            Some(o) => o.run(|| handler()),
-            None => handler(),
-        };
+        // A transaction for the handler (`crate::reactive::batch`). From the
+        // Escape path this joins the one `dispatch_keyboard_event` opened; it
+        // is a transaction of its own only for a direct `dispatch_dismiss`
+        // (Android Back). Untracked (#931): `dispatch_dismiss` is public, so it
+        // can be called from inside an effect, and a handler's reads (an
+        // overlay's `opened_fn`) must not subscribe that effect.
+        let took = crate::reactive::batch(|| {
+            crate::reactive::untracked_handler(|| match &owner {
+                Some(o) => o.run(|| ask(&handler)),
+                None => ask(&handler),
+            })
+        });
         if took {
             consumed = true;
             break;
@@ -192,10 +487,7 @@ pub fn dispatch_dismiss() -> bool {
     // Prune what we found dead. Entries are moved out and dropped *after* the
     // borrow ends: a handler is arbitrary user state whose `Drop` may re-enter.
     if !dead.is_empty() {
-        let reaped = STACK.with(|s| {
-            let Ok(mut stack) = s.try_borrow_mut() else {
-                return Vec::new();
-            };
+        let reaped = STACK.try_with_mut(|stack| {
             let mut out = Vec::new();
             let mut i = 0;
             while i < stack.len() {
@@ -220,30 +512,32 @@ pub fn dispatch_dismiss() -> bool {
 /// `try_borrow_mut` because this runs from [`DismissHandle`]'s `Drop`, which a
 /// panic can drive while the stack is already borrowed.
 fn remove(id: u64) {
-    let reaped = STACK.with(|s| {
-        let Ok(mut stack) = s.try_borrow_mut() else {
-            // Unreachable today: every mutable borrow of `STACK` either runs no
-            // user code under it (`push`) or moves entries out rather than
-            // dropping them under it (the prune). Said out loud anyway, because
-            // failing here leaves a *released* handler in the stack, still
-            // answering Escape, and a silent no-op in a release path is the
-            // family this codebase keeps being bitten by.
-            debug_assert!(false, "dismiss stack borrowed while releasing entry {id}");
-            tracing::warn!("dismiss stack borrowed while releasing entry {id}; entry leaked");
-            return None;
-        };
+    // `try_with`: a handle held in another thread-local (a component's drag
+    // state) can be dropped at thread exit, after the stack is gone; there is
+    // nothing left to release then (#2091).
+    let reaped = STACK.try_with_mut(|stack| {
         stack
             .iter()
             .position(|e| e.id == id)
             .map(|i| stack.remove(i))
     });
-    drop(reaped);
+    if reaped.is_none() && STACK.is_borrowed() {
+        // Unreachable today: every mutable borrow of `STACK` either runs no
+        // user code under it (`push`) or moves entries out rather than
+        // dropping them under it (the prune). Said out loud anyway, because
+        // failing here leaves a *released* handler in the stack, still
+        // answering Escape, and a silent no-op in a release path is the
+        // family this codebase keeps being bitten by.
+        debug_assert!(false, "dismiss stack borrowed while releasing entry {id}");
+        tracing::warn!("dismiss stack borrowed while releasing entry {id}; entry leaked");
+    }
+    drop(reaped.flatten());
 }
 
 /// How many handlers are registered on this thread. Diagnostics and tests only.
 #[doc(hidden)]
 pub fn dismiss_handler_count() -> usize {
-    STACK.with(|s| s.borrow().len())
+    STACK.with(|s| s.len())
 }
 
 #[cfg(test)]
@@ -251,13 +545,13 @@ mod tests {
     use super::*;
     use crate::context::push_dispatching_doc;
     use crate::reactive::{Scope, Signal};
-    use std::cell::Cell as StdCell;
+    use std::cell::{Cell as StdCell, RefCell};
 
     /// Every test shares one thread-local stack, and `cargo test` reuses
     /// threads. Start from empty so an earlier test's leaked handle cannot
     /// answer this one's Escape.
     fn clear_stack() {
-        let reaped = STACK.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        let reaped = STACK.with_mut(|s| std::mem::take(&mut **s));
         drop(reaped);
     }
 
@@ -450,7 +744,7 @@ mod tests {
 
     /// Both halves of the permissive rule: a handler registered with no document
     /// serves every document (a headless host, a test), and a dispatch with no
-    /// document reaches every handler (rinch-web, which never marks dispatch).
+    /// document reaches every handler (rinch-web's key on no root, #2811).
     #[test]
     fn a_document_less_registration_or_dispatch_stays_permissive() {
         clear_stack();
@@ -509,5 +803,263 @@ mod tests {
         drop(first);
         drop(slot);
         assert_eq!(dismiss_handler_count(), 0);
+    }
+
+    // ------------------------------------------------ key handlers (#434)
+
+    use crate::dom::mock::MockDomDocument;
+    use crate::dom::{DomDocument, NodeHandle};
+    use crate::events::{KeyEventData, KeyEventKind, dispatch_keyboard_event};
+
+    fn press(key: &str) -> KeyEventData {
+        KeyEventData::new(key, key)
+    }
+
+    /// A mock document holding `body > owner > inner` and `body > other`, with
+    /// `inner` focused — the shape of a combobox (owner = the component root,
+    /// inner = its trigger) beside another field.
+    struct Doc {
+        _doc: Rc<RefCell<MockDomDocument>>,
+        owner: NodeHandle,
+        inner: NodeHandle,
+        other: NodeHandle,
+    }
+
+    fn doc() -> Doc {
+        let doc = Rc::new(RefCell::new(MockDomDocument::new()));
+        let dyn_doc: Rc<RefCell<dyn DomDocument>> = doc.clone();
+        let weak = Rc::downgrade(&dyn_doc);
+        let (owner, inner, other) = {
+            let mut d = doc.borrow_mut();
+            let body = d.body();
+            let owner = d.create_element("div");
+            let inner = d.create_element("div");
+            let other = d.create_element("input");
+            d.append_child(body, owner);
+            d.append_child(owner, inner);
+            d.append_child(body, other);
+            (owner, inner, other)
+        };
+        let h = |id| NodeHandle::new(id, weak.clone());
+        let doc_out = Doc {
+            owner: h(owner),
+            inner: h(inner),
+            other: h(other),
+            _doc: doc,
+        };
+        doc_out.inner.focus();
+        doc_out
+    }
+
+    /// **#803.** An entry anchored *inside* another entry's anchor is asked
+    /// first, even though it was pushed first — `Modal { Popover { … } }`
+    /// renders, and registers, the popover before the modal. Both are open, so
+    /// the fixture counts which one answered: "something closed" passes
+    /// against LIFO too. A third, unrelated entry pushed later (`other`, a
+    /// sibling) still goes first: the DOM order replaces LIFO only between
+    /// entries it relates.
+    #[test]
+    fn an_entry_anchored_inside_another_is_asked_before_it_whatever_the_push_order() {
+        clear_stack();
+        let d = doc();
+        let (inner_hits, inner_f) = recorder(true);
+        let (outer_hits, outer_f) = recorder(true);
+        let _inner = push_dismiss_handler_within(&d.inner, inner_f);
+        let _outer = push_dismiss_handler_within(&d.owner, outer_f);
+
+        assert!(dispatch_dismiss());
+        assert_eq!(inner_hits.get(), 1, "the overlay inside answers Escape");
+        assert_eq!(outer_hits.get(), 0, "and the one around it does not");
+
+        // An unrelated entry pushed later keeps LIFO's place on top.
+        let (other_hits, other_f) = recorder(true);
+        let _other = push_dismiss_handler_within(&d.other, other_f);
+        assert!(dispatch_dismiss());
+        assert_eq!(other_hits.get(), 1, "the later, unrelated entry goes first");
+        assert_eq!(inner_hits.get(), 1);
+        assert_eq!(outer_hits.get(), 0);
+    }
+
+    /// The reorder is transitive and leaves equal anchors in LIFO order.
+    #[test]
+    fn dom_order_puts_descendants_first_and_keeps_lifo_otherwise() {
+        let d = doc();
+        // Topmost first: owner, other, inner, owner(again).
+        let anchors = vec![
+            Some(d.owner.clone()),
+            Some(d.other.clone()),
+            Some(d.inner.clone()),
+            None,
+            Some(d.owner.clone()),
+        ];
+        assert_eq!(dom_order(&anchors), vec![2, 0, 1, 3, 4]);
+    }
+
+    /// A key handler hears presses — any key, not just Escape — and never a
+    /// release; a dismiss entry never hears a non-Escape key.
+    #[test]
+    fn a_key_handler_is_offered_every_press_and_no_release() {
+        clear_stack();
+        let d = doc();
+        let seen = Rc::new(RefCell::new(Vec::<String>::new()));
+        let s = seen.clone();
+        let (dismiss_hits, dismiss) = recorder(true);
+        let _d = push_dismiss_handler(0, dismiss);
+        let _k = push_key_handler(
+            &d.owner,
+            move |k| {
+                s.borrow_mut().push(k.key.clone());
+                k.key == "ArrowDown"
+            },
+            || {},
+        );
+
+        assert!(dispatch_keyboard_event(&press("ArrowDown")));
+        assert!(
+            !dispatch_keyboard_event(&press("x")),
+            "declined: not consumed"
+        );
+        assert!(!dispatch_keyboard_event(
+            &press("ArrowDown").with_kind(KeyEventKind::Up)
+        ));
+        assert_eq!(*seen.borrow(), ["ArrowDown", "x"], "no release reached it");
+        assert_eq!(dismiss_hits.get(), 0, "a dismiss entry hears only Escape");
+
+        // Escape: offered to the key handler, declined, then dismissed.
+        assert!(dispatch_keyboard_event(&press("Escape")));
+        assert_eq!(seen.borrow().last().map(String::as_str), Some("Escape"));
+        assert_eq!(dismiss_hits.get(), 1);
+    }
+
+    /// LIFO among key handlers, and a released one is asked nothing.
+    #[test]
+    fn key_handlers_are_topmost_first_and_released_on_drop() {
+        clear_stack();
+        let d = doc();
+        let below = Rc::new(StdCell::new(0u32));
+        let b = below.clone();
+        let _below = push_key_handler(
+            &d.owner,
+            move |_| {
+                b.set(b.get() + 1);
+                true
+            },
+            || {},
+        );
+        let above = push_key_handler(&d.owner, |_| true, || {});
+        assert!(dispatch_keyboard_event(&press("ArrowUp")));
+        assert_eq!(below.get(), 0, "the topmost consumed first");
+        drop(above);
+        assert!(dispatch_keyboard_event(&press("ArrowUp")));
+        assert_eq!(below.get(), 1);
+    }
+
+    /// A key handler whose component was disposed is never run.
+    #[test]
+    fn a_dead_owners_key_handler_is_not_run() {
+        clear_stack();
+        let d = doc();
+        let ran = Rc::new(StdCell::new(false));
+        let r = ran.clone();
+        let scope = Scope::new();
+        let handle = scope.run(|| {
+            push_key_handler(
+                &d.owner,
+                move |_| {
+                    r.set(true);
+                    true
+                },
+                || {},
+            )
+        });
+        scope.dispose();
+        assert!(!dispatch_keyboard_event(&press("ArrowDown")));
+        assert!(!ran.get());
+        drop(handle);
+    }
+
+    /// The review of PR #1165: an open popup took every key in the document.
+    /// A key entry is offered keys only while the focus is inside its owner —
+    /// the owner itself or a descendant — and never while focus is elsewhere
+    /// or unknown.
+    #[test]
+    fn a_key_handler_is_offered_keys_only_while_focus_is_inside_its_owner() {
+        clear_stack();
+        let d = doc();
+        let hits = Rc::new(StdCell::new(0u32));
+        let h = hits.clone();
+        let _k = push_key_handler(
+            &d.owner,
+            move |_| {
+                h.set(h.get() + 1);
+                true
+            },
+            || {},
+        );
+
+        assert!(
+            dispatch_keyboard_event(&press("a")),
+            "focus on a descendant"
+        );
+        d.owner.focus();
+        assert!(dispatch_keyboard_event(&press("a")), "focus on the owner");
+        assert_eq!(hits.get(), 2);
+
+        d.other.focus();
+        assert!(
+            !dispatch_keyboard_event(&press("a")),
+            "focus on another field: its key is not the popup's"
+        );
+        assert_eq!(hits.get(), 2, "and the handler is not even asked");
+    }
+
+    /// `notify_focus_moved` calls `on_focus_leave` for an entry whose owner no
+    /// longer holds the focus, and not for one whose owner still does.
+    #[test]
+    fn notify_focus_moved_calls_on_focus_leave_only_when_focus_left() {
+        clear_stack();
+        let d = doc();
+        let left = Rc::new(StdCell::new(0u32));
+        let l = left.clone();
+        let _k = push_key_handler(&d.owner, |_| true, move || l.set(l.get() + 1));
+
+        d.owner.focus();
+        notify_focus_moved(d.owner.doc_key());
+        assert_eq!(left.get(), 0, "focus moved within the owner");
+
+        d.other.focus();
+        notify_focus_moved(d.owner.doc_key());
+        assert_eq!(left.get(), 1, "focus left the owner");
+    }
+
+    /// `notify_window_blurred` calls `on_focus_leave` for a key entry whose
+    /// owner still holds the focus (#1171), where `notify_focus_moved` does
+    /// not; a dismiss entry is not asked, and an entry of another document is
+    /// left alone.
+    #[test]
+    fn notify_window_blurred_calls_on_focus_leave_while_focus_stays_1171() {
+        clear_stack();
+        let d = doc();
+        let left = Rc::new(StdCell::new(0u32));
+        let l = left.clone();
+        let _k = push_key_handler(&d.owner, |_| true, move || l.set(l.get() + 1));
+        let dismissed = Rc::new(StdCell::new(0u32));
+        let dm = dismissed.clone();
+        let _e = push_dismiss_handler(d.owner.doc_key(), move || {
+            dm.set(dm.get() + 1);
+            true
+        });
+
+        d.owner.focus();
+        notify_focus_moved(d.owner.doc_key());
+        assert_eq!(left.get(), 0, "control: focus is still in the owner");
+
+        let other = doc();
+        notify_window_blurred(other.owner.doc_key());
+        assert_eq!(left.get(), 0, "another document's window blur");
+
+        notify_window_blurred(d.owner.doc_key());
+        assert_eq!(left.get(), 1, "the window lost the keyboard");
+        assert_eq!(dismissed.get(), 0, "a dismiss entry is not asked");
     }
 }

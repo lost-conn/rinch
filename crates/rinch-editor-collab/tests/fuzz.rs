@@ -1,7 +1,8 @@
 //! Seeded, deterministic fuzz/property tests for the collab adapter.
 //!
-//! Two invariants are stress-tested over thousands of random edits, spanning both
-//! flat text-blocks and list containers (nested to depth 3 in practice):
+//! Two invariants are stress-tested over thousands of random edits, spanning flat
+//! text-blocks, the containers (lists and quotes, nested to depth 3 in practice) and
+//! tables:
 //!
 //! 1. **`model ≡ project(model)`** — after EVERY local edit, the CRDT must read
 //!    back (`projected_doc`) as *exactly* the editor model that produced it. This is
@@ -10,7 +11,8 @@
 //! 2. **Convergence** — N peers make concurrent random edits and relay their
 //!    incremental deltas (interleaved, FIFO so a change's deps always precede it).
 //!    Once every peer has seen every delta, all peers must project to the *identical*
-//!    document. This is the exact incremental-delta path pimble / `EditorHandle` use.
+//!    document, and one whose block structure the schema allows (`schema_valid`).
+//!    This is the exact incremental-delta path pimble / `EditorHandle` use.
 //!
 //! A trial is **replayable bit-for-bit** from its `(seed, peers, rounds)` triple
 //! (issue #214). Two things have to be pinned for that, not one. The **edit script**
@@ -33,7 +35,11 @@ use std::rc::Rc;
 use rinch_editor_collab::CollabSession;
 use rinch_editor_collab::testing::{session_from_bytes_with_client_id, session_with_client_id};
 use rinch_editor_core::model::Fragment;
-use rinch_editor_core::{EditorState, Node, Pos, Schema, Selection, Slice, default_plugins};
+use rinch_editor_core::{
+    AttrValue, Attrs, EditorState, Node, Pos, Schema, Selection, SetNodeAttrStep, Slice,
+    default_plugins,
+};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// xorshift64* — tiny, deterministic, no deps.
 struct Rng(u64);
@@ -111,14 +117,27 @@ fn random_text(rng: &mut Rng) -> String {
 /// Apply one random *projectable* edit to `state` — insert / delete / mark / split /
 /// block-type, plus the list container ops (wrap, unwrap, indent, outdent). Returns
 /// `None` (skip) when the random selection makes the op invalid; the fuzz tolerates
-/// skips. Stays inside the projected scope (no task lists, blockquotes or tables), so
+/// skips. Stays inside the projected scope (no task lists), so
 /// `record_local` never hits the A22 `Unsupported` boundary — a failure here is a real
 /// projection bug, not an out-of-scope node. **Inline atoms are in scope** and are
 /// generated deliberately: they are one char of a block's text carrying a reserved
 /// formatting attribute, so every text splice and mark resync in the projection now has
 /// to carry them, and only random interleaving exercises that at the boundaries.
-fn random_edit(rng: &mut Rng, state: &EditorState) -> Option<EditorState> {
-    match rng.below(11) {
+/// `images` also lets the inline-atom op insert an `image`; see that arm for why only
+/// the convergence-only trial (`fuzz_with_images_converges`) passes `true`.
+///
+/// An edit that leaves a table that does not tile its grid (a ragged row) is dropped:
+/// the projection refuses one, as it should, and the edits that make one here are not
+/// ones the editor's UI makes. A raw `tr.delete` across rows is one (`deleteSelection`
+/// refuses that selection). `splitBlock` with the caret at a gap inside a cell was the
+/// other until #1232, when it split the cell; it refuses there now.
+fn random_edit(rng: &mut Rng, state: &EditorState, images: bool) -> Option<EditorState> {
+    let next = random_edit_unchecked(rng, state, images)?;
+    tables_tile(&next.doc).then_some(next)
+}
+
+fn random_edit_unchecked(rng: &mut Rng, state: &EditorState, images: bool) -> Option<EditorState> {
+    match rng.below(16) {
         // Insert text (weighted — the common case).
         0..=3 => {
             let p = random_pos(rng, state);
@@ -167,7 +186,7 @@ fn random_edit(rng: &mut Rng, state: &EditorState) -> Option<EditorState> {
         // a textblock: an inline node between two blocks is not a shape the model can
         // place, and generating one would (correctly) fail the projection assertion
         // below rather than find a real bug.
-        7 => {
+        11 => {
             let p = random_pos(rng, state);
             let parent_is_textblock = state
                 .doc
@@ -177,22 +196,64 @@ fn random_edit(rng: &mut Rng, state: &EditorState) -> Option<EditorState> {
             if !parent_is_textblock {
                 return None;
             }
-            // `hard_break`, never `image` — **not** because an image is out of scope
-            // (it is not; the projection tests round-trip one with all three attrs)
-            // but because it would break `replaying_a_trial_is_byte_identical` for a
-            // reason that has nothing to do with atoms. A mark value carrying two or
-            // more attrs is an `Any::Map`, and yrs encodes one by iterating a
-            // `HashMap`, whose order is seeded per instance — so `{"@type":"image",
-            // "src":…}` serializes in either order from one run to the next. An
-            // attr-less atom's value is a single-key map, which has only one order.
-            // The same latent non-determinism is reachable today through a `link`
-            // mark's `href`+`title`, which this fuzz also never generates; fixing it
-            // means changing the wire encoding of every mark value, which is a
-            // format bump and a separate change.
-            let atom = state
-                .schema()
-                .branch("hard_break", Fragment::empty())
-                .ok()?;
+            // A `hard_break` by default, and an `image` only when `images` is set — **not**
+            // because an image is out of scope (it is not; the projection tests round-trip
+            // one with all three attrs). It used to break
+            // `replaying_a_trial_is_byte_identical` (issue #841): a mark value carrying two
+            // or more attrs is an `Any::Map`, and yrs encodes one by iterating a `HashMap`,
+            // whose order is seeded per instance, so `{"@type":"image","src":…}`
+            // serializes in either order from one run to the next. Since #1851 every
+            // atom's value has two keys or more (`@for`, its own char), a hard break's
+            // too, and the replay compares a canonical form instead ([`canonical`]).
+            //
+            // Images are fuzzed in their own trial, which asserts convergence. Two `src`
+            // values, so that adjacent images are sometimes identical and sometimes not.
+            // In the image trial, most of these change an attr of an image already
+            // in the document instead: every per-attribute write, against the peers'
+            // splits, joins and deletions around it.
+            if images && rng.chance(70) {
+                let mut found = Vec::new();
+                state
+                    .doc
+                    .nodes_between(0, state.doc.content_size(), &mut |n, pos, _| {
+                        if n.type_name() == "image" {
+                            found.push(pos);
+                        }
+                        true
+                    });
+                if !found.is_empty() {
+                    let at = found[rng.below(found.len())];
+                    let attr = ["alt", "title", "src"][rng.below(3)];
+                    let value = format!("{attr}{}", rng.below(4));
+                    let mut tr = state.tr();
+                    tr.step(Box::new(SetNodeAttrStep::new(
+                        at,
+                        attr,
+                        AttrValue::from(value.as_str()),
+                    )))
+                    .ok()?;
+                    IMAGE_ATTRS_SET.fetch_add(1, Ordering::Relaxed);
+                    return Some(state.apply(tr));
+                }
+            }
+            let atom = if images && rng.chance(50) {
+                IMAGES_INSERTED.fetch_add(1, Ordering::Relaxed);
+                state
+                    .schema()
+                    .create_node(
+                        "image",
+                        Attrs::new()
+                            .with("src", AttrValue::from(["a.png", "b.png"][rng.below(2)]))
+                            .with("alt", AttrValue::from("x")),
+                        Fragment::empty(),
+                    )
+                    .ok()?
+            } else {
+                state
+                    .schema()
+                    .branch("hard_break", Fragment::empty())
+                    .ok()?
+            };
             let mut tr = state.tr();
             tr.replace(p.0, p.0, Slice::new(Fragment::from_node(atom), 0, 0))
                 .ok()?;
@@ -201,9 +262,9 @@ fn random_edit(rng: &mut Rng, state: &EditorState) -> Option<EditorState> {
         // Wrap/unwrap the block in a list, and nest/un-nest list items. These are the
         // container operations — they are what makes the projection recursive, so the
         // fuzz has to produce them or list convergence goes untested. Only the
-        // projectable containers appear here: task lists and blockquotes are still
-        // `Unsupported`, and generating one would (correctly) fail the projection
-        // assertion below rather than find a real bug.
+        // projectable containers appear here (lists, and quotes and tables in their own
+        // arms): task lists are still `Unsupported`, and generating one would
+        // (correctly) fail the projection assertion below rather than find a real bug.
         9 => {
             let p = random_pos(rng, state);
             let mut tr = state.tr();
@@ -211,6 +272,42 @@ fn random_edit(rng: &mut Rng, state: &EditorState) -> Option<EditorState> {
             let placed = state.apply(tr);
             let cmd = ["toggleBulletList", "toggleOrderedList"][rng.below(2)];
             placed.run(cmd)
+        }
+        // Wrap the block in a quote. Its way out is the lift in the next arm, which
+        // lifts a block out of whatever wraps it, a quote or a list.
+        12 => {
+            let p = random_pos(rng, state);
+            let mut tr = state.tr();
+            tr.set_selection(Selection::cursor(p));
+            let next = state.apply(tr).run("wrapInBlockquote")?;
+            QUOTES_WRAPPED.fetch_add(1, Ordering::Relaxed);
+            Some(next)
+        }
+        // Tables: insert one, or change the structure of the one the caret is in.
+        // Typing, splitting, wrapping and deleting inside cells come from the other
+        // arms, whose random positions land in cells as anywhere else.
+        13 | 14 => {
+            let p = random_pos(rng, state);
+            if EXTRA_TABLE_OPS.with(|x| x.get())
+                && let Some(next) = extra_table_op(rng, state, p)
+            {
+                TABLE_EDITS.with(|c| c.set(c.get() + 1));
+                return Some(next);
+            }
+            let mut tr = state.tr();
+            tr.set_selection(Selection::cursor(p));
+            let placed = state.apply(tr);
+            let cmd = [
+                "insertTable",
+                "addRowAfter",
+                "addColumnBefore",
+                "deleteRow",
+                "deleteColumn",
+                "splitCell",
+            ][rng.below(6)];
+            let next = placed.run(cmd)?;
+            TABLE_EDITS.with(|c| c.set(c.get() + 1));
+            Some(next)
         }
         // Indent / outdent a list item (creates and collapses nesting depth).
         10 => {
@@ -220,6 +317,30 @@ fn random_edit(rng: &mut Rng, state: &EditorState) -> Option<EditorState> {
             let placed = state.apply(tr);
             let cmd = ["sinkListItem", "liftListItem"][rng.below(2)];
             placed.run(cmd)
+        }
+        // A scene break (review of #836) — the command, or a whole textblock replaced
+        // by a rule (the `---` input rule's shape).
+        7 => {
+            let p = random_pos(rng, state);
+            let mut tr = state.tr();
+            tr.set_selection(Selection::cursor(p));
+            state.apply(tr).run("insertHorizontalRule")
+        }
+        8 => {
+            let p = random_pos(rng, state);
+            let r = state.doc.resolve(p).ok()?;
+            if !r.parent().is_textblock() {
+                return None;
+            }
+            let d = r.depth();
+            let (start, end) = (r.before(d)?, r.after(d)?);
+            let hr = state
+                .schema()
+                .create_node("horizontal_rule", Default::default(), Fragment::empty())
+                .ok()?;
+            let mut tr = state.tr();
+            tr.replace_with(start, end, Fragment::from_node(hr)).ok()?;
+            Some(state.apply(tr))
         }
         // Set the block type (paragraph / heading / code_block — all flat).
         _ => {
@@ -239,9 +360,74 @@ fn random_edit(rng: &mut Rng, state: &EditorState) -> Option<EditorState> {
     }
 }
 
+/// Whether every table in `node` tiles its grid: each slot covered by exactly one cell.
+fn tables_tile(node: &Node) -> bool {
+    if node.type_name() == "table" {
+        let width = rinch_editor_core::tables::column_count(node);
+        let height = node.child_count();
+        let mut taken = vec![false; width * height];
+        for r in 0..height {
+            let row = node.child(r);
+            let mut c = 0;
+            for k in 0..row.child_count() {
+                while c < width && taken[r * width + c] {
+                    c += 1;
+                }
+                let cell = row.child(k);
+                let cs = cell.attrs().get_int("colspan").unwrap_or(1).max(1) as usize;
+                let rs = cell.attrs().get_int("rowspan").unwrap_or(1).max(1) as usize;
+                if c + cs > width || r + rs > height {
+                    return false;
+                }
+                for rr in r..r + rs {
+                    for cc in c..c + cs {
+                        if std::mem::replace(&mut taken[rr * width + cc], true) {
+                            return false;
+                        }
+                    }
+                }
+                c += cs;
+            }
+        }
+        if width == 0 || taken.iter().any(|t| !t) {
+            return false;
+        }
+    }
+    (0..node.child_count()).all(|i| tables_tile(node.child(i)))
+}
+
 /// The canonical "two docs are the same model" check.
 fn same(a: &Node, b: &Node) -> bool {
     a == b
+}
+
+/// Whether every node's children satisfy its schema content expression, and every
+/// child carries only marks its parent allows: a converged document must be one a model
+/// can hold, not merely the same on every peer. (Two peers each deleting one of a
+/// container's two children used to converge on an empty list, which none can; a code
+/// block retyped while a peer formats it used to converge on marks and a hard break
+/// inside `<pre>`, #1227.)
+fn schema_valid(node: &Node) -> bool {
+    schema_valid_in(&Schema::starter_kit(), node)
+}
+
+fn schema_valid_in(schema: &Schema, node: &Node) -> bool {
+    if node.is_text() {
+        return true;
+    }
+    let names: Vec<&str> = (0..node.child_count())
+        .map(|i| node.child(i).type_name())
+        .collect();
+    node.node_type().content_match().matches(&names)
+        && (node.type_name() != "table" || tables_tile(node))
+        && (0..node.child_count()).all(|i| {
+            let child = node.child(i);
+            child
+                .marks()
+                .iter()
+                .all(|m| schema.allows_mark(node.type_name(), m.type_name()))
+                && schema_valid_in(schema, child)
+        })
 }
 
 /// N peers sharing one CRDT lineage, plus the global delta queue and each peer's
@@ -258,6 +444,146 @@ struct Swarm {
     seen: Vec<usize>,
     /// Local edits projected so far (a trial that made none proves nothing).
     edits: usize,
+    /// Whether [`random_edit`] may insert images (see its inline-atom arm).
+    images: bool,
+    /// Percent of local edits that are an undo or a redo instead (#1249): `0` in every
+    /// trial but [`fuzz_undo_and_redo_among_remote_changes`], so the others' random
+    /// streams are what they were.
+    undo_percent: u64,
+    /// How deltas reach the peers ([`Delivery`]), from a random stream of its own.
+    delivery: Delivery,
+    delivery_rng: Rng,
+    /// `got[q][i]`: whether peer `q` has integrated `queue[i]` (out-of-order delivery).
+    got: Vec<Vec<bool>>,
+    /// Integrates that failed transiently while delivery was out of order.
+    transient_errors: u64,
+}
+
+thread_local! {
+    /// Undos and redos that applied and changed the document, on this thread (a
+    /// test's own: the tests of this binary run in parallel) — the positive
+    /// control for [`fuzz_undo_and_redo_among_remote_changes`].
+    static HISTORY_EDITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Images inserted by [`random_edit`] across the whole test binary — the positive
+/// control that the image trial generated any.
+static IMAGES_INSERTED: AtomicUsize = AtomicUsize::new(0);
+/// How many image attr changes [`random_edit`] has made, for the same control.
+static IMAGE_ATTRS_SET: AtomicUsize = AtomicUsize::new(0);
+
+/// Blocks wrapped in a quote by [`random_edit`] — the positive control that the trials
+/// exercise quotes at all.
+static QUOTES_WRAPPED: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// Table commands applied by [`random_edit`] on this thread — the positive
+    /// control for tables.
+    static TABLE_EDITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    /// Undos and redos whose tables [`assert_tables_tile`] checked (#1937), on
+    /// this thread.
+    static UNDOS_CHECKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Panic unless every table of `doc` tiles its grid, after peer `p`'s `cmd`.
+fn assert_tables_tile(doc: &Node, seed: u64, p: usize, cmd: &str) {
+    doc.nodes_between(0, doc.content_size(), &mut |n: &Node, at, _| {
+        if n.type_name() == "table" {
+            let problems = rinch_editor_core::tables::table_problems(n);
+            assert!(
+                problems.is_empty(),
+                "a {cmd} left the table at {at} ragged (seed={seed}, peer={p}): {problems:?}"
+            );
+        }
+        true
+    });
+}
+
+thread_local! {
+    /// Whether [`random_edit`]'s table arm also merges cells, sets a cell attribute and
+    /// swaps two rows ([`extra_table_op`]): changes of a table's grid and of a cell's
+    /// own keys, which a table's cell index must not be carried through (review of
+    /// #1926). Off in the older trials, so their random streams are what they were.
+    static EXTRA_TABLE_OPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One of the table changes [`EXTRA_TABLE_OPS`] adds, around position `p`, or `None`
+/// (then the table arm runs a command as before).
+fn extra_table_op(rng: &mut Rng, state: &EditorState, p: Pos) -> Option<EditorState> {
+    let cell_at = |doc: &Node, p: usize| -> Option<usize> {
+        let r = doc.resolve(Pos(p)).ok()?;
+        (1..=r.depth())
+            .rev()
+            .find(|&d| r.node(d).type_name().ends_with("cell"))
+            .and_then(|d| r.before(d))
+    };
+    match rng.below(4) {
+        0 => {
+            // Merge the cells around two positions.
+            let q = random_pos(rng, state);
+            let (a, b) = (cell_at(&state.doc, p.0)?, cell_at(&state.doc, q.0)?);
+            if a == b {
+                return None;
+            }
+            let mut tr = state.tr();
+            tr.set_selection(Selection::cell(Pos(a), Pos(b)));
+            state.apply(tr).run("mergeCells")
+        }
+        1 => {
+            // A cell attribute: one of the cell map's own keys, not its blocks.
+            let a = cell_at(&state.doc, p.0)?;
+            let mut tr = state.tr();
+            let v = format!("n{}", rng.below(5));
+            tr.set_node_attr(a, "data-note", AttrValue::from(v.as_str()))
+                .ok()?;
+            Some(state.apply(tr))
+        }
+        2 => {
+            // Swap two rows of the table around `p`, as one replace of the table.
+            let r = state.doc.resolve(p).ok()?;
+            let d = (1..=r.depth()).find(|&d| r.node(d).type_name() == "table")?;
+            let table = r.node(d).clone();
+            let at = r.before(d)?;
+            let (i, j) = (
+                rng.below(table.child_count()),
+                rng.below(table.child_count()),
+            );
+            if i == j {
+                return None;
+            }
+            let mut rows: Vec<Node> = (0..table.child_count())
+                .map(|k| table.child(k).clone())
+                .collect();
+            rows.swap(i, j);
+            let new_table = table.copy_with_content(Fragment::from_children(rows));
+            let mut tr = state.tr();
+            tr.replace(
+                at,
+                at + table.node_size(),
+                Slice::new(Fragment::from_node(new_table), 0, 0),
+            )
+            .ok()?;
+            Some(state.apply(tr))
+        }
+        _ => None,
+    }
+}
+
+/// How a [`Swarm`] delivers the deltas its peers produce.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Delivery {
+    /// Each peer integrates every delta in production order.
+    Fifo,
+    /// A peer integrates the next delta it has not had 60% of the time, else any one
+    /// it has not had: an update ahead of one it depends on is parked by yrs, or leaves
+    /// a gap in a client's clocks.
+    OutOfOrder,
+    /// As `OutOfOrder`, and 15% of the time two to four undelivered deltas merged into
+    /// one update (`merge_updates_v1`), which may itself carry a gap.
+    Merged,
 }
 
 /// A distinct, deterministic yrs client id for peer `p` of the trial at `seed`.
@@ -315,6 +641,12 @@ impl Swarm {
             queue: Vec::new(),
             seen: vec![0usize; peers],
             edits: 0,
+            images: false,
+            undo_percent: 0,
+            delivery: Delivery::Fifo,
+            delivery_rng: Rng::new(seed.wrapping_mul(31)),
+            got: vec![Vec::new(); peers],
+            transient_errors: 0,
         }
     }
 
@@ -325,10 +657,31 @@ impl Swarm {
     /// Project peer `p`'s move to `next`, check the load-bearing invariant, and queue
     /// whatever it broadcasts.
     fn record_local(&mut self, seed: u64, p: usize, next: EditorState) {
-        self.sessions[p]
-            .record_local(&self.schema, &self.states[p].doc, &next.doc)
-            .expect("flat edit projects cleanly");
-        let projected = self.sessions[p].projected_doc(&self.schema).unwrap();
+        let recorded = self.sessions[p].record_local(&self.schema, &self.states[p].doc, &next.doc);
+        if let Err(e) = recorded {
+            // Out of order, the shared document may not read until a missing update
+            // arrives (#196's transient class), and the edit stalls outbound (#220):
+            // the model keeps it, and a later edit or the flush catches up.
+            assert!(
+                self.delivery != Delivery::Fifo
+                    && !self.sessions[p].is_poisoned()
+                    && !matches!(e, rinch_editor_collab::CollabError::Unsupported(_)),
+                "flat edit projects cleanly (seed={seed}, peer={p}): {e}"
+            );
+            self.transient_errors += 1;
+            self.states[p] = next;
+            return;
+        }
+        let projected = match self.sessions[p].projected_doc(&self.schema) {
+            Ok(doc) => doc,
+            // Out of order, the shared document may not read until a missing update
+            // arrives (#196's transient class).
+            Err(e) if self.delivery != Delivery::Fifo => {
+                let _ = e;
+                next.doc.clone()
+            }
+            Err(e) => panic!("the projection reads back (seed={seed}, peer={p}): {e}"),
+        };
         if !same(&projected, &next.doc) {
             use rinch_editor_core::serialize::node_to_html;
             panic!(
@@ -349,17 +702,71 @@ impl Swarm {
         self.edits += 1;
     }
 
-    /// Deliver peer `q`'s next unseen delta (a no-op when it is already caught up).
+    /// Deliver to peer `q` a delta it has not had (a no-op when it is caught up): the
+    /// next one, or under out-of-order [`Delivery`] any one, or several merged.
     fn deliver(&mut self, seed: u64, q: usize) {
-        if self.seen[q] >= self.queue.len() {
+        if self.delivery == Delivery::Fifo {
+            if self.seen[q] >= self.queue.len() {
+                return;
+            }
+            let delta = self.queue[self.seen[q]].clone();
+            self.seen[q] += 1;
+            let next = self.sessions[q]
+                .integrate_incremental(&self.states[q], &delta)
+                .expect("delta integrates");
+            self.integrated(seed, q, next);
             return;
         }
-        let delta = self.queue[self.seen[q]].clone();
-        self.seen[q] += 1;
-        if let Some(next) = self.sessions[q]
-            .integrate_incremental(&self.states[q], &delta)
-            .expect("delta integrates")
-        {
+        self.got[q].resize(self.queue.len(), false);
+        let undelivered: Vec<usize> = (0..self.queue.len()).filter(|&i| !self.got[q][i]).collect();
+        if undelivered.is_empty() {
+            return;
+        }
+        let (roll, pick) = (self.delivery_rng.next() % 100, self.delivery_rng.next());
+        let picks: Vec<usize> = if roll < 60 {
+            vec![undelivered[0]]
+        } else if roll < 85 || self.delivery == Delivery::OutOfOrder {
+            vec![undelivered[pick as usize % undelivered.len()]]
+        } else {
+            // Two to four of the first few undelivered, in a random order.
+            let k = 2 + pick as usize % 3;
+            let mut first: Vec<usize> = undelivered.iter().copied().take(k + 2).collect();
+            let mut out = Vec::new();
+            while !first.is_empty() && out.len() < k {
+                out.push(first.remove(self.delivery_rng.below(first.len())));
+            }
+            out
+        };
+        for &i in &picks {
+            self.got[q][i] = true;
+        }
+        self.seen[q] = self.got[q].iter().take_while(|g| **g).count();
+        let delta = if picks.len() == 1 {
+            self.queue[picks[0]].clone()
+        } else {
+            yrs::merge_updates_v1(
+                picks
+                    .iter()
+                    .map(|&i| self.queue[i].as_slice())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("updates merge")
+        };
+        match self.sessions[q].integrate_incremental(&self.states[q], &delta) {
+            Ok(next) => self.integrated(seed, q, next),
+            Err(e) => {
+                assert!(
+                    !self.sessions[q].is_poisoned(),
+                    "an out-of-order integrate poisoned the session (seed={seed}, peer={q}): {e}"
+                );
+                self.transient_errors += 1;
+            }
+        }
+    }
+
+    /// Check and keep what peer `q`'s integrate answered.
+    fn integrated(&mut self, seed: u64, q: usize, next: Option<EditorState>) {
+        if let Some(next) = next {
             // A remote integration also lands the model at project(CRDT).
             assert!(
                 same(
@@ -367,6 +774,12 @@ impl Swarm {
                     &next.doc
                 ),
                 "model ≡ project(model) violated after integrate (seed={seed}, peer={q})"
+            );
+            assert!(
+                schema_valid(&next.doc),
+                "a remote integration produced a document the schema does not allow \
+                 (seed={seed}, peer={q}): {}",
+                rinch_editor_core::serialize::node_to_html(&next.doc)
             );
             self.states[q] = next;
         }
@@ -379,6 +792,19 @@ impl Swarm {
                 self.deliver(seed, q);
             }
         }
+        if self.delivery != Delivery::Fifo {
+            // A transient failure left a model behind its CRDT: every delta at once
+            // (nothing new to the CRDT) brings each model to the read.
+            let all =
+                yrs::merge_updates_v1(self.queue.iter().map(|d| d.as_slice()).collect::<Vec<_>>())
+                    .expect("updates merge");
+            for q in 0..self.peers() {
+                let next = self.sessions[q]
+                    .integrate_incremental(&self.states[q], &all)
+                    .expect("the whole history integrates");
+                self.integrated(seed, q, next);
+            }
+        }
     }
 
     /// `rounds` interleaved random edit/deliver steps.
@@ -387,7 +813,24 @@ impl Swarm {
             // 60% make a local edit, 40% deliver a pending delta.
             if rng.chance(60) {
                 let p = rng.below(self.peers());
-                let Some(next) = random_edit(rng, &self.states[p]) else {
+                let next = if self.undo_percent > 0 && rng.chance(self.undo_percent) {
+                    let cmd = if rng.chance(50) { "undo" } else { "redo" };
+                    let next = self.states[p].run(cmd);
+                    if next.as_ref().is_some_and(|n| n.doc != self.states[p].doc) {
+                        HISTORY_EDITS.with(|c| c.set(c.get() + 1));
+                    }
+                    // An undo or redo leaves every table tiling its grid (#1937):
+                    // one it made ragged is repaired in its own transaction, so
+                    // the edit still projects (a ragged table is `Unsupported`).
+                    if let Some(next) = &next {
+                        assert_tables_tile(&next.doc, seed, p, cmd);
+                        UNDOS_CHECKED.with(|c| c.set(c.get() + 1));
+                    }
+                    next
+                } else {
+                    random_edit(rng, &self.states[p], self.images)
+                };
+                let Some(next) = next else {
                     continue;
                 };
                 self.record_local(seed, p, next);
@@ -402,6 +845,16 @@ impl Swarm {
     /// what its own model holds (model ≡ project, post-flush).
     fn assert_converged(&self, seed: u64) {
         let reference = self.sessions[0].projected_doc(&self.schema).unwrap();
+        assert!(
+            schema_valid(&reference),
+            "the converged document is not one the schema allows (seed={seed})"
+        );
+        // No edit here types U+FFFC (`random_text`), so one in a text node is an inline
+        // atom that lost its `@atom` attribute (#1851).
+        assert!(
+            !holds_text_fffc(&reference),
+            "an inline atom read back as a literal U+FFFC (seed={seed}): {reference:?}"
+        );
         for q in 0..self.peers() {
             let projected = self.sessions[q].projected_doc(&self.schema).unwrap();
             assert!(
@@ -420,13 +873,19 @@ impl Swarm {
     }
 }
 
+/// Whether a text node anywhere in `node` holds U+FFFC.
+fn holds_text_fffc(node: &Node) -> bool {
+    node.text().is_some_and(|t| t.contains('\u{FFFC}'))
+        || (0..node.child_count()).any(|i| holds_text_fffc(node.child(i)))
+}
+
 /// Everything about a finished trial that a replay must reproduce: how many local edits
-/// it made, and the full CRDT state every peer converged on (yrs's own bytes, so this
-/// covers block ids and tie-breaks, not just the visible text).
+/// it made, and the full CRDT state every peer converged on (in a canonical form, so
+/// this covers clocks, tie-breaks and formatting, not just the visible text).
 #[derive(PartialEq, Eq, Debug)]
 struct Fingerprint {
     edits: usize,
-    snapshots: Vec<Vec<u8>>,
+    snapshots: Vec<String>,
 }
 
 impl Swarm {
@@ -434,16 +893,109 @@ impl Swarm {
         Fingerprint {
             edits: self.edits,
             snapshots: (0..self.peers())
-                .map(|p| self.sessions[p].snapshot())
+                .map(|p| canonical(&self.sessions[p].snapshot()))
                 .collect(),
         }
     }
+}
+
+/// A snapshot in a form two replays of one trial write identically: every client's
+/// clock, the delete set, and every shared type walked in order with each map's keys
+/// sorted. Not the bytes: an `@atom` value is a yrs map, which encodes its keys in
+/// `HashMap` order, random per run, and since #1851 every atom's value has two keys or
+/// more (its type and `@for`, its own char). The order of a map's keys carries nothing.
+fn canonical(bytes: &[u8]) -> String {
+    use yrs::types::text::YChange;
+    use yrs::updates::decoder::Decode;
+    use yrs::{Any, Array, ArrayRef, Map, Out, ReadTxn, Text, Transact, TransactionMut, Update};
+    fn any(a: &Any) -> String {
+        match a {
+            Any::Map(m) => {
+                let mut kv: Vec<String> =
+                    m.iter().map(|(k, v)| format!("{k}:{}", any(v))).collect();
+                kv.sort();
+                format!("{{{}}}", kv.join(","))
+            }
+            Any::Array(v) => format!("[{}]", v.iter().map(any).collect::<Vec<_>>().join(",")),
+            other => format!("{other:?}"),
+        }
+    }
+    fn out(txn: &TransactionMut, o: Out, s: &mut String) {
+        match o {
+            Out::Any(a) => s.push_str(&any(&a)),
+            Out::YText(t) => {
+                for d in t.diff(txn, YChange::identity) {
+                    let attrs = d.attributes.map(|a| {
+                        let mut kv: Vec<String> =
+                            a.iter().map(|(k, v)| format!("{k}={}", any(v))).collect();
+                        kv.sort();
+                        kv.join(";")
+                    });
+                    s.push_str(&format!("<{:?}|{:?}>", d.insert, attrs));
+                }
+            }
+            Out::YMap(m) => {
+                let mut keys: Vec<String> = m.keys(txn).map(str::to_string).collect();
+                keys.sort();
+                s.push('{');
+                for k in keys {
+                    s.push_str(&k);
+                    s.push(':');
+                    out(txn, m.get(txn, &k).unwrap(), s);
+                    s.push(',');
+                }
+                s.push('}');
+            }
+            Out::YArray(a) => array(txn, &a, s),
+            other => s.push_str(&format!("{other:?}")),
+        }
+    }
+    fn array(txn: &TransactionMut, a: &ArrayRef, s: &mut String) {
+        s.push('[');
+        for v in a.iter(txn) {
+            out(txn, v, s);
+            s.push(',');
+        }
+        s.push(']');
+    }
+    let doc = yrs::Doc::with_options(yrs::Options {
+        offset_kind: yrs::OffsetKind::Utf16,
+        ..Default::default()
+    });
+    let content = doc.get_or_insert_array("content");
+    let atoms = doc.get_or_insert_map("atoms");
+    let meta = doc.get_or_insert_map("meta");
+    let mut txn = doc.transact_mut();
+    txn.apply_update(Update::decode_v1(bytes).unwrap()).unwrap();
+    let mut clocks: Vec<String> = txn
+        .state_vector()
+        .iter()
+        .map(|(c, k)| format!("{c:?}={k}"))
+        .collect();
+    clocks.sort();
+    // The delete set, per client, so content deleted alike is still compared.
+    let mut deleted: Vec<String> = txn
+        .snapshot()
+        .delete_set
+        .iter()
+        .map(|(c, r)| format!("{c:?}={:?}", r.iter().collect::<Vec<_>>()))
+        .collect();
+    deleted.sort();
+    let mut s = format!("{clocks:?}{deleted:?}");
+    array(&txn, &content, &mut s);
+    out(&txn, Out::YMap(atoms), &mut s);
+    out(&txn, Out::YMap(meta), &mut s);
+    s
 }
 
 /// Run one fuzz trial: `peers` peers, `rounds` interleaved edit/deliver steps, then a
 /// flush, asserting the two invariants throughout. Returns the trial's fingerprint, which
 /// `replaying_a_trial_is_byte_identical` uses to pin replayability.
 fn fuzz_trial(seed: u64, peers: usize, rounds: usize) -> Fingerprint {
+    fuzz_trial_with(seed, peers, rounds, false)
+}
+
+fn fuzz_trial_with(seed: u64, peers: usize, rounds: usize, images: bool) -> Fingerprint {
     let schema = schema();
     let mut rng = Rng::new(seed);
     let mut swarm = Swarm::new(
@@ -452,6 +1004,7 @@ fn fuzz_trial(seed: u64, peers: usize, rounds: usize) -> Fingerprint {
         initial_state(&schema).doc.clone(),
         peers,
     );
+    swarm.images = images;
     swarm.run_rounds(seed, rounds, &mut rng);
     swarm.flush(seed);
     swarm.assert_converged(seed);
@@ -547,11 +1100,94 @@ fn fuzz_deletion_to_empty_trial(seed: u64, peers: usize, rounds: usize) -> Finge
     swarm.fingerprint()
 }
 
+/// How many integrates on this thread read back only what their update changed,
+/// and how many read the whole document, while `f` runs (#1241). Every partial read
+/// is compared with a whole one as it happens (`testing::set_incremental_read_check`,
+/// on in this crate's debug tests).
+fn integrate_reads_in(f: impl FnOnce()) -> (u64, u64) {
+    use rinch_editor_collab::testing::integrate_reads;
+    let before = integrate_reads();
+    f();
+    let after = integrate_reads();
+    (after.0 - before.0, after.1 - before.1)
+}
+
 #[test]
 fn fuzz_two_peers_converge() {
-    for seed in 1..=24u64 {
-        let _ = fuzz_trial(seed, 2, 220);
+    let (partial, whole) = integrate_reads_in(|| {
+        for seed in 1..=24u64 {
+            let _ = fuzz_trial(seed, 2, 220);
+        }
+    });
+    // The positive control for the partial read (#1241): about half the
+    // integrates of this test, of the tables test and of the images test take it
+    // (2359 of 4404, 1634 of 3078 and 3586 of 6047 when written), each compared
+    // with a whole read.
+    assert!(partial >= 1000, "{partial} partial reads, {whole} whole");
+}
+
+#[test]
+fn fuzz_wraps_blocks_in_quotes() {
+    // The positive control for the quote arm of `random_edit`, counted over trials of
+    // its own so it does not depend on which other tests share the binary's counter.
+    let before = QUOTES_WRAPPED.load(Ordering::Relaxed);
+    for seed in 800..=807u64 {
+        let _ = fuzz_trial(seed, 3, 300);
     }
+    let wrapped = QUOTES_WRAPPED.load(Ordering::Relaxed) - before;
+    assert!(
+        wrapped >= 20,
+        "the trials must actually wrap blocks in quotes to test them (wrapped {wrapped})"
+    );
+}
+
+#[test]
+fn fuzz_edits_tables_among_everything_else() {
+    // The positive control for the table arm: tables inserted and restructured while
+    // the other arms type, split, wrap and delete in and around their cells.
+    let before = TABLE_EDITS.with(|c| c.get());
+    let (partial, whole) = integrate_reads_in(|| {
+        for seed in 900..=907u64 {
+            let _ = fuzz_trial(seed, 3, 300);
+        }
+    });
+    // The partial read's positive control (see `fuzz_two_peers_converge`).
+    assert!(partial >= 1000, "{partial} partial reads, {whole} whole");
+    let applied = TABLE_EDITS.with(|c| c.get()) - before;
+    assert!(
+        applied >= 20,
+        "the trials must actually edit tables to test them (applied {applied})"
+    );
+}
+
+/// #1249: undo and redo among remote changes. The history maps an event through every
+/// change it did not record (a peer's) before it reverts it; it used to replay the
+/// steps at their old positions, which broke `model ≡ project(model)` (#1856), nested
+/// a paragraph in a paragraph or reverted a peer's text. 15% of local edits here are an
+/// undo or a redo (seed 275 with two peers was #1249's first repro).
+#[test]
+fn fuzz_undo_and_redo_among_remote_changes() {
+    let before = HISTORY_EDITS.with(|c| c.get());
+    for seed in (1000..=1023u64).chain([275]) {
+        let peers = 2 + (seed % 2) as usize;
+        let schema = schema();
+        let mut rng = Rng::new(seed);
+        let mut swarm = Swarm::new(
+            seed,
+            schema.clone(),
+            initial_state(&schema).doc.clone(),
+            peers,
+        );
+        swarm.undo_percent = 15;
+        swarm.run_rounds(seed, 400, &mut rng);
+        swarm.flush(seed);
+        swarm.assert_converged(seed);
+    }
+    let applied = HISTORY_EDITS.with(|c| c.get()) - before;
+    assert!(
+        applied >= 200,
+        "the trials must actually undo and redo to test them (applied {applied})"
+    );
 }
 
 #[test]
@@ -576,6 +1212,32 @@ fn fuzz_many_peers_converge() {
     }
 }
 
+/// Images in the random edit stream: every per-char `@atom` resync, and the splices
+/// around a placeholder whose value carries real attrs, under random interleaving
+/// (review of #838). Convergence only — never compare these trials' bytes (#841).
+#[test]
+fn fuzz_with_images_converges() {
+    let before = IMAGES_INSERTED.load(Ordering::Relaxed);
+    let attrs_before = IMAGE_ATTRS_SET.load(Ordering::Relaxed);
+    let (partial, whole) = integrate_reads_in(|| {
+        for seed in 700..=715u64 {
+            let _ = fuzz_trial_with(seed, 2 + (seed % 3) as usize, 300, true);
+        }
+    });
+    // The partial read's positive control (see `fuzz_two_peers_converge`).
+    assert!(partial >= 1000, "{partial} partial reads, {whole} whole");
+    let inserted = IMAGES_INSERTED.load(Ordering::Relaxed) - before;
+    assert!(
+        inserted >= 20,
+        "the trial must actually insert images to test anything (inserted {inserted})"
+    );
+    let set = IMAGE_ATTRS_SET.load(Ordering::Relaxed) - attrs_before;
+    assert!(
+        set >= 20,
+        "the trial must actually change images' attrs to test anything (changed {set})"
+    );
+}
+
 #[test]
 fn fuzz_deletion_to_empty_recovers_and_converges() {
     // Issue #192: the random trials above never reach a zero-block CRDT — a single peer's
@@ -593,13 +1255,129 @@ fn fuzz_deletion_to_empty_recovers_and_converges() {
     }
 }
 
+// ─── Delivery out of order, and grid changes (review of #1926) ──────────────────
+
+/// One trial with `delivery`, the extra table changes on ([`EXTRA_TABLE_OPS`]),
+/// pictures every other seed and undo/redo every fourth. Answers the integrates and
+/// local edits that failed transiently (out of order only).
+fn delivery_trial(seed: u64, peers: usize, delivery: Delivery) -> u64 {
+    let undo = if seed % 4 == 1 { 15 } else { 0 };
+    delivery_trial_with(seed, peers, delivery, undo)
+}
+
+/// [`delivery_trial`] with `undo` percent of local edits an undo or a redo.
+fn delivery_trial_with(seed: u64, peers: usize, delivery: Delivery, undo: u64) -> u64 {
+    EXTRA_TABLE_OPS.with(|x| x.set(true));
+    let schema = schema();
+    let mut rng = Rng::new(seed);
+    let mut swarm = Swarm::new(
+        seed,
+        schema.clone(),
+        initial_state(&schema).doc.clone(),
+        peers,
+    );
+    swarm.images = seed.is_multiple_of(2);
+    // Undo and redo every fourth seed: with these grid changes an undo panicked in
+    // the history's mapping (`StepMap::recover`, from `Branch::pop_event`) until
+    // #1935.
+    swarm.undo_percent = undo;
+    swarm.delivery = delivery;
+    swarm.delivery_rng = Rng::new(seed.wrapping_mul(31) + delivery as u64);
+    swarm.run_rounds(seed, 300, &mut rng);
+    swarm.flush(seed);
+    swarm.assert_converged(seed);
+    EXTRA_TABLE_OPS.with(|x| x.set(false));
+    swarm.transient_errors
+}
+
+/// Grid changes (merged cells, a cell's attributes, swapped rows) among everything
+/// else, delivered in order: every partial read is compared with a whole read
+/// (`testing::set_incremental_read_check`), so a table's cell index carried through a
+/// change of its grid shows as a wrong read.
+#[test]
+fn fuzz_grid_changes_in_order() {
+    let before = TABLE_EDITS.with(|c| c.get());
+    let (partial, whole) = integrate_reads_in(|| {
+        for seed in 5001..=5024u64 {
+            delivery_trial(seed, 2 + (seed % 3) as usize, Delivery::Fifo);
+        }
+    });
+    assert!(partial >= 1000, "{partial} partial reads, {whole} whole");
+    let applied = TABLE_EDITS.with(|c| c.get()) - before;
+    assert!(applied >= 100, "only {applied} table changes applied");
+}
+
+/// Deltas delivered out of order (review of #1926). yrs parks an update that arrives
+/// ahead of one it depends on, or keeps a gap in its sender's clocks, and the update
+/// that fills the gap fires no event for a change inside any type its sender created
+/// after the gap: no path names it, so the read must be the whole one. Seeds 9001 and
+/// 9002 diverged before the record was spoiled for it (a paragraph read back without
+/// the char typed in it).
+#[test]
+fn fuzz_out_of_order_delivery_converges() {
+    let mut transient = 0;
+    let (partial, whole) = integrate_reads_in(|| {
+        for seed in 9001..=9024u64 {
+            transient += delivery_trial(seed, 2 + (seed % 3) as usize, Delivery::OutOfOrder);
+        }
+    });
+    // Both kinds of read ran (437 partial, 7865 whole when written: a gap stays
+    // open for a while, and every integrate while it is reads the whole document).
+    assert!(partial >= 200, "{partial} partial reads, {whole} whole");
+    assert!(whole >= 500, "{partial} partial reads, {whole} whole");
+    let _ = transient;
+}
+
+/// As [`fuzz_out_of_order_delivery_converges`], with batches of deltas merged into one
+/// update, which can carry a gap of its own.
+#[test]
+fn fuzz_merged_delivery_converges() {
+    let (partial, whole) = integrate_reads_in(|| {
+        for seed in 9101..=9124u64 {
+            delivery_trial(seed, 2 + (seed % 3) as usize, Delivery::Merged);
+        }
+    });
+    assert!(partial >= 200, "{partial} partial reads, {whole} whole");
+    assert!(whole >= 500, "{partial} partial reads, {whole} whole");
+}
+
+/// #1937: undo and redo among peers' grid changes (merged cells, cell attributes,
+/// swapped rows), delivered in order, out of order and in merged batches. After every
+/// undo and redo every table tiles its grid (`assert_tables_tile`): one the undo made
+/// ragged is repaired in its own transaction (an undo of my merge after a peer's merge
+/// restored cells into the peer's table and kept the spans). And the edit still
+/// records to the CRDT: a ragged table is `Unsupported`, which stalled outbound.
+#[test]
+fn fuzz_undo_among_grid_changes_keeps_tables_tiling() {
+    let before = (
+        UNDOS_CHECKED.with(|c| c.get()),
+        HISTORY_EDITS.with(|c| c.get()),
+    );
+    for (base, delivery) in [
+        (7001u64, Delivery::Fifo),
+        (7101, Delivery::OutOfOrder),
+        (7201, Delivery::Merged),
+    ] {
+        for seed in base..base + 16 {
+            delivery_trial_with(seed, 2 + (seed % 3) as usize, delivery, 30);
+        }
+    }
+    let checked = UNDOS_CHECKED.with(|c| c.get()) - before.0;
+    let applied = HISTORY_EDITS.with(|c| c.get()) - before.1;
+    assert!(
+        checked >= 1000 && applied >= 300,
+        "{checked} undos and redos checked, {applied} changed the document"
+    );
+}
+
 /// Issue #214: a `(seed, peers, rounds)` triple must reproduce a trial **exactly**, or a
 /// fuzz failure cannot be debugged — the report names a seed that does something else
 /// when you run it.
 ///
-/// The check is not "the text matches": it compares each peer's whole yrs state, so a
-/// differing tie-break or block id fails it even when the visible document happens to
-/// agree. It also compares the edit *count*, which is the symptom that made the old
+/// The check is not "the text matches": it compares each peer's whole yrs state (every
+/// client's clock, every shared type with its formatting; see [`canonical`] for why
+/// not the bytes), so a differing tie-break or block id fails it even when the visible
+/// document happens to agree. It also compares the edit *count*, which is the symptom that made the old
 /// non-determinism visible — random positions are drawn from the live document, so a
 /// different convergence changes which later edits are applicable at all.
 ///

@@ -17,20 +17,34 @@ rinch-core.workspace = true
 rinch-macros.workspace = true
 rinch-platform = { workspace = true }
 tracing.workspace = true
+# `init_logging` (#1773) hands `log` records to the same output as `tracing`
+# events. Already in every lock: `tracing` depends on it.
+log = "0.4"
+# The CSS generic-family enum `AppFont` names (#1769). It is the very type
+# parley/fontique re-export (`fontique::GenericFamily` is `parlance::GenericFamily`),
+# named here directly so `rinch::font` builds without the desktop text stack —
+# on wasm32 too. Already in Cargo.lock through parley; no dependencies of its own.
+# From parley's fork at parley's rev (the workspace Cargo.toml), or it is a second copy.
+parlance = { version = "0.1", git = "https://github.com/joeleaver/parley-fork", rev = "a95d78063bc05502327e384d9fdac927016d877a", default-features = false }
 
-# Desktop-only rendering deps (optional, enabled by `desktop` feature)
+# Spellchecking (#2862): the configuration `App::spellcheck` takes on every
+# target, and on the desktop the engine that marks text fields. Pure Rust; a
+# web build links only the configuration (the browser checks there).
+rinch-spell = { workspace = true }
+
+# Desktop-only rendering deps (optional, enabled by the `windowing` feature)
 rinch-dom = { workspace = true, optional = true }
 rinch-editable = { workspace = true, optional = true }
+# The word segmentation text fields and the editor share (#1619).
+rinch-words = { workspace = true, optional = true }
 parley = { workspace = true, optional = true }
 peniko = { version = "0.6", optional = true }
-vello = { version = "0.7", optional = true }
+vello = { workspace = true, optional = true }
 serde_json = { version = "1", optional = true }
 
-# Desktop-only windowing/rendering (optional, enabled by `desktop` feature)
+# Desktop-only windowing/rendering (optional, enabled by the `windowing` feature)
 bytemuck = { version = "1", features = ["derive"], optional = true }
 rinch-renderer = { workspace = true, optional = true }
-anyrender = { workspace = true, optional = true }
-anyrender_vello = { workspace = true, optional = true }
 wgpu = { workspace = true, optional = true }
 winit = { workspace = true, optional = true }
 muda = { workspace = true, optional = true }
@@ -41,17 +55,20 @@ tracing-subscriber = { workspace = true, optional = true }
 png = { version = "0.17", optional = true }
 base64 = { version = "0.22", optional = true }
 keyboard-types = { version = "0.7", optional = true }
+# A file drag's `file:` URIs to paths (#1962; winit 0.31.0-beta.4 hands over
+# URIs, not paths).
+url = { version = "2", optional = true }
 
 # Optional features
-rfd = { workspace = true, optional = true }
 rinch-clipboard = { workspace = true, optional = true }
 tray-icon = { workspace = true, optional = true }
 
 # Platform-independent optional deps
 rinch-theme = { workspace = true, optional = true }
 rinch-components = { workspace = true, optional = true }
+rinch-html = { workspace = true, optional = true }
 rinch-debug = { path = "../rinch-debug", optional = true }
-# ProseMirror-style editor core. Pulled in by the `desktop` feature; the desktop
+# ProseMirror-style editor core. Pulled in by the `windowing` feature; the desktop
 # runtime's input/IME/focus glue (in `app`/`shell`) reads its `Selection`/`Pos`/
 # command types directly.
 rinch-editor-core = { workspace = true, optional = true }
@@ -63,6 +80,8 @@ rinch-editor-core = { workspace = true, optional = true }
 # — so default builds (desktop AND web) link zero CRDT code.
 rinch-editor-view = { workspace = true, optional = true }
 rinch-video = { workspace = true, optional = true }
+# Node-and-wire editor canvas (graph feature).
+rinch-graph-view = { workspace = true, optional = true }
 # HTTP client for the network image loader (image-network). Standalone, opt-in:
 # nothing else in the facade depends on it, so default builds link no HTTP stack.
 rinch-http = { workspace = true, optional = true }
@@ -90,19 +109,84 @@ rinch-clipboard = { workspace = true, features = ["test-backend"] }
 # the optional `components` feature: the test then runs under `cargo test -p
 # rinch` with no flags, which is how it will actually be run.
 rinch-components = { workspace = true }
+# Test-only: `app::click_link_tests` mounts a real `HtmlView` and clicks a
+# link inside the HTML it was given.
+rinch-html = { workspace = true }
 # Test-only: `app::stepper_state_709_tests` needs a `TablerIcon` to name a
 # per-step icon with. The facade deliberately does not depend on this crate — the
 # icon enum is not in the prelude — so it is a dev-dependency.
 rinch-tabler-icons = { workspace = true }
+# Test-only: `app::graph_canvas_wheel_tests` drives the node-graph canvas's wheel
+# through the real desktop wheel path, without the optional `graph` feature (so
+# the test runs under `cargo test -p rinch` with no flags).
+rinch-graph-view = { workspace = true }
+# Test-only: `gpu_rounded_corners_2321` reads Chrome's screenshots (grey PNGs
+# under `tests/fixtures`). The version the optional `png` dependency already is.
+png = "0.17"
+# Test-only: `gpu_encoder_pool_2688_tests` counts wgpu-hal's command encoders
+# (`Device::get_internal_counters`), which only the `counters` feature keeps.
+wgpu = { workspace = true, features = ["counters"] }
+# Test-only: `tests/testing_harness.rs` drives the public harness, so this
+# crate's own tests turn its `testing` feature on (and nothing else: default
+# features off, so the `--no-default-features` CI jobs stay what they are).
+rinch = { path = ".", default-features = false, features = ["testing"] }
+
+# Vello's shaders from build-time naga IR (#2468), on native targets only: on
+# WebGPU, wgpu would write the module back out as WGSL for the browser to parse.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+vello = { workspace = true, optional = true, features = ["naga_ir"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# Their `log` feature (#2531): without it both print their errors with
+# `eprintln!`, which panics when stderr is a closed pipe (a session that
+# ended), and a second panic while winit's Wayland state drops aborts the app.
+# With it the errors go through `log` to rinch's subscriber, which drops a
+# failed write. Already in Cargo.lock (winit's Wayland backend).
+wayland-backend = { version = "0.3", features = ["log"], optional = true }
+calloop-wayland-source = { version = "0.4", features = ["log"], optional = true }
+# Reading why the event loop could not be built (#2761, `shell/run_error.rs`):
+# its `ConnectError` (no compositor) and `WaylandError` (a connection that
+# broke). Already in Cargo.lock (winit's Wayland backend).
+wayland-client = { version = "0.31", optional = true }
+# `malloc_trim` after a GPU renderer compiles its shaders (#2468,
+# `gpu_init.rs`). Already in Cargo.lock.
+libc = { version = "0.2", optional = true }
+# The system font watch (#2537): inotify on the font directories, woken by an
+# eventfd, so an idle app makes no wake-ups for it. Already in Cargo.lock with
+# both features, through calloop, polling and smithay-client-toolkit.
+rustix = { version = "1.1", features = ["fs", "event"], optional = true }
 gtk = { version = "0.18", optional = true }
 ksni = { workspace = true, optional = true }
 # AT-SPI (D-Bus) accessibility adapter for Linux. Pulls zbus/atspi/async-io; only
 # compiled when the `a11y` feature is on. Windows/macOS adapters are a follow-up.
 accesskit_unix = { version = "0.22", optional = true }
+# X11 overlay hints (`WM_HINTS.input`, `_NET_WM_STATE_SKIP_TASKBAR`, #1519) that
+# winit has no API for, and global hotkeys' X11 grabs + XInput2 raw key events
+# (`global-hotkeys`, #1521). Already in the graph through winit-x11.
+# RandR: a monitor's CRTC rectangle, which winit's video mode gives unrotated
+# (a portrait monitor reads as landscape, #1884).
+x11rb = { version = "0.13", default-features = false, features = ["xfixes", "shape", "xinput", "xkb", "randr"], optional = true }
+# zbus for the Wayland GlobalShortcuts portal (`global-hotkeys`, #1521, see
+# hotkey/backend/portal.rs) and the freedesktop notification service
+# (`notifications`, #1522, see notification/backend/freedesktop.rs), each run
+# inside a current-thread tokio runtime on its own thread (right whether zbus
+# ends up in async-io or tokio mode). None adds a package to Cargo.lock. (tokio is the crate-wide optional
+# dependency, so the feature builds it on every platform; a Linux-only rename
+# of it does not survive a build that also has `gpu`: "depends on crate tokio
+# multiple times with different names".)
+zbus = { version = "5", default-features = false, features = ["async-io"], optional = true }
+futures-lite = { version = "2", optional = true }
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Native file and message dialogs. The browser's message dialogs need no crate
+# and no feature (`dialogs::web`, #1821), and a browser file picker gives no
+# path (#1773).
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+rfd = { workspace = true, optional = true }
+
+# The browser: `wasm32-unknown-unknown`, not every `wasm32`. A WASI guest
+# (`wasm32-wasip1`) that embeds rinch's components runs inside a host that is
+# not a browser, where these crates are stubs that panic when reached.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 wasm-bindgen = "0.2"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = [
@@ -114,29 +198,102 @@ web-sys = { version = "0.3", features = [
     "MouseEvent", "WheelEvent", "PointerEvent",
     "EventTarget", "AddEventListenerOptions",
     "ResizeObserver", "ResizeObserverEntry", "ResizeObserverSize", "DomRectReadOnly",
+    # `RenderSurfaceHandle::layout_rect` (#1768): the canvas's client rect.
+    "DomRect",
+    # `init_logging`'s console output and panic hook (#1773).
+    "console",
+    # `rinch::window` (#1770): the page's resolution media query.
+    "MediaQueryList",
+    # `rinch::file` (#1771): the picker's hidden `<input type=file>` and the
+    # `FileReader` a picked or dropped file is read with.
+    "HtmlElement", "HtmlInputElement", "Node", "Event",
+    "Blob", "File", "FileList", "FileReader", "DomException",
+    # `rinch::worker` (#1772): a Web Worker running the app's own module.
+    "Worker", "WorkerOptions", "WorkerType", "MessageEvent", "ErrorEvent",
+    "DedicatedWorkerGlobalScope", "BlobPropertyBag", "Url",
 ] }
 
+# `web-gpu` (#1768): the device acquisition is a promise, awaited in a task of
+# its own. Already in Cargo.lock (the dev-dependency below, and wgpu's `webgpu`).
+wasm-bindgen-futures = { version = "0.4", optional = true }
+
+# Test-only: the browser tests under `tests/` that need `rinch` alone (no
+# `rinch-web`), e.g. `embed_web_runtime_1956.rs` (`--features embed`).
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+wasm-bindgen-futures = "0.4"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Test-only: the live X11 hotkey test types through XTEST (`hotkey::backend::x11`).
+x11rb = { version = "0.13", features = ["xinput", "xtest"] }
+# Test-only: the live activation-token test (`tests/activation_token_2501/`)
+# presses a key on a nested compositor, through wlroots' virtual keyboard
+# (`zwp_virtual_keyboard_v1`, protocols-misc) or KWin's fake input
+# (`org_kde_kwin_fake_input`, protocols-plasma), and runs a plain toplevel
+# that activates itself with a token (xdg-shell and xdg-activation,
+# protocols). All four are already in the graph through winit.
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }
+# Test-only: the live input-region test (`tests/input_region_2741/`) clicks
+# on headless sway through wlroots' virtual pointer (`zwlr_virtual_pointer_v1`),
+# already in the graph through winit's sctk.
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# Test-only: the text settings' oracle (`text_rasterization::fontconfig_oracle`,
+# #2773) opens libfontconfig at run time to read the settings the way rinch
+# did before, from a configuration of its own. Already in Cargo.lock.
+libloading = "0.8"
+
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Graphics_Gdi", "Win32_Foundation"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Graphics_Gdi", "Win32_Foundation", "Win32_UI_WindowsAndMessaging",
+    # Global hotkeys: the WH_KEYBOARD_LL hook, RegisterHotKey, the hook
+    # thread's message pump.
+    "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Threading", "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    # `rinch::window::open_url` (#1770): ShellExecuteW.
+    "Win32_UI_Shell",
+] }
+# Toast notifications (`notifications`, #1522): WinRT `Windows.UI.Notifications`
+# and the HKCU AppUserModelId registration. 0.62 is already in Cargo.lock.
+windows = { version = "0.62", optional = true, features = [
+    "UI_Notifications", "Data_Xml_Dom", "Foundation",
+    "Win32_System_WinRT", "Win32_System_Registry", "Win32_Foundation", "Win32_Security",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The non-activating panel's `becomesKeyOnlyIfNeeded` / `hidesOnDeactivate`
+# (#1519). Already in the graph through winit-appkit.
+objc2 = { version = "0.6", optional = true }
+# UserNotifications completion handlers (`notifications`, #1522); in Cargo.lock.
+block2 = { version = "0.6", optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["native-activity"], optional = true }
 ndk = { version = "0.9", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
-log = { version = "0.4", optional = true }
 android_logger = { version = "0.14", optional = true }
 rinch-android = { workspace = true, optional = true }
 
 [features]
 default = ["desktop"]
-desktop = [
+# Windows, input, the software and DOM renderers, the DOM menu bar: everything
+# a window needs, without the native menus. A layer-shell surface, a borderless
+# overlay or a game takes this one (with `gpu-renderer` for the GPU renderer),
+# and links no GTK and no libxdo on Linux (#2435).
+windowing = [
     "dep:rinch-dom", "dep:rinch-editable", "dep:parley",
     "dep:peniko", "dep:serde_json",
-    "dep:winit", "dep:muda",
+    "dep:winit",
+    "dep:x11rb", "dep:objc2", "dep:rustix",
+    "dep:wayland-backend", "dep:calloop-wayland-source", "dep:wayland-client",
     "dep:tracing-subscriber",
-    "dep:png", "dep:base64", "dep:keyboard-types",
+    "dep:png", "dep:base64", "dep:keyboard-types", "dep:url",
     "dep:bytemuck",
     "dep:softbuffer", "rinch-dom/software-renderer",
+    # ICC-tagged pictures converted to sRGB at decode, as Chrome does (#2779).
+    "rinch-dom/color-management",
     # The desktop shell implements + drives `PlatformRenderer` (over vello::Scene), so it
     # needs rinch-platform's `renderer` module. (A web build leaves this off → no vello.)
     "rinch-platform/renderer",
@@ -144,7 +301,21 @@ desktop = [
     # (its rinch-dom view needs the desktop renderer; the web view reuses the same
     # renderer-agnostic rinch-editor-view crate).
     "dep:rinch-editor-core", "dep:rinch-editor-view",
+    # Word motion / delete / double-click split a CJK or Thai run by ICU's
+    # dictionary (#939). parley already links that data here (its
+    # `complex-scripts` feature), so it costs this build nothing.
+    "rinch-editor-core/word-dictionary",
+    # The same dictionary for the text fields' word motion (#1619).
+    "dep:rinch-words", "rinch-editable/word-dictionary",
 ]
+# The native menus, through muda: the menu bar a window wears on Windows and
+# macOS, and the menus a tray shows. On Linux muda links GTK 3 and libxdo, and
+# a window's menu is the DOM bar either way. Without this a `Menu` set on a
+# window is the DOM bar on every platform, with the same shortcuts and
+# callbacks (#2435).
+native-menus = ["windowing", "dep:muda"]
+# Everything a desktop app gets by default: windowing and the native menus.
+desktop = ["windowing", "native-menus"]
 android = [
     "dep:rinch-dom", "dep:rinch-editable", "dep:parley",
     "dep:peniko", "dep:serde_json",
@@ -153,12 +324,16 @@ android = [
     "dep:bytemuck",
     # No softbuffer: the Android shell presents straight into the
     # `ANativeWindow` (`SoftSurface`), and `shell::softbuffer_renderer` is
-    # `desktop`-only. raw-window-handle likewise belongs to `android-gpu`,
+    # `windowing`-only. raw-window-handle likewise belongs to `android-gpu`,
     # whose `AndroidWindow` is its only user in an Android build.
     "rinch-dom/software-renderer",
+    "rinch-dom/color-management",
     "dep:android-activity", "dep:ndk",
-    "dep:log", "dep:android_logger",
+    "dep:android_logger",
     "dep:rinch-android",
+    # Text fields split words as the editor does (#1619); parley's
+    # `complex-scripts` links the same ICU data, so the dictionary is free here.
+    "dep:rinch-words", "rinch-editable/word-dictionary",
     # Paste is not optional on a phone. On Android `rinch-clipboard` is only
     # the JNI bridge to `ClipboardManager` (no arboard), so this costs
     # nothing — and without it `handle_paste` reads an empty string, a
@@ -167,12 +342,16 @@ android = [
     # (issue #813).
     "clipboard",
 ]
-gpu = [
-    "desktop",
-    "dep:vello", "dep:wgpu",
-    "dep:rinch-renderer", "dep:anyrender", "dep:anyrender_vello",
+# The GPU renderer (Vello on wgpu) beside the software one, on `windowing`
+# alone: no native menus.
+gpu-renderer = [
+    "windowing",
+    "dep:vello", "dep:wgpu", "dep:libc",
+    "dep:rinch-renderer",
     "dep:tokio", "dep:pollster", "dep:futures-util",
 ]
+# The GPU renderer on the full `desktop` build.
+gpu = ["desktop", "gpu-renderer"]
 android-gpu = [
     "android",
     "dep:vello", "dep:wgpu",
@@ -186,37 +365,159 @@ android-gpu = [
 # desktop windowing stack (no winit / softbuffer / muda / tokio). The consumer owns
 # the wgpu Device/Queue/Surface and composites the returned Vello scene over its own
 # WebGPU render. Mirrors how `android` builds `app` without winit, minus native deps.
-# rinch-dom comes in with default-features off (workspace root), so tiny-skia/swash
-# (`software-renderer`) stay out — the embed path is Vello-only.
+# rinch-dom comes in with default-features off (workspace root), so the software
+# window path (`software-renderer`) stays out — the embed path draws with Vello;
+# swash comes in for the glyph-mask atlas (`glyph-atlas`), and tiny-skia with
+# the software painter's code as the offscreen raster of `filter: blur()` and
+# `drop-shadow()` (`filter-raster`, #2719).
 embed = [
-    "dep:rinch-dom", "dep:rinch-editable", "dep:parley",
+    "dep:rinch-dom", "dep:rinch-editable", "dep:rinch-words", "dep:parley",
     "dep:peniko",
     "rinch-platform/renderer",
-    "dep:vello", "dep:wgpu",
+    "dep:vello", "dep:wgpu", "dep:libc",
+    # The split compositor's uniforms (#1866).
+    "dep:bytemuck",
+    # Text from the glyph-mask atlas (#2286); swash, without the software painter.
+    "rinch-dom/glyph-atlas",
+    # The offscreen raster a `filter` that moves pixels is drawn through
+    # (#2719): tiny-skia (already in the graph through resvg) and the
+    # software painter's code, not its window path.
+    "rinch-dom/filter-raster",
+    # ICC-tagged pictures converted to sRGB at decode (#2779).
+    "rinch-dom/color-management",
 ]
 file-dialogs = ["rfd"]
 clipboard = ["dep:rinch-clipboard"]
-system-tray = ["tray-icon", "gtk", "ksni"]
+# The tray's menus are muda's, so the tray brings the native menus with it.
+system-tray = ["native-menus", "tray-icon", "gtk", "ksni"]
 memory-profile = ["memory-stats"]
 theme = ["dep:rinch-theme", "rinch-core/theme"]
 components = ["theme", "dep:rinch-components"]
+# `rinch::html`: the allow-list cleaner and `HtmlView`, for showing HTML the
+# app did not write (mail, feeds, help pages). Adds ammonia and css-inline.
+html = ["dep:rinch-html"]
 debug = ["dep:rinch-debug"]
+# `rinch::testing`: a headless harness for an app's own tests (#2553). Mounts a
+# component into a `RinchApp` with no window and no display, sends it input
+# through the dispatch the desktop shell uses, and reads the document back.
+# Adds no dependency; it does nothing without `windowing` (so a web build that
+# turns it on gets no module, and compiles as before).
+testing = []
 video = ["dep:rinch-video"]
+# Node-and-wire editors: the graph model and canvas (docs/design/node-graph.md).
+graph = ["dep:rinch-graph-view"]
 image-network = ["dep:rinch-http"]
 # Editor accessibility (M7b): derive an accesskit TreeUpdate from EditorState and
 # push it through a per-platform adapter. Linux uses accesskit_unix (AT-SPI); other
-# desktop platforms fall back to a no-op bridge until their adapters land.
-a11y = ["desktop", "rinch-editor-core/a11y", "dep:accesskit", "dep:accesskit_unix"]
+# desktop platforms fall back to a no-op bridge until their adapters land. Implies
+# `windowing`, not `desktop`: nothing of it needs the native menus (#2435).
+a11y = ["windowing", "rinch-editor-core/a11y", "dep:accesskit", "dep:accesskit_unix"]
 # Derive serde on the editor's durable wire shape (DocNode / BlockData).
 serde = ["rinch-editor-core/serde"]
 # Collaborative editing (M9): the Step↔CRDT adapter (yrs), wired into `EditorHandle`
 # inside rinch-editor-view. The ONLY thing in the workspace that links a CRDT engine —
-# opt-in, so it stays out of every default build (desktop AND web). Implies `desktop`
-# (the editor wiring is a desktop feature); forwards to the shared view crate, which is
-# wasm-compatible with no shims, so the web view reuses the SAME adapter.
-collaboration = ["desktop", "rinch-editor-view/collaboration"]
+# opt-in, so it stays out of every default build (desktop AND web). Implies
+# `windowing` (the editor wiring is a windowed feature, and needs no native menus,
+# #2435); forwards to the shared view crate, which is wasm-compatible with no shims,
+# so the web view reuses the SAME adapter.
+collaboration = ["windowing", "rinch-editor-view/collaboration"]
+# Operating-system notifications (`rinch::notification`, issue #1522): the
+# freedesktop D-Bus service on Linux, WinRT toasts on Windows,
+# UserNotifications on macOS. Off by default; implies no windowing.
+notifications = [
+    "dep:zbus", "dep:futures-lite",
+    "dep:tokio", "tokio/rt", "tokio/sync",
+    "dep:windows",
+    "dep:objc2", "dep:block2",
+]
+# System-wide hotkeys with press/release (`rinch::hotkey`, issue #1521): Windows
+# low-level hook + RegisterHotKey, macOS Carbon hot keys + CGEventTap, X11
+# grabs + XInput2, the Wayland GlobalShortcuts portal. Off by default. Implies
+# `windowing`, not `desktop`: it needs no native menus (#2435).
+global-hotkeys = [
+    "windowing",
+    "dep:zbus", "dep:futures-lite", "dep:x11rb",
+    "dep:tokio", "tokio/rt", "tokio/sync", "tokio/time",
+]
+
+# The GPU render callback on the web (`RenderSurfaceHandle::set_gpu_render_callback`,
+# #1768): rinch requests a WebGPU device (`rinch::web_gpu`) and hands each frame
+# the canvas's current texture. WebGPU only, no WebGL (without WebGPU the surface
+# reports no GPU frames and the CPU render callback runs). Off by default, so a
+# web build that does not ask links no wgpu. It does nothing off the browser.
+web-gpu = ["dep:wgpu", "dep:wasm-bindgen-futures"]
+
+# Background workers that reply on the UI thread (`rinch::worker`, issue
+# #1772): a thread on the desktop, a Web Worker running the app's own wasm
+# module on the web. Off by default. On the web it reads the glue's
+# `import.meta.url`, so the wasm-bindgen glue must be an ES module
+# (`--target web`, trunk's default), and the page's CSP must allow `blob:`
+# workers.
+worker = []
+
+# Issue #2761: `try_run` with no display, or one gone before the loop runs.
+# Its own `main` (no libtest harness): each case re-runs the binary as a child
+# that builds the event loop on its main thread, as winit requires.
+[[test]]
+name = "start_without_display_2761"
+harness = false
+required-features = ["windowing"]
 
 # Probe app for the ignored e2e test tests/debug_event_latency.rs (issue #153).
 [[example]]
 name = "debug_click_latency"
-required-features = ["desktop", "debug"]
+required-features = ["windowing", "debug"]
+
+[[example]]
+name = "hide_show_geometry"
+required-features = ["windowing"]
+
+[[example]]
+name = "prepare_probe"
+required-features = ["windowing"]
+
+[[example]]
+name = "first_frame_scale_probe"
+required-features = ["windowing"]
+
+[[example]]
+name = "layer_commit_probe"
+required-features = ["windowing"]
+
+[[example]]
+name = "input_region_probe"
+required-features = ["windowing"]
+
+[[example]]
+name = "activation_token_probe"
+required-features = ["windowing"]
+
+# Probe for issue #2843: a software wallpaper's RssShmem around its idle trim.
+[[example]]
+name = "idle_trim_probe"
+required-features = ["windowing"]
+
+# Probe for the ignored live test tests/focus_race_2731 (issue #2731).
+[[example]]
+name = "focus_race_probe"
+required-features = ["windowing"]
+
+[[example]]
+name = "windows_probe"
+required-features = ["windowing"]
+
+[[example]]
+name = "windows_unplug_probe"
+required-features = ["windowing"]
+
+[[example]]
+name = "window_roles_probe"
+required-features = ["windowing"]
+
+[[example]]
+name = "content_size_probe"
+required-features = ["windowing"]
+
+[[example]]
+name = "display_loss_probe"
+required-features = ["windowing"]

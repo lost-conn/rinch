@@ -1,10 +1,12 @@
 //! Resolving mixed `calc()` values for Taffy-consumed properties (#278).
 //!
 //! A `Calc { px, pct }` (see `computed_style/from_stylo/calc.rs`) has no Taffy
-//! representation: Taffy 0.12's calc pointer (`CompactLength::calc`) is only
+//! representation: Taffy's calc pointer (`CompactLength::calc`) is only
 //! resolvable by callers implementing the layout-tree traits themselves —
 //! `TaffyTree`'s `LayoutPartialTree::resolve_calc_value` is hardcoded to
-//! `0.0` (taffy-0.12.2, `src/tree/taffy_tree.rs:391`), with no hook. So rinch
+//! `0.0` (taffy-0.14.0, `src/tree/taffy_tree.rs:387`; 0.12 did the same), with no hook — and
+//! since #1260 rinch builds Taffy without its `calc` feature, so the pointer
+//! does not exist in this build at all. So rinch
 //! resolves these itself with the two-pass shape
 //! `ifc::resolve_percentage_inline_blocks` (#120) already uses:
 //!
@@ -41,13 +43,31 @@
 //! absolute child (`flexbox.rs:2166`, `block.rs:580`), as CSS says.
 //!
 //! Deliberate parity with the plain-percentage rules elsewhere:
-//! - An ICB-absolute box's own `width`/`height` `Calc` is baked from the
-//!   viewport by `out_of_flow::apply_out_of_flow_size_overrides` exactly like
-//!   a plain `Percent` there (#204), so this pass leaves those two fields
-//!   alone for such nodes.
-//! - Everything `out_of_flow` leaves parent-resolved for plain percentages
-//!   (#386 — min/max sizes, padding/margin on the box) stays parent-resolved
-//!   for `Calc` too.
+//! - An absolute box whose containing block is not its Taffy parent — the
+//!   initial containing block (#204) or a positioned ancestor further up
+//!   (#386) — has its own `width`/`height` `Calc` baked from that box by
+//!   `out_of_flow::apply_out_of_flow_size_overrides` exactly like a plain
+//!   `Percent` there, so this pass leaves those two fields alone for such
+//!   nodes.
+//! - Its other `Calc` values (min/max sizes, padding, margin, insets) resolve
+//!   here against that same containing block, as `out_of_flow` resolves the
+//!   plain percentages, and the basis is always definite: a containing
+//!   block's used size never depends on a box resolved against it.
+//!   (Not for a box inside an atomic inline: this pass does not reach a
+//!   detached compute, so no `Calc` in one is resolved, in flow or out —
+//!   #1412. An atomic inline's *own* `width`/`min-width`/`max-width`
+//!   `Calc` is resolved by `ifc::own_percentage_widths` against its
+//!   containing block when the box is measured, #2146.)
+//!   A `position: fixed` box whose containing block is the viewport takes
+//!   the same arm, against the viewport (#1980: `width: calc(25% + 0px)` in
+//!   an 800px viewport is 200, not a quarter of its parent); one under an
+//!   ancestor that contains fixed boxes resolves against that ancestor as an
+//!   absolute box does (#1372).
+//! - An absolute box whose containing block *is* its Taffy parent resolves
+//!   against that parent's padding box with the basis definite on both axes
+//!   for the same reason, however the parent is sized — an auto-height
+//!   block, a content-sized flex or grid container, a grid item (#1789,
+//!   #1974: `top: calc(100% + 4px)` there used to keep only its `4px`).
 //! - The out-of-flow *position* patch goes through
 //!   `LengthPercentageAutoValue::resolve`, which resolves a `Calc` against
 //!   the real containing block exactly.
@@ -56,6 +76,7 @@ use crate::RinchDocument;
 use crate::computed_style::{
     ComputedStyle, DimensionValue, LengthPercentageAutoValue, LengthPercentageValue, PositionValue,
 };
+use crate::node::RawNodeId;
 
 impl ComputedStyle {
     /// Whether any Taffy-consumed field of this style carries a mixed calc
@@ -132,11 +153,16 @@ fn patch_lpa(
 /// Same for sizes — floored at zero, a box cannot be negative-sized. Against
 /// an indefinite basis a percentage size behaves as `auto` (CSS 10.5), so the
 /// whole `Calc` does too, replacing the seed rather than keeping it.
-fn patch_dim(target: &mut taffy::Dimension, v: DimensionValue, basis: Option<f32>) {
+/// Generic over the target type because Taffy 0.14 stores `size`/`flex_basis`
+/// as a `Dimension` and `min_size`/`max_size` as a `LengthPercentageAuto`.
+fn patch_dim<T>(target: &mut T, v: DimensionValue, basis: Option<f32>)
+where
+    T: taffy::style_helpers::FromLength + taffy::style_helpers::TaffyAuto,
+{
     if matches!(v, DimensionValue::Calc { .. }) {
         *target = match basis {
-            Some(b) => taffy::Dimension::length(v.resolve_calc(b).unwrap_or(0.0)),
-            None => taffy::Dimension::auto(),
+            Some(b) => T::from_length(v.resolve_calc(b).unwrap_or(0.0)),
+            None => T::AUTO,
         };
     }
 }
@@ -145,10 +171,10 @@ impl RinchDocument {
     /// The rinch node whose Taffy node is `node_id`'s Taffy parent: the
     /// nearest ancestor that owns a Taffy node (`display: contents` ancestors
     /// generate none and their children are reparented in Taffy).
-    fn taffy_parent_rinch(&self, node_id: usize) -> Option<usize> {
+    fn taffy_parent_rinch(&self, node_id: RawNodeId) -> Option<RawNodeId> {
         let mut current = self.tree.get(node_id)?.parent?;
         loop {
-            let node = self.tree.get(current)?;
+            let node = self.tree.get_live(current)?;
             if node.taffy_id.is_some() {
                 return Some(current);
             }
@@ -164,7 +190,7 @@ impl RinchDocument {
     /// than the flexbox spec's full definiteness rules (a definite-flex-basis
     /// main axis, an inset-derived absolute size and grid axes all answer
     /// "indefinite" here).
-    fn calc_axis_definite(&self, node_id: usize, axis: Axis, depth: u32) -> bool {
+    fn calc_axis_definite(&self, node_id: RawNodeId, axis: Axis, depth: u32) -> bool {
         if depth > 64 {
             return false;
         }
@@ -185,10 +211,9 @@ impl RinchDocument {
                     None => true, // the root resolves against the viewport
                 }
             }
-            // `Intrinsic` rides with `Auto` because that is what it lays out
-            // as (#626) — Taffy never sees the keyword. When the keywords are
-            // implemented this arm splits: a `max-content` axis is definite
-            // once measured, where `auto` may not be.
+            // `Intrinsic` rides with `Auto`: a keyword is not a declared
+            // length, so this walk proves nothing about it. Conservative for
+            // a content keyword, whose axis is definite once measured (#691).
             DimensionValue::Auto | DimensionValue::Intrinsic(_) => {
                 // An auto-sized absolute shrinks to fit its content.
                 if matches!(
@@ -203,7 +228,7 @@ impl RinchDocument {
                 // What Taffy does with the auto depends on the parent's
                 // layout mode — read the parent's *Taffy* style, which
                 // carries rinch's element-default display/direction.
-                let Some(p_taffy) = self.tree.get(p).and_then(|n| n.taffy_id) else {
+                let Some(p_taffy) = self.tree.get_live(p).and_then(|n| n.taffy_id) else {
                     return false;
                 };
                 let Ok(p_style) = self.tree.taffy.style(p_taffy) else {
@@ -248,20 +273,135 @@ impl RinchDocument {
     /// Resolve every `Calc` layout value against the sizes the last Taffy
     /// compute produced, writing resolved lengths into the Taffy styles.
     /// Returns whether anything changed — the caller re-runs the compute
-    /// until this answers `false` (see `resolve_layout`).
-    pub(crate) fn resolve_layout_calcs(&mut self) -> bool {
-        let mut targets: Vec<(usize, taffy::NodeId)> = Vec::new();
+    /// until this answers `false` (see `resolve_layout`) — and whether a
+    /// changed one is inside an atomic inline.
+    ///
+    /// Such a box is laid out by its own detached compute, which the root
+    /// compute does not reach, so each atomic inline around a rewritten node
+    /// is queued for `remeasure_dirty_atomic_inlines` here (which also drops
+    /// what `resolve_percentage_inline_blocks` recorded for it, #2136), and
+    /// the caller runs that and the percentage pass, as it does for a re-baked
+    /// absolute box. Before #2136 the box was left as it was, and only the
+    /// percentage pass's re-layout of every percentage box on every pass
+    /// corrected it — one layout late.
+    pub(crate) fn resolve_layout_calcs(&mut self) -> (bool, bool) {
+        let mut targets: Vec<(RawNodeId, taffy::NodeId)> = Vec::new();
         for (id, node) in &self.tree.nodes {
             if let Some(taffy_id) = node.taffy_id
-                && node.computed_style.has_layout_calc()
+                && (node.computed_style.has_layout_calc()
+                    || Self::caption_margins_need_layout(node))
             {
                 targets.push((id, taffy_id));
             }
         }
         if targets.is_empty() {
-            return false;
+            return (false, false);
         }
 
+        let mut changed = false;
+        let mut in_atomic = false;
+        for (id, taffy_id) in targets {
+            let before = match self.tree.taffy.style(taffy_id) {
+                Ok(s) => s.clone(),
+                Err(_) => continue,
+            };
+            let mut ts = before.clone();
+            self.patch_layout_calcs(id, taffy_id, &mut ts);
+            if before != ts {
+                let _ = self.tree.taffy.set_style(taffy_id, ts);
+                changed = true;
+                // Inside an atomic inline (the node itself excluded: its own
+                // style is read by the compute of the IFC around it)? Only
+                // when the percentage has a definite basis there: a box
+                // between the two with a length width, or the atomic inline's
+                // own width a length or a percentage. Under an `auto` (or
+                // keyword) atomic inline the percentage is cyclic, and CSS
+                // Sizing 3 §5.2.1 takes it as `auto` for the box's
+                // contribution: re-measuring then iterated toward the box's
+                // own width (5 calc passes and 20px for `calc(50% + 10px)`,
+                // the fixpoint cap for `90%`) where Chrome 156 keeps the box
+                // at its contribution and the child at `calc` of it.
+                let mut cur = self.tree.nodes.get(id).and_then(|n| n.parent);
+                while let Some(a) = cur {
+                    let Some(an) = self.tree.nodes.get(a) else {
+                        break;
+                    };
+                    use crate::computed_style::DimensionValue as D;
+                    if an.display_mode.is_atomic_inline() {
+                        if matches!(
+                            an.computed_style.width,
+                            D::Length(_) | D::Percent(_) | D::Calc { .. }
+                        ) {
+                            in_atomic = true;
+                            self.mark_atomic_inline_dirty(id);
+                        }
+                        break;
+                    }
+                    if matches!(an.computed_style.width, D::Length(_)) {
+                        // A definite basis below the atomic inline: find the
+                        // box around it to re-measure.
+                        let mut up = an.parent;
+                        while let Some(b) = up {
+                            let Some(bn) = self.tree.nodes.get(b) else {
+                                break;
+                            };
+                            if bn.display_mode.is_atomic_inline() {
+                                in_atomic = true;
+                                self.mark_atomic_inline_dirty(id);
+                                break;
+                            }
+                            up = bn.parent;
+                        }
+                        break;
+                    }
+                    cur = an.parent;
+                }
+            }
+        }
+        (changed, in_atomic)
+    }
+
+    /// What a Taffy style `ts` rebuilt from node `id`'s computed values is
+    /// compared with the stored one as: `ts` with its `Calc` layout values
+    /// resolved by [`Self::patch_layout_calcs`], or `None` — compare `ts`
+    /// itself — when the node has none (or its style belongs to the
+    /// `display: contents` splice).
+    ///
+    /// The rebuilt style carries each `Calc` as its length part (the seed);
+    /// the stored one, the length `resolve_layout_calcs` resolved that seed
+    /// to. Compared unresolved, a new `calc()` whose length part equalled the
+    /// old resolved length was judged unchanged and its layout skipped (#767).
+    /// Only the comparison sees the resolved copy: a changed style is stored
+    /// seeded, as before, for `resolve_layout_calcs` to resolve after the
+    /// compute — a box laid out in a detached compute (inside an atomic
+    /// inline, #1412) is not reached by that pass, and a restyle that stored
+    /// the resolved copy laid it out unlike a fresh layout of the same style.
+    pub(crate) fn taffy_style_for_compare(
+        &self,
+        id: RawNodeId,
+        taffy_id: taffy::NodeId,
+        ts: &taffy::Style,
+    ) -> Option<taffy::Style> {
+        let node = &self.tree.nodes[id];
+        if !(node.computed_style.has_layout_calc() || Self::caption_margins_need_layout(node))
+            || node.taffy_style_owned_by_contents_splice()
+        {
+            return None;
+        }
+        let mut resolved = ts.clone();
+        self.patch_layout_calcs(id, taffy_id, &mut resolved);
+        Some(resolved)
+    }
+
+    /// Write into `ts` — node `id`'s Taffy style — the lengths its `Calc`
+    /// layout values resolve to against the sizes the last Taffy compute
+    /// produced: the per-node step of [`Self::resolve_layout_calcs`].
+    pub(crate) fn patch_layout_calcs(
+        &self,
+        id: RawNodeId,
+        taffy_id: taffy::NodeId,
+        ts: &mut taffy::Style,
+    ) {
         let viewport = self.tree.viewport;
         // Basis box of a laid-out Taffy node, or the viewport for a node with
         // no Taffy parent — the same fallback the rest of the engine uses for
@@ -290,90 +430,102 @@ impl RinchDocument {
             }
         };
 
-        let mut changed = false;
-        for (id, taffy_id) in targets {
-            let parent = self.tree.taffy.parent(taffy_id);
-            let is_abs = matches!(
-                self.tree.nodes[id].computed_style.position,
-                PositionValue::Absolute | PositionValue::Fixed
-            );
-            // An absolute child resolves against the parent's padding box;
-            // an in-flow one against its content box.
-            let (pw, ph) = basis_box(&self.tree.taffy, parent, !is_abs);
-            let (ow, oh) = basis_box(&self.tree.taffy, Some(taffy_id), true);
+        let parent = self.tree.taffy.parent(taffy_id);
+        let is_abs = matches!(
+            self.tree.nodes[id].computed_style.position,
+            PositionValue::Absolute | PositionValue::Fixed
+        );
+        // An absolute box whose containing block is not its Taffy parent
+        // — the initial one (#204) or an ancestor further up (#386) — and a
+        // fixed box against the viewport (#1980) resolve against that box,
+        // whose size is always definite to them.
+        let abs_cb = is_abs
+            .then(|| crate::out_of_flow::out_of_flow_kind(&self.tree, id))
+            .flatten()
+            .and_then(|kind| crate::out_of_flow::ContainingBox::of(&self.tree, kind));
+        // An absolute child resolves against the parent's padding box;
+        // an in-flow one against its content box.
+        let (pw, ph) = match abs_cb {
+            Some(cb) => (cb.width, cb.height),
+            None => basis_box(&self.tree.taffy, parent, !is_abs),
+        };
+        let (ow, oh) = basis_box(&self.tree.taffy, Some(taffy_id), true);
 
-            // Definiteness per basis axis: an axis that is content-sized
-            // resolves the percentage part as zero/auto instead (module doc).
-            let parent_rinch = self.taffy_parent_rinch(id);
-            let (pw_def, ph_def) = match parent_rinch {
-                Some(p) => (
-                    self.calc_axis_definite(p, Axis::X, 0),
-                    self.calc_axis_definite(p, Axis::Y, 0),
-                ),
-                None => (true, true), // viewport
-            };
-            let (ow_def, oh_def) = (
-                self.calc_axis_definite(id, Axis::X, 0),
-                self.calc_axis_definite(id, Axis::Y, 0),
-            );
-            let basis = |b: f32, definite: bool| (definite && b.is_finite()).then_some(b);
-            let (pw, ph) = (basis(pw, pw_def), basis(ph, ph_def));
-            let (ow, oh) = (basis(ow, ow_def), basis(oh, oh_def));
+        // Definiteness per basis axis: an axis that is content-sized
+        // resolves the percentage part as zero/auto instead (module doc).
+        // An absolute box laid out in its own containing block (the
+        // Taffy parent) has a definite basis too, whatever sizes that
+        // block: it is laid out after the block's size is final, and an
+        // out-of-flow box sizes nothing above it, so the percentage
+        // cannot feed its own basis. Judging it by the in-flow rule made
+        // `top: calc(100% + 4px)` under an auto-height block `4px`
+        // (#1789, #1974) while a plain `top: 100%` (Taffy's) resolved.
+        // A fixed box under an ancestor that contains fixed boxes is one of
+        // these (`box_position`, #1372).
+        let absolute = matches!(self.tree.nodes[id].box_position(), PositionValue::Absolute);
+        let parent_rinch = self.taffy_parent_rinch(id);
+        let (pw_def, ph_def) = match parent_rinch {
+            _ if abs_cb.is_some() || absolute => (true, true),
+            Some(p) => (
+                self.calc_axis_definite(p, Axis::X, 0),
+                self.calc_axis_definite(p, Axis::Y, 0),
+            ),
+            None => (true, true), // viewport
+        };
+        let (ow_def, oh_def) = (
+            self.calc_axis_definite(id, Axis::X, 0),
+            self.calc_axis_definite(id, Axis::Y, 0),
+        );
+        let basis = |b: f32, definite: bool| (definite && b.is_finite()).then_some(b);
+        let (pw, ph) = (basis(pw, pw_def), basis(ph, ph_def));
+        let (ow, oh) = (basis(ow, ow_def), basis(oh, oh_def));
 
-            // flex-basis resolves against the flex container's inner main size.
-            let parent_main = match parent
-                .and_then(|p| self.tree.taffy.style(p).ok())
-                .map(|s| s.flex_direction)
-            {
-                Some(taffy::FlexDirection::Column | taffy::FlexDirection::ColumnReverse) => ph,
-                _ => pw,
-            };
+        // flex-basis resolves against the flex container's inner main size.
+        let parent_main = match parent
+            .and_then(|p| self.tree.taffy.style(p).ok())
+            .map(|s| s.flex_direction)
+        {
+            Some(taffy::FlexDirection::Column | taffy::FlexDirection::ColumnReverse) => ph,
+            _ => pw,
+        };
 
-            // An ICB-absolute's own width/height Calc was baked from the
-            // viewport at style-apply time (out_of_flow, #204) — leave them.
-            let skip_own_size = crate::out_of_flow::out_of_flow_kind(&self.tree, id)
-                == Some(crate::out_of_flow::OutOfFlowKind::IcbAbsolute);
+        // Such a box's own width/height Calc is baked from its containing
+        // block by `out_of_flow` — leave them.
+        let skip_own_size = abs_cb.is_some();
 
-            let before = match self.tree.taffy.style(taffy_id) {
-                Ok(s) => s.clone(),
-                Err(_) => continue,
-            };
-            let mut ts = before.clone();
-            let cs = &self.tree.nodes[id].computed_style;
+        let cs = &self.tree.nodes[id].computed_style;
 
-            if !skip_own_size {
-                patch_dim(&mut ts.size.width, cs.width, pw);
-                patch_dim(&mut ts.size.height, cs.height, ph);
-            }
-            patch_dim(&mut ts.min_size.width, cs.min_width, pw);
-            patch_dim(&mut ts.min_size.height, cs.min_height, ph);
-            patch_dim(&mut ts.max_size.width, cs.max_width, pw);
-            patch_dim(&mut ts.max_size.height, cs.max_height, ph);
-            patch_dim(&mut ts.flex_basis, cs.flex_basis, parent_main);
-            // Padding and margin percentages resolve against the containing
-            // block's *inline* size on every side, insets against their own
-            // axis — mirroring how Taffy resolves the plain-percent forms.
-            patch_lp(&mut ts.padding.top, cs.padding_top, pw);
-            patch_lp(&mut ts.padding.right, cs.padding_right, pw);
-            patch_lp(&mut ts.padding.bottom, cs.padding_bottom, pw);
-            patch_lp(&mut ts.padding.left, cs.padding_left, pw);
-            patch_lpa(&mut ts.margin.top, cs.margin_top, pw);
-            patch_lpa(&mut ts.margin.right, cs.margin_right, pw);
-            patch_lpa(&mut ts.margin.bottom, cs.margin_bottom, pw);
-            patch_lpa(&mut ts.margin.left, cs.margin_left, pw);
-            patch_lpa(&mut ts.inset.top, cs.top, ph);
-            patch_lpa(&mut ts.inset.bottom, cs.bottom, ph);
-            patch_lpa(&mut ts.inset.left, cs.left, pw);
-            patch_lpa(&mut ts.inset.right, cs.right, pw);
-            // Gap resolves against the container's own content box, per axis.
-            patch_lp(&mut ts.gap.width, cs.gap_column, ow);
-            patch_lp(&mut ts.gap.height, cs.gap_row, oh);
-
-            if before != ts {
-                let _ = self.tree.taffy.set_style(taffy_id, ts);
-                changed = true;
-            }
+        if !skip_own_size {
+            patch_dim(&mut ts.size.width, cs.width, pw);
+            patch_dim(&mut ts.size.height, cs.height, ph);
         }
-        changed
+        patch_dim(&mut ts.min_size.width, cs.min_width, pw);
+        patch_dim(&mut ts.min_size.height, cs.min_height, ph);
+        patch_dim(&mut ts.max_size.width, cs.max_width, pw);
+        patch_dim(&mut ts.max_size.height, cs.max_height, ph);
+        patch_dim(&mut ts.flex_basis, cs.flex_basis, parent_main);
+        // Padding and margin percentages resolve against the containing
+        // block's *inline* size on every side, insets against their own
+        // axis — mirroring how Taffy resolves the plain-percent forms.
+        patch_lp(&mut ts.padding.top, cs.padding_top, pw);
+        patch_lp(&mut ts.padding.right, cs.padding_right, pw);
+        patch_lp(&mut ts.padding.bottom, cs.padding_bottom, pw);
+        patch_lp(&mut ts.padding.left, cs.padding_left, pw);
+        patch_lpa(&mut ts.margin.top, cs.margin_top, pw);
+        patch_lpa(&mut ts.margin.right, cs.margin_right, pw);
+        patch_lpa(&mut ts.margin.bottom, cs.margin_bottom, pw);
+        patch_lpa(&mut ts.margin.left, cs.margin_left, pw);
+        patch_lpa(&mut ts.inset.top, cs.top, ph);
+        patch_lpa(&mut ts.inset.bottom, cs.bottom, ph);
+        patch_lpa(&mut ts.inset.left, cs.left, pw);
+        patch_lpa(&mut ts.inset.right, cs.right, pw);
+        // Gap resolves against the container's own content box, per axis.
+        patch_lp(&mut ts.gap.width, cs.gap_column, ow);
+        patch_lp(&mut ts.gap.height, cs.gap_row, oh);
+        // A caption's margins resolve against its table's width, and
+        // take it out of the table's padding (#2350).
+        if Self::caption_margins_need_layout(&self.tree.nodes[id]) {
+            self.patch_caption_margins(id, taffy_id, ts);
+        }
     }
 }

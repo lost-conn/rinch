@@ -43,6 +43,9 @@ struct AppInfo {
     pid: u32,
     #[allow(dead_code)]
     app_name: String,
+    /// The session token (#2481); absent for an app from before it.
+    #[serde(default)]
+    token: Option<String>,
 }
 
 /// Rinch debug client for capturing screenshots and DOM.
@@ -57,11 +60,18 @@ impl RinchCapture {
     /// Discovers apps via the same directory `rinch-debug` writes to.
     pub fn connect() -> Result<Self, CaptureError> {
         let app = discover_app()?;
-        Self::connect_to_port(app.port)
+        Self::connect_with_token(app.port, app.token)
     }
 
-    /// Connect to a specific port.
+    /// Connect to a specific port, sending no token: reaches only an app
+    /// from before #2481. See [`connect_with_token`](Self::connect_with_token).
     pub fn connect_to_port(port: u16) -> Result<Self, CaptureError> {
+        Self::connect_with_token(port, None)
+    }
+
+    /// Connect to a specific port with the token from the app's discovery
+    /// file, which an app refuses to talk without (#2481).
+    pub fn connect_with_token(port: u16, token: Option<String>) -> Result<Self, CaptureError> {
         let addr = format!("127.0.0.1:{}", port);
         let mut stream = TcpStream::connect(&addr)
             .map_err(|e| CaptureError::ConnectionFailed(format!("{}: {}", addr, e)))?;
@@ -73,11 +83,18 @@ impl RinchCapture {
         let handshake = HandshakeRequest {
             protocol: "rinch-debug".to_string(),
             version: 1,
+            token,
         };
         let bytes = serde_json::to_vec(&handshake)
             .map_err(|e| CaptureError::ProtocolError(e.to_string()))?;
         write_frame(&mut stream, &bytes)?;
-        let _response = read_frame(&mut stream)?;
+        let response = read_frame(&mut stream)?;
+        let refused = serde_json::from_slice::<serde_json::Value>(&response)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string));
+        if let Some(error) = refused {
+            return Err(CaptureError::ConnectionFailed(error));
+        }
 
         Ok(Self {
             stream,
@@ -139,12 +156,47 @@ impl RinchCapture {
         }
     }
 
+    /// The nodes matching a simple selector (`tag`, `.class`, `[attr]`,
+    /// `[attr=value]`), with their text content and on-screen box.
+    pub fn query_selector(
+        &mut self,
+        selector: &str,
+    ) -> Result<Vec<crate::runner::NodeMatch>, CaptureError> {
+        let data = match self.execute(DebugCommandKind::QuerySelector {
+            selector: selector.to_string(),
+        })? {
+            DebugResult::Json { data } => data,
+            _ => {
+                return Err(CaptureError::CommandFailed(
+                    "QuerySelector returned no data".into(),
+                ));
+            }
+        };
+        let nodes = data.as_array().ok_or_else(|| {
+            CaptureError::ProtocolError("QuerySelector did not return an array".into())
+        })?;
+        nodes.iter().map(node_match).collect()
+    }
+
+    /// Press one key, by `key_press` name (e.g. `"Escape"`).
+    pub fn key_press(&mut self, key: &str) -> Result<(), CaptureError> {
+        self.execute(DebugCommandKind::KeyPress {
+            key: key.to_string(),
+            shift: false,
+            ctrl: false,
+            alt: false,
+            modifiers: Vec::new(),
+        })?;
+        Ok(())
+    }
+
     /// Click at coordinates.
     pub fn click(&mut self, x: f64, y: f64) -> Result<(), CaptureError> {
         self.execute(DebugCommandKind::Click {
             x: x as f32,
             y: y as f32,
             button: None,
+            modifiers: None,
         })?;
         Ok(())
     }
@@ -156,15 +208,50 @@ impl RinchCapture {
     }
 }
 
-/// Discover a running rinch app.
+/// Read one node of a `query_selector` answer: `text_content` and the
+/// `absolute` box (logical px, the space `click` takes).
+fn node_match(node: &serde_json::Value) -> Result<crate::runner::NodeMatch, CaptureError> {
+    let abs = &node["absolute"];
+    let num = |key: &str| {
+        abs[key].as_f64().ok_or_else(|| {
+            CaptureError::ProtocolError(format!("query_selector node has no absolute.{}", key))
+        })
+    };
+    Ok(crate::runner::NodeMatch {
+        text: node["text_content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        x: num("x")?,
+        y: num("y")?,
+        width: num("width")?,
+        height: num("height")?,
+    })
+}
+
+/// Environment variable naming the PID of the app to test, for a host with
+/// more than one debug-enabled rinch app running.
+pub const PID_ENV: &str = "RINCH_VISUAL_TEST_PID";
+
+/// Discover the running rinch app to test.
+///
+/// With [`PID_ENV`] set, that app and no other. Otherwise there must be
+/// exactly one live app: picking whichever discovery file the directory
+/// listing yields first used to photograph an arbitrary app.
 fn discover_app() -> Result<AppInfo, CaptureError> {
-    let debug_dir = rinch_debug::discovery::discovery_dir();
+    let wanted = match std::env::var(PID_ENV) {
+        Ok(v) => Some(v.trim().parse::<u32>().map_err(|_| {
+            CaptureError::ConnectionFailed(format!("{PID_ENV}={v:?} is not a PID"))
+        })?),
+        Err(_) => None,
+    };
+    let debug_dir = rinch_debug::discovery::discovery_dir().ok_or(CaptureError::NoAppFound)?;
 
     if !debug_dir.exists() {
         return Err(CaptureError::NoAppFound);
     }
 
-    // Look for .json files
+    let mut live = Vec::new();
     for entry in std::fs::read_dir(&debug_dir).map_err(|_| CaptureError::NoAppFound)? {
         let entry = entry.map_err(|_| CaptureError::NoAppFound)?;
         let path = entry.path();
@@ -172,18 +259,30 @@ fn discover_app() -> Result<AppInfo, CaptureError> {
         if path.extension().map(|e| e == "json").unwrap_or(false)
             && let Ok(contents) = std::fs::read_to_string(&path)
             && let Ok(info) = serde_json::from_str::<AppInfo>(&contents)
+            && is_process_running(info.pid)
         {
-            // Verify process is still running
-            if is_process_running(info.pid) {
-                return Ok(info);
-            } else {
-                // Cleanup stale file
-                let _ = std::fs::remove_file(&path);
-            }
+            live.push(info);
         }
     }
 
-    Err(CaptureError::NoAppFound)
+    if let Some(pid) = wanted {
+        return live
+            .into_iter()
+            .find(|a| a.pid == pid)
+            .ok_or(CaptureError::NoAppFound);
+    }
+    match live.len() {
+        0 => Err(CaptureError::NoAppFound),
+        1 => Ok(live.remove(0)),
+        _ => Err(CaptureError::ConnectionFailed(format!(
+            "{} rinch apps are running ({}); set {PID_ENV} to choose one",
+            live.len(),
+            live.iter()
+                .map(|a| a.pid.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
 }
 
 /// Check if a process is running.

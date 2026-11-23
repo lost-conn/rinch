@@ -24,8 +24,9 @@
 //! `push_layer` in this crate is handed a *bounds* shape along with the opacity.
 //! The two painters read that shape very differently.
 //! [`TinySkiaPainter::push_layer`](super::skia_painter::TinySkiaPainter) names
-//! the parameter `_bounds` and never looks at it — its layer is a pixmap the
-//! size of the whole surface, composited back whole — while
+//! the parameter `_bounds` and never looks at it — its layer is a
+//! surface-sized pixmap, composited back over whatever area the painter itself
+//! saw drawn into it (its own bookkeeping, not this module's bounds) — while
 //! [`VelloPainter::push_layer`](super::vello_painter::VelloPainter) passes it
 //! straight to `vello::Scene::push_layer`, which *clips* every command inside
 //! the layer to it.
@@ -267,9 +268,11 @@ const MAX_DEPTH: u32 = 32;
 /// away. See the note on `Fixed` in [`Walk::node`].
 ///
 /// It is a claim about what this walk can *bound*, not a proof that nothing
-/// clips the box: a clip the fixed box's owning stacking context was itself
-/// hoisted past does still reach it (#549), so `Escapes` can be more generous
-/// than the truth. That is the direction this module errs in on purpose.
+/// clips the box: the clips above a transformed, filtered or masked ancestor,
+/// and a transformed or filtered one's own, do still reach a fixed box (#549),
+/// so `Escapes` can be more
+/// generous than the truth. That is the direction this module errs in on
+/// purpose.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Extent {
     /// Provably nothing is drawn.
@@ -398,8 +401,41 @@ pub fn opacity_layer_bounds(
     x: f64,
     y: f64,
 ) -> Rect {
+    match opacity_layer_extent(tree, node_id, scale, x, y) {
+        // A zero-area answer is not worth trusting even when it is arrived at
+        // honestly: the layer is being pushed because paint is about to draw
+        // something into it, and a degenerate clip would blank whatever that
+        // is. The zero-area branch in `paint_node` reaches this with an element
+        // that has no box of its own and no children, and `UNBOUNDED` is
+        // exactly what that branch passed before this function existed.
+        Extent::Within(r) if r.width() > 0.0 && r.height() > 0.0 => r,
+        _ => UNBOUNDED,
+    }
+}
+
+/// Whether the subtree at `node_id` provably paints nothing at all, whatever
+/// clips are open around it: the walk [`opacity_layer_bounds`] uses answers
+/// [`Extent::Nothing`], or that all it draws lies within a rect of no area
+/// (anything that draws a pixel, a border, a stroke or a glyph, gives its
+/// rect area). `x`/`y` are the node's painted origin, as there.
+pub(super) fn paints_nothing_at_all(
+    tree: &NodeTree,
+    node_id: RawNodeId,
+    scale: f64,
+    x: f64,
+    y: f64,
+) -> bool {
+    match opacity_layer_extent(tree, node_id, scale, x, y) {
+        Extent::Nothing => true,
+        Extent::Within(r) => !(r.width() > 0.0 && r.height() > 0.0),
+        Extent::Unknown | Extent::Escapes => false,
+    }
+}
+
+/// The subtree's extent as the walk finds it (see [`opacity_layer_bounds`]).
+fn opacity_layer_extent(tree: &NodeTree, node_id: RawNodeId, scale: f64, x: f64, y: f64) -> Extent {
     let Some(node) = tree.get(node_id) else {
-        return UNBOUNDED;
+        return Extent::Unknown;
     };
     // The walk re-derives every node's position as `offset + layout.x * scale`,
     // including the root's, so hand it the offset that reproduces the `x`/`y`
@@ -416,16 +452,42 @@ pub fn opacity_layer_bounds(
         skip_root_clip: false,
         absolutes_escape_clips: false,
         clipper_below_cb: false,
+        clipper_below_fixed_cb: false,
+    };
+    walk.node(node_id, offset_x, offset_y, Affine::IDENTITY, true, 0)
+}
+
+/// Where `node_id`'s subtree paints, for a damage computation: `Some(rect)`,
+/// `Some` of an empty rect when it provably paints nothing, `None` when the
+/// walk cannot bound it.
+///
+/// [`opacity_layer_bounds`] folds "nothing" into [`UNBOUNDED`], which is right
+/// for a layer about to be drawn into and wrong for damage: a box-less block
+/// whose only content was just hidden paints nothing, and reading that as
+/// unbounded repainted the whole surface.
+pub(super) fn subtree_paint_extent(
+    tree: &NodeTree,
+    node_id: RawNodeId,
+    scale: f64,
+    x: f64,
+    y: f64,
+) -> Option<Rect> {
+    let node = tree.get(node_id)?;
+    let offset_x = x - node.layout.x as f64 * scale;
+    let offset_y = y - node.layout.y as f64 * scale;
+    let mut walk = Walk {
+        tree,
+        scale,
+        budget: MAX_VISITS,
+        skip_root_clip: false,
+        absolutes_escape_clips: false,
+        clipper_below_cb: false,
+        clipper_below_fixed_cb: false,
     };
     match walk.node(node_id, offset_x, offset_y, Affine::IDENTITY, true, 0) {
-        // A zero-area answer is not worth trusting even when it is arrived at
-        // honestly: the layer is being pushed because paint is about to draw
-        // something into it, and a degenerate clip would blank whatever that
-        // is. The zero-area branch in `paint_node` reaches this with an element
-        // that has no box of its own and no children, and `UNBOUNDED` is
-        // exactly what that branch passed before this function existed.
-        Extent::Within(r) if r.width() > 0.0 && r.height() > 0.0 => r,
-        _ => UNBOUNDED,
+        Extent::Nothing => Some(Rect::ZERO),
+        Extent::Within(r) => Some(r),
+        Extent::Unknown | Extent::Escapes => None,
     }
 }
 
@@ -490,6 +552,7 @@ pub(super) fn clip_cuts_nothing(
         skip_root_clip: true,
         absolutes_escape_clips: false,
         clipper_below_cb: false,
+        clipper_below_fixed_cb: false,
     };
     match walk.node(node_id, offset_x, offset_y, Affine::IDENTITY, true, 0) {
         // Half a device pixel of slack, matching the tolerance every other
@@ -567,6 +630,7 @@ pub(super) fn subtree_is_entirely_outside(
         skip_root_clip: false,
         absolutes_escape_clips: true,
         clipper_below_cb: false,
+        clipper_below_fixed_cb: false,
     };
     match walk.node(node_id, offset_x, offset_y, Affine::IDENTITY, true, 0) {
         Extent::Within(r) => !region_hits(transform.transform_rect_bbox(r)),
@@ -590,7 +654,14 @@ pub(super) fn subtree_is_entirely_outside(
     }
 }
 
-/// Convenience for the call sites, which all want a [`PaintShape`].
+/// The bounds of the layer an element with `opacity` below 1 is painted in,
+/// as the [`PaintShape`] the call sites push.
+///
+/// A subtree the walk proves paints **nothing** gets an empty rect at the
+/// element's own origin, where [`opacity_layer_bounds`] answers [`UNBOUNDED`]:
+/// Vello allocates a layer's tiles over its whole bounds, so a dimmed element
+/// that draws nothing would cost a window of tiles. Nothing is drawn into the
+/// layer, so an empty clip cuts nothing away.
 pub(super) fn opacity_layer_shape(
     tree: &NodeTree,
     node_id: RawNodeId,
@@ -598,7 +669,11 @@ pub(super) fn opacity_layer_shape(
     x: f64,
     y: f64,
 ) -> PaintShape {
-    opacity_layer_bounds(tree, node_id, scale, x, y).into()
+    match opacity_layer_extent(tree, node_id, scale, x, y) {
+        Extent::Nothing => Rect::new(x, y, x, y).into(),
+        Extent::Within(r) if r.width() > 0.0 && r.height() > 0.0 => r.into(),
+        _ => UNBOUNDED.into(),
+    }
 }
 
 struct Walk<'a> {
@@ -632,14 +707,84 @@ struct Walk<'a> {
     /// that establishes a containing block for absolutes — i.e. whether there
     /// is a clip in scope that an absolute found here would escape.
     ///
-    /// Mirrors [`crate::stacking::Collector`]'s `cb_depth`, which is the
+    /// Mirrors `crate::stacking::Collector`'s `cb_depth`, which is the
     /// authority: an absolute's clip chain is `live[..cb_depth]`, counted
     /// *after* the containing block's own clip is pushed, so that block's clip
     /// is in the chain and every clip inside it is not.
     clipper_below_cb: bool,
+    /// [`Self::clipper_below_cb`] for a `position: fixed` box whose
+    /// containing block is an ancestor (#1372): cleared by a node that
+    /// establishes a containing block for fixed boxes, not by a merely
+    /// positioned one.
+    clipper_below_fixed_cb: bool,
 }
 
 impl Walk<'_> {
+    /// What an IFC root's own inline content draws. A root collapsed to no
+    /// area draws it too (it overflows the box), so both arms of [`Self::node`]
+    /// ask.
+    fn inline_extent(
+        &self,
+        node: &crate::Node,
+        x: f64,
+        y: f64,
+        scroll: Vec2,
+        transform: Affine,
+    ) -> Extent {
+        let Some(inline) = &node.text_layout else {
+            return Extent::Nothing;
+        };
+        let (off_x, off_y) = super::ifc_root_content_origin(node);
+        let content_x = x + off_x as f64 * self.scale - scroll.x;
+        let content_y = y + off_y as f64 * self.scale - scroll.y;
+        let mut text = Rect::new(
+            content_x,
+            content_y,
+            content_x + inline.painted_width() as f64 * self.scale,
+            content_y + inline.layout.height() as f64 * self.scale,
+        );
+        // What it draws past those line boxes: text `vertical-align`
+        // moves off its line, inline elements' backgrounds and borders
+        // (which reach past the line by their padding and border, #1762)
+        // and wavy underlines (#1817) — measured by the one function the
+        // damage ink reads too, from the geometry paint draws with.
+        // Before #1762 and #1817 a clip was elided whenever the unshifted
+        // lines fitted, and the pill, the raised text or the wave painted
+        // outside the box.
+        if let Some(past) =
+            super::text::inline_ink_past_lines(|id| self.tree.get(id), inline, self.scale)
+        {
+            text = text.union(past + Vec2::new(content_x, content_y));
+        }
+        // The shadows its inline elements declare are drawn with it (#1048).
+        let mut reach = text_shadow_reach(text, &node.computed_style.text_shadow, self.scale);
+        // A `-webkit-text-stroke` reaches past the glyphs (#2719): the
+        // root's own, and its inline elements' where one may differ.
+        let mut stroke = super::text_stroke_reach(&node.computed_style.text_paint);
+        if self.tree.inline_text_shadows {
+            for list in super::member_text_shadows(node, true, |id| self.tree.get(id)) {
+                reach = reach.union(text_shadow_reach(text, list, self.scale));
+            }
+            stroke = inline
+                .text_ranges
+                .iter()
+                .filter(|r| !r.is_br)
+                .filter_map(|r| {
+                    self.tree
+                        .get(r.node_id)?
+                        .parent
+                        .and_then(|p| self.tree.get(p))
+                })
+                .map(|e| super::text_stroke_reach(&e.computed_style.text_paint))
+                .fold(stroke, f32::max);
+        }
+        if stroke > 0.0 {
+            let s = stroke as f64 * self.scale;
+            reach = reach.union(text.inflate(s, s));
+        }
+        Extent::Within(transform.transform_rect_bbox(reach))
+    }
+
     /// The extent of everything `paint_node` would draw for this node and its
     /// subtree, in the layer's coordinate space.
     ///
@@ -775,7 +920,7 @@ impl Walk<'_> {
             // against the software painter can see it — so
             // `a_fixed_descendant_is_not_narrowed_by_a_clipper_it_escapes`
             // asserts on the bounds themselves.
-            if cs.position == PositionValue::Fixed {
+            if node.box_position() == PositionValue::Fixed {
                 return Extent::Escapes;
             }
             // `position: absolute` escapes the clippers **below its containing
@@ -797,8 +942,12 @@ impl Walk<'_> {
             // and is what `Extent::Escapes` cannot express; this is the
             // conservative whole-escape instead.
             if self.absolutes_escape_clips
-                && self.clipper_below_cb
-                && cs.position == PositionValue::Absolute
+                && node.box_position() == PositionValue::Absolute
+                && if node.is_contained_fixed() {
+                    self.clipper_below_fixed_cb
+                } else {
+                    self.clipper_below_cb
+                }
             {
                 return Extent::Escapes;
             }
@@ -809,7 +958,7 @@ impl Walk<'_> {
             // create a second implementation of it to drift out of step with the
             // first. That drift is precisely the class of bug this module exists
             // to close, so a sticky descendant answers `Unknown`.
-            if cs.position == PositionValue::Sticky {
+            if node.box_position() == PositionValue::Sticky {
                 return Extent::Unknown;
             }
         }
@@ -839,11 +988,12 @@ impl Walk<'_> {
             }
 
             // A box collapsed to zero in one dimension still keeps its origin
-            // and its transform, and paint still walks into it (#142). A box
-            // collapsed in *both* is one paint returns from — but the stacking
-            // walk descends *through* it to hoist positioned descendants out,
-            // and those are painted. Recursing into it costs a level and can
-            // only enlarge the result, which is the right way to be wrong.
+            // and its transform, and paint still walks into it (#142); so does
+            // a box collapsed in *both* since #1696 (a `0x0` stacking context's
+            // descendants are entries of its own sequence, and an in-flow
+            // child of a `0x0` box overflows it). The walk here does not apply
+            // the box's own zero-area clip, so it can only enlarge the result,
+            // which is the right way to be wrong.
             //
             // Read that "only enlarge" narrowly: it is measured against *not*
             // recursing, not against what this branch used to return. When the
@@ -852,15 +1002,19 @@ impl Walk<'_> {
             // smaller shape than the one this branch shipped before, and it is
             // the only branch of which that is true. The module doc's safety
             // property is stated with this exception; see "The one rule".
+            //
+            // `paint_node`'s zero-area arm draws the box's own inline content,
+            // which `children` skips as drawn by the IFC.
             let transform = self.own_transform(node, x, y, parent_transform, is_root);
-            return self.scoped_children(
+            let inline = self.inline_extent(node, x, y, scroll, transform);
+            return inline.union(self.scoped_children(
                 node,
                 x - scroll.x,
                 y - scroll.y,
                 transform,
                 depth,
                 is_root,
-            );
+            ));
         }
 
         let x = offset_x + layout.x as f64 * self.scale;
@@ -879,7 +1033,8 @@ impl Walk<'_> {
         // — the empirical match to Chrome's visible extent — so the whole blur
         // radius is a deliberate half-blur of slack, cheap insurance against
         // that approximation being retuned outward later. Inset shadows are
-        // painted inside the box, and `paint_box_shadow` skips them anyway.
+        // painted inside the box (`paint_inset_box_shadow` clips them to the
+        // padding box), so they reach nothing past it.
         for shadow in &cs.box_shadow {
             if shadow.inset {
                 continue;
@@ -919,20 +1074,7 @@ impl Walk<'_> {
         // the enclosing element boxes are in the union, so it is a pre-existing
         // approximation left where it was rather than a new one introduced here.
         let mut extent = Extent::Within(transform.transform_rect_bbox(own));
-        if let Some(inline) = &node.text_layout {
-            let (off_x, off_y) = super::ifc_root_content_origin(node);
-            let content_x = x + off_x as f64 * self.scale - scroll.x;
-            let content_y = y + off_y as f64 * self.scale - scroll.y;
-            let text = Rect::new(
-                content_x,
-                content_y,
-                content_x + inline.layout.width() as f64 * self.scale,
-                content_y + inline.layout.height() as f64 * self.scale,
-            );
-            extent = extent.union(Extent::Within(
-                transform.transform_rect_bbox(text_shadow_reach(text, node, self.scale)),
-            ));
-        }
+        extent = extent.union(self.inline_extent(node, x, y, scroll, transform));
 
         // A text node paints its cached Parley layout at its own origin. The
         // layout can be a little wider than the box Taffy sized for it (see the
@@ -946,9 +1088,18 @@ impl Walk<'_> {
                 y + cached.height() as f64 * self.scale,
             );
             // Text shadows on a text node come from its parent's style.
-            let styled = node.parent.and_then(|p| self.tree.get(p)).unwrap_or(node);
+            let styled = node
+                .parent
+                .and_then(|p| self.tree.get_live(p))
+                .unwrap_or(node);
+            // And so does its stroke (#2719).
+            let stroke =
+                super::text_stroke_reach(&styled.computed_style.text_paint) as f64 * self.scale;
             extent = extent.union(Extent::Within(
-                transform.transform_rect_bbox(text_shadow_reach(text, styled, self.scale)),
+                transform.transform_rect_bbox(
+                    text_shadow_reach(text, &styled.computed_style.text_shadow, self.scale)
+                        .union(text.inflate(stroke, stroke)),
+                ),
             ));
         }
 
@@ -962,9 +1113,13 @@ impl Walk<'_> {
         // carry its own copy of paint's `overflow_y`-only spelling and a
         // paragraph explaining that it was deliberately mirroring a deviation.
         //
-        // The rect is the border box, radii and all: a rounded clip is inside
-        // its own square, so intersecting with the square is the conservative
-        // answer and the one an *extent* wants.
+        // The rect is [`super::clip_shape`]'s own — the **padding** box
+        // (#536), not `rect` above (the border box `own`'s box-shadow/outline
+        // reach is measured against, which is unaffected: neither is clipped
+        // by this bracket, since both paint before it opens). Square, radii
+        // dropped: a rounded clip is inside its own square, so intersecting
+        // with the square is the conservative answer and the one an *extent*
+        // wants.
         //
         // Paint also sometimes decides not to push a clip it is entitled to
         // (card K43: a clip that covers the render target, or one nothing
@@ -976,11 +1131,36 @@ impl Walk<'_> {
         // only**: [`clip_cuts_nothing`] asks what the root's clip would have to
         // cut, so narrowing by that very clip first would answer "nothing" for
         // every clipping box in the document.
-        if node.clips_overflow() && !(is_root && self.skip_root_clip) {
-            children = children.clipped_to(transform.transform_rect_bbox(rect));
+        //
+        // Nor is the root narrowed by its own clip when an absolute box inside
+        // escapes it (#2815): one whose containing block is above the root,
+        // which paint lifts the root's bracket around. The whole subtree is
+        // then left unnarrowed there — wider than exact, never narrower.
+        if let Some((clip_rect, _)) = super::clip_shape(node, self.scale, x, y)
+            && !(is_root
+                && (self.skip_root_clip || super::holds_escaping_absolute(self.tree, node_id)))
+        {
+            children = children.clipped_to(transform.transform_rect_bbox(clip_rect));
         }
 
-        extent.union(children)
+        let extent = extent.union(children);
+        // A `filter` that moves pixels spreads everything the box and its
+        // stacking context draw by its reach (#2719), through the transform.
+        if !cs.filter.is_empty()
+            && cs.has_raster_filter()
+            && let Extent::Within(r) = extent
+        {
+            let [l, t, rr, b] = super::filter::list_outsets(&cs.filter);
+            let c = transform.as_coeffs();
+            let k = c[0].hypot(c[1]).max(c[2].hypot(c[3])) * self.scale;
+            return Extent::Within(Rect::new(
+                r.x0 - l as f64 * k,
+                r.y0 - t as f64 * k,
+                r.x1 + rr as f64 * k,
+                r.y1 + b as f64 * k,
+            ));
+        }
+        extent
     }
 
     /// [`Self::children`] with [`Self::clipper_below_cb`] updated for this node
@@ -988,11 +1168,15 @@ impl Walk<'_> {
     ///
     /// Three answers, and the order of the arms is the whole of it:
     ///
-    /// - **The root: `false`.** The root of this walk is the stacking context
-    ///   that collects the sequence its absolutes are entries of, and paint
-    ///   opens the collecting root's own clip bracket around that whole
-    ///   sequence (#549) — so the root's clip is one no absolute inside escapes,
-    ///   whether or not the root establishes their containing block.
+    /// - **The root: `false`, unless an absolute inside escapes a clip.** The
+    ///   root of this walk is the stacking context that collects the sequence
+    ///   its absolutes are entries of. An absolute whose containing block is
+    ///   above the root escapes the root's own clip and the clips paint has
+    ///   open around the root that belong to that block's descendants: paint
+    ///   lifts them around its entry (#2815). So the flag starts `true` when
+    ///   the root is not that block, holds such an absolute
+    ///   (`holds_escaping_absolute`) and either clips itself or has such a
+    ///   clip open around it (`open_clips_an_absolute_escapes`).
     /// - **A node that establishes a containing block: `false`.** `cb_depth` is
     ///   counted *after* that node's own clip is pushed, so its clip is in the
     ///   chain and nothing is escaped yet.
@@ -1008,13 +1192,32 @@ impl Walk<'_> {
         is_root: bool,
     ) -> Extent {
         let outer = self.clipper_below_cb;
-        self.clipper_below_cb = if is_root || node.establishes_abs_containing_block() {
+        let outer_fixed = self.clipper_below_fixed_cb;
+        // The root's own clip, and the clips paint has open around it, are
+        // escaped by an absolute inside whose containing block is above the
+        // root (#2815). Asked of the cull only, the one caller that reads
+        // these flags, and only once an absolute is known to be there.
+        let root_escaped = is_root
+            && self.absolutes_escape_clips
+            && super::holds_escaping_absolute(self.tree, node.id)
+            && (node.clips_overflow() || super::open_clips_an_absolute_escapes(self.tree, node.id));
+        self.clipper_below_cb = if is_root {
+            root_escaped && !node.establishes_abs_containing_block()
+        } else if node.establishes_abs_containing_block() {
             false
         } else {
             outer || node.clips_overflow()
         };
+        self.clipper_below_fixed_cb = if is_root {
+            root_escaped && !node.establishes_fixed_containing_block()
+        } else if node.establishes_fixed_containing_block() {
+            false
+        } else {
+            outer_fixed || node.clips_overflow()
+        };
         let extent = self.children(node, offset_x, offset_y, transform, depth);
         self.clipper_below_cb = outer;
+        self.clipper_below_fixed_cb = outer_fixed;
         extent
     }
 
@@ -1040,7 +1243,7 @@ impl Walk<'_> {
 
         // The box tree, not the element tree (#566).
         for &child_id in crate::RinchDocument::box_tree_children(&self.tree.nodes, node.id).iter() {
-            let Some(child) = self.tree.get(child_id) else {
+            let Some(child) = self.tree.get_live(child_id) else {
                 continue;
             };
             if ifc_root && child.ifc_root == Some(node.id) && !child.creates_stacking_context() {
@@ -1097,6 +1300,9 @@ impl Walk<'_> {
                     let parley::layout::PositionedLayoutItem::InlineBox(positioned) = item else {
                         continue;
                     };
+                    if crate::ifc::is_edge_box(positioned.id) {
+                        continue;
+                    }
                     acc = acc.union(self.node(
                         positioned.id as RawNodeId,
                         content_x,
@@ -1134,25 +1340,27 @@ impl Walk<'_> {
     }
 }
 
-/// `rect` grown by however far `node`'s `text-shadow` carries its glyphs.
+/// `rect` grown by however far the `text-shadow` list `shadows` carries its
+/// glyphs.
 ///
-/// `render_text_with_shadow` offsets the shadow pass in *unscaled* layout units
-/// while the main text is drawn scaled, so the reach is taken at whichever of
-/// the two is larger; a shadow drawn nearer than the rect allows is not a
-/// problem, one drawn further is. The blur radius is included even though this
-/// painter draws shadow text without blurring it, because the day it does the
-/// glyphs will spread by it.
-fn text_shadow_reach(rect: Rect, node: &Node, scale: f64) -> Rect {
-    let shadows = &node.computed_style.text_shadow;
+/// `render_text_with_shadow` draws each shadow pass `offset × scale` physical
+/// px from the scaled text, at the text's own size (#409), so the reach is the
+/// offset plus [`REACH_PER_BLUR`](super::text_shadow::REACH_PER_BLUR) blur
+/// radii — three standard deviations, where the blur stops (#980) — times
+/// `scale`.
+fn text_shadow_reach(
+    rect: Rect,
+    shadows: &[crate::computed_style::TextShadowValue],
+    scale: f64,
+) -> Rect {
     if shadows.is_empty() {
         return rect;
     }
-    let unit = scale.max(1.0);
     let mut grown = rect;
     for shadow in shadows {
-        let blur = shadow.blur_radius.abs() as f64 * unit;
-        let dx = shadow.offset_x as f64 * unit;
-        let dy = shadow.offset_y as f64 * unit;
+        let blur = shadow.blur_radius.abs() as f64 * super::text_shadow::REACH_PER_BLUR * scale;
+        let dx = shadow.offset_x as f64 * scale;
+        let dy = shadow.offset_y as f64 * scale;
         grown = grown.union(Rect::new(
             rect.x0 + dx - blur,
             rect.y0 + dy - blur,

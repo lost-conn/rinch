@@ -11,7 +11,7 @@
 //! focus-arbiter authority (design A10). The runtime holds the focused editor's
 //! container id and resolves it to a handle via [`editor_for`].
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 
 // Whether a drag-select owned by `owner` may be read or ended while `caller`'s
 // events are being dispatched (issue #139). The rule lives in rinch-core so the
@@ -20,17 +20,53 @@ use std::cell::{Cell, RefCell};
 // `Some` keys that differ are refused. rinch-web passes `None` throughout — one
 // page, one pointer stream, one mouseup listener that must be able to end
 // whatever is in flight.
+use rinch_core::DocList;
 use rinch_core::doc_matches as same_doc;
 
 use crate::handle::EditorHandle;
+use crate::images::ImageHover;
+use crate::links::{LinkHover, LinkSpan};
 
 thread_local! {
+    /// The token the next registration is given — see [`EDITORS`].
+    static NEXT_TOKEN: Cell<u64> = const { Cell::new(0) };
+    /// See [`set_overlay_refresher`].
+    static OVERLAY_REFRESHER: Cell<Option<fn()>> = const { Cell::new(None) };
+    /// How many live editors on this thread have an
+    /// [`EditorHandle::on_link_hover`] callback — see [`link_hover_wanted`].
+    static LINK_HOVER_LISTENERS: Cell<usize> = const { Cell::new(0) };
+    /// How many live editors on this thread have an
+    /// [`EditorHandle::on_image_hover`] callback — see [`image_hover_wanted`].
+    static IMAGE_HOVER_LISTENERS: Cell<usize> = const { Cell::new(0) };
+    /// See [`set_focus_handler`].
+    static FOCUS_HANDLER: Cell<Option<fn(u64)>> = const { Cell::new(None) };
+    /// See [`set_blur_handler`].
+    static BLUR_HANDLER: Cell<Option<fn(u64)>> = const { Cell::new(None) };
+    /// See [`set_unregister_listener`].
+    static UNREGISTER_LISTENER: Cell<Option<UnregisterListener>> = const { Cell::new(None) };
+    /// See [`set_overlay_pass_scheduler`].
+    static OVERLAY_PASS_SCHEDULER: Cell<Option<fn()>> = const { Cell::new(None) };
+    /// See [`set_node_view_host_listener`].
+    static NODE_VIEW_HOST_LISTENER: Cell<Option<NodeViewHostListener>> = const { Cell::new(None) };
+}
+
+rinch_core::doc_keyed! {
     /// `(doc_key, container node id, handle)` for every mounted editor. The
     /// [`doc_key`](rinch_core::dom::DomDocument::doc_key) scopes entries per
     /// document: container node ids are per-document slab indices, so two
     /// documents on one thread (two embedded `RinchContext`s, or two desktop
     /// windows) can both hold an editor at the same container id (issue #134).
-    static EDITORS: RefCell<Vec<(u64, usize, EditorHandle)>> = const { RefCell::new(Vec::new()) };
+    ///
+    /// Each entry also carries the token its registration was given, so a
+    /// mount's cleanup releases **its own** registration only (#1498): the id
+    /// is a slab index `rinch-dom` re-issues, and a later editor may be
+    /// registered under it by the time that cleanup runs.
+    ///
+    /// Swept with its document (#2797): an editor its document's code
+    /// registered where no scope will release it (in a cleanup run as the
+    /// document is disposed, or by key with [`register_editor`]) goes when the
+    /// document dies.
+    static EDITORS: DocList<Registered> = DocList::new(|r| Some(r.doc_key));
     /// In-progress pointer drag-selects as `(doc, container id, anchor
     /// position)` — **at most one per document**, exactly as [`EDITORS`] holds
     /// at most one handle per `(doc, container)`.
@@ -42,9 +78,183 @@ thread_local! {
     /// still contend for it, so B's mousedown would wipe the anchor A is still
     /// dragging from, and A's mouseup could then no longer clear the entry it no
     /// longer owns.
-    static DRAG: RefCell<Vec<(Option<u64>, usize, usize)>> = const { RefCell::new(Vec::new()) };
-    /// See [`set_overlay_refresher`].
-    static OVERLAY_REFRESHER: Cell<Option<fn()>> = const { Cell::new(None) };
+    ///
+    /// Swept with its document (#2797); a `None` entry is no document's.
+    static DRAG: DocList<(Option<u64>, u64, usize)> = DocList::new(|d| d.0);
+    /// The link each document's pointer is over, as `(doc, editor, link)` —
+    /// at most one per document, keyed like [`DRAG`]. See [`set_link_hover`].
+    /// Swept with its document (#2797), silently, as an unmount forgets it.
+    static LINK_HOVER: DocList<(Option<u64>, EditorHandle, LinkSpan)> = DocList::new(|h| h.0);
+    /// The image each document's pointer is over, as `(doc, editor, hover)` —
+    /// at most one per document, keyed like [`DRAG`]. See [`set_image_hover`].
+    /// Swept with its document (#2797), silently, as an unmount forgets it.
+    static IMAGE_HOVER: DocList<(Option<u64>, EditorHandle, ImageHover)> = DocList::new(|h| h.0);
+    /// The `doc_key`s of documents with an editor that is owed an overlay pass
+    /// no DOM change will bring — see [`overlay_pass_owed`]. Empty while nothing
+    /// is owed. Swept with its document (#2797).
+    static OVERLAY_PASSES_OWED: DocList<u64> = DocList::new(|doc| Some(*doc));
+}
+
+/// What [`set_node_view_host_listener`] takes: `(doc_key, container id, the
+/// view's host element, mounted)`.
+pub type NodeViewHostListener = fn(u64, u64, &rinch_core::dom::NodeHandle, bool);
+
+/// Tell the node-view code whom to notify when an editor's node view is mounted
+/// (`true`) or unmounted (`false`) on a host element — after the fact, with no
+/// borrow held. The web registers one: it watches each host's box with a
+/// `ResizeObserver` and owes the editor an overlay pass when one changes size, so
+/// the caret and the selection highlight below a view that grew follow it.
+/// Desktop registers none: its post-layout overlay pass compares the hosts'
+/// boxes itself.
+///
+/// An editor's own container is handed over the same way while it has
+/// [margin anchors](EditorHandle::set_margin_anchors) (#1677): a resize that
+/// rewraps its text then reports where their lines went.
+///
+/// Per thread, like the rest of this registry; setting it again replaces it.
+pub fn set_node_view_host_listener(listener: NodeViewHostListener) {
+    NODE_VIEW_HOST_LISTENER.with(|slot| slot.set(Some(listener)));
+}
+
+/// Tell the [`set_node_view_host_listener`] listener about a host.
+pub(crate) fn notify_node_view_host(
+    doc_key: u64,
+    container: u64,
+    host: &rinch_core::dom::NodeHandle,
+    mounted: bool,
+) {
+    if let Some(listener) = NODE_VIEW_HOST_LISTENER.with(|slot| slot.get()) {
+        listener(doc_key, container, host, mounted);
+    }
+}
+
+/// Owe the editors of document `doc_key` an overlay pass because something
+/// outside the document's own changes moved them — a node view's host resized.
+/// What a [`set_node_view_host_listener`] listener calls.
+pub fn owe_overlay_pass_for(doc_key: u64) {
+    owe_overlay_pass(doc_key);
+}
+
+/// Tell [`EditorHandle::focus`] how this platform gives an editor the keyboard,
+/// given its container id. The web registers one (it focuses its capture
+/// textarea at once, as a mousedown does); desktop registers none, and the
+/// handle posts a focus request on the container that the runtime applies
+/// through its focus arbiter.
+///
+/// Per thread, like the rest of this registry; setting it again replaces it.
+pub fn set_focus_handler(focus: fn(u64)) {
+    FOCUS_HANDLER.with(|slot| slot.set(Some(focus)));
+}
+
+/// Tell [`EditorHandle::blur`] how this platform takes the keyboard away from
+/// an editor, given its container id — [`set_focus_handler`]'s other half. The
+/// web registers one (it blurs its capture textarea at once, if that editor
+/// holds it); desktop registers none, and the handle posts a release
+/// ([`rinch_core::post_release_request`]) that the runtime applies through its
+/// focus arbiter, in order with any focus request.
+///
+/// Per thread, like the rest of this registry; setting it again replaces it.
+pub fn set_blur_handler(blur: fn(u64)) {
+    BLUR_HANDLER.with(|slot| slot.set(Some(blur)));
+}
+
+/// What [`set_unregister_listener`] takes: `(doc_key, container id)`.
+pub type UnregisterListener = fn(u64, u64);
+
+/// Tell [`unregister_editor`] whom to notify once an editor has left the
+/// registry — `(doc_key, container id)`, after the entry and its link-hover
+/// state are gone and with no registry borrow held. The web registers one: its
+/// hidden capture textarea mirrors the focused editor's text and would
+/// otherwise keep it, focused and selected, after that editor unmounted
+/// (issue #1112). Desktop registers none.
+///
+/// Per thread, like the rest of this registry; setting it again replaces it.
+pub fn set_unregister_listener(listener: UnregisterListener) {
+    UNREGISTER_LISTENER.with(|slot| slot.set(Some(listener)));
+}
+
+/// The registered [`set_focus_handler`], if any.
+pub(crate) fn focus_handler() -> Option<fn(u64)> {
+    FOCUS_HANDLER.with(|slot| slot.get())
+}
+
+/// The registered [`set_blur_handler`], if any.
+pub(crate) fn blur_handler() -> Option<fn(u64)> {
+    BLUR_HANDLER.with(|slot| slot.get())
+}
+
+/// Note that an editor in document `doc_key` is owed an overlay pass
+/// ([`update_all_carets`]) that no DOM change will bring: a selection moved by a
+/// transaction that changed no DOM (#1001), or a
+/// [`scroll_into_view`](EditorHandle::scroll_into_view) waiting for geometry.
+///
+/// Tells the registered [`set_overlay_pass_scheduler`] when this document goes
+/// from owing nothing to owing a pass. May be called with an editor's borrow
+/// held: the scheduler only schedules.
+pub(crate) fn owe_overlay_pass(doc_key: u64) {
+    let newly = OVERLAY_PASSES_OWED.with_mut(|r| {
+        if r.contains(&doc_key) {
+            false
+        } else {
+            r.push(doc_key);
+            true
+        }
+    });
+    if newly && let Some(schedule) = OVERLAY_PASS_SCHEDULER.with(|slot| slot.get()) {
+        schedule();
+    }
+}
+
+/// Tell the registry how to get an owed overlay pass ([`overlay_pass_owed`])
+/// run on a runtime with no frame loop to ask.
+///
+/// Desktop and embed need none: their frame clock asks [`overlay_pass_owed`]
+/// on every turn. The web has no such loop — it refreshes the overlays from its
+/// own input handlers — so a selection set from a timer, an effect or a toolbar
+/// button's click reached no refresh at all (#1001). It registers a scheduler
+/// that queues a microtask, and the microtask runs the pass only if one is
+/// still owed ([`any_overlay_pass_owed`]): an input handler that refreshes
+/// right after its edit has cleared it by then, so a keystroke pays for one
+/// empty microtask and no second geometry read.
+///
+/// `schedule` is called with an editor's borrow held and must not run the
+/// pass itself. Per thread, like the rest of this registry; setting it again
+/// replaces it.
+pub fn set_overlay_pass_scheduler(schedule: fn()) {
+    OVERLAY_PASS_SCHEDULER.with(|slot| slot.set(Some(schedule)));
+}
+
+/// Whether any document on this thread is owed an overlay pass — the
+/// question a runtime whose pass covers every document at once (the web's
+/// `update_all_carets(None, ..)`) asks. See [`overlay_pass_owed`].
+pub fn any_overlay_pass_owed() -> bool {
+    OVERLAY_PASSES_OWED.with(|r| !r.is_empty())
+}
+
+/// Whether an editor in document `doc_key` is owed an overlay pass
+/// ([`update_all_carets`]) since that document's last one: its selection moved
+/// (`set_selection`, `command("selectAll")`, any local transaction that moved
+/// it — #1001), or it asked to
+/// [`scroll_into_view`](EditorHandle::scroll_into_view).
+///
+/// Neither changes any DOM, so a runtime whose frame skips the layout and
+/// overlay pass when nothing is dirty (desktop, embed) never runs the pass for
+/// them by itself. It runs them when this is `true`, which is what makes a
+/// selection set or a scroll asked for outside any input event — from a timer,
+/// an effect, a toolbar command — reach the screen. The next pass clears it
+/// whether or not a reveal could be fulfilled, so a reveal that has no geometry
+/// yet waits for a pass that happens anyway rather than forcing one every
+/// frame. An input path that runs the pass itself right after its edit clears
+/// it there, and pays nothing more.
+pub fn overlay_pass_owed(doc_key: u64) -> bool {
+    OVERLAY_PASSES_OWED.with(|r| r.contains(&doc_key))
+}
+
+/// [`overlay_pass_owed`] under its first name: it was added for
+/// [`scroll_into_view`](EditorHandle::scroll_into_view) alone (#922), and now
+/// also answers for a selection change (#1001).
+pub fn reveal_owed(doc_key: u64) -> bool {
+    overlay_pass_owed(doc_key)
 }
 
 /// Tell the editor view how to get its overlays (caret, selection highlight)
@@ -82,9 +292,8 @@ pub(crate) fn request_overlay_refresh() {
 /// Replaces `doc`'s own in-progress drag-select, and only that one: a second
 /// document's anchor is left in place, because the gesture it belongs to is
 /// still being made.
-pub fn begin_drag(doc: Option<u64>, container: usize, anchor: usize) {
-    DRAG.with(|d| {
-        let mut drags = d.borrow_mut();
+pub fn begin_drag(doc: Option<u64>, container: u64, anchor: usize) {
+    DRAG.with_mut(|drags| {
         drags.retain(|(owner, _, _)| !same_doc(*owner, doc));
         drags.push((doc, container, anchor));
     });
@@ -96,10 +305,9 @@ pub fn begin_drag(doc: Option<u64>, container: usize, anchor: usize) {
 /// Answers `None` for a drag-select armed by a *different* document, so a second
 /// `RinchApp` on the same thread (a DevTools window, a second embedded context)
 /// neither extends nor reads the first one's selection.
-pub fn drag_anchor(doc: Option<u64>) -> Option<(usize, usize)> {
+pub fn drag_anchor(doc: Option<u64>) -> Option<(u64, usize)> {
     DRAG.with(|d| {
-        d.borrow()
-            .iter()
+        d.iter()
             .find(|(owner, _, _)| same_doc(*owner, doc))
             .map(|(_, container, anchor)| (*container, *anchor))
     })
@@ -108,21 +316,172 @@ pub fn drag_anchor(doc: Option<u64>) -> Option<(usize, usize)> {
 /// End any in-progress pointer drag-select **owned by `doc`**. Another
 /// document's drag-select is left alone: its mouseup has not happened yet.
 pub fn end_drag(doc: Option<u64>) {
-    DRAG.with(|d| {
-        d.borrow_mut()
-            .retain(|(owner, _, _)| !same_doc(*owner, doc))
+    DRAG.with_mut(|d| d.retain(|(owner, _, _)| !same_doc(*owner, doc)));
+}
+
+/// Whether any editor on this thread has an [`EditorHandle::on_link_hover`]
+/// callback. A runtime asks this on every pointer move before doing any link
+/// hover work, so an app that registers none pays one thread-local read per
+/// move and no hit test or text query.
+pub fn link_hover_wanted() -> bool {
+    LINK_HOVER_LISTENERS.with(Cell::get) > 0
+}
+
+pub(crate) fn link_hover_listener_added() {
+    LINK_HOVER_LISTENERS.with(|c| c.set(c.get() + 1));
+}
+
+pub(crate) fn link_hover_listener_removed() {
+    // `try_with`: an editor can be dropped during thread-local teardown.
+    let _ = LINK_HOVER_LISTENERS.try_with(|c| c.set(c.get().saturating_sub(1)));
+}
+
+/// Report which link the pointer of document `doc` is over after a pointer
+/// move: `Some((editor, hover))`, or `None` when it is over no link (plain
+/// text, outside every editor). `doc` is keyed as [`begin_drag`]'s is (`None`
+/// for a runtime with a single page-wide pointer stream).
+///
+/// Fires the editors' [`EditorHandle::on_link_hover`] callbacks only for a
+/// change: a move that stays on the same link of the same editor fires
+/// nothing; one that leaves an editor's links fires that editor's `None`; one
+/// that reaches a link fires its editor's `Some`, and a move from one link
+/// straight onto another link of the same editor fires only the new `Some`.
+/// "The same link" is the same [`LinkSpan`] (href, title and range), so a
+/// resting pointer whose link was edited is reported again on its next move.
+/// Callbacks run after the registry's borrow is released.
+pub fn set_link_hover(doc: Option<u64>, hovered: Option<(EditorHandle, LinkHover)>) {
+    let previous = LINK_HOVER.with_mut(|h| {
+        let index = h.iter().position(|(owner, _, _)| *owner == doc);
+        if let (Some(i), Some((editor, hover))) = (index, &hovered)
+            && h[i].1.same_editor(editor)
+            && h[i].2 == hover.link
+        {
+            return Err(()); // unchanged
+        }
+        let previous = index.map(|i| h.remove(i));
+        if let Some((editor, hover)) = &hovered {
+            h.push((doc, editor.clone(), hover.link.clone()));
+        }
+        Ok(previous)
     });
+    let Ok(previous) = previous else { return };
+    if let Some((_, old, _)) = previous
+        && hovered
+            .as_ref()
+            .is_none_or(|(editor, _)| !editor.same_editor(&old))
+    {
+        old.notify_link_hover(None);
+    }
+    if let Some((editor, hover)) = &hovered {
+        editor.notify_link_hover(Some(hover));
+    }
+}
+
+/// Whether any editor on this thread has an [`EditorHandle::on_image_hover`]
+/// callback: [`link_hover_wanted`]'s question for images, asked on every
+/// pointer move before any image hover work.
+pub fn image_hover_wanted() -> bool {
+    IMAGE_HOVER_LISTENERS.with(Cell::get) > 0
+}
+
+pub(crate) fn image_hover_listener_added() {
+    IMAGE_HOVER_LISTENERS.with(|c| c.set(c.get() + 1));
+}
+
+pub(crate) fn image_hover_listener_removed() {
+    // `try_with`: an editor can be dropped during thread-local teardown.
+    let _ = IMAGE_HOVER_LISTENERS.try_with(|c| c.set(c.get().saturating_sub(1)));
+}
+
+/// Report which image the pointer of document `doc` is over after a pointer
+/// move: `Some((editor, hover))`, or `None` when it is over no image of any
+/// editor. `doc` is keyed as [`begin_drag`]'s is.
+///
+/// Fires the editors' [`EditorHandle::on_image_hover`] callbacks only for a
+/// change, as [`set_link_hover`] does: leaving an editor's images fires its
+/// `None`; reaching an image fires its editor's `Some`; a move from one image
+/// straight onto another of the same editor fires only the new `Some`. "The
+/// same image" is an equal [`ImageHover`] — position, attrs **and** rect — so
+/// the next move over an image that was edited, or that a scroll or a
+/// relayout moved under a resting pointer, reports it again with its new box.
+/// Callbacks run after the registry's borrow is released.
+pub fn set_image_hover(doc: Option<u64>, hovered: Option<(EditorHandle, ImageHover)>) {
+    let previous = IMAGE_HOVER.with_mut(|h| {
+        let index = h.iter().position(|(owner, _, _)| *owner == doc);
+        if let (Some(i), Some((editor, hover))) = (index, &hovered)
+            && h[i].1.same_editor(editor)
+            && h[i].2 == *hover
+        {
+            return Err(()); // unchanged
+        }
+        let previous = index.map(|i| h.remove(i));
+        if let Some((editor, hover)) = &hovered {
+            h.push((doc, editor.clone(), hover.clone()));
+        }
+        Ok(previous)
+    });
+    let Ok(previous) = previous else { return };
+    if let Some((_, old, _)) = previous
+        && hovered
+            .as_ref()
+            .is_none_or(|(editor, _)| !editor.same_editor(&old))
+    {
+        old.notify_image_hover(None);
+    }
+    if let Some((editor, hover)) = &hovered {
+        editor.notify_image_hover(Some(hover));
+    }
+}
+
+/// One mounted editor: see [`EDITORS`].
+struct Registered {
+    doc_key: u64,
+    container_id: u64,
+    token: u64,
+    handle: EditorHandle,
 }
 
 /// Register `handle` under its document's `doc_key` and `container_id`
 /// (replacing any prior registration **for that same document + container** —
 /// another document's editor at a colliding container id is left registered).
-pub fn register_editor(doc_key: u64, container_id: usize, handle: EditorHandle) {
-    EDITORS.with(|e| {
-        let mut e = e.borrow_mut();
-        e.retain(|(dk, id, _)| !(*dk == doc_key && *id == container_id));
-        e.push((doc_key, container_id, handle));
+///
+/// The entry is dropped, silently, when [`NodeHandle::set_inner_html`] frees
+/// the container (#1516): `rinch-dom` hands a freed id to the next node it
+/// mints, which must not answer [`editor_for_doc`] as the dead editor.
+///
+/// [`NodeHandle::set_inner_html`]: rinch_core::dom::NodeHandle::set_inner_html
+pub fn register_editor(doc_key: u64, container_id: u64, handle: EditorHandle) {
+    register_editor_token(doc_key, container_id, handle);
+}
+
+/// [`register_editor`], answering the token that names this registration, for
+/// [`unregister_editor_token`].
+pub(crate) fn register_editor_token(doc_key: u64, container_id: u64, handle: EditorHandle) -> u64 {
+    let token = NEXT_TOKEN.with(|next| {
+        let token = next.get();
+        next.set(token + 1);
+        token
     });
+    rinch_core::dom::on_nodes_freed(rinch_core::dom::FreedNodesListener {
+        wants: has_editors,
+        forget: forget_freed_containers,
+    });
+    // Out of the borrow: dropping a replaced handle may run `EditorCore`'s
+    // `Drop`.
+    let _replaced: Vec<Registered> = EDITORS.with_mut(|e| {
+        let (replaced, kept) = std::mem::take(&mut **e)
+            .into_iter()
+            .partition(|r| r.doc_key == doc_key && r.container_id == container_id);
+        **e = kept;
+        e.push(Registered {
+            doc_key,
+            container_id,
+            token,
+            handle,
+        });
+        replaced
+    });
+    token
 }
 
 /// Forget the editor mounted at `container_id`.
@@ -131,21 +490,132 @@ pub fn register_editor(doc_key: u64, container_id: usize, handle: EditorHandle) 
 /// driver already drops windows for editors no longer in [`all_editors`] on its
 /// next sweep, and a stale window is never read in between (it is only consulted
 /// for currently-registered editors). So removal from the registry is sufficient.
-pub fn unregister_editor(doc_key: u64, container_id: usize) {
-    EDITORS.with(|e| {
-        e.borrow_mut()
-            .retain(|(dk, id, _)| !(*dk == doc_key && *id == container_id))
+///
+/// It also forgets a link hover the editor was holding, **without** calling its
+/// `on_link_hover` back. An unmount is silent, as the focus registry's is
+/// (#147/#183): the callback's captures belong to the scope being disposed, so a
+/// `None` delivered on the next pointer move would read freed signals. Dropping
+/// the entry here is also what releases the editor's count in
+/// [`link_hover_wanted`] at the unmount rather than at the next move, since the
+/// entry held a strong handle.
+///
+/// Last, it tells the [`set_unregister_listener`], if one is registered.
+///
+/// This drops whatever is registered at the key. An [`Editor`](crate::Editor)'s
+/// own mount does not release itself this way (#1498): it drops only the
+/// registration it made, so a later editor on a re-issued container id stays.
+pub fn unregister_editor(doc_key: u64, container_id: u64) {
+    // Its document's blink clock goes with it (#1149): nothing is left to blink
+    // or restore, and the clock would otherwise outlive a dropped context.
+    crate::blink::forget(doc_key, container_id);
+    release(doc_key, container_id, None);
+}
+
+/// Forget the editor registered at `(doc_key, container_id)` under `token`, if
+/// that registration is still the one there (#1498). What a mount's scope
+/// cleanup calls: by then the container may have been freed and its id handed
+/// to another editor, whose registration (and blink clock) must stay.
+pub(crate) fn unregister_editor_token(doc_key: u64, container_id: u64, token: u64) {
+    if release(doc_key, container_id, Some(token)) {
+        crate::blink::forget(doc_key, container_id);
+    }
+}
+
+/// Drop the registration at `(doc_key, container_id)` — only the one made
+/// under `token` when one is given — with the hover state it held, then tell
+/// the [`set_unregister_listener`]. Whether one was dropped.
+fn release(doc_key: u64, container_id: u64, token: Option<u64>) -> bool {
+    let removed: Vec<Registered> = EDITORS.with_mut(|e| {
+        let (removed, kept) = std::mem::take(&mut **e).into_iter().partition(|r| {
+            r.doc_key == doc_key
+                && r.container_id == container_id
+                && token.is_none_or(|t| t == r.token)
+        });
+        **e = kept;
+        removed
     });
+    if removed.is_empty() {
+        return false;
+    }
+    let handles: Vec<EditorHandle> = removed.into_iter().map(|r| r.handle).collect();
+    forget_hovers(&handles);
+    drop(handles);
+    if let Some(listener) = UNREGISTER_LISTENER.with(|slot| slot.get()) {
+        listener(doc_key, container_id);
+    }
+    true
+}
+
+/// Forget the link and image hover any of `removed` holds, silently.
+fn forget_hovers(removed: &[EditorHandle]) {
+    // Taken out of the borrow and dropped after it: dropping the last handle
+    // runs `EditorCore`'s `Drop`, which must not find `LINK_HOVER` (or
+    // `IMAGE_HOVER`) borrowed.
+    let _forgotten: Vec<_> = LINK_HOVER.with_mut(|h| {
+        let mut forgotten = Vec::new();
+        let mut i = 0;
+        while i < h.len() {
+            if removed.iter().any(|r| r.same_editor(&h[i].1)) {
+                forgotten.push(h.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        forgotten
+    });
+    drop(_forgotten);
+    let _forgotten: Vec<_> = IMAGE_HOVER.with_mut(|h| {
+        let mut forgotten = Vec::new();
+        let mut i = 0;
+        while i < h.len() {
+            if removed.iter().any(|r| r.same_editor(&h[i].1)) {
+                forgotten.push(h.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        forgotten
+    });
+    drop(_forgotten);
+}
+
+/// Whether any editor is registered on this thread.
+fn has_editors() -> bool {
+    EDITORS.with(|e| !e.is_empty())
+}
+
+/// Forget every editor whose container is one of `ids` in `doc_key`: nodes
+/// `NodeHandle::set_inner_html` is about to free, whose ids `rinch-dom` hands
+/// to the next nodes it mints (#1516). Each goes as [`unregister_editor`]'s
+/// does — its blink clock, a drag-select from it and its hover state with it,
+/// silently, and the [`set_unregister_listener`] told — and the mount scope's
+/// own cleanup later finds nothing and does nothing.
+fn forget_freed_containers(doc_key: u64, ids: &[rinch_core::dom::NodeId]) {
+    let freed: std::collections::HashSet<u64> = ids.iter().map(|id| id.0).collect();
+    let hit: Vec<u64> = EDITORS.with(|e| {
+        e.iter()
+            .filter(|r| r.doc_key == doc_key && freed.contains(&r.container_id))
+            .map(|r| r.container_id)
+            .collect()
+    });
+    for container_id in hit {
+        crate::blink::forget(doc_key, container_id);
+        DRAG.with_mut(|d| {
+            d.retain(|(owner, container, _)| {
+                !(*container == container_id && same_doc(*owner, Some(doc_key)))
+            })
+        });
+        release(doc_key, container_id, None);
+    }
 }
 
 /// Every mounted editor as `(doc_key, container id, handle)`. The desktop
 /// virtualization driver sweeps these each layout — filtered to its own
 /// document — to maintain a per-editor block window.
-pub fn all_editors() -> Vec<(u64, usize, EditorHandle)> {
+pub fn all_editors() -> Vec<(u64, u64, EditorHandle)> {
     EDITORS.with(|e| {
-        e.borrow()
-            .iter()
-            .map(|(dk, id, h)| (*dk, *id, h.clone()))
+        e.iter()
+            .map(|r| (r.doc_key, r.container_id, r.handle.clone()))
             .collect()
     })
 }
@@ -154,12 +624,11 @@ pub fn all_editors() -> Vec<(u64, usize, EditorHandle)> {
 /// `doc_key`**. Runtimes that resolved `container_id` from their own document
 /// (hit-testing, `FocusTarget::Editor`) must use this form — container ids
 /// collide across documents on one thread (issue #134).
-pub fn editor_for_doc(doc_key: u64, container_id: usize) -> Option<EditorHandle> {
+pub fn editor_for_doc(doc_key: u64, container_id: u64) -> Option<EditorHandle> {
     EDITORS.with(|e| {
-        e.borrow()
-            .iter()
-            .find(|(dk, id, _)| *dk == doc_key && *id == container_id)
-            .map(|(_, _, h)| h.clone())
+        e.iter()
+            .find(|r| r.doc_key == doc_key && r.container_id == container_id)
+            .map(|r| r.handle.clone())
     })
 }
 
@@ -170,12 +639,11 @@ pub fn editor_for_doc(doc_key: u64, container_id: usize) -> Option<EditorHandle>
 /// the common single-document case; with several documents a collision resolves
 /// to the earliest registration. Prefer [`editor_for_doc`] where the document
 /// is known.
-pub fn editor_for(container_id: usize) -> Option<EditorHandle> {
+pub fn editor_for(container_id: u64) -> Option<EditorHandle> {
     EDITORS.with(|e| {
-        e.borrow()
-            .iter()
-            .find(|(_, id, _)| *id == container_id)
-            .map(|(_, _, h)| h.clone())
+        e.iter()
+            .find(|r| r.container_id == container_id)
+            .map(|r| r.handle.clone())
     })
 }
 
@@ -190,9 +658,34 @@ pub fn editor_for(container_id: usize) -> Option<EditorHandle> {
 /// `doc_key`: pass `Some(key)` to touch only that document's editors (a desktop
 /// or embed runtime driving its own post-layout pass); `None` sweeps every
 /// mounted editor (the web runtime, which drives all islands from one place).
-pub fn update_all_carets(doc_key: Option<u64>, focused: Option<usize>) -> bool {
+///
+/// Every editor, focused or not, then gets its pending
+/// [`scroll_into_view`](EditorHandle::scroll_into_view) fulfilled if it has
+/// one and the geometry for it — after the caret, so its scroll is queued last
+/// and wins over the caret's. `true` is returned for that as for a moved
+/// overlay: the probes it placed need a layout before the scroll is applied.
+///
+/// Before any of that, every editor with
+/// [margin anchors](EditorHandle::set_margin_anchors) measures their lines
+/// and reports a change to its
+/// [`on_margin_layout`](EditorHandle::on_margin_layout) callback; `true` is
+/// returned when one ran, since the app may have moved what it draws.
+pub fn update_all_carets(doc_key: Option<u64>, focused: Option<u64>) -> bool {
+    // Read first, written only when something is owed: the pass runs every
+    // frame, and a write is what joins the sweep's inventory.
+    if OVERLAY_PASSES_OWED.with(|r| !r.is_empty()) {
+        OVERLAY_PASSES_OWED.with_mut(|r| r.retain(|dk| doc_key.is_some_and(|k| k != *dk)));
+    }
     let editors = all_editors();
     let mut moved = false;
+    // The margin anchors first, while the geometry is the layout's alone: a
+    // caret pass below writes its overlays, which a host that lays out
+    // afterwards (desktop) would count as layout still owed.
+    for (dk, _, handle) in &editors {
+        if doc_key.is_none_or(|k| k == *dk) {
+            moved |= handle.margin_pass();
+        }
+    }
     for (dk, id, handle) in editors {
         if doc_key.is_some_and(|k| k != dk) {
             continue;
@@ -202,6 +695,7 @@ pub fn update_all_carets(doc_key: Option<u64>, focused: Option<usize>) -> bool {
         } else {
             moved |= handle.hide_overlays();
         }
+        moved |= handle.reveal_pass();
     }
     moved
 }
@@ -212,7 +706,7 @@ pub fn update_all_carets(doc_key: Option<u64>, focused: Option<usize>) -> bool {
 /// `Send`-safe `post_remote_delta` that marshals a transport-thread delta onto the
 /// main thread and calls this. Returns whether the editor's document changed.
 #[cfg(feature = "collaboration")]
-pub fn collab_receive_for(container_id: usize, delta: &[u8]) -> bool {
+pub fn collab_receive_for(container_id: u64, delta: &[u8]) -> bool {
     match editor_for(container_id) {
         Some(handle) => handle.collab_receive(delta),
         None => false,
@@ -222,6 +716,38 @@ pub fn collab_receive_for(container_id: usize, delta: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A focused editor that is not registered gets no blink clock (#1149,
+    /// review of #1168): the arbiter keeps naming an unmounted editor until
+    /// the next key, and a clock made for it outlived its document.
+    #[test]
+    fn a_blink_tick_for_an_unregistered_editor_keeps_no_clock() {
+        let dk = 9_101;
+        assert!(crate::caret_blink_tick(dk, Some(99)).is_none());
+        assert_eq!(crate::blink::target(dk), None, "a clock for no editor");
+    }
+
+    /// An editor that unregisters takes its document's blink clock with it
+    /// (#1149): it is what releases the clock of a context dropped with its
+    /// editor still focused.
+    #[test]
+    fn unregistering_the_blinking_editor_drops_its_clock() {
+        let dk = 9_102;
+        register_editor(dk, 5, crate::create_editor());
+        crate::blink::set_target(dk, Some(5));
+        unregister_editor(dk, 6);
+        assert_eq!(
+            crate::blink::target(dk),
+            Some(5),
+            "another editor's clock went"
+        );
+        unregister_editor(dk, 5);
+        assert_eq!(
+            crate::blink::target(dk),
+            None,
+            "the clock outlived its editor"
+        );
+    }
 
     /// The drag-select anchor is per-document (issue #139).
     ///

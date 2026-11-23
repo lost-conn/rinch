@@ -12,7 +12,7 @@
 //!   1. Collect platform events
 //!   2. ctx.update(&events)        // rinch processes input, updates layout
 //!   3. game.render()              // render game scene
-//!   4. overlay.render(ctx.scene()) // render rinch UI to texture
+//!   4. overlay.render(&device, &queue, &mut ctx) // render rinch UI to texture
 //!   5. composite game + UI        // blit both to swapchain
 //! ```
 //!
@@ -25,6 +25,14 @@
 //! - **Split layout**: Rinch renders toolbars/panels around a
 //!   [`GameViewport`] hole. Query the viewport rect with
 //!   [`RinchContext::viewport_rect`] and render the game into that region.
+//!
+//! # Input methods (IME)
+//!
+//! The host owns the window, so it owns the platform input method. After each
+//! [`update`](RinchContext::update), [`RinchContext::take_ime_change`] says
+//! whether to switch it on (a text field, an editor or an `on_ime` target took
+//! focus), move its candidate box (the caret moved), or switch it off; feed
+//! the composition back in as `PlatformEvent::Ime` events on the next update.
 //!
 //! # Example
 //!
@@ -44,14 +52,14 @@
 //!
 //! // In your game loop:
 //! let actions = ctx.update(&platform_events);
-//! let scene = ctx.scene();
+//! let ui = overlay.render(&device, &queue, &mut ctx);
 //! ```
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use peniko::Color;
-use vello::{AaConfig, AaSupport, RenderParams, Renderer as VelloRenderer, RendererOptions, Scene};
+use vello::{RenderParams, Renderer as VelloRenderer, Scene};
 use wgpu::{
     Device, Extent3d, Queue, Texture, TextureDescriptor, TextureDimension, TextureFormat,
     TextureUsages, TextureView, TextureViewDescriptor,
@@ -63,6 +71,19 @@ use rinch_platform::{AppAction, PlatformEvent};
 
 use crate::app::RinchApp;
 use crate::app::hit_testing::hit_test;
+pub use crate::app::{ImeChange, ImeState};
+use crate::font::{AppFont, FontData};
+pub use crate::host_texture::{
+    HostTexture, HostTextureError, HostTextureImages, HostTextureOptions, TextureAlpha,
+    TextureRefresh, host_texture,
+};
+#[cfg(feature = "windowing")]
+pub use crate::window_request::WindowRequest;
+/// The rect type of [`ImeState::cursor_area`].
+pub use rinch_core::ElementBounds;
+
+#[cfg(feature = "windowing")]
+pub(crate) mod window_requests;
 
 // ── LayoutRect ───────────────────────────────────────────────────────────────
 
@@ -96,10 +117,28 @@ pub struct RinchContextConfig {
     /// font and text would otherwise render as zero glyphs. (Registering a font
     /// *after* [`RinchContext::new`] via [`register_font`](RinchContext::register_font)
     /// is too late for the initial mount.)
-    pub fonts: Vec<&'static [u8]>,
+    ///
+    /// Each is font data that declares nothing
+    /// ([`RinchApp::register_font_data`]): reachable by its own family name,
+    /// a last-resort fallback for every script, and the answer to the generic
+    /// slots of its own class **only where the platform left them empty** —
+    /// on wasm, the first sans-serif face becomes `sans-serif`; on a desktop,
+    /// whose platform fills every slot, no generic changes (#2102). A face
+    /// meant to answer a generic the platform already fills is claimed with
+    /// [`RinchContext::register_app_font`].
+    ///
+    /// The bytes may be `'static` (`BYTES.into()`) or owned — a `Vec<u8>`, an
+    /// `Arc<[u8]>`, a `Blob<u8>` ([`FontData`]) — and an owned face is dropped
+    /// with the context (#2101).
+    pub fonts: Vec<FontData>,
 }
 
 // ── RinchContext ──────────────────────────────────────────────────────────────
+
+/// The next [`RinchContext::sliced_frame`] stamp, shared by every context so
+/// that a stamp names one frame of one context (#1976). Starts at 1: `0` is
+/// "no frame".
+static NEXT_SLICED_STAMP: AtomicU64 = AtomicU64::new(1);
 
 /// Handle to an embedded rinch UI.
 ///
@@ -114,6 +153,27 @@ pub struct RinchContext {
     size: (u32, u32),
     scale_factor: f64,
     dirty: Arc<AtomicBool>,
+    /// When the focused editor's caret next toggles, as of the last
+    /// [`update`](RinchContext::update) — see [`RinchContext::next_wake`].
+    next_wake: Option<rinch_platform::Instant>,
+    /// The IME state [`take_ime_change`](RinchContext::take_ime_change) last
+    /// reported, which its next answer is the change from.
+    ime_reported: ImeState,
+    /// The `RenderSurface` ids in this context's document, as of the last
+    /// [`scene`](RinchContext::scene): what its surface pass drives, and what
+    /// `update` / `needs_update` ask about a new frame for.
+    surface_ids: Vec<usize>,
+    /// How many `scene()` calls ran the surface pass — see
+    /// [`RinchContext::surface_pass_count`].
+    surface_passes: u64,
+    /// The stamp of the last frame [`sliced_frame`](Self::sliced_frame)
+    /// painted, `0` before the first: unique across every context, so a
+    /// [`RinchOverlayRenderer`] that holds a different one holds another
+    /// frame's slices, or none (#1976).
+    sliced_stamp: u64,
+    /// The GPU textures the host registered for `data-host-texture`
+    /// elements, by name (#2082).
+    host_textures: crate::host_texture::HostTextures,
     /// This context's signal-change subscription. Multi-subscriber: several
     /// concurrent contexts (plus a mounted shell/web root) each hold their own,
     /// and dropping this context detaches only its own callback — creating or
@@ -135,11 +195,24 @@ impl RinchContext {
     ///
     /// The component function runs immediately, building the initial DOM.
     /// Call this once during game initialization.
+    ///
+    /// On wasm32 it also installs the browser's timer backend and task
+    /// scheduler (issue #1956), so `set_timeout`, `sleep` and `spawn_local`
+    /// work with no `rinch-web` root on the page. A timer armed *before* the
+    /// first context is created needs `rinch::install_web_runtime()` first.
     pub fn new<F>(config: RinchContextConfig, component: F) -> Self
     where
         F: FnOnce(&mut RenderScope) -> NodeHandle + 'static,
     {
         let mut app = RinchApp::new(component);
+
+        // Spellcheck is on by default in an embedded UI too (#2862), unless
+        // the host configured it (`rinch::spellcheck::configure`, before or
+        // after this) — the settings are the thread's, shared by every
+        // context on it. Nothing is loaded until a field is used.
+        if rinch_spell::runtime::config().is_none() {
+            rinch_spell::runtime::set_config(rinch_spell::runtime::SpellcheckConfig::default());
+        }
 
         // Per-document theme (issue #138): generate this context's CSS from its
         // own config and hand it to the app before mount. The thread-global
@@ -151,7 +224,7 @@ impl RinchContext {
                 Some(ref theme) => crate::generate_theme_css_string(theme),
                 None => crate::generate_theme_css_string(&ThemeProviderProps::default()),
             };
-            app.owned_theme_css = Some(css);
+            app.set_owned_theme_css(Some(css));
         }
         let _ = &config.theme; // suppress unused warning when theme feature is off
 
@@ -165,21 +238,12 @@ impl RinchContext {
         // pass has glyphs (essential on wasm, which has no system fonts). These are
         // drained onto the document's render font context during mount_component.
         for font in &config.fonts {
-            app.register_font_data(font);
+            app.register_font_data(font.clone());
         }
 
         let width = config.width.max(1);
         let height = config.height.max(1);
         let scale_factor = config.scale_factor;
-
-        // Mount the component (builds DOM, runs initial layout) at the
-        // *logical* viewport — `width`/`height` are physical (see
-        // `rinch_platform::to_logical`). The display scale goes in first so
-        // the initial style resolution sees the right `device_pixel_ratio`
-        // (issue #211).
-        app.set_device_pixel_ratio(scale_factor);
-        let (logical_w, logical_h) = rinch_platform::to_logical((width, height), scale_factor);
-        app.mount_component(logical_w as f32, logical_h as f32);
 
         // Arm cross-thread signal dispatch. Both halves are required and they
         // are required together: `register_main_thread` is what *arms* the
@@ -193,8 +257,61 @@ impl RinchContext {
         // the shell's dispatcher, which additionally wakes the winit event loop.
         // Both push onto the same `rinch-core` queue, so either dispatcher feeds
         // both drain sites.
-        rinch_core::register_main_thread();
+        // Dispatcher first: a worker send between the two would otherwise
+        // find a main thread registered and no dispatcher, and panic.
+        //
+        // Both before the mount (issue #1032, the CI failure of #1663): while no
+        // main thread is registered `is_main_thread()` answers `true` on every
+        // thread, so a timer armed by the component that came due before the
+        // mount finished hopped to "the main thread" inline on the
+        // `rinch-timer` thread, found nothing parked there, and was lost.
         rinch_core::set_cross_thread_dispatcher_if_unset(queue_on_main_thread);
+        rinch_core::register_main_thread();
+
+        // In a browser, the timer backend and task scheduler (issue #1956).
+        // Native rinch-core has a timer thread of its own; a browser has no
+        // threads, so without this a `set_timeout` (and a `sleep`, and every
+        // `rinch-ws` / `rinch-rtc` timer) armed by this context's UI never
+        // fired unless the page also mounted a `rinch-web` root, and a
+        // `spawn_local` task was polled only by the next `update()`'s drain of
+        // the main-thread queue. Now tasks are polled in a microtask, as under
+        // `rinch-web`. Before the mount, so the component's own timers are
+        // scheduled. Not the poll drain: `update()` does that once a frame,
+        // and a second drain would sample every-frame polls twice.
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        crate::web_runtime::install_web_scheduling();
+
+        // Mount the component (builds DOM, runs initial layout) at the
+        // *logical* viewport — `width`/`height` are physical (see
+        // `rinch_platform::to_logical`). The display scale goes in first so
+        // the initial style resolution sees the right `device_pixel_ratio`
+        // (issue #211).
+        // The host's size is physical: it is the surface's own
+        // (`window_physical_size`, published once the host turns publishing
+        // on).
+        app.set_surface_size((width, height));
+        app.set_device_pixel_ratio(scale_factor);
+        let (logical_w, logical_h) = rinch_platform::to_logical((width, height), scale_factor);
+        // What the component's code asks of its window, from its first line,
+        // is this context's for its host to read (#2801).
+        #[cfg(feature = "windowing")]
+        window_requests::mounting(|| {
+            app.mount_component(logical_w as f32, logical_h as f32);
+            app.doc_key()
+        });
+        #[cfg(not(feature = "windowing"))]
+        app.mount_component(logical_w as f32, logical_h as f32);
+        // On wasm32 the mount's image loads were only queued (a loader is app
+        // code, not run inside the document's borrow): run them now, and lay
+        // out again so the pictures they answer are in the first frame. A
+        // background is requested by that layout's cascade, hence the loop.
+        // Nothing is queued on native, where loads have threads of their own.
+        for _ in 0..2 {
+            if !rinch_dom::image_cache::run_queued_loads() {
+                break;
+            }
+            app.resolve_and_repaint(logical_w as f32, logical_h as f32);
+        }
 
         // Subscribe to signal changes so the game loop can detect dirty state.
         // A guard-based subscription (not the legacy single slot): each context
@@ -210,6 +327,12 @@ impl RinchContext {
             size: (width, height),
             scale_factor,
             dirty,
+            next_wake: None,
+            ime_reported: ImeState::default(),
+            surface_ids: Vec::new(),
+            surface_passes: 0,
+            sliced_stamp: 0,
+            host_textures: Default::default(),
             _signal_change_sub: signal_change_sub,
         }
     }
@@ -218,8 +341,17 @@ impl RinchContext {
     ///
     /// Returns actions the game should handle (e.g. `SetCursor`, `Exit`).
     /// Input events that rinch doesn't consume are ignored.
+    ///
+    /// Also runs the housekeeping the desktop event loop does each turn,
+    /// including the focused editor's caret blink: an event-driven host should
+    /// call `update` again at [`next_wake`](RinchContext::next_wake) even with
+    /// no input.
     pub fn update(&mut self, events: &[PlatformEvent]) -> Vec<AppAction> {
         let mut all_actions = Vec::new();
+
+        // One `update` (plus the `scene` that follows it) is one performance
+        // frame: close the previous one before this one's work starts.
+        self.app.end_perf_frame();
 
         // Run the per-frame housekeeping the desktop runtime does ahead of each
         // paint, in the same order it does.
@@ -236,6 +368,10 @@ impl RinchContext {
         // single layout pass below absorb all of them.
         rinch_core::drain_main_callbacks();
         rinch_core::reactive::drain_polls();
+        // Work a background thread sent the app itself — a plain `<input>`
+        // paste whose clipboard read answered (issue #328) — lands with the
+        // queued writes, before this frame's events.
+        let deferred_ran = self.app.run_deferred_work() > 0;
 
         // Process each event
         for event in events {
@@ -245,10 +381,41 @@ impl RinchContext {
             all_actions.extend(actions);
         }
 
+        // Blink the focused editor's caret (issue #331) — the tick desktop runs
+        // after every event-loop turn. Ahead of the layout pass below, so the
+        // toggle's style write is resolved in this same update.
+        if self.tick_caret_blink() && !all_actions.contains(&AppAction::RequestRedraw) {
+            all_actions.push(AppAction::RequestRedraw);
+        }
+
+        // A `RenderSurface` frame submitted since the last scene — from its
+        // render callback's previous run, another thread, a decoder — is
+        // something to draw. `scene` collects it.
+        // So is a surface that wants its render callback run again: a
+        // continuous one, or one with a frame requested (#1768).
+        if (crate::render_surface::inline_surfaces_dirty(&self.surface_ids)
+            || crate::render_surface::surfaces_want_frame(&self.surface_ids))
+            && !all_actions.contains(&AppAction::RequestRedraw)
+        {
+            all_actions.push(AppAction::RequestRedraw);
+        }
+
+        // Image loads queued since the last frame (wasm32 runs them here, on
+        // this thread, with no document borrowed: a loader may write
+        // signals). Their answers are drained by the layout below.
+        rinch_dom::image_cache::run_queued_loads();
+
         // If signals changed, resolve layout
-        if self.dirty.swap(false, Ordering::AcqRel) || self.app.has_dirty_nodes() {
+        if self.dirty.swap(false, Ordering::AcqRel) || deferred_ran || self.app.has_dirty_nodes() {
             let (w, h) = self.logical_size();
-            if self.app.resolve_and_repaint(w, h) {
+            let mut repainted = self.app.resolve_and_repaint(w, h);
+            // That layout's cascade may have requested background images:
+            // run them and lay out once more, so a loader that answers at once
+            // is shown in this frame. (Never on native.)
+            if rinch_dom::image_cache::run_queued_loads() {
+                repainted |= self.app.resolve_and_repaint(w, h);
+            }
+            if repainted {
                 // Deduplicate RequestRedraw
                 if !all_actions.contains(&AppAction::RequestRedraw) {
                     all_actions.push(AppAction::RequestRedraw);
@@ -265,11 +432,169 @@ impl RinchContext {
         all_actions
     }
 
+    /// The last completed performance frame: every [`rinch_dom::perf`]
+    /// counter for the previous `update` + `scene`.
+    pub fn perf_last_frame(&self) -> rinch_dom::perf::FrameStats {
+        self.app.last_frame_perf()
+    }
+
+    /// Every performance counter since the context was created or last
+    /// [`reset_perf`](Self::reset_perf), the current frame included.
+    pub fn perf_total(&self) -> rinch_dom::perf::FrameStats {
+        self.app.total_perf()
+    }
+
+    /// Zero the performance counters.
+    pub fn reset_perf(&mut self) {
+        self.app.reset_perf();
+    }
+
     /// Get the current Vello scene. Rebuilds only if dirty.
     ///
-    /// The returned scene contains the full rinch UI and can be rendered
-    /// to a texture via [`RinchOverlayRenderer`] or your own Vello setup.
+    /// The returned scene contains the full rinch UI, for a host that
+    /// renders it with its own Vello setup. [`RinchOverlayRenderer::render`]
+    /// takes the context instead, and does not use this.
+    ///
+    /// Each [`GameViewport`]'s box is cleared **in the scene** (#1866), which
+    /// is approximate inside a clip: along a clipping ancestor's edges near the
+    /// viewport (in each 16px tile the clip's outline crosses), Vello keeps
+    /// what the clip saved, so a band of that ancestor's background can show
+    /// over the game. `RinchOverlayRenderer::render` cuts the viewports out
+    /// after Vello instead, exactly.
+    ///
+    /// **Use `rinch::vello`.** rinch depends on Vello 0.11 from
+    /// `joeleaver/vello-fork` at a pinned commit (#1955), which fixes two
+    /// image-atlas bugs of stock Vello 0.11. Build Vello types from `rinch::vello`
+    /// (and its `peniko`/`kurbo`), and wgpu types from `rinch::wgpu`, instead of
+    /// declaring your own `vello`/`wgpu` dependencies, so the versions can never
+    /// drift (for an extra wgpu feature, keep `wgpu = "30"` with just that feature;
+    /// Cargo unifies it). No `[patch]` line is needed.
+    ///
+    /// This context's mounted `RenderSurface`s are driven here, as the desktop
+    /// paint drives them: each is told its layout size, its render callback
+    /// runs, and its latest frame is painted inline at its box. Call it once
+    /// per frame: **every** call runs the render callbacks again, so a second
+    /// `scene()` in one frame renders each callback-driven surface twice.
+    ///
+    /// It draws no host texture (#2082): an image drawn in a scene must be
+    /// registered with the renderer that renders it, which here is the
+    /// host's. Use [`Self::scene_with_textures`] with that renderer instead.
     pub fn scene(&mut self) -> &Scene {
+        self.paint_scene();
+        self.app.painter.scene()
+    }
+
+    /// [`Self::scene`] with the context's host textures (#2082) drawn by
+    /// their `data-host-texture` elements, for a host that renders the scene
+    /// with its own Vello `renderer`: `images` holds what that renderer has
+    /// registered of them (keep one beside each renderer and pass it every
+    /// frame; it keeps each context's registrations apart, so one renderer
+    /// may draw several contexts in turn). Two renderers taking turns on one
+    /// context are drawn correctly, at the price of painting the scene again
+    /// at each change of renderer: its images are each renderer's own. The textures due a copy are converted or marked for
+    /// Vello to copy again here, so render the scene with `renderer` before
+    /// the next call. [`RinchOverlayRenderer::render`] does this itself.
+    pub fn scene_with_textures(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        renderer: &mut VelloRenderer,
+        images: &mut HostTextureImages,
+    ) -> &Scene {
+        let installed = self.install_host_textures(device, queue, renderer, images);
+        self.paint_scene();
+        if installed {
+            rinch_dom::paint::set_host_texture_images(None);
+        }
+        self.app.painter.scene()
+    }
+
+    /// Bring `images` up to this context's host textures for `renderer` and
+    /// hand them to the next paint; a change to what the scene draws marks
+    /// it dirty. `false` (nothing installed) while neither has a texture.
+    fn install_host_textures(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        renderer: &mut VelloRenderer,
+        images: &mut HostTextureImages,
+    ) -> bool {
+        if self.host_textures.is_empty() {
+            if images.clear(renderer, &self.host_textures) {
+                self.app.mark_scene_dirty();
+            }
+            return false;
+        }
+        let (map, changed) = images.sync(device, queue, renderer, &self.host_textures);
+        // A scene painted with another renderer's images names images this
+        // renderer has not registered: paint it again for this one.
+        let other = self.host_textures.paint_with(images);
+        if changed || other {
+            self.app.mark_scene_dirty();
+        }
+        rinch_dom::paint::set_host_texture_images(Some(map));
+        true
+    }
+
+    /// Show `texture` in every element with `data-host-texture="<name>"`
+    /// (the [`HostTexture`] component), with the default
+    /// [`HostTextureOptions`]: see [`Self::register_texture_with`].
+    pub fn register_texture(
+        &mut self,
+        name: impl Into<String>,
+        texture: &Texture,
+    ) -> Result<(), HostTextureError> {
+        self.register_texture_with(name, texture, HostTextureOptions::default())
+    }
+
+    /// Show `texture`, a texture the host owns on the device it renders this
+    /// context with, in every element with `data-host-texture="<name>"`
+    /// (#2082), drawn as `options` says, until it is unregistered or another
+    /// is registered under the name.
+    ///
+    /// - **Replacing.** Registering again under a name replaces its texture.
+    ///   One of the same size and options is cheap (the double-buffered
+    ///   swap): the scene does not change, the renderer copies from the new
+    ///   texture. A new size, alpha mode or route repaints the scene once.
+    /// - **Lifetime.** The context keeps a handle to `texture` (and the
+    ///   renderer one, until its next render) — the GPU memory is freed only
+    ///   once both have let go. Unregister it before you `destroy()` it.
+    /// - **Formats and usages.** `Rgba8Unorm` with `COPY_SRC` is copied as it
+    ///   is; `Rgba8UnormSrgb`, `Bgra8Unorm`, `Bgra8UnormSrgb` (and
+    ///   `Rgba8Unorm` without `COPY_SRC`) need `TEXTURE_BINDING` and go
+    ///   through one conversion pass per refresh. Anything else is refused:
+    ///   [`HostTextureError`].
+    /// - **Refresh.** Copied again at every render unless `options` says
+    ///   [`TextureRefresh::OnChange`]; then only after [`Self::texture_changed`]
+    ///   or a new registration. Draw into the texture before the render that
+    ///   should show it; a host that renders only on demand renders after it
+    ///   draws (the context cannot know the texture changed).
+    /// - **Drawn by** [`RinchOverlayRenderer::render`] and
+    ///   [`Self::scene_with_textures`]; [`Self::scene`] draws none.
+    pub fn register_texture_with(
+        &mut self,
+        name: impl Into<String>,
+        texture: &Texture,
+        options: HostTextureOptions,
+    ) -> Result<(), HostTextureError> {
+        self.host_textures.register(name.into(), texture, options)
+    }
+
+    /// Stop showing the texture registered under `name`; its elements draw
+    /// their background only. `false` when none was.
+    pub fn unregister_texture(&mut self, name: &str) -> bool {
+        self.host_textures.unregister(name)
+    }
+
+    /// Say the texture under `name` was drawn into, so a
+    /// [`TextureRefresh::OnChange`] texture is copied at the next render.
+    /// `false` when no texture is registered under `name`.
+    pub fn texture_changed(&mut self, name: &str) -> bool {
+        self.host_textures.changed(name)
+    }
+
+    /// Paint the scene [`Self::scene`] returns.
+    fn paint_scene(&mut self) {
         // `build_scene`'s size reaches `paint_document` as its `viewport`, which
         // is in **logical** pixels — the unit every other caller passes, and the
         // unit it had to settle on once card K43 gave the parameter a job. This
@@ -281,8 +606,155 @@ impl RinchContext {
         // with two meanings. `logical_size` is the same conversion `update`
         // already uses.
         let (lw, lh) = self.logical_size();
+        let surface_pixels = self.prepare_render_surfaces();
+        let installed = !surface_pixels.is_empty();
+        if installed {
+            rinch_dom::paint::set_surface_pixels(Some(surface_pixels));
+        }
         self.app
-            .build_scene(self.scale_factor, (lw as u32, lh as u32))
+            .build_scene(self.scale_factor, (lw as u32, lh as u32));
+        if installed {
+            rinch_dom::paint::set_surface_pixels(None);
+        }
+    }
+
+    /// [`Self::scene`] painted for [`RinchOverlayRenderer::render`] (#1866):
+    /// each `GameViewport` split out of the scene as a base layer with no
+    /// game, for the split compositor to cut exactly. The frame's slices and
+    /// its stamp when it was painted, `None` when the last one is still
+    /// current; the scene is `self.app.painter`'s.
+    ///
+    /// `fed` is the stamp of the frame whose slices the calling renderer
+    /// holds (`0`: none). Unless it is this context's last sliced frame, the
+    /// frame is painted whether or not anything changed (#1976): a new
+    /// renderer (the host's step after a device loss), a renderer that
+    /// another one took a turn from, or one that last drew another context
+    /// holds no slices of the scene it is about to render, and the cached
+    /// scene alone has nothing painted after its viewports.
+    fn sliced_frame(
+        &mut self,
+        fed: u64,
+    ) -> Option<(u64, Vec<rinch_dom::paint::slicing::SurfaceSlice>)> {
+        if fed == 0 || fed != self.sliced_stamp {
+            self.app.request_repaint();
+        }
+        let (lw, lh) = self.logical_size();
+        let surface_pixels = self.prepare_render_surfaces();
+        let installed = !surface_pixels.is_empty();
+        if installed {
+            rinch_dom::paint::set_surface_pixels(Some(surface_pixels));
+        }
+        let slices = self
+            .app
+            .build_scene_with(self.scale_factor, (lw as u32, lh as u32), true);
+        if installed {
+            rinch_dom::paint::set_surface_pixels(None);
+        }
+        let slices = slices?;
+        self.sliced_stamp = NEXT_SLICED_STAMP.fetch_add(1, Ordering::Relaxed);
+        Some((self.sliced_stamp, slices))
+    }
+
+    /// Drive this context's mounted `RenderSurface`s for this frame and return their
+    /// pixels for inline painting — the desktop paint's surface steps, in its
+    /// order (issue #331): tell each surface its **physical** layout size, run
+    /// the render callbacks (which skip a surface not yet measured), then
+    /// collect the frames. A surface that delivered a frame since the last
+    /// scene marks the scene dirty; one that did not is still installed, so a
+    /// scene rebuilt for some other reason draws its last frame.
+    ///
+    /// Only the inline path. The compositor path — video, and a surface
+    /// registered under a `data-viewport` name — is the host's to composite in
+    /// an embedded context, like a `GameViewport` hole, and a
+    /// `GpuTextureRegistrar` texture is not read back here: the host owns the
+    /// device (see the game-engine guide).
+    ///
+    /// Only **this** context's surfaces — the ones in its own document. The
+    /// registry is thread-global, and a pass over every surface would run
+    /// another context's render callbacks and take its fresh frame, leaving
+    /// that context's own `scene()` cached with the old one.
+    ///
+    /// A thread with no inline surface registered skips the pass, and with it
+    /// the document walk that finds the surfaces: every step would be a no-op,
+    /// and the walk is O(document) on a `scene()` that is otherwise a cache
+    /// hit.
+    fn prepare_render_surfaces(
+        &mut self,
+    ) -> std::collections::HashMap<usize, rinch_dom::paint::SurfacePixelData> {
+        use crate::render_surface as rs;
+        if !rs::any_inline_surface_registered() {
+            self.surface_ids.clear();
+            return Default::default();
+        }
+        self.surface_passes += 1;
+        let s = self.scale_factor as f32;
+        self.surface_ids.clear();
+        self.surface_ids = self.app.update_render_surface_layouts(s, false);
+        rs::invoke_render_callbacks_for(&self.surface_ids);
+        let (pixels, fresh) = rs::collect_surface_pixels_for(&self.surface_ids);
+        if !fresh.is_empty() {
+            self.app.request_repaint();
+        }
+        pixels
+    }
+
+    /// How many [`scene`](RinchContext::scene) calls have run the
+    /// `RenderSurface` pass, which walks the document to find this context's
+    /// surfaces. It is skipped while the thread has no surface registered, so
+    /// that a `scene()` on an unchanged document stays a cache hit. A
+    /// structural test hook, not a stable API.
+    #[doc(hidden)]
+    pub fn surface_pass_count(&self) -> u64 {
+        self.surface_passes
+    }
+
+    /// Advance the focused editor's caret blink and record when it next
+    /// toggles. Returns whether the caret toggled (a redraw is owed).
+    #[cfg(feature = "windowing")]
+    fn tick_caret_blink(&mut self) -> bool {
+        let focused = self.app.blinking_editor_id();
+        match crate::editor::caret_blink_tick(self.app.doc_key(), focused) {
+            Some(blink) => {
+                self.next_wake = Some(rinch_platform::Instant::now() + blink.next);
+                blink.redraw
+            }
+            None => {
+                self.next_wake = None;
+                false
+            }
+        }
+    }
+
+    /// No rich-text editor without `windowing`, so nothing blinks.
+    #[cfg(not(feature = "windowing"))]
+    fn tick_caret_blink(&mut self) -> bool {
+        false
+    }
+
+    /// When this context next needs an [`update`](RinchContext::update) with
+    /// no input, or `None` when nothing is scheduled.
+    ///
+    /// Today that is the focused editor's caret blink (issue #331), or a
+    /// pointer resting over an element with a `title`, whose tooltip shows at
+    /// that instant (issue #1646): an
+    /// editor's caret toggles every 530 ms while it has the keyboard, and it
+    /// is what the desktop runtime arms its only timed wake
+    /// (`ControlFlow::WaitUntil`) with. A host that renders continuously can
+    /// ignore this — every `update` ticks the blink. An event-driven host
+    /// schedules a wake for this instant, or its caret toggles only when some
+    /// other event happens to arrive. [`needs_update`](RinchContext::needs_update)
+    /// answers `true` once it has passed.
+    ///
+    /// As of the last `update`: it moves when the caret moves (the blink
+    /// restarts solid) and becomes `None` when the editor loses the keyboard or
+    /// the host window reports `WindowFocus(false)`. A running transition or
+    /// animation is not a wake — `update` answers `RequestRedraw` for each of
+    /// its frames instead.
+    pub fn next_wake(&self) -> Option<rinch_platform::Instant> {
+        match (self.next_wake, self.app.title_tooltip_deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Notify rinch the window was resized.
@@ -298,7 +770,11 @@ impl RinchContext {
         // by `scale_factor`. Re-laying out at the physical size here made the
         // document `scale_factor` times too wide until the next signal change.
         let (lw, lh) = rinch_platform::to_logical((width, height), self.scale_factor);
-        self.app.resize_layout(lw, lh);
+        // The host's size is the surface's; laid out at the logical size,
+        // both published in one batch, as a desktop window's `Resized` does
+        // (for a host that turned publishing on).
+        self.app.set_surface_size((width, height));
+        self.app.window_resized(lw, lh);
     }
 
     /// Update the display scale factor (DPI).
@@ -308,8 +784,14 @@ impl RinchContext {
     /// [`update`](RinchContext::update) re-resolves at the new logical size
     /// (physical size ÷ scale), so `resolution`-gated styles and the layout
     /// viewport change together.
+    ///
+    /// For a host that turned publishing on, the scale, the new logical size
+    /// and the host's size go out in one batch: `rinch::window`'s readers of
+    /// them run once.
     pub fn set_scale_factor(&mut self, scale: f64) {
         self.scale_factor = scale;
+        let (lw, lh) = rinch_platform::to_logical(self.size, scale);
+        self.app.set_window_logical_size(lw, lh);
         self.app.set_device_pixel_ratio(scale);
     }
 
@@ -326,9 +808,10 @@ impl RinchContext {
     /// path for changing an embedded context's theme.
     #[cfg(feature = "theme")]
     pub fn set_theme(&mut self, theme: &ThemeProviderProps) {
-        self.app.owned_theme_css = Some(crate::generate_theme_css_string(theme));
+        self.app
+            .set_owned_theme_css(Some(crate::generate_theme_css_string(theme)));
         // Wake the next update() — resolve_and_repaint detects the owned-CSS
-        // change against its cached last_theme_css and does the full restyle,
+        // change against its cached last_theme_key and does the full restyle,
         // exactly like the shell's thread-slot comparison path.
         self.dirty.store(true, Ordering::Release);
     }
@@ -384,17 +867,82 @@ impl RinchContext {
         true
     }
 
-    /// Returns `true` if a text input, contenteditable, or generic focusable
-    /// node (`tabindex`, issue #228) is focused.
+    /// Returns `true` if a text input, contenteditable, or a generic
+    /// focusable node that registered its own key handling
+    /// ([`FocusEntry::on_key`](crate::focus_registry::FocusEntry::on_key),
+    /// issue #228) is focused.
     ///
     /// When this returns `true`, the game should route keyboard events to
-    /// rinch instead of handling them as game input. A Tab-focused generic
-    /// node counts: rinch consumes Enter/Space to activate it, so a host that
-    /// kept the keyboard would double-handle those keys.
+    /// rinch instead of handling them as game input.
+    ///
+    /// **A plain `<button>` or `<a href>` the user just clicked does *not*
+    /// count** (issue #548). Such a tag is focusable with no `tabindex`
+    /// needed (issue #252), so a mouse click alone claims rinch's keyboard
+    /// focus — but with no registered [`on_key`][k], the button only ever
+    /// consumes Enter/Space through the runtime's own activation path, and
+    /// that is not reason enough for a host to give up its own Esc/hotkey
+    /// handling. A *registered* generic node — a custom widget that reads
+    /// arrow keys or its own shortcuts via `on_key` — still counts, Tab-focused
+    /// or mouse-clicked alike: the runtime cannot tell you which keys it
+    /// wants without seeing them. See
+    /// [`RinchApp::has_focused_key_consumer`](crate::app::RinchApp::has_focused_key_consumer)
+    /// for that half on its own, and
+    /// [`RinchApp::has_focused_node`](crate::app::RinchApp::has_focused_node) for
+    /// "is *any* generic node focused" if you need the coarser question for
+    /// something else (it is the wrong one for this).
+    ///
+    /// [k]: crate::focus_registry::FocusEntry::on_key
     pub fn wants_keyboard(&self) -> bool {
         self.app.has_focused_input()
             || self.app.has_focused_contenteditable()
-            || self.app.has_focused_node()
+            || self.app.has_focused_key_consumer()
+    }
+
+    /// The IME state the focused target wants: whether the host's platform
+    /// input method should be on, and where its candidate box goes, in
+    /// **logical** pixels of this context (multiply by the scale factor for
+    /// physical). The same answer the desktop shell applies to its window
+    /// after every event-loop turn: on for a focused `<input>`/`<textarea>`,
+    /// an editor that is not read-only, or a node registered with
+    /// [`FocusEntry::on_ime`](crate::focus_registry::FocusEntry::on_ime); off
+    /// for anything else and while the host reported the window blurred
+    /// (`PlatformEvent::WindowFocus(false)`). The caret area is where the caret
+    /// is painted, a field's horizontal scroll and transforms included.
+    ///
+    /// This is a different question from [`wants_keyboard`](Self::wants_keyboard):
+    /// a node that reads keys but takes no text wants the keyboard and no IME.
+    pub fn ime_state(&self) -> ImeState {
+        self.app.ime_state()
+    }
+
+    /// The request that brings the host's input method from what this method
+    /// last reported to [`ime_state`](Self::ime_state), or `None` when nothing
+    /// changed. Call it after each [`update`](Self::update) and apply the
+    /// answer: [`ImeChange::Enable`] / [`ImeChange::Disable`] switch the
+    /// platform input method on or off, [`ImeChange::Update`] moves its
+    /// candidate box. It is the decision the desktop shell makes for its
+    /// window, so a host that applies every answer tracks the IME as a desktop window
+    /// does. Composition comes back in through [`update`](Self::update) as
+    /// `PlatformEvent::Ime` events, which go to the focused target.
+    pub fn take_ime_change(&mut self) -> Option<ImeChange> {
+        let desired = self.app.ime_state();
+        self.ime_reported.change_to(desired)
+    }
+
+    /// The requests this context's code made of its window since the last
+    /// call, oldest first: what [`rinch::windows`](mod@crate::windows),
+    /// [`set_window_title`](crate::window::set_window_title) and
+    /// [`rinch::exit`](crate::exit) ask for (a title, show and hide, a size,
+    /// exit, …), the same [`WindowRequest`] `rinch::testing`'s `TestApp`
+    /// reports. A context has no window of rinch's, so nothing is applied:
+    /// the host may honour each for its own window, or ignore it.
+    ///
+    /// Only this context's: another context's requests are its own, and a
+    /// request made outside any context's code goes to a desktop runtime if
+    /// one runs in the process, and is dropped if none was ever made.
+    #[cfg(feature = "windowing")]
+    pub fn take_window_requests(&mut self) -> Vec<WindowRequest> {
+        window_requests::take(self.app.doc_key())
     }
 
     /// Register font data for text rendering **after** the initial mount.
@@ -406,16 +954,76 @@ impl RinchContext {
     /// system fallback font — supply the font via
     /// [`RinchContextConfig::fonts`] instead.
     ///
-    /// The data should be a TrueType (`.ttf`) or OpenType (`.otf`) font file.
-    pub fn register_font(&mut self, data: &'static [u8]) {
+    /// The data should be a TrueType (`.ttf`) or OpenType (`.otf`) font file,
+    /// `'static` or owned ([`FontData`]); an owned face lives as long as this
+    /// context and is dropped with it (#2101). What the face answers to is
+    /// as for [`RinchContextConfig::fonts`]: it changes no generic slot the
+    /// platform (or an earlier face) already fills (#2102).
+    pub fn register_font(&mut self, data: impl Into<FontData>) {
         self.app.register_font_data(data);
+    }
+
+    /// Register a face and the generics it **claims** ([`AppFont`]): the
+    /// embed's form of [`App::fonts`](crate::App::fonts), for a face that is
+    /// to answer `sans-serif` (or `serif`, `monospace`) ahead of what the
+    /// platform maps there. The claim is explicit; plain font data never
+    /// takes a generic slot from the platform.
+    ///
+    /// Like [`register_font`](RinchContext::register_font), it reaches the
+    /// mounted document and applies to the layout passes after it; text laid
+    /// out by the mount inside [`new`](RinchContext::new) is re-measured
+    /// against it then.
+    pub fn register_app_font(&mut self, font: AppFont) {
+        self.app.register_app_font(font);
     }
 
     /// Whether the UI needs a repaint.
     ///
     /// Useful for game engines that want to skip rendering unchanged frames.
+    /// True while a wheel glide (#2287) runs: each `update` moves it a
+    /// frame's worth, so a host that updates only when this says so keeps it
+    /// going.
     pub fn needs_update(&self) -> bool {
-        self.dirty.load(Ordering::Acquire) || self.app.has_dirty_nodes()
+        self.dirty.load(Ordering::Acquire)
+            || self.app.has_dirty_nodes()
+            || self.app.has_deferred_work()
+            || crate::render_surface::inline_surfaces_dirty(&self.surface_ids)
+            || crate::render_surface::surfaces_want_frame(&self.surface_ids)
+            // A wheel glide (#2287) moves a frame's worth at each `update`.
+            || self.app.wheel_scroll_animating()
+            || self
+                .next_wake()
+                .is_some_and(|t| rinch_platform::Instant::now() >= t)
+    }
+
+    /// Tell rinch the pointer left the UI's surface (the window, or the
+    /// region of it the host routes to rinch): the same as passing
+    /// [`PlatformEvent::MouseLeft`] to [`update`](Self::update), now. A host
+    /// must report it one way or the other, or what the pointer was over
+    /// stays `:hover`, never hears its `onmouseleave` (issue #2672), and a
+    /// `title` tooltip (issue #1646) shown or waiting when the pointer left
+    /// stays until the next press, key or move. Returns whether a frame is
+    /// owed (a shown tooltip went, or a `:hover` style changed).
+    ///
+    /// To turn tooltips off altogether, call
+    /// `app_mut().set_title_tooltips(false)`.
+    pub fn pointer_left(&mut self) -> bool {
+        let shown = self.app.title_tooltip_text().is_some();
+        let actions = self
+            .app
+            .handle_event(PlatformEvent::MouseLeft, self.size, self.scale_factor);
+        shown || actions.contains(&AppAction::RequestRedraw)
+    }
+
+    /// Turn the built-in DevTools keys on (the default) or off (issue #2689):
+    /// F12 and Alt+I, which rinch's key fallback answers with
+    /// `AppAction::ToggleDevTools` and `AppAction::ToggleInspectMode` when
+    /// nothing in the UI claimed the key. A host that has no DevTools to open
+    /// turns them off so the keys are not consumed and go on to the rest of
+    /// rinch's key handling. `RINCH_DEVTOOLS=on|off` in the environment still
+    /// wins. The same as `app_mut().set_devtools(enabled)`.
+    pub fn set_devtools(&mut self, enabled: bool) {
+        self.app.set_devtools(enabled);
     }
 
     /// Access the underlying `RinchApp` for advanced use cases.
@@ -452,12 +1060,12 @@ impl Drop for RinchContext {
 ///
 /// The two gates differ because the items do: `encode_png` is plain CPU work,
 /// while `capture_texture_rgba` reads back a wgpu texture and is
-/// `#[cfg(feature = "gpu")]`. Re-exporting both on `debug` alone meant `rinch`
+/// `#[cfg(feature = "gpu-renderer")]`. Re-exporting both on `debug` alone meant `rinch`
 /// with `debug` + `embed` and *without* `gpu` did not compile at all — a
 /// combination nothing in the workspace or CI had ever built, because
 /// `cargo test --workspace` unifies `rinch/gpu` on from `examples/game-embed`.
 /// Found by naming `debug` on CI's gated-test line for #401's pins.
-#[cfg(all(feature = "debug", feature = "gpu"))]
+#[cfg(all(feature = "debug", feature = "gpu-renderer"))]
 pub use crate::shell::screenshot::capture_texture_rgba;
 #[cfg(feature = "debug")]
 pub use crate::shell::screenshot::encode_png;
@@ -566,13 +1174,28 @@ impl RinchContext {
 /// scene directly. This struct manages a [`vello::Renderer`] and an
 /// intermediate render texture sized to the window.
 ///
+/// **The texture holds straight (non-premultiplied) alpha**, which is what
+/// Vello writes: composite it over your game with straight-alpha blending
+/// (`wgpu::BlendState::ALPHA_BLENDING`, `src * a + dst * (1 - a)`), or
+/// premultiply in your shader first. `PREMULTIPLIED_ALPHA_BLENDING` on the
+/// raw texture adds the full colour of every translucent pixel. Where a
+/// [`GameViewport`] is, the texture is transparent (#1866).
+///
+/// **Use `rinch::vello`.** rinch depends on Vello 0.11 from
+/// `joeleaver/vello-fork` at a pinned commit (#1955), which fixes two
+/// image-atlas bugs of stock Vello 0.11. Build Vello types from `rinch::vello`
+/// (and its `peniko`/`kurbo`), and wgpu types from `rinch::wgpu`, instead of
+/// declaring your own `vello`/`wgpu` dependencies, so the versions can never
+/// drift (for an extra wgpu feature, keep `wgpu = "30"` with just that feature;
+/// Cargo unifies it). No `[patch]` line is needed.
+///
 /// # Usage
 ///
 /// ```ignore
 /// let mut overlay = RinchOverlayRenderer::new(&device, 1280, 720, TextureFormat::Rgba8Unorm);
 ///
 /// // Each frame:
-/// let view = overlay.render(&device, &queue, ctx.scene());
+/// let view = overlay.render(&device, &queue, &mut ctx);
 /// // composite `view` on top of your game scene
 /// ```
 pub struct RinchOverlayRenderer {
@@ -581,9 +1204,51 @@ pub struct RinchOverlayRenderer {
     width: u32,
     height: u32,
     format: TextureFormat,
+    /// The `GameViewport`s split out of the last painted frame (#1866).
+    split: crate::split_frame::SplitFrame,
+    compositor: Option<crate::split_compositor::SplitCompositor>,
+    /// The stamp of the context frame whose slices `split` holds, `0` for
+    /// none: a context asked by a renderer holding another stamp paints the
+    /// frame again for it (#1976).
+    fed: u64,
+    /// A failed slice apply was logged and none has succeeded since: a
+    /// persistent error logs once, not every frame.
+    slice_error_logged: bool,
+    /// Where Vello renders the UI while a viewport is split: the split
+    /// compositor then writes `render_texture` from it.
+    below: Option<Texture>,
+    /// A frame went out undrawn and no `render` has followed (#2071).
+    render_owed: bool,
+    /// The context's host textures registered with `renderer` (#2082).
+    host_images: HostTextureImages,
+    /// The submissions that ended the recent frames, for the limit on
+    /// frames in flight (#2688): see [`crate::gpu_frames_in_flight()`].
+    pub(crate) in_flight: crate::gpu_frames_in_flight::FramesInFlight,
 }
 
+/// What became of the frames a [`RinchOverlayRenderer`] rendered, from
+/// [`RinchOverlayRenderer::check_frames`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverlayCheck {
+    /// A frame overflowed Vello's buffers and went out undrawn, so the
+    /// texture is wrong until the next [`RinchOverlayRenderer::render`].
+    pub needs_render: bool,
+    /// When to check again, until this is `None`: not every frame's counters
+    /// are back from the GPU.
+    pub check_again_at: Option<rinch_platform::Instant>,
+}
+
+/// How soon a host looks again for Vello's counters: half a 60 Hz frame.
+const OVERLAY_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
+
 impl RinchOverlayRenderer {
+    /// Tests only (#2688): how many of this overlay's frames have been
+    /// submitted and not yet waited for.
+    #[doc(hidden)]
+    pub fn frames_in_flight_pending(&self) -> usize {
+        self.in_flight.pending()
+    }
+
     /// Create a new overlay renderer from the game engine's wgpu device.
     ///
     /// The `format` should match the texture format you'll composite with
@@ -592,16 +1257,9 @@ impl RinchOverlayRenderer {
         let width = width.max(1);
         let height = height.max(1);
 
-        let renderer = VelloRenderer::new(
-            device,
-            RendererOptions {
-                antialiasing_support: AaSupport::all(),
-                use_cpu: false,
-                num_init_threads: None,
-                pipeline_cache: None,
-            },
-        )
-        .expect("Failed to create Vello renderer");
+        let renderer =
+            crate::gpu_init::new_renderer(device, crate::gpu_antialiasing::scene_aa_support())
+                .expect("Failed to create Vello renderer");
 
         let render_texture = Self::create_texture(device, format, width, height);
 
@@ -611,33 +1269,216 @@ impl RinchOverlayRenderer {
             width,
             height,
             format,
+            split: Default::default(),
+            compositor: None,
+            fed: 0,
+            slice_error_logged: false,
+            below: None,
+            render_owed: false,
+            host_images: HostTextureImages::new(),
+            in_flight: Default::default(),
         }
     }
 
-    /// Render the rinch scene to a texture.
+    /// What became of the frames [`Self::render`] submitted (#2071). This
+    /// never waits for the GPU.
+    ///
+    /// A host rendering every frame need not call this: `render` does. A host
+    /// that renders only when [`RinchContext::needs_update`] says so does: a
+    /// lost frame is a fact about this renderer's buffers, so the context
+    /// cannot know of it, and the texture would stay wrong until something
+    /// else changed. After each `render`, call this at `check_again_at` until
+    /// it is `None`, and `render` when `needs_render` is true.
+    ///
+    /// Do not call it after a device loss: see [`vello::Renderer::check_frames`].
+    pub fn check_frames(&mut self, device: &Device) -> OverlayCheck {
+        let check = self.renderer.check_frames(device);
+        if check == vello::FrameCheck::Lost {
+            // A stamp no frame has: the next `render` paints the slices again.
+            self.fed = 0;
+            self.render_owed = true;
+        }
+        OverlayCheck {
+            needs_render: self.render_owed,
+            check_again_at: (check != vello::FrameCheck::Settled)
+                .then(|| rinch_platform::Instant::now() + OVERLAY_CHECK_INTERVAL),
+        }
+    }
+
+    /// Keep a [`vello::BumpReport`] of each frame whose counters come back
+    /// from now on, at most `capacity` (the newest), until
+    /// [`Self::take_bump_reports`] drains them; 0 stops and drops them. Off
+    /// by default, and off nothing is kept ([`vello::Renderer::record_bump_reports`]).
+    ///
+    /// For measuring the rules that size Vello's bump buffers against what
+    /// frames need: `examples/bump-calibration` (#2466).
+    pub fn record_bump_reports(&mut self, capacity: usize) {
+        self.renderer.record_bump_reports(capacity);
+    }
+
+    /// The [`vello::BumpReport`]s kept since the last take, oldest first;
+    /// recording goes on ([`vello::Renderer::take_bump_reports`]).
+    pub fn take_bump_reports(&mut self) -> Vec<vello::BumpReport> {
+        self.renderer.take_bump_reports()
+    }
+
+    /// Render `ctx`'s UI to a texture.
     ///
     /// Returns a [`TextureView`] that the game can sample/composite.
     /// The texture has a transparent background so it can be alpha-blended
-    /// over the game scene.
-    pub fn render(&mut self, device: &Device, queue: &Queue, scene: &Scene) -> TextureView {
+    /// over the game scene; its alpha is straight, not premultiplied (see the
+    /// type's docs).
+    ///
+    /// Each [`GameViewport`] is the base layer (#1866): the texture is
+    /// transparent inside its box (its own `border-radius`, clipped and
+    /// transformed as the element is), and what is painted after it — its
+    /// children, later siblings, popups — is drawn over it. The box is cut
+    /// out by a compositor pass after Vello, from the frame's slices, so it is
+    /// exact under every clip around the viewport. (Before #1866 this took
+    /// `ctx.scene()`; a scene rendered on its own clears the viewports in the
+    /// scene, which is approximate inside clips, see [`RinchContext::scene`].)
+    ///
+    /// Call it once per frame, in place of `ctx.scene()`: it drives the
+    /// context's `RenderSurface`s as `scene()` does.
+    ///
+    /// A renderer may be replaced (after a device loss: the renderer is
+    /// bound to its device, the context is not), and several may take turns
+    /// on one context or one on several contexts: a renderer that does not
+    /// hold the context's last painted frame has it painted again, so its
+    /// first `render` is complete with nothing changed in the document
+    /// (#1976). Nothing needs marking dirty.
+    ///
+    /// It waits for the GPU only to keep this renderer's frames in flight at
+    /// [`crate::gpu_frames_in_flight()`] (#2688): with the default of 2, a
+    /// `render` first waits until every earlier frame but the last has
+    /// finished. More frames in flight let more wgpu command encoders be alive
+    /// at once, and the driver keeps each one's memory for the life of the
+    /// process; [`crate::set_gpu_frames_in_flight`] changes the limit. The
+    /// frame's end is a submission made after everything the host has
+    /// submitted so far, so the limit holds the host's own frames in flight to
+    /// it too; it is one setting for the whole process (`0` lifts it for every
+    /// renderer).
+    ///
+    /// A frame that overflowed Vello's buffers goes out undrawn and is found out from its counters a frame or so
+    /// later (#2071): the next `render` then draws it again, slices included,
+    /// so an overflow shows as a frame or two without the UI. A host that does
+    /// not render every frame asks [`Self::check_frames`] when to.
+    pub fn render(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        ctx: &mut RinchContext,
+    ) -> TextureView {
+        let limit = self.in_flight.limit();
+        self.in_flight.begin(device, limit);
+        self.check_frames(device);
+        self.render_owed = false;
+        // Host textures (#2082) first: a change to what the scene draws
+        // marks it dirty, and the paint below reads the images.
+        let installed =
+            ctx.install_host_textures(device, queue, &mut self.renderer, &mut self.host_images);
+        let sliced = ctx.sliced_frame(self.fed);
+        if installed {
+            rinch_dom::paint::set_host_texture_images(None);
+        }
+        if let Some((stamp, slices)) = sliced {
+            self.fed = stamp;
+            if let Err(e) = self.split.apply(
+                device,
+                queue,
+                &mut self.renderer,
+                crate::split_frame::SplitChange {
+                    drop: Vec::new(),
+                    all: true,
+                    add: slices,
+                },
+            ) {
+                if !self.slice_error_logged {
+                    tracing::error!("rinch: overlay split slices: {e}");
+                    self.slice_error_logged = true;
+                }
+                self.split.clear();
+                // Holding none of the frame's slices: ask for it again.
+                self.fed = 0;
+            } else {
+                self.slice_error_logged = false;
+            }
+        }
+        let scene = ctx.app.painter.scene();
         let view = self
             .render_texture
             .create_view(&TextureViewDescriptor::default());
+        let split = !self.split.is_empty();
+        let below = if split {
+            let (w, h) = (self.width, self.height);
+            let below = self
+                .below
+                .take()
+                .filter(|t| t.width() == w && t.height() == h)
+                .unwrap_or_else(|| {
+                    device.create_texture(&TextureDescriptor {
+                        label: Some("rinch overlay below"),
+                        size: Extent3d {
+                            width: w,
+                            height: h,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: TextureDimension::D2,
+                        format: TextureFormat::Rgba8Unorm,
+                        usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    })
+                });
+            let below_view = below.create_view(&TextureViewDescriptor::default());
+            self.below = Some(below);
+            Some(below_view)
+        } else {
+            self.below = None;
+            None
+        };
 
         self.renderer
             .render_to_texture(
                 device,
                 queue,
                 scene,
-                &view,
+                below.as_ref().unwrap_or(&view),
                 &RenderParams {
                     base_color: Color::TRANSPARENT,
                     width: self.width,
                     height: self.height,
-                    antialiasing_method: AaConfig::Msaa16,
+                    antialiasing_method: crate::gpu_antialiasing::scene_aa(),
                 },
             )
             .expect("Vello render_to_texture failed");
+
+        if let Some(below) = below {
+            let format = self.format;
+            let compositor = self.compositor.get_or_insert_with(|| {
+                crate::split_compositor::SplitCompositor::new(device, format)
+            });
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("rinch overlay split"),
+            });
+            self.split.composite_with(
+                compositor,
+                device,
+                &mut encoder,
+                &below,
+                &view,
+                (self.width, self.height),
+                &Default::default(),
+                true,
+            );
+            let end = queue.submit(Some(encoder.finish()));
+            self.in_flight.end(end);
+        } else {
+            // Vello's own submission is the frame's last, and it does not
+            // hand back its index: an empty submission after it does.
+            self.in_flight.end(queue.submit(None));
+        }
 
         view
     }
@@ -652,6 +1493,13 @@ impl RinchOverlayRenderer {
         self.width = width;
         self.height = height;
         self.render_texture = Self::create_texture(device, self.format, width, height);
+    }
+
+    /// How many host textures (#2082) this renderer has registered with its
+    /// Vello so far. A test hook, not a stable API.
+    #[doc(hidden)]
+    pub fn host_texture_registrations(&self) -> u64 {
+        self.host_images.registration_count()
     }
 
     /// Get the current render texture (e.g. for binding to a shader).
@@ -683,7 +1531,9 @@ impl RinchOverlayRenderer {
             format,
             usage: TextureUsages::STORAGE_BINDING
                 | TextureUsages::TEXTURE_BINDING
-                | TextureUsages::COPY_SRC,
+                | TextureUsages::COPY_SRC
+                // The split compositor writes it (#1866).
+                | TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         })
     }
@@ -696,6 +1546,16 @@ impl RinchOverlayRenderer {
 /// Place this component in your rinch UI layout wherever you want the game
 /// scene to show through. Use [`RinchContext::viewport_rect`] to query
 /// the computed layout rect and render your game into that region.
+///
+/// The viewport is the **base layer** (#1866): its box (its own
+/// `border-radius`, clipped and transformed as the element is) is
+/// transparent in [`RinchOverlayRenderer::render`]'s texture, so nothing
+/// painted beneath it — ancestor backgrounds, earlier siblings — covers the
+/// game, and anything painted after it — its children, later siblings,
+/// popups — draws over it. ([`RinchContext::scene`] clears it in the scene,
+/// approximate inside clips.) A debug build warns once
+/// where that cannot hold: the viewport inside an `opacity < 1`, `mask-image`
+/// or `filter` group, or under a rotation, scale or skew.
 ///
 /// The component renders as a transparent, **hittable** `div`. Hittability is
 /// what routes input: [`RinchContext::wants_mouse`] hit-tests the DOM and walks

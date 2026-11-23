@@ -1,0 +1,666 @@
+# Absolute/fixed positioning and static position
+
+Read this page when your task touches: containing blocks, out_of_flow, static position, shrink-to-fit absolute boxes.
+
+Moved verbatim from `CLAUDE.md` on 2026-10-22 (the index there points here). New mechanism notes for this area go on this page, not in `CLAUDE.md`. A code comment that cites a `CLAUDE.md` section by name means a section now on one of these pages: `grep -rn '<name>' docs/internals/`.
+
+**Absolute positioning.** Taffy resolves an out-of-flow box against its **direct
+parent**, always. CSS resolves an absolute box against the **padding box of the
+nearest ancestor that establishes a containing block**
+(`Node::establishes_abs_containing_block`: positioned, or transformed) — or,
+when it has none, against the initial containing block. rinch corrects both
+(`crates/rinch-dom/src/out_of_flow.rs`, whose module doc has the detail):
+
+- **No such ancestor** (#204, `OutOfFlowKind::IcbAbsolute`): the viewport.
+  `inset: 0` inside an unpositioned 300x200 div gives an 800x600 box.
+- **An ancestor that is not the box Taffy lays it out in** (#386,
+  `OutOfFlowKind::AncestorAbsolute(cb)`): that ancestor's padding box.
+  `relative 400x300 > static 300x200 > abs(inset: 0)` gives 400x300 at the
+  grandparent's origin, where it gave 300x200 in the parent. The layout parent
+  is the nearest ancestor that generates a box — a `display: contents` wrapper
+  and a non-atomic inline element are stepped over — so `relative > contents >
+  abs` is still Taffy's own answer and costs nothing.
+
+Both match the browser and therefore `rinch-web`. The correction is a pre-layout
+**size** bake into the Taffy style (so the box's own children lay out inside the
+right box) plus a **position** written as a *parent-relative* value
+(`out_of_flow::place_absolute`), so `LayoutResult` keeps its meaning and no
+coordinate consumer — paint, stacking, hit testing, `ClickContext`, the MCP
+`absolute` contract — needs an exception. An axis with both insets `auto` keeps
+the box's static position (below).
+
+**An ancestor's size is not known before the compute**, so that case is a
+fixpoint in `resolve_layout`, sharing `calc_layout`'s loop and its cap of 8:
+`out_of_flow::bake_at_style_site` bakes from the ancestor's **last** laid-out
+size when a style is (re)built, `RinchDocument::resolve_ancestor_absolutes`
+compares every such box after each root compute and rewrites the ones whose
+ancestor came out at another size, and the compute re-runs while it rewrote any
+(`abs_containing_block_passes`). An out-of-flow box sizes nothing above it, so
+this converges in **one** extra compute — plus one per level when a containing
+block is itself an absolute resolved against a non-parent. What it costs in
+**computes**, pinned in `perf_regression_scenarios`: a box whose size does not
+depend on its containing block (`right: 5px; bottom: 5px; width: 40px`) is
+placed and never re-sized, so it never pays one; a size-dependent one
+(`inset: 0`, `width: 50%`) pays one extra compute on the document's first
+layout and one per resize of its containing block — not on a later pass, a
+restyle of the box, its insertion under a block that already has a size, or an
+inline inset write (the #280 fast path bakes the size for the new insets
+itself, `out_of_flow::rebake_after_inset_write`).
+
+**The passes look only at the boxes that need them** (review of #1409; they
+iterated every `position: absolute` node at first, which cost a list of
+ordinary badges +12% per relayout). An absolute child of its own positioned
+parent — Taffy's own answer — is in no index and no pass on a scroll, and on
+a layout in none unless its width is `auto`/`fit-content` with no inline inset
+(a `top: 100%` dropdown) and its parent is not a grid (#2377): those are in
+`NodeTree::abs_static_fits` and visited once per
+layout after the lines (#1404; one `abs_boxes_visited` each, no compute when
+nothing moved). `NodeTree::ancestor_absolutes` holds the ancestor-resolved boxes (kept
+by the style sites; `read_layout_results` classifies every absolute box anyway,
+and one it finds the sites missed — a box *between* it and its containing block
+stopped being `display: contents` with no restyle of the absolute one — is
+added and the layout resolved again in the same pass,
+`out_of_flow::note_kind_at_read`); the size check after each compute iterates
+that. `NodeTree::placed_absolutes` holds what the read-back placed this layout
+(ancestor and ICB boxes); the second placement and a scroll iterate that. The
+counter is `abs_boxes_visited`, one per box per pass: 0 for a document of
+direct-child badges, 2 per layout per ancestor-resolved box (size check,
+placement), 1 per ICB box. Measured (Callgrind, 500 rows with one badge each,
+one leaf restyled and laid out, against `main`, which did not resolve these
+boxes at all): direct-child badges 1.78M → 1.79M instructions, ICB badges
+2.01M → 2.02M, ancestor-resolved badges 2.31M → 2.69–2.75M — about 0.8k
+instructions per ancestor-resolved box per layout, which is the size compare
+and the placement.
+
+**A change of containing block owes a layout whether or not a Taffy style
+changes.** A node that starts or stops establishing a containing block — in the
+cascade, or on the `tick_transitions` frame a `transform` transition finishes
+at `none` — re-syncs the absolute descendants that resolve against it (below;
+the walk stops below a nearer containing block, whose boxes the flip cannot
+reach, so a hover `transform` on a card of `position: relative` rows runs no
+compute) *and*, when there is one, sets `layout_dirty`: a box whose size
+does not depend on its containing block (`right: 5px; width: 40px`) has the
+same Taffy style under either, and only the read-back places it. Without that
+it stayed where the old containing block put it until something else laid out
+(`abs_containing_block_tests::a_position_only_box_follows_a_change_of_containing_block`;
+the initial-containing-block half was already so before #386).
+
+**Every site that rebuilds a Taffy style from `computed_style` calls
+`bake_at_style_site`** — the cascade's sync and both tick re-syncs — which is
+also what stops `tick_transitions`/`tick_animations` from dropping a `fixed`
+box's viewport size on a transition frame. A new rebuild site that skips it
+costs an ancestor case one compute (the pass after the compute puts the bake
+back) and loses the viewport cases until the next cascade.
+
+**The containing block's rules, for both absolute cases** (Chrome 153's numbers
+are in `crates/rinch-dom/tests/abs_containing_block_tests.rs`): insets and a
+percentage `width`/`height`/`min-*`/`max-*` resolve against the padding box, a
+percentage `padding` or `margin` against its **width** on every side; margins
+come out of the space between two insets; `margin: auto` between two insets
+centres a sized box (one `auto` takes all the free space; a box larger than the
+space still centres on the block axis and starts at the inset on the inline
+one); a mixed `calc()` in any of those resolves against the same box
+(`calc_layout`) — except for a box inside an atomic inline, where no `calc()`
+is resolved at all, in flow or out of it (#1412, older than #386: a `width: calc(50%
++ 10px)` child of a 200px `inline-block` is 10px wide; the plain-percentage
+rules above do hold there). That holds for a box whose containing block is
+its own parent too, however the parent is sized: `top: calc(100% + 4px)` under
+an auto-height `position: relative` block, a content-sized flex or grid
+container, or a grid item resolves its `100%` against the parent's laid-out
+padding box. `calc_layout` judged that basis by the in-flow rule
+(`calc_axis_definite`: an auto height is indefinite, so the percentage is 0)
+until #1789/#1974, and such a dropdown came out at `top: 4px`, over its own
+trigger, while a plain `top: 100%` (Taffy's) was right; an absolute box sizes
+nothing above it, so its basis is definite whatever sizes the block
+(`tests/abs_calc_inset_auto_cb_1789_tests.rs`, Chrome 155's numbers). A real
+0x0 box is placed; one in a `display: none`
+subtree is not (`out_of_flow::is_laid_out`).
+
+**Scrolling.** A scroller *between* a box and its containing block does not
+carry the box — it is the containing block's content, not the scroller's — on
+an inset axis and a static-position one alike (Chrome: `top: 6px` and a
+static box both stay put at `scrollTop = 40`). The containing block's **own**
+scroll does carry it, and for the initial containing block the `<body>`'s
+scroll is that scroll (rinch's page scroll). Since `layout` is parent-relative,
+the position carries the scroll offsets of the boxes between
+(`+ Σ chain.scroll`), and a scroll runs no layout — so `NodeTree::mark_scrolled`
+calls `out_of_flow::replace_after_scroll`, which writes those boxes again.
+It costs one flag read unless the scrolled box lies between a placed box and
+its containing block (`Node::on_abs_chain`, set as the read-back walks each
+chain): a scroller of rows whose badges resolve against their own row, direct
+child or not, re-places nothing, and a scroller holding 500 ICB boxes re-places
+all 500 (about 0.6k instructions each, 0.3M a notch — each really has to be
+written again to stay still). It drops no hit-test extent: an absolute box is
+positioned, so it is in no `flow_extent`, and the stacking sequences that hold
+its offset are the ones a scroll drops anyway
+(`perf_regression_tests::a_second_wheel_notch_with_an_escaping_absolute_recomputes_no_extent`).
+The re-placed box is pushed paint-dirty, so a notch's damage includes a box
+that did not move on screen. **A new scroll-offset writer that
+bypasses `mark_scrolled` lets such a box ride the scroller until the next
+layout.** Before #386 an ICB box rode every scroller it was written in, and
+jumped back to the viewport on the next layout while the page was scrolled.
+`resolve_layout` also places every placed box a second time
+(`out_of_flow::replace_all`) when something on the way to a containing block
+was written after the read-back: an anonymous block box's own read-back, the
+line position an inline formatting context gives an `inline-block`, a scroll
+offset the clamp pulled in. Each of those three writers sets
+`NodeTree::abs_late_moves` when it actually moved something, and a layout in
+which none did skips the second placement. The `!layout_dirty` text-only path
+runs the second of them with no read-back at all — a `text-align` change moves
+an `inline-block` along its line there — so it calls `replace_all` too, after
+its `build_ifc_layouts`; `replace_all` consumes the flag
+(`review2_1409_tests::c1_*`, `c3_*`); **a new writer of a box's position
+or scroll offset that runs after `read_layout_results` must set it too.**
+
+**The static position** (#633, #632, #634; CSS 2.1 §10.3.7, §10.6.4). An axis
+with both insets `auto` keeps the box where it would have been in the flow —
+for `absolute` and for `fixed` (which went to the viewport's origin until #633).
+Taffy's answer, after the preceding in-flow sibling in the layout parent, is
+that place except among **inline content**, which Taffy sees as one leaf. There
+the lines answer (Chrome 153, pinned with the bundled Inter in
+`tests/static_position_tests.rs`): a **block-level** box goes at the content
+box's left edge (whatever the `text-align`) below the line holding the content
+before it, or at the first line's top when nothing precedes it; a box that was
+**inline-level before `position` blockified it** — a `<span style="position:
+absolute">`, an `inline-block` one — sits in its line where that content ends,
+at the line box's top, and moves with `text-align`. At a soft wrap the box stays
+on the line the content before it is on (a space hung there is not counted);
+after a forced break it starts the next line. Its own margins are added.
+The mechanism: `walk_inline_children` notes each out-of-flow box it passes
+(`IfcText::note_out_of_flow`; a direct child standing inside an anonymous box's
+run — or before its first member, with no block between: an inline-level box
+there starts the first line, which `text-align` moves — joins no run, #406, so
+it is noted from `Node::run_out_of_flow`, recorded where the runs are
+grouped); `ifc::resolve_out_of_flow_marks` turns each note
+into both positions once the lines are broken (`InlineLayout::out_of_flow`; a
+`text-overflow: ellipsis` cut keeps the lines, #1100); `Node::static_ifc_root` names the root and
+the note's index on the box, so `out_of_flow::static_location` costs one flag
+read for a box outside inline content and one indexed look for one inside
+(`abs_static_lookup_steps`: N looks for N boxes in one paragraph, pinned at two
+sizes by `perf_regression_scenarios::static_boxes_in_one_paragraph_are_looked_up_by_index`
+— a search per box was quadratic, 8000 boxes 1.9 → 10.4 ms per relayout); and which position is the box's is
+`ComputedStyle::inline_level_before_blockify` (Stylo's `original_display`),
+read at placement — a change of it alone moves no Taffy value, and neither
+does `absolute` ↔ `fixed`, so the cascade sets `layout_dirty` for either on an
+out-of-flow box. The lines are built after the read-back, so
+`shape_ifc_root_paint_layout` calls `out_of_flow::place_static_after_lines` for
+each box its new lines hold, and so does `read_layout_results_for_box` when an anonymous box moved: that
+writes an absolute box whose layout parent is its containing block directly —
+it is in no list — and sets `abs_late_moves` for the rest. **A new writer of an
+IFC root's position that runs after the read-back owes the same call.** The
+position is measured with nothing scrolled (a box shown in a scroller already
+at `scrollTop = 40` sits where it would at 0): for a fixed box, whose `layout`
+is a viewport position, that is the sum of the layouts above it
+(`out_of_flow::place_fixed_static`; the sum ends at a fixed ancestor and takes
+the baked scroll back off an absolute one), and no scroll moves it afterwards. A
+fixed box with a static axis is pushed to `placed_absolutes` (one
+`abs_boxes_visited` per layout); one with insets on both axes, and an absolute
+box placed by Taffy, static or not, are in no pass. In a **flex** container
+the static position is the box as its sole flex item: `justify-content` on the
+main axis and `align-self`, else `align-items`, on the cross (`stretch` as the
+start; #1492 — `to_taffy_style` used to force `align-self: flex-start` on every
+out-of-flow box, so the cross axis ignored `align-items`; pins:
+`static_position_flex_1492_tests.rs`, Chrome 153). In a **grid** container
+that is its containing block, Taffy aligns the box in the container's padding
+box by its own `justify-self`/`align-self`, else the container's
+`justify-items`/`align-items` (#1511 carried the `justify-*` pair, which used to
+be dropped; pins: `justify_items_1511_tests.rs`, Chrome 156). In a **block**
+container a block-level box is aligned by its `justify-self`, else the
+container's `justify-items` (#2541, Taffy fork item 26, `static_aligned_x`):
+the container's content box is the static-position rectangle, which
+css-position-3 §4.1 makes the inset-modified containing block the box is
+aligned in — from the content start to the containing block's end for a
+start-aligned box, from the containing block's start to the content end for an
+end-aligned one, the widest span centred on the content box's centre for a
+centred one; an overflowing box spills from those edges, or under `safe` starts
+there. `normal` and `stretch` start it. A box that was inline-level before
+`position` blockified it is not aligned (`taffy_style_from_computed` hands
+Taffy `justify-self: start` for it; Chrome 157 keeps an `<span
+style="position: absolute; justify-self: end">` with no text around it at the
+start). Chrome 157 takes `justify-self: left` as the start edge here, the right
+under `rtl` (an in-flow box takes the left); rinch keeps `left` physical
+(`abs_left_rtl`, a known difference). Pins: the `abs_*` rows of
+`justify_direction_1995_tests.rs`. In a grid that
+is **not** its containing block (an unpositioned grid; css-grid-1 §9.4) it is
+aligned the same way in the grid's **content** box, whatever its grid
+placement (#1986: Taffy's padding-box or area answer is replaced by
+`out_of_flow::static_location_in_grid`, for an absolute and a fixed box), and
+an auto-width one is shrunk to fit in the room that alignment leaves, as in a
+flex container (`StaticAnchor::Start`/`End`/`Center` from the content edges;
+pins: `oof_percent_bases_tests.rs`, Chrome 157). The static position follows rinch's line boxes: below a
+line holding a 26px `inline-block` and text it is at Chrome's 37 since parley
+0.12 lined the box up on a strut (it was 4px high, a 26px line, before — #663;
+`a_block_level_box_below_a_line_with_a_tall_inline_block`).
+
+**A positioned inline span is a containing block too** (#631, CSS 2.1 §10.1):
+`out_of_flow_kind` answers `AncestorAbsolute(span)` for a `position: relative`
+or `sticky` non-atomic inline, which has no box at all, and the block is read
+out of the lines of the inline formatting context that flows the span: from
+the top-left of its first fragment to the bottom-right of its last, zero wide
+when that is left of the first (a wrapped span); for a right-to-left span
+(its own `direction`) from the top-right of its first to the bottom-left of
+its last, the sides its padding and border close (#2616, Chrome 157:
+`tests/inline_geom_2616_tests.rs`). The same two sides are where
+`bounding_rect` grows the fragments by the padding and border; before #2616 a
+right-to-left span took them on the left of its first fragment and the right
+of its last. A fragment's left and right
+are the **visual** extent of its content (a span of right-to-left text is as
+wide as its text), its top and bottom the span's **own font's** rounded ascent
+and descent around the baseline whatever its children are set in (the face its
+stack resolves an `x` to, `out_of_flow::font_box`), moved by the span's **own**
+`vertical-align` shift (the shifts of the span and the inline elements around
+it added up and rounded, as parley places its text, #1357 — a shifted child at
+its start or end moves nothing); an empty span is a zero-width fragment where it sits
+(Chrome 153, pinned with the bundled Inter in
+`tests/abs_inline_containing_block_tests.rs` and `review_1434_tests.rs`).
+**The spans of one context are measured together, once per set of lines**
+(`RinchDocument::measure_inline_containing_blocks` →
+`out_of_flow::measure_span_fragments`): one walk of the lines' clusters and one
+of the context's entries, kept beside the lines in
+`InlineLayout::span_fragments`, so each look at a box is a lookup and rebuilt
+lines (which come back with none) are measured again. It was one walk of the
+whole context per box per pass, quadratic in the boxes of one paragraph (review
+of #1434: a relayout of 800 badges in one paragraph took 1.36 s). The counters
+are `abs_inline_measures` and `abs_inline_measure_steps`, pinned at two sizes
+by `perf_regression_scenarios::spans_in_one_paragraph_are_measured_in_one_linear_walk`
+(854 steps for 50 badges, 1,708 for 100; spans nested in one another each
+walk their own clusters, so that case grows with the nesting depth). The chain of such a box ends at the
+block container **element** holding the line (`out_of_flow::inline_host` — an
+anonymous block box is stepped through), so that element's scroll carries the
+box and a scroller between the two does not. The position is snapped to the
+pixel grid in that element's frame, since a fragment starts between pixels (a
+host that is itself an `inline-block` stands between pixels on its own line,
+and the box with it). **Lines are built after the read-back**, so both halves
+run late, and only when the read-back met such a box
+(`NodeTree::abs_inline_cb_seen`): after `build_ifc_layouts` the spans are
+measured, `replace_all` places the boxes (on the text-only path too, where a
+`text-align` change moves the span), and `resolve_ancestor_absolutes(true)`
+compares each bake with the fragment the new lines give — a rewrite sends
+`resolve_layout` round again (compute, read-back, lines), so a box **sized**
+from a fragment whose size changed costs one more compute in that layout (the
+first one, a text edit inside the span) and a position-only one costs none.
+Not Chrome's, each pinned: a **split** inline (one holding a block-level child,
+#513) is not measured and keeps the block container (**#1424**) (a span in a
+block that draws a `text-overflow: ellipsis` "…" is measured since #1100, which
+keeps the lines and cuts them at paint); a wrapped span in a font taller than its `line-height` allows spans lines
+rinch keeps at the line height (three 22px lines of `16px/20px`: 66 tall
+against Chrome's 70); a wrapped **right-to-left** span's right edge is 4.5px
+off Chrome's, since parley puts a right-to-left line's trailing space at the
+line's left end where Chrome hangs it out of the line, and an empty span at
+the very end of a right-to-left run is 5px right of Chrome's; a span that ends in a `<br>` has no empty last fragment
+on the next line. (This list used to add that a line of nothing but atomic
+inlines has no strut, #624/#1258, so a span on one hangs from the boxes'
+bottom edge. Such a line has the strut since parley 0.12, and one holding only
+zero-size boxes since Parley Fork item 4 in `dependencies.md`; where a span's
+fragment sits on it has not been re-measured against Chrome.) And **paint does
+not clip such a box by a static scroller around its span** (**#1438**, older
+than #631: `stacking::Collector` descends the box tree, never meets the span,
+and ends the box's clip chain at the next positioned box), so a badge whose
+line is scrolled out of a static `overflow: auto` div is drawn outside it;
+layout, the scroll range and damage do see the span.
+
+**A relative inline element moves everything it holds** (#1425, #2346; CSS
+2.1 §9.4.3): its text, background, border and decorations, the atomic inlines
+in its lines (`inline-block`, `inline-flex`, images), the relative spans
+nested in it, and the boxes it is the containing block of. It has no box, so
+the move is post-layout, recorded with the lines (a `vertical-align` is
+parley's since #1357, placed in the line it grows):
+the IFC walk (`push_inline_spans`) records an `InlineRelativeSpan` (owner and
+byte range, an empty range for a span holding only atomic inlines) for every
+`display: inline` element with `position: relative`, and
+`RinchDocument::resolve_relative_spans`, run when the paint lines are shaped
+(`shape_ifc_root_paint_layout`, before `write_inline_positions`), resolves
+each one's offset against the containing block — the root, or the element an
+anonymous block box stands in — and sets the spans that move nothing aside
+(`InlineLayout::relative_spans_resting`), so a span that is only an abspos
+anchor costs paint nothing, and can still move later. A percentage `left`/
+`right` is of the block's content width; a percentage `top`/`bottom` of its
+content height when that is definite, else `auto`. **Definite is layout's
+answer, not a mirror of its rules** (#2427): at each IFC root's final layout
+the measure closures (`run_taffy`, `compute_atomic_inline_root`) call
+`ifc::note_containing_block_height`, which stores in
+`Node::containing_block_height_definite` what Taffy itself would resolve a
+child's percentage height against — for a root measured as itself,
+`ifc::leaf_height_is_definite` (a root holding an out-of-flow box is measured
+through its #466 measure leaf, a block child of the root, which answers as an
+anonymous box does, #2457):
+the parent handed it a height and `known_dimensions_are_definite` calls it
+definite (every parent hands a leaf its style-resolved height — a length, a
+percentage of a definite parent, an `aspect-ratio` of its width; a flex, grid
+or absolute parent hands the height it lays it out at, definite for a
+stretched item, also in an auto-height or `min-height` row or an auto grid
+row, a column item's flexed height in a definite column, an absolute box's
+inset-given height); for an anonymous block box, whether its
+`parent_size.height` is `Some`, the parent's percentage basis. Chrome 157 agrees on every case
+pinned (a `flex-start` row item, a `flex: 1` item of an auto column, a
+`start` grid item and a `min-height`-only block stay indefinite). A
+`position: fixed` box's percentage `width`/`height` are baked from the
+viewport (`apply_out_of_flow_size_overrides`, #2427), where Taffy used to
+resolve them against the box's layout parent — unless an ancestor with a
+`transform` or `contain: paint`/`layout` is its containing block
+(`out_of_flow::fixed_containing_block_is_viewport`), where Taffy's answer is
+kept (Chrome's when that ancestor is the layout parent; rinch still places
+such a box against the viewport); `top` wins over
+`bottom`, and `left` over `right` in a left-to-right block (Chrome 156).
+Offsets **compose** (`InlineLayout::relative_offset_at` sums every span over a
+byte; `element_relative_offset` sums an element's and its inline ancestors').
+The consumers: `write_inline_positions` adds the offset to each atomic
+inline's `layout` (so layout, paint, hit testing, `painted_border_box` and
+damage follow it with nothing of their own); `paint::text::draw_text` moves
+each glyph, and starts a new stretch where the offset changes so the
+underline and line-through move with their glyphs; `inline_background_rects`
+moves the element's background and border; the wavy underline moves with
+its first byte; `inline_ink_past_lines` counts the moved lines, so damage
+reaches them and a root that clips its overflow keeps its clip; the caret and
+`get_glyph_bounds` (`InlineLayout::glyph_offset_at`) and the selection
+highlight (`text_query::selection_rects_for_inline`, the range cut at each
+span's edges) are where the text is drawn, and so are the editor's queries
+(`query_selection_rects_with_boxes` through
+`selection_rects_with_boxes_for_inline`, each selected box asked with the
+piece drawn at its offset; `query_inline_box_caret` and the edge-box caret,
+`InlineLayout::inline_box_relative_offset`; `query_line_box`) and the
+desktop editor's link-hover rect; a span's fragments
+(`measure_span_fragments`) move, so a box hung from it does
+(`left: 5px; top: 3px` puts `left: 0; top: 0` at Chrome's `(52.641, 10)`,
+snapped to 53), and so does the static position of an `auto`-inset box in it
+(the `OutOfFlowMark`s: an inline-level box's `inline`, a block-level one's
+`block_x`/`block_y` — Chrome's `(18, 32)` for a `left: 7px; top: 5px` span,
+`(11, 27)` without), and the span's own `getBoundingClientRect`. A box
+inside a relative **split** inline (#513, #2408) moves with it: Taffy lays it
+out as a child of the container, so its read-back
+(`read_layout_results`, `split_inline_relative_offset`) adds the offsets
+of the relative split inlines around it, resolved against that container
+as the text beside it is (Chrome 157: `(18, 32)` for a `left: 7px; top: 5px`
+span, `(11, 27)` without, `(21, 34)` inside a nested `left: 3px; top: 2px`
+one); an inset change of a split inline takes a compute for it. **Kept lines are resolved
+again** (#2457, #2412): `build_ifc_layouts` asks
+`RinchDocument::refresh_relative_spans` of every root it keeps that has a
+relative span, moving or resting, and when an offset moved it writes the
+atomic inlines again, places the static positions again (the marks move by
+the difference), drops the span fragments for a re-measure, bumps the root's
+text-layout stamp and pushes it paint-dirty (`relative_span_refreshes`). So a
+percentage `top` follows a containing block whose height or definiteness
+changed (Chrome 157: a row growing 100 → 200px moves `top: 10%` from 8 to
+18). A change of `position` of an inline element rebuilds the lines
+(`same_relative_offset_inputs`, part of `same_text_layout_inputs`); a change
+of its **insets alone** does not: the cascade names its IFC root in
+`NodeTree::relative_offset_roots`, which sends `resolve_layout` down the
+text-only path to that refresh — no reshape and no compute, since a
+`display: inline` element's Taffy style carries no inset
+(`taffy_style_from_computed`: Taffy lays out no box for it). A `position: sticky` inline is not moved, as before: where nothing
+scrolls it past its insets that is Chrome's answer too, and where a scroll
+would push it rinch's does not stick (sticky offsets are applied to boxes).
+Pinned in `tests/relative_inline_offset_2346_tests.rs`
+(layout, paint, pixels, Chrome 156) and `rinch/src/app/relative_inline_hit_2346_tests.rs`.
+
+**A relative inline element paints as a positioned box** (#2819, CSS 2.1
+Appendix E step 8): its background, border, text, decorations and the atomic
+inlines in it are drawn in its own entry of the stacking context's sequence,
+in tree order with the other positioned boxes, or at its `z-index` (with
+`opacity`, as one group). It always was an entry
+(`stacking::paints_at_stacking_root`), but paint skipped it
+(`drawn_by_its_ifc`) and its IFC root drew its runs with the in-flow content,
+so an earlier `position: absolute` sibling covered it whatever the `z-index`
+(Braynard's HUD: an absolute outline layer over a relative fill layer). Now
+`paint_sequence_entry` draws such an entry (`paint::paints_in_own_entry`: a
+flowed inline element with `position: relative`) through
+`paint_layered_span`, which calls `paint_inline_layout` with `only:
+Some(span)`, and the root's own paint leaves it out: `InlineScope` (built from
+the IFC's `relative_spans` and `relative_spans_resting`, so a change of
+`position`, which rebuilds the lines, keeps it current) decides per text
+range, inline background and atomic inline which paint draws it, by the
+innermost layered span that is or holds the node (`LayeredSpans::owner_of`),
+and goes into every mask the IFC paint builds (`TextMask`, `ShadowGroup`,
+`TextFragment`). A span's entry draws nothing of the root's own (uncovered
+bytes, the ellipsis, the highlights) nor of a layered span nested in it, which
+paints in its own entry (a stacking-context span's sequence holds its nested
+ones, `paint_children_with_stacking`). The entry's offset is the root's
+scrolled border-box origin, since a flowed inline element's `layout` is zeroed;
+the root's content origin is added to it. Hit testing walks the same entry:
+a point on the span's moved text (`text_query::layered_span_at`, its
+selection rects at its offset) answers the IFC root, as a hit on any of its
+text does, before the boxes below the span in the sequence. Pinned in
+`tests/positioned_inline_paint_2819_tests.rs` (Chrome 158 pixels, both clip
+routes; selection, highlight and drag-ghost twins) and
+`relative_inline_hit_2346_tests.rs`. **A static inline element
+that is a stacking context** (#2869: a `filter`, an `opacity` below 1, a
+`mask-image`; `ifc::is_static_inline_layer`) paints in its own entry the same
+way: its byte range is recorded with the relative ones in
+`relative_spans_resting`, at a zero offset (`resolve_relative_spans` resolves
+no insets for it), whether it is one is compared by
+`same_relative_offset_inputs` and an `opacity` tick that makes it one rebuilds
+the lines (`settle_ticked_text`). Its `filter` is drawn by
+`filter::paint_filtered_span`: everything its entry draws, every line's
+fragment, into one offscreen raster covering `text::layered_span_extent` (its
+lines' boxes at its offset, with `inline_ink_past_lines` and a margin of its
+`font-size`) grown by the list's reach, the whole list applied there (the
+colour functions too: a span has no box for the overlays a block uses), then
+composited at its `opacity`; a list of `drop-shadow()`s alone draws the
+shadows from the raster and the span again over them. A relative span's
+filter goes the same way. Hit testing is unchanged by the filter (Chrome: a
+filter does not affect hit testing): the span's text and atomic inlines are
+hit at its entry, and its shadow is not hit. Damage: a span has no box, so
+its change damages its IFC root's rect and ink (`compute_damage`'s box-less
+inline branch), grown by the span's own filter reach now and as it was painted
+(`PaintedState::filter_reach`), so a filter added, removed or changed repaints
+the shadow past the root (review of #2895: a hover glow on a link in a
+shrink-wrapped label); a change inside the span is grown by the span's reach
+as an ancestor's (`filter::ancestor_reach`). Pinned in
+`tests/inline_filter_damage_2869_tests.rs` (partial frame against a fresh full
+paint, static and relative spans). The raster is not cached, and a
+positioned box inside a filtered span reaching past the span's lines is cut
+at the raster's edge. Pinned in `tests/inline_filter_gradient_2869_tests.rs`
+(Chrome 158 pixels: a shadow under a span's box and its text, `invert()`, a
+wrapped span, a relative one, Braynard's HUD numeral: a relative gold
+`background-clip: text` gradient under a `drop-shadow`) and
+`relative_inline_hit_2346_tests.rs`. Not Chrome's yet: a `sticky` inline is
+still drawn with the root's runs (no byte range is recorded for it); an
+absolute box **inside** a relative span is a unit of its host (#591), so it
+is ordered after every positioned descendant of the span, where Chrome puts it
+at its tree position (a relative span after it inside the same span is drawn
+under it, not over); an atomic inline that is itself positioned is still drawn
+by its IFC (`drawn_by_its_ifc`'s own note); the span's `opacity` group is
+unbounded (its extent is its lines', which no box records).
+**Highlights:** the root draws its read-only selection and the editor's held
+highlight boxes (#2666) under its text, and the span's entry, drawn after,
+draws them again over its own opaque background, clipped to it
+(`paint::text::layered_background_path`, the boxes replayed from
+`PAINTED_HIGHLIGHTS`), so a selection shows over a relative span's background
+as over a static one's. **Snapshots:** in a `paint_subtree` (a drag ghost) a
+span whose entry is held by a stacking context outside the snapshot (a plain
+dragged box holding it) is drawn by its IFC root, as before #2819
+(`layered_entry_is_painted`).
+A pointer on moved **text** is mapped to the character drawn under it
+(#2404): `text_query::unmoved_point` finds the innermost relative span whose
+moved fragment (its selection rects, one per line piece, moved by every
+span around its text) holds the point and moves the point back before the
+lookup, and every point query over an IFC root goes through it
+(`grapheme_offset_in_inline`, `cluster_range_in_inline`,
+`glyph_cluster_in_inline`; `inline_box_in_inline` tests each box where it
+is drawn) — a click's caret, a drag's selection, link hover, the editor's
+link click and caret placement (Chrome 157: a quarter into the drawn `e`
+of a `left: 7px; top: 5px` span is offset 1 of its text, on the line and in
+the band below it only the moved text covers). The band is hit only inside
+the root's own box.
+
+**An auto-width absolute box is shrunk to fit in what its containing block
+leaves it** (#1404, CSS 2.1 §10.3.7): that block's padding-box width less the
+insets and margins, and with both inline insets `auto` the room its static
+position leaves — not its Taffy parent's whole width. Where the static position
+is (`out_of_flow::StaticAnchor`, on the node as `Node::abs_static_anchor`): a
+box among inline content starts there and may run to the block's end; a block-level box in a block container is
+anchored as its `justify-self` aligns it (#2541, `block_inline_alignment`):
+started at the content start (the right under `rtl`) it may run to the block's
+far edge, end-aligned it may start at the block's near edge, centred it gets
+twice the shorter distance from the content box's centre to a block edge; in a flex container it is placed as the sole item, so an
+end-aligned box gets the room from the block's start to the container's
+content end, and a centred one twice the shorter distance from the content
+box's centre to a block edge (Chrome 155; the inline-axis alignment is
+`justify-content` in a row, `align-self`/`align-items` in a column — so
+`Stack align="center"` holding a tooltip-like box). Three routes, all to
+`fit-content`: a box whose layout parent is its containing block gets the
+`fit-content` **keyword** (`out_of_flow::fit_in_layout_parent`), which Taffy's
+block and flex algorithms measure at the block less the insets and margins —
+only when an inset or margin takes room, so a plain box keeps `auto` and one
+measure; an ancestor-resolved or ICB box is baked `fit-content(<px>)` with the
+room (`apply_out_of_flow_size_overrides`); and the anchor, which Taffy does not
+know before the compute, is measured after the lines are built
+(`RinchDocument::resolve_static_shrink_to_fit`, over `NodeTree::abs_static_fits`)
+and read by every bake; an anchor away from the edge of a box's own parent
+takes a length from the parent's last layout, checked by the same pass.
+**A grid that is the box's containing block is left to Taffy** (#2377): the
+containing block is then the box's **grid area** (css-grid-1 §9.1), which
+only Taffy knows, so `fit_in_layout_parent` writes nothing for a grid's child
+and Taffy sizes an `auto` or `fit-content` width in the area less the insets
+and margins (Taffy Fork item 31 in `dependencies.md`) and places it from the
+area. An `auto` grid line is the padding edge on its side, so `grid-column:
+2` runs from line 2 to the padding edge, and an unplaced box has the whole
+padding box. It used to take a length from the whole grid's padding box: a
+box in `grid-column: 2` of `100px 200px` with `margin: 0 17px 0 23px` was 260
+wide where Chrome 153 has 160 (pins: `tests/abs_grid_area_2377_tests.rs`;
+a box placed by a line or area *name* is placed the same way since #2704).
+**Cost, in root computes**
+(pinned by `what_shrink_to_fit_costs_in_root_computes`): a box whose size does
+not depend on its containing block's, or one with a single inset in its own
+parent, pays nothing; one shrunk to fit from a static anchor away from its
+block's edge pays **one** more on its first layout and on each resize of the
+block it is measured against; an ancestor-resolved box (#386) of any auto
+width — newly including one with a single inset — pays one more on its first
+layout and one per resize of its containing block, as `inset: 0` always has,
+and **two** more on its first layout with a static anchor too; none pays
+anything on a relayout that moves nothing. An ICB box re-bakes (and is
+re-measured) on every viewport resize, with no extra compute. The room a
+box is measured in has its own horizontal margins out already, and Taffy's
+leaf algorithm no longer takes them off a second time (#2361, Taffy fork item
+17); `out_of_flow::absolute_leaf_inputs`, which put them back for an absolute
+leaf, went with that.
+An `auto` atomic inline capped by #1476 answers an IFC measure at its capped
+width **rounded**, as its layout will be (`round(width)`) — the answer it gives
+once laid out there — so a container sized from it does not move by the
+rounding between an incremental and a fresh layout, nor come out a pixel
+narrower than the box it holds. Pins:
+`tests/abs_shrink_to_fit_1404_tests.rs` (74 Chrome 155 rows) and
+`review_1510_1010_fixtures.rs`. Content that wraps is as wide as the room
+(**#1276**, #2330): an IFC measured at a definite width with no width known
+answers `InlineLayout::fit_content_width`, CSS's `min(max-content,
+max(min-content, available))` — the room when a line wrapped softly, the widest
+line when a piece that cannot break is wider, the max-content width when
+nothing wrapped. It answered the widest line (the issue's example 390x40,
+Chrome 394x40). A word `overflow-wrap: break-word` broke at the room is a
+piece that cannot break there (#2363): its breaks are not in the min-content
+width, so the box takes the whole word (`node::unbroken_min_content`). The same answer sizes a float, a `fit-content` box and a flex
+or grid item aligned to its start (`fit_content_wrapped_2330_tests.rs`), and
+it is the room less the box's horizontal margins once: Taffy's leaf algorithm
+took them out of a room its parent had already taken them out of (#2361: a
+float of wrapping text with `margin: 0 20px` in 300px was 220x60, Chrome
+260x40; the same for `fit-content` and a start-aligned grid item), and a column
+flex handed an item its whole width, so a block there holding the text was 300
+(the fork's item 17, `float_room_round3_tests.rs`); a row
+flex item's base size is still its max-content width. A paragraph laid out
+beside floats keeps the widest line (its lines wrap for the floats as well).
+With less room than its min-content width, a box sized by its content (no
+width known, and `auto` `width`, `min-width` and `max-width` of its own) takes
+the widest piece that cannot break, and its height is that of its lines broken
+**at that width**, not at the room (#2425): the measure breaks them again
+there. Taffy lays a float or an absolute box out at both sizes the measure
+answers, so a float of `x -5 (-5) a-5` in a `width: 0` block was 29 wide and
+100 tall (five lines at the room), painting four; Chrome 156 28.52x80. The IFC
+measure cache's entries are by room, so an entry keeps both answers (`IfcMeasure::at_width`
+beside `height`): a box given that room as its width (a block in the same 0-wide
+block) has the room's lines, and a grid or table cell asked its min-content
+size again is served from the cache as before
+(`shrink_to_fit_overflow_height_2425_tests.rs`; the three
+`perf_regression_scenarios` that ask such sizes kill a version that does not
+keep it).
+The second build is made only when it can differ (#2540): when the room's
+lines have no soft wrap (`Regular`/`Emergency`) and no atomic inline
+(`ifc::lines_hold_when_wider`) — one line, or lines every one of which a
+forced break ends — they are the lines at any wider width, and the room's
+height and baseline are kept as the at-width answer. A flex item's
+min-content measure offers no room, so before this a one-word label in a flex
+row (a clock) was broken twice on every change of its text. The builds made
+are counted in `ifc_rebreak_at_width`, not in `shape_measure_ifc`.
+A box whose containing block is a non-parent ancestor is counted in the scroll
+range of the nearest scroll container at or above that block since #770
+(`out_of_flow::overflow_scroller`; paint-and-damage.md, "Absolutes below the
+first box"). **A fixed box against the viewport takes all of the rules
+above** (#1980, #2002; `out_of_flow::takes_containing_block_rules`): the
+viewport is the box the initial containing block is, so its percentage and
+`calc()` sizes, margins and padding are of the viewport (`calc_layout` gives it
+the viewport as `abs_cb`), its margins are added to its position and come out
+of the room between two insets, and `margin: auto` centres it
+(`out_of_flow::place_fixed`, `axis_start` as for an ICB box: Chrome 157 puts
+`inset: 0; margin: auto; width: 200px; height: 100px` at `(300, 250)`, and
+`left: 0; right: 0; margin: 0 auto; max-width: 300px` at `x = 250`, 300 wide —
+the read-back used to stretch that `auto` width to the whole room after Taffy's
+`max-width`). **Not covered:** a mixed `calc()` on a **grid-placed** absolute child resolves
+against the grid container's padding box, not its grid area (**#1981**: only
+Taffy computes the area, and `calc_layout` resolves after it; plain
+percentages are Taffy's and right).
+
+**A fixed box under a transformed ancestor is contained by it** (#1372). A
+`transform` other than `none` (an identity included), `contain: paint` or
+`layout`, a `filter` or `backdrop-filter`, a `perspective`, or a `will-change`
+naming one of those or `transform` makes the element the containing block of
+its `position: fixed` descendants (CSS Transforms 1 §2;
+`Node::establishes_fixed_containing_block`, the non-transform ones read from
+`ComputedStyle::contains_fixed`). A positioned element does not, nor does a
+fixed box (Chrome 151: a fixed box in a fixed box in a transformed div is
+placed against the div); `opacity`, `contain: size` and a transform on a
+non-atomic inline do not either. The cascade keeps the answer on the box,
+`Node::fixed_contained` (`out_of_flow::sync_fixed_containment`, called for each
+node it styles, parents first), and re-answers for every fixed descendant of a
+node that starts or stops being such a containing block — in the cascade and
+in the transition tick (`resync_fixed_descendants`), the twins of the absolute
+re-sync. Every fixed box under that node is re-synced, not only those whose
+flag flips: one that stays contained has still changed containing block when a
+node between it and an outer one starts or stops being one (`a > b > c`, `c`
+losing `contain: paint`). A `filter`, `backdrop-filter` or `will-change:
+filter` contains on a non-atomic inline too (`ComputedStyle::contains_fixed_inline`;
+the box hangs from the span's first fragment, the #631 machinery), where
+`contain`, `perspective` and `transform` do not apply. A running `transform`
+animation is not re-answered by `tick_animations`: Chrome 151 keeps the box
+contained while one runs, even at a `none` keyframe. `Node::box_position` answers `absolute` for a contained fixed box, so
+every consumer that asks it — `out_of_flow_kind`, the read-back, the scroll
+re-placement, the scroll range (`contributes_to_scrollable_overflow`), the
+stacking collector, the damage clip walk, layer bounds, hit testing — takes the
+absolute arm, and the box is placed against the ancestor's padding box
+(`AncestorAbsolute`, or Taffy's own answer when the ancestor is its layout
+parent), takes an absolute box's percentage, margin and static-position rules,
+scrolls with the ancestor's content and with the page, and paints and hits
+under the ancestor's transform. Two walks differ from an absolute box's: the
+containing block is the nearest ancestor that establishes one *for fixed
+boxes*, so a `position: relative` box between does not stand in for it
+(`out_of_flow_kind` and `contributes_to_scrollable_overflow` choose the
+predicate by `Node::fixed_contained`), and the clippers it escapes are the ones
+below that ancestor (`Collector::fixed_cb_depth`, `Walk::clipper_below_fixed_cb`
+in `layer_bounds`, `PaintedState::contained_fixed`/`contains_fixed` in the
+damage clip walk, and paint's and hit testing's lift of the clips above the
+stacking context that paints it, `paint::absolute_containing_block_above`,
+#2815). It is still a stacking context
+(`creates_stacking_context` reads the computed `position`). Pins:
+`tests/fixed_in_transform_1372_tests.rs` (layout, scroll, toggles, Chrome 151),
+`fixed_margins_2376_tests.rs`'s `t*` rows,
+`app/fixed_in_transform_1372_tests.rs` in `rinch` (clips, stacking, scale,
+rotate, a transformed scroller: hit testing against software paint). Components must keep their dismiss backdrops out of
+transformed boxes: an open `Drawer` panel is `transform: none` and a centred
+`Popover` dropdown is centred by `floating.rs` (`app/component_backdrop_in_transform_1372_tests.rs`).
+
+**A fixed box is shrunk to fit too** (#893): the same bake, against the
+viewport (`ContainingBox::viewport`). An `auto` or `fit-content` width with
+fewer than two horizontal insets is `fit-content(<px>)` of the viewport less
+the insets — with both `auto`, of the room its static position leaves, a
+`StaticAnchor` measured from the unscrolled parent origin that
+`place_fixed_static` uses, so the read-back pushes such a box to
+`abs_static_fits` beside the absolute ones. An `auto` height with fewer than
+two vertical insets is left to Taffy, i.e. the content's; a percentage
+`min-`/`max-` size is baked against the viewport. It used to fill the viewport
+on both axes, `max-width` the only cap (a tooltip was drawn at its
+`max-width`), and the read-back replaced a one-inset height by a sum of the
+children's heights (`compute_content_height`, removed), which dropped text
+lines, `aspect-ratio` and the replaced measure (#1569). Pins:
+`tests/fixed_shrink_to_fit_893_tests.rs` (Chrome 156),
+`aspect_ratio_1286_tests::a_fixed_box_takes_the_ratio`. **A component whose overlay must cover its parent (e.g.
+`LoadingOverlay`) needs that parent to declare `position: relative`** — without
+it the overlay covers whatever positioned ancestor it does have, or the
+window, as it always has on the web.

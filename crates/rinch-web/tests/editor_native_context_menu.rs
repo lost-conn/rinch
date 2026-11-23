@@ -45,6 +45,9 @@ use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
+#[path = "support/clipboard.rs"]
+mod clipboard;
+
 fn document() -> web_sys::Document {
     web_sys::window().unwrap().document().unwrap()
 }
@@ -295,11 +298,7 @@ fn clipboard(el: &web_sys::Element, name: &str, plain: Option<&str>) -> web_sys:
     if let Some(text) = plain {
         dt.set_data("text/plain", text).unwrap();
     }
-    let init = web_sys::ClipboardEventInit::new();
-    init.set_bubbles(true);
-    init.set_cancelable(true);
-    init.set_clipboard_data(Some(&dt));
-    let ev = web_sys::ClipboardEvent::new_with_event_init_dict(name, &init).unwrap();
+    let ev = clipboard::clipboard_event(name, &dt);
     el.dispatch_event(&ev).unwrap();
     dt
 }
@@ -1771,6 +1770,51 @@ fn with_the_flag_on_the_parked_textarea_keeps_the_browsers_menu() {
     assert!(
         !ev.default_prevented(),
         "the parked textarea is an editing context: the browser's menu stays"
+    );
+    f.teardown();
+}
+
+/// A node outline that was shown and then cleared must not be
+/// read back as a live one. Node-select the rule, then Select All (the overlay
+/// pass clears the outline, and the head after the rule has no caret rect): the
+/// menu key must park at the editor's own box, as when no outline was ever
+/// shown, not at the cleared outline's stale box. Kills: hiding the outline
+/// with `visibility` while `menu_key_anchor` filters it on its client rect alone.
+#[wasm_bindgen_test]
+fn a_cleared_node_outline_is_not_a_menu_key_anchor() {
+    let f = Fixture::mount_content(ENDS_WITH_RULE, false);
+    f.focus_at(f.point(0, 2));
+    let hr = rule();
+    let at = centre(&hr);
+    mouse("mousedown", at.0, at.1, 0);
+    mouse("mouseup", at.0, at.1, 0);
+    let shown = document()
+        .query_selector("[data-pm-editor] [data-pm-selected]")
+        .unwrap()
+        .is_some_and(|el| el.get_bounding_client_rect().width() > 0.0);
+    assert!(shown, "positive control: the rule's node outline was shown");
+    assert!(f.handle.command("selectAll"));
+    // The overlay pass a frame runs: a text selection clears the node outline.
+    f.handle.update_caret();
+    let editor = document()
+        .query_selector("[data-pm-editor]")
+        .unwrap()
+        .expect("the editor");
+    let r = editor.get_bounding_client_rect();
+    let probe = ((r.x() + 6.0) as f32, (r.y() + 6.0) as f32);
+    assert!(
+        !is_capture(&under(probe.0, probe.1)),
+        "positive control: nothing parked at the editor's corner before the key"
+    );
+    let ta = f.capture();
+
+    let _ev = key_event(&ta, "keydown", "ContextMenu", false);
+
+    let hit = under(probe.0, probe.1);
+    assert!(
+        is_capture(&hit),
+        "parked at the editor's box, found <{}>",
+        hit.tag_name()
     );
     f.teardown();
 }

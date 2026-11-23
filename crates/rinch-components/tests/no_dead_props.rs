@@ -53,7 +53,7 @@
 //! the CSS all lives in `src/styles/`, which this scan does not read.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::PathBuf;
 
 /// Props that are declared, documented, and still not wired — the debt #474
 /// catalogued, with the sub-cluster each belongs to. Every entry must name a
@@ -68,23 +68,14 @@ use std::path::Path;
 /// `RadioGroup::size` and `Accordion::disable_chevron_rotation`. **D** (content
 /// and input props) is all but one: the two `description`s landed.
 ///
-/// The one below is a different kind of entry from any that came before it, and
-/// worth reading as the exception it is. Every earlier entry was *missing
-/// wiring* — a `render` that never looked at a field, curable inside the
-/// component. `Textarea::max_rows` was wired during #707 and **reverted**,
-/// because a `max-height` cannot bind on a rinch `<textarea>` at any value: the
-/// control has no content height, so its used height is exactly the `min-height`
-/// that `rows` and the sheet's floor give it, and `min-height` beats
-/// `max-height`. Reading the prop was easy and would have been a lie. The
-/// ratchet's whole purpose is to keep that visible rather than let an empty list
-/// assert something untrue, which is why the prop is here rather than read.
-const ALLOWLIST: &[(&str, &str)] = &[
-    // #474 category D — blocked below the component, on #715.
-    (
-        "Textarea::max_rows",
-        "#715: no max-height can bind on a textarea whose height is its min-height",
-    ),
-];
+/// `Textarea::max_rows` was the one exception to all of this — wired during
+/// #707, then **reverted**, because a `max-height` could not yet do what the
+/// prop means on a rinch `<textarea>`: before #297/#1152 the control's
+/// content height was a `min-height` rinch wrote, and one `min-height` always
+/// beats another `max-height` in CSS. #715 closed that gap (the control's
+/// `rows` is now a Taffy *measure*, so `max-height` binds), and `max_rows` is
+/// wired for real — the list is empty again.
+const ALLOWLIST: &[(&str, &str)] = &[];
 
 /// One top-level item: the header line that opens it plus its whole text.
 struct Item {
@@ -209,7 +200,15 @@ fn pub_fields(item: &Item) -> Vec<String> {
 
 /// Every `<Struct>::<field>` in this crate that no impl of `<Struct>` reads.
 fn unread_props() -> BTreeSet<String> {
-    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // The run-time `CARGO_MANIFEST_DIR`, which `cargo test` sets for the test
+    // process, before the one baked in at compile time: a shared target dir can
+    // hand this test the binary a since-deleted git worktree built, and the
+    // baked path would still point into that worktree (#275). The baked one is
+    // only the fallback for running this binary by hand.
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    let src_dir = manifest_dir.join("src");
     let mut unread = BTreeSet::new();
     let mut components_seen = 0usize;
 

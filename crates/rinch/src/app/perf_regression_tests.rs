@@ -1,0 +1,3331 @@
+//! Performance regression scenarios at the shell: idle, keyed `for`, scrolling,
+//! dragging, theme and scale changes, and one scenario per full-repaint reason.
+//!
+//! Each drives a real `RinchApp` on the software painter the way the desktop
+//! runtime does (`perf_expect`: `AboutToWait`, then the paint the loop asked
+//! for) and asserts the **whole** frame — every non-timing counter exact,
+//! anything unlisted `0` (#877's contract). A scenario that does unexpected
+//! work is pinned as it is and says so in its doc: the pin is a finding, not an
+//! endorsement, and the fix that removes the work updates the number.
+//!
+//! Each scenario also carries a **positive control**: the counter that proves
+//! it did the thing it names (a repaint for a repaint, a moved row for a move).
+//! Without one, an idle scenario that accidentally painted nothing because it
+//! never mounted would pass as a perfect idle.
+//!
+//! The editor's scenarios are in `perf_regression_editor_tests.rs`; the
+//! document-level ones are `crates/rinch-dom/tests/perf_regression_scenarios.rs`.
+//! A failure prints the frame it saw, ready to paste; `PERF_BASELINE_PRINT=1`
+//! prints every frame:
+//!
+//! ```text
+//! PERF_BASELINE_PRINT=1 cargo test -p rinch --lib perf_regression -- --nocapture --test-threads=1
+//! ```
+//!
+//! No number here moves with the host's font set, and that takes two things.
+//! Line boxes are declared (`line-height`, fixed heights), which pins the
+//! vertical axis. Every app is built with `perf_expect::new_app`, whose
+//! `sans-serif` is the bundled Inter, and every run of text is set in
+//! `sans-serif`, which pins the horizontal one. A declared line box alone does
+//! **not** make a width, a caret step or a repainted area font-independent:
+//! the editor's ArrowRight repainted 608 px on one host and 640 on CI before
+//! the font was bundled.
+
+use super::perf_expect::*;
+use super::*;
+use crate as rinch;
+use rinch_components::{Drawer, Loader};
+use rinch_core::{Component, Signal};
+use rinch_dom::perf::{Counter::*, FrameStats};
+use rinch_macros::rsx;
+
+const ROW_CSS: &str = "
+    body, input, button { font-family: sans-serif; }
+    body { font-size: 14px; line-height: 20px; }
+    .row { height: 20px; }
+    .row:hover { background-color: rgb(200, 0, 0); }
+    .field { position: absolute; left: 300px; top: 300px; width: 200px; height: 24px;
+             box-sizing: border-box; }
+    .scroller { width: 300px; height: 400px; overflow-y: auto; }
+    .big { width: 800px; height: 600px; }
+    .big.on { background-color: rgb(0, 0, 200); }
+    .side { position: absolute; left: 600px; top: 400px; width: 180px; height: 180px; overflow-y: auto; }
+    .side-row { height: 20px; }
+";
+
+/// Ten static rows, a text `<input>`, and a 200-row scroller off to the side.
+///
+/// `.field` is `box-sizing: border-box`, so its UA padding and border sit
+/// inside its 200×24 box: the scenarios' areas were recorded when rinch sized
+/// every box that way (#1278), and a text `<input>` is `content-box` by
+/// default, in Chrome as here — 208×30 without the declaration, which grows
+/// every repaint and clip that covers the field without costing more work.
+fn static_page() -> RinchApp {
+    mount_settled(|scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        let style = scope.create_element("style");
+        let css = scope.create_text(ROW_CSS);
+        style.append_child(&css);
+        root.append_child(&style);
+        for i in 0..10 {
+            let row = scope.create_element("div");
+            row.set_attribute("class", "row");
+            let t = scope.create_text(&format!("row {i}"));
+            row.append_child(&t);
+            root.append_child(&row);
+        }
+        let input = scope.create_element("input");
+        input.set_attribute("class", "field");
+        input.set_attribute("value", "typed");
+        // A text field is one the text engine owns: it carries an `oninput`.
+        let on_input = rinch_core::events::register_input_handler(
+            rinch_core::events::InputCallback::new(|_| {}),
+        );
+        input.set_attribute("data-oninput", &on_input.0.to_string());
+        root.append_child(&input);
+        // A clipping scroller well away from anything the scenarios on this
+        // page damage. A partial repaint must prune it on its box, not walk
+        // into its 200 rows: that is what `paint_nodes_visited` pins in the
+        // hover and "type one character" frames.
+        let side = scope.create_element("div");
+        side.set_attribute("class", "side");
+        for i in 0..200 {
+            let row = scope.create_element("div");
+            row.set_attribute("class", "side-row");
+            let t = scope.create_text(&format!("side {i}"));
+            row.append_child(&t);
+            side.append_child(&row);
+        }
+        root.append_child(&side);
+        root
+    })
+}
+
+fn click(app: &mut RinchApp, x: f32, y: f32) {
+    let button = MouseButton::Left;
+    app.handle_event(PlatformEvent::MouseDown { x, y, button }, SIZE, 1.0);
+    app.handle_event(PlatformEvent::MouseUp { x, y, button }, SIZE, 1.0);
+}
+
+fn key(app: &mut RinchApp, key: KeyCode, text: Option<&str>) {
+    app.handle_event(
+        PlatformEvent::KeyDown {
+            key,
+            logical_key: None,
+            text: text.map(str::to_string),
+            modifiers: Modifiers::default(),
+            repeat: KeyRepeat::Fresh,
+        },
+        SIZE,
+        1.0,
+    );
+    app.handle_event(
+        PlatformEvent::KeyUp {
+            key,
+            logical_key: None,
+            modifiers: Modifiers::default(),
+        },
+        SIZE,
+        1.0,
+    );
+}
+
+// ── Idle ───────────────────────────────────────────────────────────────────
+
+const IDLE_TURNS: usize = 20;
+
+/// An app with nothing happening asks for no frame and does no work, however
+/// many times the loop turns. Positive control: a hover on the same app does
+/// repaint, so the zero is the loop's, not a dead app's.
+#[test]
+fn an_idle_app_redraws_nothing() {
+    let mut app = static_page();
+    let (redraws, total) = idle_turns(&mut app, IDLE_TURNS);
+    assert_eq!(redraws, 0, "no idle turn may ask for a frame");
+    expect_frame("idle", &total, &[]);
+
+    let hover = interaction(&mut app, |app| {
+        app.handle_event(PlatformEvent::MouseMove { x: 20.0, y: 30.0 }, SIZE, 1.0);
+    });
+    assert_eq!(hover.get(RepaintPartial), 1, "positive control: {hover:?}");
+    expect_frame(
+        "hover a row",
+        &hover,
+        &[
+            (StyleResolves, 1),
+            (ElementsCascaded, 1),
+            (StyleNodesVisited, 1),
+            (StyleInvalidations, 1),
+            (TaffyStyleSyncs, 1),
+            (LayoutResolves, 1),
+            (LayoutSkippedPaintOnly, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 22400),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 5),
+            (StackingOrderBuilds, 2),
+            (GlyphAtlasHits, 15),
+            (ClipMasks, 1),
+            (ClipMaskPx, 25600),
+            (HitTests, 1),
+            (HitTestNodesVisited, 3),
+            // 14 → 15 (#509, #826): `static_page`'s `<style>` element is
+            // `display: none` by the UA sheet and carries its CSS source as
+            // a text child — the exact #509 shape. Before the fix that text
+            // was wrongly flowed by the `<style>` element's own (dead) IFC,
+            // so `flow_extent`'s `child.is_text() && child.ifc_root.is_some()`
+            // skip excused it from a `hit_extents_computed` bump of its own;
+            // fixed, it carries no `ifc_root` and is walked as an ordinary
+            // (0x0, harmless) child once.
+            (HitExtentsComputed, 15),
+        ],
+    );
+}
+
+/// A focused `<input>` costs nothing while idle either. Its caret does **not**
+/// blink — only the rich-text editor's does (`caret_blink_tick` is the
+/// runtime's one timed wake) — so there is no per-blink cost to pin. The
+/// positive control is the focus itself: typing a character into the field
+/// repaints it.
+#[test]
+fn a_focused_input_idles_for_free() {
+    let mut app = static_page();
+    let focus = interaction(&mut app, |app| click(app, 310.0, 310.0));
+    assert!(
+        matches!(app.focus_target, FocusTarget::Input(_)),
+        "precondition: the input holds the keyboard"
+    );
+    assert!(focus.get(PaintFrames) == 1, "{focus:?}");
+    settle(&mut app);
+
+    let (redraws, total) = idle_turns(&mut app, IDLE_TURNS);
+    assert_eq!(redraws, 0);
+    expect_frame("idle, input focused", &total, &[]);
+
+    // #536 moved these two: `.field`'s UA `input { border: 2px inset; }`
+    // alongside its `overflow: clip !important` means the clip is now the
+    // padding box, 2px inset from the border box on every side. That is a
+    // tighter clip than before, so `clip_cuts_nothing`'s elision (card K43 —
+    // a clip that provably removes nothing is never pushed) stops applying:
+    // the field's own content used to fit inside the old (border-box) clip
+    // with enough slack to elide the push outright, and no longer fits inside
+    // the new (smaller) one. One extra `push_clip` — the field's own, where
+    // before only something else in this frame's damage pushed one — and the
+    // extra pixels are that bracket's own area.
+    // #1721 added `shape_input_scroll` 1: a single-line field's displayed
+    // line is shaped once per change of its text or caret, to keep the caret
+    // in view; the paint and the IME poll at the unchanged state reuse it, so
+    // the idle turns above stay at 0.
+    let typed = interaction(&mut app, |app| key(app, KeyCode::KeyX, Some("x")));
+    expect_frame(
+        "type one character into an input",
+        &typed,
+        &[
+            (ShapePaint, 1),
+            (ShapeInputScroll, 1),
+            (LayoutResolves, 1),
+            (LayoutSkippedPaintOnly, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 6656),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 2),
+            (StackingOrderBuilds, 1),
+            (GlyphAtlasHits, 3),
+            (GlyphAtlasMisses, 3),
+            (ClipMasks, 2),
+            (ClipMaskPx, 12432),
+        ],
+    );
+}
+
+/// The window losing and regaining the keyboard while an `<input>` holds it
+/// (#2763) repaints nothing: the field keeps its claim, its caret and its
+/// text, so neither frame changes a pixel. Each direction is delivered as the
+/// desktop shell delivers it on Wayland: `WindowFocus`, then the IME events
+/// winit's text input sends at the keyboard's leave (`Disabled`) and enter
+/// (`Enabled`, then an empty `Preedit` clearing a composition that was never
+/// there).
+///
+/// **Both frames were the field's whole box, `repainted_px` 6656 with
+/// `shape_paint` 1 and its 5 glyphs, before #2763.** The empty composition
+/// and the `Disabled` each named the field's node as damage whether or not
+/// `data-preedit` changed. A hidden window shown again presents its first
+/// frame before the compositor's keyboard enter (#2731), so every show after
+/// a hide paid that repaint a second time.
+///
+/// Positive control: a real composition still repaints the field, and so
+/// does clearing it.
+#[test]
+fn a_window_focus_round_trip_repaints_nothing_in_a_focused_input() {
+    let mut app = static_page();
+    interaction(&mut app, |app| click(app, 310.0, 310.0));
+    assert!(
+        matches!(app.focus_target, FocusTarget::Input(_)),
+        "precondition: the input holds the keyboard"
+    );
+    settle(&mut app);
+    // Whether the event asked for a redraw.
+    let ime = |app: &mut RinchApp, event: ImeEvent| {
+        app.handle_event(PlatformEvent::Ime(event), SIZE, 1.0)
+            .contains(&AppAction::RequestRedraw)
+    };
+    let empty_preedit = || ImeEvent::Preedit {
+        text: String::new(),
+        cursor: None,
+    };
+
+    let lost = interaction(&mut app, |app| {
+        app.handle_event(PlatformEvent::WindowFocus(false), SIZE, 1.0);
+        assert!(!ime(app, ImeEvent::Disabled), "no composition to end");
+    });
+    expect_frame(
+        "input: the window loses the keyboard",
+        &lost,
+        &[(RepaintNone, 1)],
+    );
+
+    let gained = interaction(&mut app, |app| {
+        app.handle_event(PlatformEvent::WindowFocus(true), SIZE, 1.0);
+        assert!(!ime(app, ImeEvent::Enabled));
+        assert!(!ime(app, empty_preedit()), "no composition to clear");
+    });
+    expect_frame(
+        "input: the window regains the keyboard",
+        &gained,
+        &[(RepaintNone, 1)],
+    );
+
+    let composed = interaction(&mut app, |app| {
+        let k = ImeEvent::Preedit {
+            text: "k".into(),
+            cursor: Some((1, 1)),
+        };
+        assert!(
+            ime(app, k),
+            "positive control: a composition asks for its frame"
+        );
+    });
+    assert_eq!(
+        composed.get(RepaintPartial),
+        1,
+        "positive control: {composed:?}"
+    );
+    let cleared = interaction(&mut app, |app| {
+        assert!(
+            ime(app, empty_preedit()),
+            "positive control: clearing it too"
+        );
+    });
+    assert_eq!(
+        cleared.get(RepaintPartial),
+        1,
+        "positive control: {cleared:?}"
+    );
+}
+
+/// A paused `@keyframes` animation asks for no frame (#763).
+#[test]
+fn a_paused_animation_idles_for_free() {
+    let mut app = mount_settled(|scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        let style = scope.create_element("style");
+        let css = scope.create_text(
+            "@keyframes k { from { transform: translateX(0px); } to { transform: translateX(50px); } }
+             .spin { width: 20px; height: 20px; background: rgb(0, 0, 200);
+                     animation: k 1s linear infinite; animation-play-state: paused; }",
+        );
+        style.append_child(&css);
+        root.append_child(&style);
+        let b = scope.create_element("div");
+        b.set_attribute("class", "spin");
+        root.append_child(&b);
+        root
+    });
+    assert_eq!(
+        app.doc
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .tree
+            .active_animations
+            .len(),
+        1,
+        "positive control: the animation is registered (and paused)"
+    );
+    let (redraws, total) = idle_turns(&mut app, IDLE_TURNS);
+    assert_eq!(redraws, 0);
+    expect_frame("idle, paused animation", &total, &[]);
+}
+
+/// A `Loader` with the shipped component stylesheet installed, and nothing
+/// else — bare, or inside a closed `Drawer`.
+fn mount_loader(in_closed_drawer: bool) -> RinchApp {
+    let mut app = new_app(move |scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        let style = scope.create_element("style");
+        let css = rinch_components::generate_component_css();
+        let text = scope.create_text(&css);
+        style.append_child(&text);
+        root.append_child(&style);
+        let loader = Loader::default().render(scope, &[]);
+        if in_closed_drawer {
+            let drawer = Drawer {
+                opened_fn: Some(std::rc::Rc::new(|| false)),
+                position: "left".to_string(),
+                ..Default::default()
+            }
+            .render(scope, &[loader]);
+            root.append_child(&drawer);
+        } else {
+            root.append_child(&loader);
+        }
+        root
+    });
+    app.mount_component(SIZE.0 as f32, SIZE.1 as f32);
+    settle(&mut app);
+    app
+}
+
+/// Idle turns with time passing, so a running animation has something to
+/// advance. Returns each turn's frame.
+fn ticking_turns(app: &mut RinchApp, n: usize) -> Vec<(bool, FrameStats)> {
+    (0..n)
+        .map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            let asked = about_to_wait(app);
+            let s = if asked {
+                paint(app)
+            } else {
+                app.end_perf_frame().unwrap()
+            };
+            (asked, s)
+        })
+        .collect()
+}
+
+/// A running `Loader` redraws every frame — it is moving — and each frame's
+/// work is bounded and identical: the same counters, turn after turn. The
+/// oval is a `transform` animation, so it must stay on the paint-only path (no
+/// cascade, no Taffy compute, no shaping) and repaint only its own box.
+///
+/// Two counters are measured in a range instead of exactly, and only these
+/// two: the repainted area and the clip-mask area are the **rotated** oval's
+/// bounding box, which depends on the angle the clock landed on. The `md`
+/// oval is 32px square; rotated, its box is 32 × (|cos θ| + |sin θ|) wide,
+/// from 32px at 0° to 45.3px at 45°, and the damage is that box grown by the
+/// dirty margin. The floors are derived, not sampled: the damage always
+/// contains the oval's own 32px box, and the clip mask contains the damage,
+/// so neither can be under 32². Sampled floors were flaky: measured values
+/// reach down to 37² repainted and 39² of mask, and the review's 38²/42²
+/// failed about one run in eight. The ceilings are the 45° box (45.3px) plus
+/// 8px of margin, 54², and the mask 4px wider, 58², so a frame that repaints
+/// more than the oval's neighbourhood still fails. Everything else is exact.
+#[test]
+fn a_running_loader_costs_the_same_bounded_frame_every_turn() {
+    let mut app = mount_loader(false);
+    let turns = ticking_turns(&mut app, 5);
+    assert!(
+        turns.iter().all(|(asked, _)| *asked),
+        "positive control: a spinning loader asks for every frame"
+    );
+    for (i, (_, s)) in turns.iter().enumerate().skip(1) {
+        for (c, lo, hi) in [
+            (RepaintedPx, 32 * 32, 54 * 54),
+            (ClipMaskPx, 32 * 32, 58 * 58),
+        ] {
+            assert!(
+                (lo..=hi).contains(&s.get(c)),
+                "turn {i}: {} = {} is outside the rotated oval's range {lo}..={hi}",
+                c.name(),
+                s.get(c)
+            );
+        }
+        let angle_free = {
+            let p = rinch_dom::perf::PerfCounters::default();
+            p.add(RepaintedPx, s.get(RepaintedPx));
+            p.add(ClipMaskPx, s.get(ClipMaskPx));
+            s.since(&p.frame())
+        };
+        expect_frame(
+            &format!("running Loader, turn {i}"),
+            &angle_free,
+            &[
+                (PaintFrames, 1),
+                (RepaintPartial, 1),
+                (DamageRects, 1),
+                (SurfacePx, 480000),
+                (PaintNodesVisited, 4),
+                (StackingOrderBuilds, 1),
+                (ClipMasks, 1),
+            ],
+        );
+    }
+}
+
+/// A `Loader` inside a **closed** `Drawer` lets the app sleep: no turn asks for
+/// a frame, and the turns that ask for none do no work at all.
+///
+/// A closed drawer is `visibility: hidden` (#751), which is *rendered*, so an
+/// animation under it runs unless something pauses it — a browser agrees. Until
+/// #912 nothing did, and this scenario was pinned as a finding: every turn asked
+/// for a redraw that painted nothing (`repaint_none` 1), forever. The drawer's
+/// closed rule now declares `animation-play-state: paused` over its subtree, and
+/// a paused animation asks for no frame (#763). The stylesheet here is the
+/// shipped component CSS and nothing else.
+#[test]
+fn a_loader_in_a_closed_drawer_idles() {
+    let mut app = mount_loader(true);
+    {
+        let d = app.doc.as_ref().unwrap().borrow();
+        let all: Vec<_> = d.tree.active_animations.values().flatten().collect();
+        assert_eq!(
+            all.len(),
+            1,
+            "positive control: the oval's animation is registered, so the zero \
+             below is a pause and not an animation that never started"
+        );
+        assert_eq!(
+            all[0].play_state,
+            rinch_dom::animation::AnimationPlayState::Paused,
+            "and it is paused by the drawer's own closed rule"
+        );
+    }
+    let turns = ticking_turns(&mut app, IDLE_TURNS);
+    assert!(
+        turns.iter().all(|(asked, _)| !*asked),
+        "no turn asks for a frame"
+    );
+    let mut total = FrameStats::default();
+    for (_, s) in &turns {
+        total.accumulate(s);
+    }
+    expect_frame("Loader in a closed Drawer, idle", &total, &[]);
+}
+
+// ── A closed Drawer full of content (#2137) ───────────────────────────────
+
+/// Ten page rows under a closed left `Drawer` whose content is 100 rows of
+/// text, each with a translucent badge and a `z-index`ed one, under the
+/// shipped component stylesheet.
+fn closed_drawer_page() -> RinchApp {
+    mount_settled(|scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        let style = scope.create_element("style");
+        let css = format!(
+            "{}{ROW_CSS} .item {{ position: relative; height: 20px; }} \
+             .badge {{ position: absolute; right: 4px; top: 6px; width: 8px; height: 8px; \
+                       opacity: 0.5; background: rgb(200, 0, 0); }} \
+             .pin {{ position: absolute; right: 16px; top: 6px; width: 8px; height: 8px; \
+                     z-index: 1; background: rgb(0, 0, 200); }}",
+            rinch_components::generate_component_css()
+        );
+        let text = scope.create_text(&css);
+        style.append_child(&text);
+        root.append_child(&style);
+        for i in 0..10 {
+            let row = scope.create_element("div");
+            row.set_attribute("class", "row");
+            let t = scope.create_text(&format!("row {i}"));
+            row.append_child(&t);
+            root.append_child(&row);
+        }
+        let content = scope.create_element("div");
+        for i in 0..100 {
+            let item = scope.create_element("div");
+            item.set_attribute("class", "item");
+            let t = scope.create_text(&format!("drawer item {i}"));
+            item.append_child(&t);
+            for class in ["badge", "pin"] {
+                let b = scope.create_element("div");
+                b.set_attribute("class", class);
+                item.append_child(&b);
+            }
+            content.append_child(&item);
+        }
+        let drawer = Drawer {
+            opened_fn: Some(std::rc::Rc::new(|| false)),
+            position: "left".to_string(),
+            ..Default::default()
+        }
+        .render(scope, &[content]);
+        root.append_child(&drawer);
+        root
+    })
+}
+
+/// A full repaint of a page under a closed `Drawer` of 100 rows paints the
+/// page alone: the drawer is `visibility: hidden` with nothing visible in it,
+/// so paint never enters it and the stacking collector hoists nothing out of
+/// it (#2137). Before, the walk entered the drawer's root, its panel and the
+/// rows the window showed, ran their text through the visibility mask, and
+/// pushed an empty group layer for every on-screen translucent badge:
+/// `paint_nodes_visited` 160 → 22, `stacking_order_builds` 5 → 1,
+/// `paint_layers` 29 → 0. Positive control: the drawer is mounted, and closed.
+#[test]
+fn a_closed_drawer_full_of_content_costs_a_full_repaint_nothing() {
+    let mut app = closed_drawer_page();
+    {
+        let d = app.doc.as_ref().unwrap().borrow();
+        let tree = &d.tree;
+        let closed = tree
+            .nodes
+            .iter()
+            .filter(|(_, n)| {
+                n.attributes
+                    .get("class")
+                    .is_some_and(|c| c.split_whitespace().any(|c| c == "rinch-drawer__root"))
+            })
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        assert_eq!(closed.len(), 1, "positive control: the drawer is mounted");
+        let root = tree.get(closed[0]).unwrap();
+        assert!(
+            rinch_dom::visibility::hides_own(tree, root)
+                && !rinch_dom::visibility::shows_below(tree, closed[0]),
+            "positive control: the drawer is closed, and shows nothing"
+        );
+    }
+    app.mark_scene_dirty();
+    let s = paint(&mut app);
+    expect_frame(
+        "full repaint under a closed Drawer",
+        &s,
+        &[
+            (PaintFrames, 1),
+            (RepaintFull, 1),
+            (RepaintFullUnattributed, 1),
+            (RepaintedPx, 480000),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 12),
+            (StackingOrderBuilds, 1),
+            (GlyphAtlasHits, 50),
+        ],
+    );
+}
+
+/// A hover on a page row under a closed `Drawer` repaints the row, and the
+/// partial frame enters nothing of the drawer the damage crosses (#2137).
+#[test]
+fn a_hover_under_a_closed_drawer_enters_none_of_it() {
+    let mut app = closed_drawer_page();
+    let s = interaction(&mut app, |app| {
+        app.handle_event(PlatformEvent::MouseMove { x: 40.0, y: 50.0 }, SIZE, 1.0);
+    });
+    assert_eq!(s.get(RepaintPartial), 1, "positive control: {s:?}");
+    expect_frame(
+        "hover a row under a closed Drawer",
+        &s,
+        &[
+            (StyleResolves, 1),
+            (ElementsCascaded, 1),
+            (StyleNodesVisited, 1),
+            (PseudoElementPasses, 2),
+            (StyleInvalidations, 1),
+            (TaffyStyleSyncs, 1),
+            (LayoutResolves, 1),
+            (LayoutSkippedPaintOnly, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 22400),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 5),
+            (StackingOrderBuilds, 2),
+            (GlyphAtlasHits, 15),
+            (ClipMasks, 1),
+            (ClipMaskPx, 25600),
+            (PaintSurfaceAllocs, 1),
+            (HitTests, 1),
+            (HitTestNodesVisited, 3),
+            (HitExtentsComputed, 13),
+        ],
+    );
+}
+
+// ── Keyed `for`, 200 rows ──────────────────────────────────────────────────
+
+const LIST_ROWS: usize = 200;
+
+#[derive(Clone, PartialEq, Debug)]
+struct Item {
+    id: usize,
+    label: String,
+}
+
+fn items(range: std::ops::Range<usize>) -> Vec<Item> {
+    range
+        .map(|id| Item {
+            id,
+            label: format!("item {id}"),
+        })
+        .collect()
+}
+
+/// A 200-row keyed list in a 300x400 scroller — narrow enough that damage
+/// confined to it stays a partial repaint (the full-repaint threshold is half
+/// the window), so the repainted area is part of what is pinned.
+fn mount_list() -> (RinchApp, Signal<Vec<Item>>) {
+    let list = Signal::new(items(0..LIST_ROWS));
+    let app = mount_settled(move |__scope: &mut RenderScope| {
+        rsx! {
+            div {
+                style { {ROW_CSS} }
+                div { class: "scroller",
+                    for item in list.get() {
+                        div { key: item.id, class: "row", {item.label.clone()} }
+                    }
+                }
+            }
+        }
+    });
+    (app, list)
+}
+
+/// Connected nodes carrying `class="row"`.
+fn row_count(app: &RinchApp) -> usize {
+    use rinch_core::dom::{DomDocument, NodeId};
+    let d = app.doc.as_ref().unwrap().borrow();
+    let ids: Vec<u64> = d.tree.nodes.iter().map(|(id, _)| id).collect();
+    ids.into_iter()
+        .filter(|&id| d.get_attribute(NodeId(id), "class").as_deref() == Some("row"))
+        .filter(|&id| {
+            let mut cur = Some(id);
+            while let Some(c) = cur {
+                if c == d.tree.root_id {
+                    return true;
+                }
+                cur = d.tree.nodes[c].parent;
+            }
+            false
+        })
+        .count()
+}
+
+/// Move one row (the 150th to position 10): the reconcile repositions one
+/// node and re-renders none (`effect_runs` 1: the `for` itself).
+///
+/// **Findings shared by all four `for` scenarios, pinned as they are; a fix must LOWER this number, and its PR updates the pin:**
+///
+/// - **#910, fixed: paint visits the rows the scroller shows** (24: html,
+///   body, the chain down to the scroller, and the rows its clip and ink
+///   margin let through), where it visited all 205. The clip the painter has
+///   open is a cull, and a row it cuts away is dismissed by the scroller's
+///   loop without a visit. 25 → 24 (#1719): a `0x0` text node beside the
+///   `<style>`, which paints nothing, is no longer entered to find that out.
+/// - **#909, fixed: the damage is clipped by the scroller.** `repainted_px` is
+///   122 816 = 304 x 404 — the scroller's box and its 4px margin — where it
+///   was 182 400 = 304 x 600, down to the window's bottom edge: rows the
+///   change moved below the scroller's viewport, invisible, named damage.
+///   Each rect is now intersected with its node's clip chain
+///   (`paint::clip_chain_bounds`). The glyphs of the rows in the band that
+///   no longer repaints went with it (`glyph_atlas_hits` 201 → 138 over both
+///   fixes).
+/// - **Two clip masks cover 245 640 px** for that 122 816 px repaint: the
+///   damage's own clip (124 236 with its pad) and the scroller's (121 404),
+///   each filled over its bounds (since #907 the scroller's is not
+///   intersected with the damage's). Before #909 the damage mask alone was
+///   183 600.
+/// - **#914, fixed:** the moved row is neither re-cascaded nor re-shaped
+///   (`elements_cascaded` 0, `shape_*` 0): a move within one parent keeps its
+///   style (`keeps_style_across_move`) and its own IFC layout
+///   (`invalidate_ifc_left_by`). The one `ifc_measure_invalidations` left is
+///   the parent's (`invalidate_parent_ifc`).
+#[test]
+fn a_keyed_for_moves_one_row() {
+    let (mut app, list) = mount_list();
+    let s = interaction(&mut app, |_| {
+        list.update(|v| {
+            let r = v.remove(150);
+            v.insert(10, r);
+        })
+    });
+    assert_eq!(row_count(&app), LIST_ROWS, "positive control");
+    expect_frame(
+        "for: move one row",
+        &s,
+        &[
+            (IfcMeasureInvalidations, 1),
+            (LayoutResolves, 1),
+            (IfcSetupPasses, 1),
+            (IfcScopedPasses, 1),
+            (IfcScopeContainers, 2),
+            (IfcScopeNodes, 203),
+            (TaffyRootComputes, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 122816),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 24),
+            (StackingOrderBuilds, 1),
+            (GlyphAtlasHits, 138),
+            (ClipMasks, 2),
+            (ClipMaskPx, 245640),
+            (PaintSurfaceAllocs, 1),
+            (EffectRuns, 1),
+            (SignalNotifies, 1),
+        ],
+    );
+}
+
+/// Insert one row in the middle.
+#[test]
+fn a_keyed_for_inserts_one_row_in_the_middle() {
+    let (mut app, list) = mount_list();
+    let s = interaction(&mut app, |_| {
+        list.update(|v| {
+            v.insert(
+                100,
+                Item {
+                    id: 10_000,
+                    label: "new".into(),
+                },
+            )
+        })
+    });
+    assert_eq!(row_count(&app), LIST_ROWS + 1, "positive control");
+    expect_frame(
+        "for: insert one row mid-list",
+        &s,
+        &[
+            (StyleResolves, 2),
+            (ElementsCascaded, 1),
+            (StyleNodesVisited, 1),
+            (TaffyStyleSyncs, 1),
+            (TaffyStyleChanges, 1),
+            (ShapeMeasureIfc, 1),
+            (ShapeIfcBuild, 1),
+            (IfcMeasureInvalidations, 2),
+            (IfcSignatureChanges, 1),
+            (LayoutResolves, 1),
+            (IfcSetupPasses, 1),
+            (IfcScopedPasses, 1),
+            (IfcScopeContainers, 2),
+            (IfcScopeNodes, 204),
+            (TaffyRootComputes, 1),
+            (TaffyMeasureCalls, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 122816),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 24),
+            (StackingOrderBuilds, 1),
+            (GlyphAtlasHits, 137),
+            (ClipMasks, 2),
+            (ClipMaskPx, 245640),
+            (PaintSurfaceAllocs, 1),
+            (EffectRuns, 1),
+            (SignalNotifies, 1),
+        ],
+    );
+}
+
+/// Remove one row from the middle.
+#[test]
+fn a_keyed_for_removes_one_row_from_the_middle() {
+    let (mut app, list) = mount_list();
+    let s = interaction(&mut app, |_| {
+        list.update(|v| {
+            v.remove(100);
+        })
+    });
+    assert_eq!(row_count(&app), LIST_ROWS - 1, "positive control");
+    expect_frame(
+        "for: remove one row mid-list",
+        &s,
+        &[
+            (IfcMeasureInvalidations, 1),
+            (LayoutResolves, 1),
+            (IfcSetupPasses, 1),
+            (IfcScopedPasses, 1),
+            (IfcScopeContainers, 1),
+            (IfcScopeNodes, 201),
+            (TaffyRootComputes, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 122816),
+            (SurfacePx, 480000),
+            (RemovalDamageSteps, 9),
+            (PaintNodesVisited, 24),
+            (StackingOrderBuilds, 1),
+            (GlyphAtlasHits, 137),
+            (ClipMasks, 2),
+            (ClipMaskPx, 245640),
+            (PaintSurfaceAllocs, 1),
+            (EffectRuns, 1),
+            (SignalNotifies, 1),
+        ],
+    );
+}
+
+/// Replace every row with new keys: 200 removals and 200 renders.
+#[test]
+fn a_keyed_for_replaces_every_row() {
+    let (mut app, list) = mount_list();
+    let s = interaction(&mut app, |_| list.set(items(LIST_ROWS..2 * LIST_ROWS)));
+    assert_eq!(row_count(&app), LIST_ROWS, "positive control");
+    expect_frame(
+        "for: replace all rows",
+        &s,
+        &[
+            (StyleResolves, 201),
+            (ElementsCascaded, 200),
+            (StyleNodesVisited, 200),
+            (TaffyStyleSyncs, 200),
+            (TaffyStyleChanges, 200),
+            (ShapeMeasureIfc, 200),
+            (ShapeIfcBuild, 200),
+            (IfcMeasureInvalidations, 600),
+            (IfcSignatureChanges, 200),
+            (LayoutResolves, 1),
+            (IfcSetupPasses, 1),
+            (IfcScopedPasses, 1),
+            (IfcScopeContainers, 201),
+            (IfcScopeNodes, 402),
+            (TaffyRootComputes, 1),
+            (TaffyMeasureCalls, 200),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 122816),
+            (SurfacePx, 480000),
+            (RemovalDamageSteps, 1800),
+            (PaintNodesVisited, 24),
+            (StackingOrderBuilds, 1),
+            (GlyphAtlasHits, 158),
+            (GlyphAtlasMisses, 10),
+            (ClipMasks, 2),
+            (ClipMaskPx, 245640),
+            (PaintSurfaceAllocs, 1),
+            (EffectRuns, 1),
+            (SignalNotifies, 1),
+        ],
+    );
+}
+
+/// Recording a removal's old pixels costs what was removed, not what else is
+/// pending (#909's review). `rows` plain 20px rows in a scroller, every one
+/// restyled (so every one is pending paint-dirty), then removed one at a time
+/// in the same frame. Returns that frame's `removal_damage_steps`.
+fn clear_rows_one_by_one(rows: usize) -> u64 {
+    let out: Rc<RefCell<Vec<NodeHandle>>> = Rc::new(RefCell::new(Vec::new()));
+    let out2 = out.clone();
+    let mut app = mount_settled(move |scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        let scroller = scope.create_element("div");
+        scroller.set_attribute("style", "width: 300px; height: 400px; overflow-y: auto");
+        let mut v = Vec::new();
+        for _ in 0..rows {
+            let row = scope.create_element("div");
+            row.set_attribute("style", "height: 20px; background: rgb(0, 0, 200)");
+            scroller.append_child(&row);
+            v.push(row);
+        }
+        root.append_child(&scroller);
+        *out2.borrow_mut() = v;
+        root
+    });
+    let rows_h = out.borrow().clone();
+    let s = interaction(&mut app, |_| {
+        for r in &rows_h {
+            r.set_style("background", "rgb(0, 200, 0)");
+        }
+        for r in &rows_h {
+            r.remove();
+        }
+    });
+    assert!(
+        s.get(RemovalDamageSteps) > 0,
+        "positive control: removals recorded"
+    );
+    s.get(RemovalDamageSteps)
+}
+
+/// **Linear, pinned at two sizes.** Each removed row records itself (1) and
+/// walks its clip chain — the scroller, the root, the body (3) — whatever
+/// else is pending: 4 steps a row at 100 rows and at 400. Round one of #958
+/// rebuilt a set of every pending paint-dirty node per removal, O(n²) in a
+/// list clear, and no counter saw it. This one sees the walk the path does
+/// now; work added to it later has to count itself in the same counter, or
+/// it is as invisible as that set was.
+#[test]
+fn clearing_a_list_row_by_row_costs_linear_removal_damage() {
+    assert_eq!(clear_rows_one_by_one(100), 100 * STEPS_PER_ROW);
+    assert_eq!(clear_rows_one_by_one(400), 400 * STEPS_PER_ROW);
+}
+const STEPS_PER_ROW: u64 = 4;
+
+// ── Scroll ─────────────────────────────────────────────────────────────────
+
+const SCROLL_ROWS: usize = 500;
+
+/// A 300x400 scroller of 500 text rows (narrow for the reason `mount_list` gives).
+fn mount_scroller() -> (RinchApp, NodeHandle) {
+    let out: Rc<RefCell<Option<NodeHandle>>> = Rc::new(RefCell::new(None));
+    let out2 = out.clone();
+    let app = mount_settled(move |scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        let style = scope.create_element("style");
+        let css = scope.create_text(ROW_CSS);
+        style.append_child(&css);
+        root.append_child(&style);
+        let scroller = scope.create_element("div");
+        scroller.set_attribute("class", "scroller");
+        for i in 0..SCROLL_ROWS {
+            let row = scope.create_element("div");
+            row.set_attribute("class", "row");
+            let t = scope.create_text(&format!("row {i}"));
+            row.append_child(&t);
+            scroller.append_child(&row);
+        }
+        root.append_child(&scroller);
+        *out2.borrow_mut() = Some(scroller.clone());
+        root
+    });
+    let scroller = out.borrow().clone().unwrap();
+    (app, scroller)
+}
+
+/// One wheel notch over a 500-row scroller: the scroller's box repaints, no
+/// element is restyled, nothing is laid out, nothing is shaped.
+///
+/// **One hit test** routes the notch (#911 — the render-surface check and the
+/// scroll routing used to run one each). It finds the hit cache **cold** — the
+/// mount's layout dropped it and nothing has probed since — so it computes
+/// **499** extents, once: the next notch keeps them (see
+/// `a_second_wheel_notch_recomputes_no_extent`). Paint visits **24** nodes for
+/// the ~20 rows on screen; it visited all 504 until #910.
+///
+/// 498 → 499 (#509, #826): `mount_scroller`'s `<style>` element is
+/// `display: none` with its CSS source as a text child, the #509 shape —
+/// before the fix that text was wrongly flowed by the `<style>` element's
+/// own (dead) IFC, so `flow_extent`'s text-with-an-`ifc_root` skip excused it
+/// from its own extent computation; fixed, it is walked once as an ordinary
+/// (0x0) child.
+#[test]
+fn a_wheel_scroll_repaints_the_scroller_and_restyles_nothing() {
+    let (mut app, scroller) = mount_scroller();
+    let s = interaction(&mut app, |app| {
+        app.handle_event(
+            PlatformEvent::MouseWheel {
+                x: 50.0,
+                y: 100.0,
+                delta_x: 0.0,
+                delta_y: -100.0,
+            },
+            SIZE,
+            1.0,
+        );
+    });
+    assert!(scroller.scroll_top() > 0.0, "positive control: it scrolled");
+    expect_frame(
+        "wheel scroll, 500 rows",
+        &s,
+        &[
+            (LayoutResolves, 1),
+            (LayoutSkippedPaintOnly, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 122816),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 24),
+            (StackingOrderBuilds, 2),
+            (GlyphAtlasHits, 119),
+            (GlyphAtlasMisses, 2),
+            (ClipMasks, 2),
+            (ClipMaskPx, 245640),
+            (PaintSurfaceAllocs, 1),
+            (HitTests, 1),
+            (HitTestNodesVisited, 4),
+            (HitExtentsComputed, 499),
+        ],
+    );
+}
+
+fn wheel_notch(app: &mut RinchApp) {
+    app.handle_event(
+        PlatformEvent::MouseWheel {
+            x: 50.0,
+            y: 100.0,
+            delta_x: 0.0,
+            delta_y: -100.0,
+        },
+        SIZE,
+        1.0,
+    );
+}
+
+/// The **second** notch of a scroll: the one every notch after the first is.
+/// The first notch found the hit cache cold (the mount's layout dropped it)
+/// and filled it; this one must not rebuild it.
+///
+/// #911: a scroll moves the scroller's rows, but no row's *own* extent — an
+/// extent is relative to its node's origin, and the scroll offset is applied
+/// by the scroller when it places its children — and not the scroller's
+/// either, since a box that clips keeps its extent to its own box. So the
+/// scroll drops only the stacking sequences, the frame's paint-only layout
+/// pass drops nothing, and the notch computes **no** extent at all. It was 2
+/// hit tests and 493 extents.
+#[test]
+fn a_second_wheel_notch_recomputes_no_extent() {
+    let (mut app, scroller) = mount_scroller();
+    interaction(&mut app, wheel_notch);
+    let first = scroller.scroll_top();
+    assert!(first > 0.0, "positive control: the first notch scrolled");
+    let s = interaction(&mut app, wheel_notch);
+    assert!(
+        scroller.scroll_top() > first,
+        "positive control: the second notch scrolled further"
+    );
+    expect_frame(
+        "second wheel notch, 500 rows",
+        &s,
+        &[
+            (LayoutResolves, 1),
+            (LayoutSkippedPaintOnly, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 122816),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 24),
+            (StackingOrderBuilds, 2),
+            (GlyphAtlasHits, 122),
+            (GlyphAtlasMisses, 4),
+            (ClipMasks, 2),
+            (ClipMaskPx, 245640),
+            (HitTests, 1),
+            (HitTestNodesVisited, 4),
+        ],
+    );
+}
+
+/// One mouse-wheel notch, 100px, as the desktop shell reports a `LineDelta`
+/// (#2287): it glides.
+fn line_notch(app: &mut RinchApp) {
+    app.handle_event(
+        PlatformEvent::MouseWheelLines {
+            x: 50.0,
+            y: 100.0,
+            lines_x: 0.0,
+            lines_y: -2.5,
+        },
+        SIZE,
+        1.0,
+    );
+}
+
+/// One frame of a gliding wheel notch (#2287), mid-curve: a scroll write on
+/// the paint-cached path — the scroller's box repaints, no element is
+/// restyled or laid out, nothing is shaped — and **no hit test**: the
+/// scroller was picked at the notch. The same repaint as a direct notch's
+/// (`a_second_wheel_notch_recomputes_no_extent`: the scroller's box, 122816
+/// px), less its hit test and the stacking order that hit test built (1, not
+/// 2). 25 nodes painted and 122 glyph hits, against its 24 and 126: a
+/// mid-glide offset that is not a whole row shows a row more, cut. Every frame
+/// of the glide is this frame.
+///
+/// And the clock stops: once the glide has landed, idle turns ask for no
+/// frame.
+#[test]
+fn a_gliding_wheel_frame_repaints_the_scroller_and_lays_out_nothing() {
+    let (mut app, scroller) = mount_scroller();
+    let clock = |app: &mut RinchApp, ms: f64| {
+        let doc = app.doc.as_ref().unwrap();
+        doc.borrow_mut().advance_animation_clock_ms(ms);
+    };
+    app.doc
+        .as_ref()
+        .unwrap()
+        .borrow_mut()
+        .set_animation_clock_ms(Some(1_000_000.0));
+    // Warm: the first notch's frame finds the hit cache cold (see above).
+    interaction(&mut app, line_notch);
+    clock(&mut app, 30.0);
+    interaction(&mut app, |_| {});
+    let before = scroller.scroll_top();
+    clock(&mut app, 30.0);
+    let s = interaction(&mut app, |_| {});
+    let after = scroller.scroll_top();
+    assert!(
+        before > 0.0 && after > before && after < 100.0,
+        "positive control: mid-glide ({before} -> {after})"
+    );
+    expect_frame(
+        "gliding wheel frame, 500 rows",
+        &s,
+        &[
+            (LayoutResolves, 1),
+            (LayoutSkippedPaintOnly, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 122816),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 25),
+            (StackingOrderBuilds, 1),
+            (GlyphAtlasHits, 122),
+            (ClipMasks, 2),
+            (ClipMaskPx, 245640),
+        ],
+    );
+    for _ in 0..30 {
+        clock(&mut app, 10.0);
+        if !about_to_wait(&mut app) {
+            break;
+        }
+        paint(&mut app);
+    }
+    assert_eq!(scroller.scroll_top(), 100.0, "the glide landed");
+    app.reset_perf();
+    let (redraws, idle) = idle_turns(&mut app, 3);
+    assert_eq!(redraws, 0, "the clock kept turning after the glide");
+    expect_frame("idle after a glide", &idle, &[]);
+}
+
+// ── Drag ───────────────────────────────────────────────────────────────────
+
+/// A panel dragged by `Drag::absolute` over ten moves queued before one frame:
+/// one layout for the ten, and a repaint of the panel's old and new rects.
+#[test]
+fn ten_queued_drag_moves_lay_out_once() {
+    let out: Rc<RefCell<Option<NodeHandle>>> = Rc::new(RefCell::new(None));
+    let out2 = out.clone();
+    let mut app = mount_settled(move |scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        let panel = scope.create_element("div");
+        panel.set_attribute(
+            "style",
+            "position: absolute; left: 0px; top: 0px; width: 50px; height: 50px; \
+             background: rgb(0, 0, 200)",
+        );
+        root.append_child(&panel);
+        *out2.borrow_mut() = Some(panel.clone());
+        root
+    });
+    let panel = out.borrow().clone().unwrap();
+    let x = Signal::new(0.0f32);
+    let _e = rinch_core::reactive::Effect::new(move || {
+        panel.set_style("left", &format!("{}px", x.get()));
+    });
+    settle(&mut app);
+    rinch_core::Drag::absolute()
+        .on_move(move |px, _| x.set(px))
+        .start();
+    let s = interaction(&mut app, |app| {
+        for i in 0..10 {
+            app.handle_event(
+                PlatformEvent::MouseMove {
+                    x: 100.0 + i as f32 * 10.0,
+                    y: 25.0,
+                },
+                SIZE,
+                1.0,
+            );
+        }
+    });
+    rinch_core::Drag::cancel();
+    assert_eq!(
+        x.get(),
+        190.0,
+        "positive control: every move reached on_move"
+    );
+    expect_frame(
+        "drag, 10 queued moves",
+        &s,
+        &[
+            (StyleResolves, 1),
+            (ElementsCascaded, 1),
+            (StyleNodesVisited, 1),
+            (StyleInvalidations, 1),
+            (TaffyStyleSyncs, 1),
+            (TaffyStyleChanges, 1),
+            (LayoutResolves, 1),
+            (TaffyRootComputes, 1),
+            (TaffyMeasureCalls, 1),
+            (AbsBoxesVisited, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 2),
+            (RepaintedPx, 6048),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 3),
+            (StackingOrderBuilds, 1),
+            (ClipMasks, 1),
+            (ClipMaskPx, 13776),
+            (PaintSurfaceAllocs, 1),
+            (EffectRuns, 10),
+            (SignalNotifies, 10),
+        ],
+    );
+}
+
+// ── A relayout beside a page of text (#2734) ──────────────────────────────
+
+/// Thirty paragraphs of text and, off to the side, an absolutely positioned
+/// gauge whose width is set: one frame that relays out and restyles
+/// the gauge alone.
+///
+/// The damage is the gauge's old and new box. It was every paragraph too: a
+/// text child of an IFC root got its box from the root's lines when they
+/// were shaped, and every later layout read Taffy's `0x0` for it instead, so
+/// the first relayout after the paragraphs were shaped pushed all thirty
+/// texts paint-dirty and named their boxes — a full repaint for the region
+/// (`repaint_full_region_too_large`), 480000 px, where the gauge needs
+/// 2142. Positive control: the frame paints, and repaints part of the window.
+#[test]
+fn a_relayout_beside_a_page_of_text_repaints_only_the_change() {
+    let out: Rc<RefCell<Option<NodeHandle>>> = Rc::new(RefCell::new(None));
+    let out2 = out.clone();
+    let mut app = mount_settled(move |scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        let style = scope.create_element("style");
+        let css = scope.create_text(
+            "body { font-family: sans-serif; font-size: 14px; line-height: 18px; }
+             p { margin: 0; }
+             .gauge { position: absolute; left: 600px; top: 560px; width: 100px;
+                      height: 10px; background: rgb(0, 0, 200); }",
+        );
+        style.append_child(&css);
+        root.append_child(&style);
+        for i in 0..30 {
+            let p = scope.create_element("p");
+            let t = scope.create_text(&format!("Paragraph {i} of the page's text"));
+            p.append_child(&t);
+            root.append_child(&p);
+        }
+        let gauge = scope.create_element("div");
+        gauge.set_attribute("class", "gauge");
+        root.append_child(&gauge);
+        *out2.borrow_mut() = Some(gauge.clone());
+        root
+    });
+    let gauge = out.borrow().clone().unwrap();
+    let s = interaction(&mut app, |_| gauge.set_style("width", "111px"));
+    assert_eq!(s.get(RepaintPartial), 1, "positive control: {s:?}");
+    expect_frame(
+        "relayout beside a page of text",
+        &s,
+        &[
+            (StyleResolves, 1),
+            (ElementsCascaded, 1),
+            (StyleNodesVisited, 1),
+            (StyleInvalidations, 1),
+            (TaffyStyleSyncs, 1),
+            (TaffyStyleChanges, 1),
+            (LayoutResolves, 1),
+            (TaffyRootComputes, 1),
+            (TaffyMeasureCalls, 1),
+            (AbsBoxesVisited, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 2142),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 2),
+            (StackingOrderBuilds, 1),
+            (ClipMasks, 1),
+            (ClipMaskPx, 2706),
+            (PaintSurfaceAllocs, 1),
+        ],
+    );
+}
+
+// ── A relayout under a still pointer (#2766) ──────────────────────────────
+
+/// Ten `:hover` rows and, off to the side, an absolutely positioned gauge.
+fn rows_and_gauge() -> (RinchApp, NodeHandle) {
+    let out: Rc<RefCell<Option<NodeHandle>>> = Rc::new(RefCell::new(None));
+    let out2 = out.clone();
+    let app = mount_settled(move |scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        let style = scope.create_element("style");
+        let css = scope.create_text(
+            "body { font-family: sans-serif; font-size: 14px; line-height: 20px; }
+             .row { height: 20px; }
+             .row:hover { background-color: rgb(200, 0, 0); }
+             .gauge { position: absolute; left: 600px; top: 560px; width: 100px;
+                      height: 10px; background: rgb(0, 0, 200); }",
+        );
+        style.append_child(&css);
+        root.append_child(&style);
+        for i in 0..10 {
+            let row = scope.create_element("div");
+            row.set_attribute("class", "row");
+            let t = scope.create_text(&format!("row {i}"));
+            row.append_child(&t);
+            root.append_child(&row);
+        }
+        let gauge = scope.create_element("div");
+        gauge.set_attribute("class", "gauge");
+        root.append_child(&gauge);
+        *out2.borrow_mut() = Some(gauge.clone());
+        root
+    });
+    let gauge = out.borrow().clone().unwrap();
+    (app, gauge)
+}
+
+/// A layout that moves nothing under a resting mouse costs **one hit test**
+/// and nothing else (#2766): after a frame whose layout moved boxes, hover is
+/// hit-tested again at the pointer's last position, finds the row it already
+/// has, and fires no event, asks for no cursor, restyles and repaints
+/// nothing. The frame is exactly the frame the same relayout makes with no
+/// pointer in the window, plus that hit test (`hit_tests` 1, its 3 nodes and
+/// 14 extents: the layout dropped the hit cache, so it is cold; and the root's
+/// stacking order it builds), and the
+/// turns after it ask for no frame and hit-test nothing: the geometry did not
+/// move again.
+#[test]
+fn a_relayout_under_a_still_pointer_costs_one_hit_test() {
+    let relayout = |pointer: bool| {
+        let (mut app, gauge) = rows_and_gauge();
+        // The same turns either way, the move alone differing.
+        interaction(&mut app, |app| {
+            if pointer {
+                app.handle_event(PlatformEvent::MouseMove { x: 20.0, y: 30.0 }, SIZE, 1.0);
+            }
+        });
+        settle(&mut app);
+        let s = interaction(&mut app, |_| gauge.set_style("width", "111px"));
+        (app, s)
+    };
+    let (_, bare) = relayout(false);
+    let (mut app, s) = relayout(true);
+    assert_eq!(s.get(RepaintPartial), 1, "positive control: {s:?}");
+    expect_frame(
+        "relayout under a still pointer",
+        &s,
+        &[
+            (StyleResolves, 1),
+            (ElementsCascaded, 1),
+            (StyleNodesVisited, 1),
+            (StyleInvalidations, 1),
+            (TaffyStyleSyncs, 1),
+            (TaffyStyleChanges, 1),
+            (LayoutResolves, 1),
+            (TaffyRootComputes, 1),
+            (TaffyMeasureCalls, 1),
+            (AbsBoxesVisited, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 2142),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 2),
+            (StackingOrderBuilds, 2),
+            (ClipMasks, 1),
+            (ClipMaskPx, 2706),
+            (HitTests, 1),
+            (HitTestNodesVisited, 3),
+            (HitExtentsComputed, 14),
+        ],
+    );
+    // The hit test's own work is the only difference: its nodes and
+    // extents, and the stacking order it builds for the root.
+    for (c, v) in s.iter() {
+        // The surface a partial repaint draws in is allocated once, by the
+        // app's first partial repaint: the hover's own frame, in the run
+        // with the pointer.
+        if c.name().starts_with("time_") || matches!(c, RerenderEventsQueued | PaintSurfaceAllocs) {
+            continue;
+        }
+        let hit_test = match c {
+            HitTests => 1,
+            HitTestNodesVisited => 3,
+            HitExtentsComputed => 14,
+            StackingOrderBuilds => 1,
+            _ => 0,
+        };
+        assert_eq!(
+            v,
+            bare.get(c) + hit_test,
+            "{}: the pointer cost more than its hit test",
+            c.name()
+        );
+    }
+    let (redraws, total) = idle_turns(&mut app, IDLE_TURNS);
+    assert_eq!(redraws, 0, "no turn after it may ask for a frame");
+    expect_frame("idle after a relayout under a still pointer", &total, &[]);
+}
+
+// ── Theme and scale ────────────────────────────────────────────────────────
+
+/// A dark-mode toggle: the document restyles in full and the frame repaints in
+/// full, for the theme reason.
+///
+/// No paint layout is rebuilt (`shape_ifc_build` 0, #913): the one variable the
+/// toggle changes is used by no text here, and the full restyle drops an IFC's
+/// layout only when that IFC's typography moved. It used to drop all of them —
+/// 211, every row and side-scroller row.
+///
+/// And no Taffy measure call (`taffy_measure_calls` 0, was 1): the
+/// whole-document IFC pass used to `set_style` every childless block to apply
+/// the one-line floor, which dirtied the page's one childless leaf; #296
+/// removed the floor.
+#[cfg(feature = "theme")]
+#[test]
+fn a_theme_toggle_restyles_and_repaints_in_full_for_the_theme() {
+    let mut app = static_page();
+    app.set_owned_theme_css(Some(":root { --rinch-primary-color: #4dabf7; }".into()));
+    settle(&mut app);
+    app.set_owned_theme_css(Some(":root { --rinch-primary-color: #1864ab; }".into()));
+    let s = interaction(&mut app, |app| {
+        app.resolve_and_repaint(SIZE.0 as f32, SIZE.1 as f32);
+    });
+    assert_eq!(s.get(RepaintFullTheme), 1, "positive control: {s:?}");
+    expect_frame(
+        "theme toggle",
+        &s,
+        &[
+            (StyleResolves, 2),
+            (ElementsCascaded, 216),
+            (StyleNodesVisited, 427),
+            (FullRestyles, 1),
+            (FullRestyleTheme, 1),
+            (FullStyleWalks, 1),
+            (TaffyStyleSyncs, 216),
+            (ShapePaint, 1),
+            (LayoutResolves, 1),
+            (IfcSetupPasses, 1),
+            (IfcFullPasses, 1),
+            (IfcFullTheme, 1),
+            (TaffyRootComputes, 1),
+            (AbsBoxesVisited, 2),
+            (PaintFrames, 1),
+            (RepaintFull, 1),
+            (RepaintFullTheme, 1),
+            (RepaintedPx, 480000),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 27),
+            (StackingOrderBuilds, 1),
+            (GlyphAtlasHits, 136),
+            // #536, see `full_repaint_resize` above: `.field`'s UA `overflow:
+            // clip` now clips to its padding box, 2px inset for its `border:
+            // 2px inset`, tight enough that `clip_cuts_nothing`'s elision no
+            // longer applies — one extra `push_clip` (the field's own) and
+            // the extra pixels are that bracket's own area. This fixture is
+            // `theme`-gated so it was not caught by the original PR's
+            // `--features desktop` run; a merge-with-main CI failure under
+            // `--features desktop,embed,theme,clipboard,debug` found it.
+            (ClipMasks, 2),
+            (ClipMaskPx, 38656),
+        ],
+    );
+}
+
+/// A scale-factor change (the window dragged to a 2x display): the document
+/// restyles for the device pixel ratio, and the surface — twice the pixels —
+/// repaints in full. The frame's reason is `resize` (the surface resize is
+/// decided first), not `restyle`: both apply, and one full repaint is counted.
+#[test]
+fn a_scale_factor_change_restyles_and_repaints_in_full() {
+    let mut app = static_page();
+    app.handle_event(PlatformEvent::ScaleFactorChanged(2.0), SIZE, 2.0);
+    about_to_wait(&mut app);
+    let s = paint_at(&mut app, 2.0);
+    assert_eq!(s.get(FullRestyleDpr), 1, "positive control: {s:?}");
+    expect_frame(
+        "scale factor 1 -> 2",
+        &s,
+        &[
+            (StyleResolves, 1),
+            (ElementsCascaded, 216),
+            (StyleNodesVisited, 427),
+            (FullRestyles, 1),
+            (FullRestyleDpr, 1),
+            (FullStyleWalks, 1),
+            (TaffyStyleSyncs, 216),
+            (ShapePaint, 1),
+            (LayoutResolves, 1),
+            (TaffyRootComputes, 1),
+            (AbsBoxesVisited, 2),
+            (PaintFrames, 1),
+            (RepaintFull, 1),
+            (RepaintFullResize, 1),
+            (RepaintedPx, 1920000),
+            (SurfacePx, 1920000),
+            (PaintNodesVisited, 27),
+            (StackingOrderBuilds, 1),
+            // The field's "typed" is in the UA sheet's 13.3333px since #1194,
+            // not the body's 14px, so its `e` and `d` no longer share the
+            // 14px images "side" rasterised: two hits became misses.
+            (GlyphAtlasHits, 102),
+            (GlyphAtlasMisses, 34),
+            // #536: the field's UA `overflow: clip` now clips to its padding
+            // box (2px inset for its `border: 2px inset`), which is tight
+            // enough that `clip_cuts_nothing` no longer elides the push — see
+            // the comment on the same move in `a_focused_input_idles_for_free`.
+            (ClipMasks, 2),
+            (ClipMaskPx, 149920),
+            (PaintSurfaceAllocs, 1),
+        ],
+    );
+}
+
+// ── Every full-repaint reason (#879) ───────────────────────────────────────
+//
+// `first_frame`, `resize` and `invalidated` are pinned in `perf_stats_tests`,
+// `restyle` and `unattributed` in `named_damage_tests`, each by its own
+// counter alone. These assert the whole frame for every reason, so relabelling
+// one reason as another fails here.
+
+/// The first frame: no previous pixels.
+#[test]
+fn full_repaint_first_frame() {
+    let mut app = new_app(|scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        root.set_attribute(
+            "style",
+            "font-family: sans-serif; font-size: 14px; line-height: 20px",
+        );
+        let t = scope.create_text("hello");
+        root.append_child(&t);
+        root
+    });
+    app.mount_component(SIZE.0 as f32, SIZE.1 as f32);
+    app.reset_perf();
+    let s = paint(&mut app);
+    expect_frame(
+        "full repaint: first frame",
+        &s,
+        &[
+            (PaintFrames, 1),
+            (RepaintFull, 1),
+            (RepaintFullFirstFrame, 1),
+            (RepaintedPx, 480000),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 2),
+            (StackingOrderBuilds, 1),
+            (GlyphAtlasMisses, 5),
+        ],
+    );
+}
+
+/// The surface was resized.
+#[test]
+fn full_repaint_resize() {
+    let mut app = static_page();
+    app.resize_layout(SIZE.0 + 1, SIZE.1);
+    let _ = app.build_pixels(1.0, (SIZE.0 + 1, SIZE.1), false);
+    let s = app.end_perf_frame().unwrap();
+    expect_frame(
+        "full repaint: resize",
+        &s,
+        &[
+            (StyleResolves, 1),
+            (TaffyStyleSyncs, 2),
+            (ShapeMeasureIfc, 10),
+            (ShapeIfcBuild, 10),
+            (ShapePaint, 1),
+            (LayoutResolves, 1),
+            (TaffyRootComputes, 1),
+            (TaffyMeasureCalls, 11),
+            (AbsBoxesVisited, 2),
+            (PaintFrames, 1),
+            (RepaintFull, 1),
+            (RepaintFullResize, 1),
+            (RepaintedPx, 480600),
+            (SurfacePx, 480600),
+            (PaintNodesVisited, 27),
+            (StackingOrderBuilds, 1),
+            (GlyphAtlasHits, 136),
+            // #536: `.field`'s UA `overflow: clip` now clips to its padding
+            // box, 2px inset on every side for its `border: 2px inset` — tight
+            // enough that `clip_cuts_nothing` no longer elides the push (see
+            // `a_focused_input_idles_for_free`). All four `full_repaint_*`
+            // fixtures below share `static_page()` and move identically.
+            (ClipMasks, 2),
+            (ClipMaskPx, 38656),
+            (PaintSurfaceAllocs, 1),
+        ],
+    );
+}
+
+/// Something marked the scene dirty without naming what changed, and nothing
+/// else was damaged.
+#[test]
+fn full_repaint_unattributed() {
+    let mut app = static_page();
+    app.mark_scene_dirty();
+    let s = paint(&mut app);
+    expect_frame(
+        "full repaint: unattributed",
+        &s,
+        &[
+            (ShapePaint, 1),
+            (PaintFrames, 1),
+            (RepaintFull, 1),
+            (RepaintFullUnattributed, 1),
+            (RepaintedPx, 480000),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 27),
+            (StackingOrderBuilds, 1),
+            (GlyphAtlasHits, 136),
+            // #536, see `full_repaint_resize` above.
+            (ClipMasks, 2),
+            (ClipMaskPx, 38656),
+        ],
+    );
+}
+
+/// The damage covers half the surface or more.
+#[test]
+fn full_repaint_region_too_large() {
+    let out: Rc<RefCell<Option<NodeHandle>>> = Rc::new(RefCell::new(None));
+    let out2 = out.clone();
+    let mut app = mount_settled(move |scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        let style = scope.create_element("style");
+        let css = scope.create_text(ROW_CSS);
+        style.append_child(&css);
+        root.append_child(&style);
+        let big = scope.create_element("div");
+        big.set_attribute("class", "big");
+        root.append_child(&big);
+        *out2.borrow_mut() = Some(big.clone());
+        root
+    });
+    let big = out.borrow().clone().unwrap();
+    let s = interaction(&mut app, |_| big.set_attribute("class", "big on"));
+    expect_frame(
+        "full repaint: region too large",
+        &s,
+        &[
+            (StyleResolves, 1),
+            (ElementsCascaded, 1),
+            (StyleNodesVisited, 1),
+            (StyleInvalidations, 1),
+            (TaffyStyleSyncs, 1),
+            (LayoutResolves, 1),
+            (LayoutSkippedPaintOnly, 1),
+            (PaintFrames, 1),
+            (RepaintFull, 1),
+            (RepaintFullRegionTooLarge, 1),
+            (RepaintedPx, 480000),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 3),
+            (StackingOrderBuilds, 1),
+        ],
+    );
+}
+
+// ── A box that changes place in the paint order (#1384) ───────────────────
+
+const ORDER_CSS: &str = "
+    .holder { position: relative; width: 300px; height: 100px; }
+    .card { width: 100px; height: 100px; }
+    .card.dim { opacity: 0.5; }
+    .card.dimmer { opacity: 0.4; }
+    .badge { position: relative; left: 150px; z-index: 5; width: 100px; height: 100px;
+             background: rgb(200, 0, 0); }
+    .cover { position: absolute; left: 150px; top: 0; z-index: 1; width: 100px; height: 100px;
+             background: rgb(0, 0, 200); }
+";
+
+/// A card whose `z-index` badge overflows it and overlaps a sibling.
+fn order_page(card_class: &'static str) -> (RinchApp, NodeHandle) {
+    let out: Rc<RefCell<Option<NodeHandle>>> = Rc::new(RefCell::new(None));
+    let out2 = out.clone();
+    let app = mount_settled(move |scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        let style = scope.create_element("style");
+        style.append_child(&scope.create_text(ORDER_CSS));
+        root.append_child(&style);
+        let div = |scope: &mut RenderScope, parent: &NodeHandle, class: &str| {
+            let e = scope.create_element("div");
+            e.set_attribute("class", class);
+            parent.append_child(&e);
+            e
+        };
+        let holder = div(scope, &root, "holder");
+        let card = div(scope, &holder, card_class);
+        div(scope, &card, "badge");
+        div(scope, &holder, "cover");
+        *out2.borrow_mut() = Some(card);
+        root
+    });
+    let card = out.borrow().clone().unwrap();
+    (app, card)
+}
+
+/// The card becomes a stacking context (`opacity` leaves 1), which traps its
+/// badge under the sibling it used to cover. The frame repaints the card's
+/// subtree reach — 254 x 104, the card through the badge with the damage
+/// margin, cut at the window's corner — and not the window: one subtree walk in `compute_damage`, no
+/// counter of its own.
+#[test]
+fn a_box_that_becomes_a_stacking_context_repaints_its_subtrees_reach() {
+    let (mut app, card) = order_page("card");
+    let s = interaction(&mut app, |_| card.set_attribute("class", "card dim"));
+    expect_frame(
+        "card becomes a stacking context",
+        &s,
+        &[
+            (StyleResolves, 1),
+            (ElementsCascaded, 1),
+            (StyleNodesVisited, 2),
+            (StyleInvalidations, 1),
+            (TaffyStyleSyncs, 1),
+            (LayoutResolves, 1),
+            (LayoutSkippedPaintOnly, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 26416),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 6),
+            (StackingOrderBuilds, 2),
+            (ClipMasks, 1),
+            (ClipMaskPx, 27136),
+            (PaintLayers, 1),
+            (LayerPx, 10608),
+            (PaintSurfaceAllocs, 2),
+        ],
+    );
+}
+
+/// The twin that reorders nothing: the same card, already a stacking context,
+/// changes only its opacity. Its own rect (104 x 104), as before #1384 — the order check
+/// is one compare and walks nothing.
+///
+/// A pinned **finding**: the card's badge overflows it and is redrawn at the
+/// new opacity by a full repaint, so 10816 px leaves it stale (#1395). A fix
+/// raises this number.
+#[test]
+fn a_stacking_context_that_only_changes_opacity_repaints_its_own_box() {
+    let (mut app, card) = order_page("card dim");
+    let s = interaction(&mut app, |_| card.set_attribute("class", "card dimmer"));
+    expect_frame(
+        "stacking context changes opacity only",
+        &s,
+        &[
+            (StyleResolves, 1),
+            (ElementsCascaded, 1),
+            (StyleNodesVisited, 2),
+            (StyleInvalidations, 1),
+            (TaffyStyleSyncs, 1),
+            (LayoutResolves, 1),
+            (LayoutSkippedPaintOnly, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 10816),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 4),
+            (StackingOrderBuilds, 2),
+            (ClipMasks, 1),
+            (ClipMaskPx, 11236),
+            (PaintLayers, 1),
+            (PaintSurfaceAllocs, 1),
+        ],
+    );
+}
+
+/// A `<style>` element was added whose rule Stylo cannot bucket by id, class
+/// or tag (`:root`): a whole-document restyle, which can change any node's
+/// paint without naming one. (Its rule was `.late { … }`, matching nothing,
+/// until #884: that was a whole-document restyle too, and now restyles
+/// nothing — [`late_class_rule_matching_nothing_restyles_nothing`].)
+///
+/// `shape_ifc_build` and `ifc_signature_changes` are 0, not 1 (#509, #826):
+/// the appended `<style>` is `display: none` with its CSS text as a child —
+/// the #509 shape — and no longer establishes an IFC over that text at all,
+/// so it is never queued for a Parley build or counted as a changed
+/// signature. Before the fix it was wrongly flowed by its own (dead,
+/// unpainted) IFC and paid both.
+#[test]
+fn full_repaint_restyle() {
+    let mut app = static_page();
+    let s = interaction(&mut app, |app| {
+        let doc = app.doc.clone().unwrap();
+        let mut d = doc.borrow_mut();
+        let body = d.body();
+        let style = d.create_element("style");
+        let css = d.create_text(":root { --late: rgb(0, 0, 200); }");
+        d.append_child(style, css);
+        d.append_child(body, style);
+    });
+    expect_frame(
+        "full repaint: restyle",
+        &s,
+        &[
+            // 3 -> 2 and 428 -> 429 (#884): the text is appended to the
+            // `<style>` while it is detached, which used to load the sheet and
+            // walk the whole document on the spot, before the element was in
+            // it; the insertion then cascaded the element on its own. The
+            // sheet now applies when the element is connected, and the one
+            // whole-document walk reaches the `<style>` with everything else.
+            (StyleResolves, 2),
+            (ElementsCascaded, 217),
+            (StyleNodesVisited, 429),
+            (FullRestyles, 1),
+            (FullRestyleStylesheet, 1),
+            (FullStyleWalks, 1),
+            (TaffyStyleSyncs, 217),
+            (ShapePaint, 1),
+            (IfcMeasureInvalidations, 2),
+            (LayoutResolves, 1),
+            (IfcSetupPasses, 1),
+            (IfcScopedPasses, 1),
+            (IfcScopeContainers, 2),
+            (IfcScopeNodes, 4),
+            (TaffyRootComputes, 1),
+            (AbsBoxesVisited, 2),
+            (PaintFrames, 1),
+            (RepaintFull, 1),
+            (RepaintFullRestyle, 1),
+            (RepaintedPx, 480000),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 27),
+            (StackingOrderBuilds, 1),
+            (GlyphAtlasHits, 136),
+            // #536, see `full_repaint_resize` above.
+            (ClipMasks, 2),
+            (ClipMaskPx, 38656),
+        ],
+    );
+}
+
+/// A sheet loaded after mount whose rule matches no element (#884): Stylo's
+/// stylesheet invalidation names no element, so the frame resolves styles and
+/// does nothing else — no cascade, no layout, no paint.
+#[test]
+fn late_class_rule_matching_nothing_restyles_nothing() {
+    let mut app = static_page();
+    let s = interaction(&mut app, |app| {
+        let doc = app.doc.clone().unwrap();
+        doc.borrow_mut()
+            .load_css(".late { color: rgb(0, 0, 200); }");
+    });
+    expect_frame(
+        "late rule matching nothing",
+        &s,
+        &[
+            (StyleResolves, 1),
+            (LayoutResolves, 1),
+            (LayoutSkippedPaintOnly, 1),
+            (RepaintNone, 1),
+        ],
+    );
+}
+
+/// The app's sheet for [`html_view_swap_restyles_the_views_not_the_window`].
+const MAIL_CSS: &str = "
+    body { margin: 0; font-family: sans-serif; font-size: 14px; line-height: 20px; }
+    .list { position: absolute; left: 0; top: 0; width: 300px; height: 600px; overflow-y: auto; }
+    .mail-row { height: 20px; }
+    .reader { position: absolute; left: 320px; top: 0; width: 460px; height: 400px; }
+";
+
+/// A mail app (#2636): a 200-row list, a reader showing one email in an
+/// `HtmlView` keyed on it, and a footer with an app `<style>` of its own after
+/// the reader in tree order, whose `:root` rule Stylo cannot bucket. Each
+/// email's sheet is full of rules a browser applies to the whole page (`*`,
+/// `:root`, `div`); the cleaner applies them inline.
+fn mail_page() -> (RinchApp, Signal<usize>) {
+    use super::html_view_swap_2636_tests::DOCS;
+    let which = Signal::new(0usize);
+    let app = mount_settled(move |__scope: &mut RenderScope| {
+        rsx! {
+            div {
+                style { {MAIL_CSS} }
+                div { class: "list",
+                    for i in 0..200usize {
+                        div { key: i, class: "mail-row", {format!("mail {i}")} }
+                    }
+                }
+                div { class: "reader",
+                    for d in vec![which.get()] {
+                        div { key: d,
+                            {
+                                rinch_html::HtmlView {
+                                    document: DOCS[d].into(),
+                                    ..Default::default()
+                                }
+                                .render(__scope, &[])
+                            }
+                        }
+                    }
+                }
+                div { class: "footer",
+                    style { ":root { --footer-gap: 4px; }" }
+                }
+            }
+        }
+    });
+    (app, which)
+}
+
+/// Switching the reader to another email restyles the reader's new view and
+/// what is in it, not the window (#2636).
+///
+/// Positive control: the new email's elements are cascaded and laid out
+/// (`elements_cascaded`, `taffy_root_computes`). It used to be two
+/// whole-window restyles (`full_restyles: 2`, `full_restyle_stylesheet: 2`,
+/// 431 elements cascaded, every one on the page): the view's own `<style>`
+/// left and came back with `:where(.rinch-html-view…)` rules Stylo cannot
+/// bucket, and `sync_style_element_sheets` removed and re-added every
+/// `<style>` sheet after the first change, so the footer's `:root` rule
+/// re-invalidated the whole document too.
+#[test]
+fn html_view_swap_restyles_the_views_not_the_window() {
+    let (mut app, which) = mail_page();
+    let s = interaction(&mut app, |_| which.set(1));
+    expect_frame(
+        "html view swap",
+        &s,
+        &[
+            // The new view and its document: the view, its `<style>` and
+            // body, the document's elements and the keyed wrapper. The list
+            // and the footer are not cascaded.
+            (StyleResolves, 6),
+            (ElementsCascaded, 13),
+            (StyleNodesVisited, 23),
+            (TaffyStyleSyncs, 13),
+            (TaffyStyleChanges, 4),
+            (ShapeMeasureIfc, 1),
+            (ShapeIfcBuild, 1),
+            (IfcMeasureInvalidations, 9),
+            (IfcSignatureChanges, 1),
+            (LayoutResolves, 1),
+            (IfcSetupPasses, 1),
+            (IfcScopedPasses, 1),
+            (IfcScopeContainers, 6),
+            (IfcScopeNodes, 9),
+            (TaffyRootComputes, 1),
+            (TaffyMeasureCalls, 1),
+            (AbsBoxesVisited, 2),
+            (PaintFrames, 1),
+            // #2734: a partial repaint of the reader, 189072 px. It was a full
+            // one (`repaint_full_region_too_large`, 480000 px, 43 nodes
+            // visited, 228 glyph hits): the relayout flipped every text box
+            // on the page that had kept the box its lines gave it to `0x0`,
+            // and named it, which tipped the damage over half the window.
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 189072),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 8),
+            (RemovalDamageSteps, 30),
+            (StackingOrderBuilds, 2),
+            (GlyphAtlasMisses, 4),
+            (ClipMasks, 1),
+            (ClipMaskPx, 191632),
+            (EffectRuns, 3),
+            (SignalNotifies, 2),
+        ],
+    );
+}
+
+/// A sheet loaded after mount whose rule matches the rows (#884): the rows are
+/// restyled and repainted, nothing else.
+#[test]
+fn late_class_rule_restyles_and_repaints_what_it_matches() {
+    let mut app = static_page();
+    let s = interaction(&mut app, |app| {
+        let doc = app.doc.clone().unwrap();
+        doc.borrow_mut().load_css(".row { color: rgb(0, 0, 200); }");
+    });
+    expect_frame(
+        "late rule matching the rows",
+        &s,
+        &[
+            (StyleResolves, 1),
+            (ElementsCascaded, 10),
+            (StyleNodesVisited, 13),
+            (TaffyStyleSyncs, 10),
+            (ShapeIfcBuild, 10),
+            (IfcMeasureInvalidations, 10),
+            (LayoutResolves, 1),
+            (LayoutSkippedTextOnly, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 163200),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 12),
+            (StackingOrderBuilds, 1),
+            (GlyphAtlasHits, 50),
+            (ClipMasks, 1),
+            (ClipMaskPx, 164800),
+        ],
+    );
+}
+
+/// The previous frame was thrown away with no reason recorded.
+#[test]
+fn full_repaint_invalidated() {
+    let mut app = static_page();
+    app.has_previous_frame = false;
+    app.request_repaint();
+    let s = paint(&mut app);
+    expect_frame(
+        "full repaint: invalidated",
+        &s,
+        &[
+            (ShapePaint, 1),
+            (PaintFrames, 1),
+            (RepaintFull, 1),
+            (RepaintFullInvalidated, 1),
+            (RepaintedPx, 480000),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 27),
+            (StackingOrderBuilds, 1),
+            (GlyphAtlasHits, 136),
+            // #536, see `full_repaint_resize` above.
+            (ClipMasks, 2),
+            (ClipMaskPx, 38656),
+        ],
+    );
+}
+
+/// A repaint was requested and named no damage: nothing is painted at all.
+#[test]
+fn an_empty_damage_repaints_nothing() {
+    let mut app = static_page();
+    app.request_repaint();
+    let s = paint(&mut app);
+    expect_frame("repaint none", &s, &[(RepaintNone, 1)]);
+}
+
+/// `build_scene` (embed, Android, DevTools) always re-encodes the whole scene.
+#[cfg(any(feature = "gpu-renderer", feature = "embed"))]
+#[test]
+fn full_repaint_gpu() {
+    let mut app = static_page();
+    app.request_repaint();
+    let _ = app.build_scene(1.0, SIZE);
+    let s = app.end_perf_frame().unwrap();
+    expect_frame(
+        "full repaint: gpu",
+        &s,
+        &[
+            (ShapePaint, 1),
+            (PaintFrames, 1),
+            (RepaintFull, 1),
+            (RepaintFullGpu, 1),
+            (RepaintedPx, 480000),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 27),
+            (StackingOrderBuilds, 1),
+            // The glyph-mask atlas (#2286) is the thread's, shared with the
+            // software painter that painted this page's first frame in
+            // `static_page`: every glyph is a hit, and each of the 25 masks is
+            // made into its GPU image, once.
+            (GlyphAtlasHits, 136),
+            (GlyphAtlasUploads, 25),
+            (VelloClipTiles, 186),
+        ],
+    );
+}
+
+/// The second `build_scene` of the same page (#2286): every glyph drawn from
+/// the glyph-mask atlas the first frame filled, nothing rasterised or handed
+/// to the GPU again.
+#[cfg(any(feature = "gpu-renderer", feature = "embed"))]
+#[test]
+fn full_repaint_gpu_warm_atlas() {
+    let mut app = static_page();
+    app.request_repaint();
+    let _ = app.build_scene(1.0, SIZE);
+    let _ = app.end_perf_frame().unwrap();
+    app.request_repaint();
+    let _ = app.build_scene(1.0, SIZE);
+    let s = app.end_perf_frame().unwrap();
+    expect_frame(
+        "full repaint: gpu, warm atlas",
+        &s,
+        &[
+            (ShapePaint, 1),
+            (PaintFrames, 1),
+            (RepaintFull, 1),
+            (RepaintFullGpu, 1),
+            (RepaintedPx, 480000),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 27),
+            (StackingOrderBuilds, 1),
+            // The same 136 glyphs, and no upload: the GPU images are kept.
+            (GlyphAtlasHits, 136),
+            (VelloClipTiles, 186),
+        ],
+    );
+}
+
+// ── Counters with no exact scenario (#879, item 3) ─────────────────────────
+
+/// `rerender_events_queued` is folded into the frame by `end_perf_frame` from
+/// a process-wide atomic, which the runtime's dispatcher bumps
+/// (`rinch_runtime::wake::native_event_queue_tests::send_native_event_counts_one_rerender_per_drain` pins the
+/// bump). This pins the fold: three events queued between two frames reach the
+/// frame, exactly. The atomic is process-wide, so every test that writes it —
+/// this one and the `rinch_runtime` queue tests that send a `ReRender` — holds
+/// `RERENDER_EVENTS_TEST_LOCK`.
+///
+/// `time_present_ns` has no such check. It is added only by the desktop and
+/// Android runtimes' present, after a real window's `present_pixels` or GPU
+/// submit, and no test here has a window.
+#[test]
+fn queued_rerender_events_are_folded_into_the_frame() {
+    let mut app = static_page();
+    let _lock = RERENDER_EVENTS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _ = app.end_perf_frame();
+    RERENDER_EVENTS_QUEUED.fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+    let s = app.end_perf_frame().unwrap();
+    assert_eq!(s.get(RerenderEventsQueued), 3, "{s:?}");
+}
+
+/// Review of #1143: a striped, animated `Progress` in a closed `Drawer` —
+/// the animation #468 made visible must still be paused by the drawer's
+/// closed rule (#912), and must still run when the drawer is open.
+#[test]
+fn review_1143_a_striped_progress_in_a_closed_drawer_idles() {
+    for closed in [true, false] {
+        let mut app = new_app(move |scope: &mut RenderScope| {
+            let root = scope.create_element("div");
+            let style = scope.create_element("style");
+            let text = scope.create_text(&rinch_components::generate_component_css());
+            style.append_child(&text);
+            root.append_child(&style);
+            let progress = rinch_components::Progress {
+                value: Some(60.0),
+                striped: true,
+                animated: true,
+                ..Default::default()
+            }
+            .render(scope, &[]);
+            let drawer = Drawer {
+                opened_fn: Some(std::rc::Rc::new(move || !closed)),
+                position: "left".to_string(),
+                ..Default::default()
+            }
+            .render(scope, &[progress]);
+            root.append_child(&drawer);
+            root
+        });
+        app.mount_component(SIZE.0 as f32, SIZE.1 as f32);
+        settle(&mut app);
+        {
+            let d = app.doc.as_ref().unwrap().borrow();
+            let all: Vec<_> = d.tree.active_animations.values().flatten().collect();
+            assert!(!all.is_empty(), "positive control: registered");
+            let paused = all
+                .iter()
+                .all(|a| a.play_state == rinch_dom::animation::AnimationPlayState::Paused);
+            assert_eq!(paused, closed, "closed={closed}: paused iff closed");
+        }
+        let turns = ticking_turns(&mut app, IDLE_TURNS);
+        let asked = turns.iter().filter(|(a, _)| *a).count();
+        if closed {
+            assert_eq!(asked, 0, "a closed drawer asks for no frame");
+        } else {
+            assert!(asked > 0, "an open drawer's stripes run");
+        }
+    }
+}
+
+// ── Identity transforms (#415) ─────────────────────────────────────────────
+
+const IDENTITY_ROWS: usize = 300;
+
+/// A 300x400 scroller of 300 empty 20px rows, each carrying `transform`.
+fn mount_transform_rows(transform: &'static str) -> (RinchApp, NodeHandle) {
+    let out: Rc<RefCell<Option<NodeHandle>>> = Rc::new(RefCell::new(None));
+    let out2 = out.clone();
+    let app = mount_settled(move |scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        let scroller = scope.create_element("div");
+        scroller.set_attribute("style", "width: 300px; height: 400px; overflow-y: auto");
+        for _ in 0..IDENTITY_ROWS {
+            let row = scope.create_element("div");
+            row.set_attribute("style", &format!("height: 20px; transform: {transform}"));
+            scroller.append_child(&row);
+        }
+        root.append_child(&scroller);
+        *out2.borrow_mut() = Some(scroller.clone());
+        root
+    });
+    let scroller = out.borrow().clone().unwrap();
+    (app, scroller)
+}
+
+fn pointer_move(app: &mut RinchApp, x: f32, y: f32) {
+    app.handle_event(PlatformEvent::MouseMove { x, y }, SIZE, 1.0);
+}
+
+/// The frames of `mount_transform_rows`: the second wheel notch (the first
+/// fills the hit cache) and a warm pointer move after it.
+fn transform_row_frames(transform: &'static str) -> (FrameStats, FrameStats) {
+    let (mut app, scroller) = mount_transform_rows(transform);
+    interaction(&mut app, wheel_notch);
+    let first = scroller.scroll_top();
+    let notch = interaction(&mut app, wheel_notch);
+    assert!(
+        scroller.scroll_top() > first && first > 0.0,
+        "positive control: both notches scrolled"
+    );
+    interaction(&mut app, |app| pointer_move(app, 50.0, 100.0));
+    let warm = interaction(&mut app, |app| pointer_move(app, 51.0, 130.0));
+    (notch, warm)
+}
+
+/// What an identity transform costs (#415): `transform: translateX(0)` makes
+/// each row a stacking context, exactly as `translateX(1px)` or `opacity:
+/// 0.99` always has. A stacking context is hoisted into its ancestor's paint
+/// sequence; until #1719 neither paint's clip cull nor hit testing's flow
+/// extents pruned one, so every one of the 300 rows was visited by paint and
+/// by a pointer move, where the `none` twin below visits the ~20 on screen:
+/// `PaintNodesVisited` 24 → 303, `StackingOrderBuilds` 2 → 313 and
+/// `HitTestNodesVisited` 4 → 291 on a wheel notch, and 4 → 285 nodes on a warm
+/// pointer move.
+///
+/// #1719 prunes them both: paint's loop asks of a stacking-context entry what
+/// `paint_node` would have (`subtree_is_entirely_outside`), and hit testing
+/// prunes a stacking context whose subtree hoists nothing on its flow extent,
+/// since its sequence is then its flow walk. The notch is now the twin's in
+/// paint (24 visits), builds 2 sequences (313), and its hit test visits 2
+/// nodes (291); the warm move visits 2 (285). A fix to the cull or the prune
+/// must *lower* these. The rows are hoisted past the scroller, so its bars are
+/// drawn after them by the body's sequence (#1717): 1 deferred scroller.
+#[test]
+fn identity_transform_rows_cost_what_any_stacking_context_costs() {
+    let (notch, warm) = transform_row_frames("translateX(0)");
+    expect_frame(
+        "second wheel notch, 300 translateX(0) rows",
+        &notch,
+        &[
+            (LayoutResolves, 1),
+            (LayoutSkippedPaintOnly, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 122816),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 24),
+            (StackingOrderBuilds, 2),
+            (DeferredScrollbarsPainted, 1),
+            (ClipMasks, 3),
+            (ClipMaskPx, 367044),
+            (HitTests, 1),
+            (HitTestNodesVisited, 2),
+        ],
+    );
+    expect_frame(
+        "warm pointer move, 300 translateX(0) rows",
+        &warm,
+        &[
+            (PaintCachedFrames, 1),
+            (HitTests, 1),
+            (HitTestNodesVisited, 2),
+        ],
+    );
+}
+
+/// The twin: the same rows with `transform: none` are culled and pruned.
+#[test]
+fn transform_none_rows_are_culled_and_pruned() {
+    let (notch, warm) = transform_row_frames("none");
+    expect_frame(
+        "second wheel notch, 300 transform: none rows",
+        &notch,
+        &[
+            (LayoutResolves, 1),
+            (LayoutSkippedPaintOnly, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 122816),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 24),
+            (StackingOrderBuilds, 2),
+            (ClipMasks, 2),
+            (ClipMaskPx, 245640),
+            (HitTests, 1),
+            (HitTestNodesVisited, 4),
+        ],
+    );
+    expect_frame(
+        "warm pointer move, 300 transform: none rows",
+        &warm,
+        &[
+            (PaintCachedFrames, 1),
+            (HitTests, 1),
+            (HitTestNodesVisited, 4),
+        ],
+    );
+}
+
+// ── Viewports with a frame, idle (#349) ────────────────────────────────────
+
+/// Three `GameViewport`s, each with a frame on screen, and nothing happening:
+/// every turn hands paint the same frame and hole sets (`paint_software`
+/// installs them on every redraw), and comparing them with the last paint's
+/// marks nothing, schedules nothing and repaints nothing. This is the only
+/// scenario with a viewport in it, so it is what pins #349's comparison as
+/// free on an ordinary frame. Positive control: one fresh frame repaints
+/// exactly its own 200x100 box.
+#[cfg(feature = "windowing")]
+#[test]
+fn idle_viewports_repaint_nothing() {
+    use crate::render_surface::{
+        collect_viewport_frames_by_name, create_render_surface_with_name, unregister_render_surface,
+    };
+    const NAMES: [&str; 3] = ["perf-349-a", "perf-349-b", "perf-349-c"];
+    fn frame(app: &mut RinchApp) -> FrameStats {
+        app.install_viewport_frames(collect_viewport_frames_by_name(
+            &crate::render_surface::registered_surface_ids(),
+        ));
+        let stats = paint(app);
+        RinchApp::clear_viewport_frames();
+        stats
+    }
+
+    let mut app = mount_settled(|scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        for name in NAMES {
+            let card = scope.create_element("div");
+            card.set_attribute(
+                "style",
+                "width: 200px; height: 100px; overflow: hidden; \
+                 background-color: rgb(255, 200, 0);",
+            );
+            let viewport = scope.create_element("div");
+            viewport.set_attribute("style", "width: 100%; height: 100%;");
+            viewport.set_attribute("data-viewport", name);
+            card.append_child(&viewport);
+            root.append_child(&card);
+        }
+        root
+    });
+    let surfaces: Vec<_> = NAMES
+        .iter()
+        .map(|n| create_render_surface_with_name(n))
+        .collect();
+    let solid = |rgb: [u8; 3]| [rgb[0], rgb[1], rgb[2], 255].repeat(40 * 20);
+    for s in &surfaces {
+        s.writer().submit_frame(&solid([255, 0, 255]), 40, 20);
+    }
+    frame(&mut app);
+    app.reset_perf();
+
+    let mut total = FrameStats::default();
+    for turn in 0..IDLE_TURNS {
+        assert!(!about_to_wait(&mut app), "turn {turn} asks for no frame");
+        let frames =
+            collect_viewport_frames_by_name(&crate::render_surface::registered_surface_ids());
+        assert_eq!(frames.frames.len(), 3, "positive control: three frames");
+        assert_eq!(frames.holes.len(), 3, "and three holes");
+        app.install_viewport_frames(frames);
+        assert!(
+            !app.scene_dirty,
+            "turn {turn}: installing an unchanged set schedules no paint"
+        );
+        assert!(
+            app.doc
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .tree
+                .paint_dirty_nodes
+                .is_empty(),
+            "turn {turn}: and marks no node"
+        );
+        total.accumulate(&paint(&mut app));
+        RinchApp::clear_viewport_frames();
+    }
+    expect_frame(
+        "three viewports with frames, idle redraws",
+        &total,
+        &[(PaintCachedFrames, IDLE_TURNS as u64)],
+    );
+
+    surfaces[1]
+        .writer()
+        .submit_frame(&solid([0, 0, 255]), 40, 20);
+    let fresh = frame(&mut app);
+    assert_eq!(fresh.get(RepaintedPx), 200 * 100, "positive control");
+    expect_frame(
+        "one viewport's fresh frame",
+        &fresh,
+        &[
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 20000),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 4),
+            (StackingOrderBuilds, 1),
+            (ClipMasks, 1),
+            (ClipMaskPx, 21008),
+            (OpaqueImageCopies, 1),
+            // The game viewport clearing its box before its frame (#1866), as
+            // the plain rect fill: square, unrotated, unclipped where it lands.
+            (RectErases, 1),
+        ],
+    );
+
+    for s in surfaces {
+        unregister_render_surface(s.id());
+    }
+}
+
+// ── A not-ready viewport receiving frames (#1400) ──────────────────────────
+
+/// A `GameViewport` whose node says it is not ready (`data-viewport-ready=
+/// "false"`, a loading or paused screen) while its renderer keeps submitting:
+/// the node shows its own placeholder, not the frame (#348), so a new frame
+/// changes nothing on screen and is no damage. It used to repaint the
+/// viewport's box every frame, drawing the same placeholder (20000 px here).
+/// Positive control: the same frame once the node is ready repaints its box.
+#[cfg(feature = "windowing")]
+#[test]
+fn a_not_ready_viewports_fresh_frames_repaint_nothing() {
+    use crate::render_surface::{
+        collect_viewport_frames_by_name, create_render_surface_with_name, unregister_render_surface,
+    };
+    fn frame(app: &mut RinchApp) -> FrameStats {
+        app.install_viewport_frames(collect_viewport_frames_by_name(
+            &crate::render_surface::registered_surface_ids(),
+        ));
+        let stats = paint(app);
+        RinchApp::clear_viewport_frames();
+        stats
+    }
+
+    let viewport: Rc<std::cell::RefCell<Option<NodeHandle>>> = Default::default();
+    let captured = viewport.clone();
+    let mut app = mount_settled(move |scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        let card = scope.create_element("div");
+        card.set_attribute(
+            "style",
+            "width: 200px; height: 100px; overflow: hidden; \
+             background-color: rgb(255, 200, 0);",
+        );
+        let vp = scope.create_element("div");
+        vp.set_attribute(
+            "style",
+            "width: 100%; height: 100%; background-color: rgb(0, 128, 0);",
+        );
+        vp.set_attribute("data-viewport", "perf-1400");
+        vp.set_attribute("data-viewport-ready", "false");
+        card.append_child(&vp);
+        root.append_child(&card);
+        *captured.borrow_mut() = Some(vp);
+        root
+    });
+    let game = create_render_surface_with_name("perf-1400");
+    let solid = |rgb: [u8; 3]| [rgb[0], rgb[1], rgb[2], 255].repeat(40 * 20);
+    game.writer().submit_frame(&solid([255, 0, 255]), 40, 20);
+    frame(&mut app);
+    app.reset_perf();
+
+    let mut total = FrameStats::default();
+    for turn in 0..IDLE_TURNS {
+        game.writer().submit_frame(&solid([0, 0, 255]), 40, 20);
+        let frames =
+            collect_viewport_frames_by_name(&crate::render_surface::registered_surface_ids());
+        assert!(
+            frames.fresh.contains("perf-1400"),
+            "positive control: turn {turn}'s frame is fresh"
+        );
+        app.install_viewport_frames(frames);
+        assert!(
+            !app.scene_dirty,
+            "turn {turn}: a frame not shown is no paint"
+        );
+        total.accumulate(&paint(&mut app));
+        RinchApp::clear_viewport_frames();
+    }
+    expect_frame(
+        "a not-ready viewport's fresh frames",
+        &total,
+        &[(PaintCachedFrames, IDLE_TURNS as u64)],
+    );
+
+    viewport
+        .borrow()
+        .as_ref()
+        .unwrap()
+        .set_attribute("data-viewport-ready", "true");
+    let ready = frame(&mut app);
+    assert_eq!(
+        ready.get(RepaintedPx),
+        200 * 100,
+        "positive control: {ready:?}"
+    );
+
+    unregister_render_surface(game.id());
+}
+
+// ── #386: an absolute box written inside a scroller it is not content of ────
+
+/// `a_second_wheel_notch_recomputes_no_extent` with one absolute box that has
+/// no positioned ancestor written inside the scroller's first row: the
+/// scroller is between the box and its containing block, so every notch
+/// writes the box's `layout` again (`out_of_flow::replace_after_scroll`,
+/// `abs_boxes_visited`). That moves a box and still recomputes **no**
+/// hit-test extent — an absolute box is in no flow extent, and the stacking
+/// sequences holding its offset are the ones a scroll drops anyway. PR
+/// #1409's first cut invalidated the hit cache in full there: 495 extents per
+/// notch. What the box does cost a notch is damage: the re-placed box is
+/// pushed paint-dirty, and its rect merges with the scroller's.
+#[test]
+fn a_second_wheel_notch_with_an_escaping_absolute_recomputes_no_extent() {
+    let out: Rc<RefCell<Option<NodeHandle>>> = Rc::new(RefCell::new(None));
+    let out2 = out.clone();
+    let mut app = mount_settled(move |scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        let style = scope.create_element("style");
+        let css = scope.create_text(ROW_CSS);
+        style.append_child(&css);
+        root.append_child(&style);
+        let scroller = scope.create_element("div");
+        scroller.set_attribute("class", "scroller");
+        for i in 0..SCROLL_ROWS {
+            let row = scope.create_element("div");
+            row.set_attribute("class", "row");
+            let t = scope.create_text(&format!("row {i}"));
+            row.append_child(&t);
+            if i == 0 {
+                let b = scope.create_element("div");
+                b.set_attribute(
+                    "style",
+                    "position: absolute; left: 400px; top: 10px; width: 10px; height: 10px",
+                );
+                row.append_child(&b);
+            }
+            scroller.append_child(&row);
+        }
+        root.append_child(&scroller);
+        *out2.borrow_mut() = Some(scroller.clone());
+        root
+    });
+    let scroller = out.borrow().clone().unwrap();
+    interaction(&mut app, wheel_notch);
+    let first = scroller.scroll_top();
+    assert!(first > 0.0, "positive control: the first notch scrolled");
+    let s = interaction(&mut app, wheel_notch);
+    assert!(
+        scroller.scroll_top() > first,
+        "positive control: the second notch scrolled further"
+    );
+    expect_frame(
+        "a second notch, an escaping absolute box",
+        &s,
+        &[
+            (LayoutResolves, 1),
+            (LayoutSkippedPaintOnly, 1),
+            (AbsBoxesVisited, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 167256),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 25),
+            (StackingOrderBuilds, 2),
+            (GlyphAtlasHits, 122),
+            (GlyphAtlasMisses, 4),
+            (ClipMasks, 2),
+            (ClipMaskPx, 290300),
+            (HitTests, 1),
+            (HitTestNodesVisited, 4),
+        ],
+    );
+}
+
+const BIG_LIST_CSS: &str = "
+    .list { width: 200px; height: 200px; overflow: hidden; }
+    .list.dim { opacity: 0.5; }
+    .list.tint { background: rgb(9, 9, 9); }
+    .row { height: 20px; }
+    .dot { width: 50px; height: 10px; background: rgb(0, 160, 0); }
+";
+
+/// A 200 x 200 clipped list of 300 two-node rows (601 nodes).
+fn big_list_page() -> (RinchApp, NodeHandle) {
+    let out: Rc<RefCell<Option<NodeHandle>>> = Rc::new(RefCell::new(None));
+    let out2 = out.clone();
+    let app = mount_settled(move |scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        let style = scope.create_element("style");
+        style.append_child(&scope.create_text(BIG_LIST_CSS));
+        root.append_child(&style);
+        let list = scope.create_element("div");
+        list.set_attribute("class", "list");
+        root.append_child(&list);
+        for _ in 0..300 {
+            let row = scope.create_element("div");
+            row.set_attribute("class", "row");
+            let dot = scope.create_element("div");
+            dot.set_attribute("class", "dot");
+            row.append_child(&dot);
+            list.append_child(&row);
+        }
+        *out2.borrow_mut() = Some(list);
+        root
+    });
+    let list = out.borrow().clone().unwrap();
+    (app, list)
+}
+
+/// A pinned **cost**, accepted by PR #1399 (#1384): a box holding more than
+/// 512 nodes that becomes a stacking context repaints the whole window,
+/// because the walk that measures its subtree's reach gives up at its
+/// 512-node budget. Before #1384 this frame repainted the list's own rect,
+/// as the colour change below still does. A clipping box with no escaping
+/// absolute could keep its own rect when the budget trips; a fix lowers
+/// `RepaintedPx` to the twin's.
+#[test]
+fn a_large_list_that_becomes_a_stacking_context_repaints_in_full() {
+    let (mut app, list) = big_list_page();
+    let s = interaction(&mut app, |_| list.set_attribute("class", "list dim"));
+    expect_frame(
+        "large list becomes a stacking context",
+        &s,
+        &[
+            (StyleResolves, 1),
+            (ElementsCascaded, 1),
+            (StyleNodesVisited, 301),
+            (StyleInvalidations, 1),
+            (TaffyStyleSyncs, 1),
+            (LayoutResolves, 1),
+            (LayoutSkippedPaintOnly, 1),
+            (PaintFrames, 1),
+            (RepaintFull, 1),
+            (RepaintFullRegionTooLarge, 1),
+            (RepaintedPx, 480000),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 31),
+            (StackingOrderBuilds, 2),
+            (ClipMasks, 1),
+            (ClipMaskPx, 40804),
+            (PaintLayers, 1),
+            // The layer composites the rects its rows' dots were drawn in,
+            // not the span from the first to the last (#2057: 10504 before).
+            (LayerPx, 10192),
+            (PaintSurfaceAllocs, 1),
+        ],
+    );
+}
+
+/// The twin: the same list changes colour only, and repaints its own rect.
+#[test]
+fn a_large_list_that_only_changes_colour_repaints_its_own_box() {
+    let (mut app, list) = big_list_page();
+    let s = interaction(&mut app, |_| list.set_attribute("class", "list tint"));
+    expect_frame(
+        "large list changes colour only",
+        &s,
+        &[
+            (StyleResolves, 1),
+            (ElementsCascaded, 1),
+            (StyleNodesVisited, 301),
+            (StyleInvalidations, 1),
+            (TaffyStyleSyncs, 1),
+            (LayoutResolves, 1),
+            (LayoutSkippedPaintOnly, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 41616),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 25),
+            (StackingOrderBuilds, 1),
+            (ClipMasks, 2),
+            (ClipMaskPx, 83240),
+            (PaintSurfaceAllocs, 1),
+        ],
+    );
+}
+
+// ── Outer box-shadows (#976) ───────────────────────────────────────────────
+
+const CARD_CSS: &str = "
+    body { margin: 0; }
+    .card { position: absolute; width: 120px; height: 60px; border-radius: 8px;
+            background-color: rgb(255, 255, 255); }
+    .lifted { box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1), 0 1px 2px rgba(0, 0, 0, 0.2); }
+    .glow { box-shadow: 0 0 8px rgba(0, 0, 0, 0.3); }
+    .card:hover { background-color: rgb(240, 240, 255); }
+";
+
+/// Six cards: three with Mantine's two-shadow `sm` list, offset 1px down —
+/// further than its first blur layers are expanded, so the border box does
+/// not fit inside them — and three with a centred glow, whose layers all
+/// contain the box.
+fn card_page() -> RinchApp {
+    mount_settled(|scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        let style = scope.create_element("style");
+        let css = scope.create_text(CARD_CSS);
+        style.append_child(&css);
+        root.append_child(&style);
+        for i in 0..6 {
+            let card = scope.create_element("div");
+            let kind = if i < 3 { "lifted" } else { "glow" };
+            card.set_attribute("class", &format!("card {kind}"));
+            card.set_attribute(
+                "style",
+                &format!(
+                    "left: {}px; top: {}px;",
+                    40 + (i % 3) * 200,
+                    60 + (i / 3) * 200
+                ),
+            );
+            root.append_child(&card);
+        }
+        root
+    })
+}
+
+/// Hovering a card repaints it with its shadow. A card whose shadow list does
+/// not fit around its border box pays **one** clip mask for the whole list,
+/// beside the damage clip, to keep the shadow outside the box (#976) — not
+/// one per shadow. A card whose shadow fits pays only the damage clip.
+/// Positive control: each hover is a partial repaint.
+#[test]
+fn hovering_an_outer_shadowed_card_costs_one_shadow_clip() {
+    let mut app = card_page();
+    let lifted = interaction(&mut app, |app| {
+        app.handle_event(PlatformEvent::MouseMove { x: 100.0, y: 90.0 }, SIZE, 1.0);
+    });
+    assert_eq!(
+        lifted.get(RepaintPartial),
+        1,
+        "positive control: {lifted:?}"
+    );
+    expect_frame(
+        "hover a card with an offset shadow list",
+        &lifted,
+        &[
+            (StyleResolves, 1),
+            (ElementsCascaded, 1),
+            (StyleNodesVisited, 1),
+            (StyleInvalidations, 1),
+            (TaffyStyleSyncs, 1),
+            (LayoutResolves, 1),
+            (LayoutSkippedPaintOnly, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 9916),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 3),
+            (StackingOrderBuilds, 2),
+            // The damage clip, and one clip around both shadows of the list:
+            // the second is #976's, which keeps the shadow outside the box.
+            (ClipMasks, 2),
+            (ClipMaskPx, 20268),
+            (PaintSurfaceAllocs, 1),
+            (HitTests, 1),
+            (HitTestNodesVisited, 2),
+            (HitExtentsComputed, 6),
+        ],
+    );
+
+    let mut app = card_page();
+    let glow = interaction(&mut app, |app| {
+        app.handle_event(PlatformEvent::MouseMove { x: 100.0, y: 290.0 }, SIZE, 1.0);
+    });
+    assert_eq!(glow.get(RepaintPartial), 1, "positive control: {glow:?}");
+    expect_frame(
+        "hover a card with a centred shadow",
+        &glow,
+        &[
+            (StyleResolves, 1),
+            (ElementsCascaded, 1),
+            (StyleNodesVisited, 1),
+            (StyleInvalidations, 1),
+            (TaffyStyleSyncs, 1),
+            (LayoutResolves, 1),
+            (LayoutSkippedPaintOnly, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 12096),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 3),
+            (StackingOrderBuilds, 2),
+            // The damage clip only: a shadow around the box needs no clip.
+            (ClipMasks, 1),
+            (ClipMaskPx, 13024),
+            (HitTests, 1),
+            (HitTestNodesVisited, 2),
+            (HitExtentsComputed, 3),
+        ],
+    );
+}
+
+// ── Positioned and nested rows in a scroller (#1719) ──────────────────────
+
+/// `branch` children per open folder, `depth` levels, every folder open, every
+/// node with an icon (`li > content > icon > svg > path`).
+fn open_tree(
+    level: usize,
+    prefix: &str,
+    branch: usize,
+    depth: usize,
+    open: &mut std::collections::HashSet<String>,
+) -> Vec<rinch_components::TreeNodeData> {
+    use rinch_components::TreeNodeData;
+    (0..branch)
+        .map(|i| {
+            let v = format!("{prefix}.{i}");
+            let mut n = TreeNodeData::new(v.clone(), format!("node {v}"))
+                .with_icon(rinch_tabler_icons::TablerIcon::Folder);
+            if level + 1 < depth {
+                open.insert(v.clone());
+                n = n.with_children(open_tree(level + 1, &v, branch, depth, open));
+            }
+            n
+        })
+        .collect()
+}
+
+/// rinch's own `Tree` — 363 rows, five levels, every folder open — in a
+/// 300x400 scroller, with a custom `render_node` written in `rsx!` (an `if`
+/// and a reactive text, each a `display: contents` wrapper), the shape of an
+/// app's file tree. Returns the app and the scroller.
+fn mount_open_tree() -> (RinchApp, NodeHandle) {
+    use rinch_components::{
+        RenderTreeNode, RenderTreeNodePayload, Tree, UseTreeOptions, UseTreeReturn,
+    };
+    let out: Rc<RefCell<Option<NodeHandle>>> = Rc::new(RefCell::new(None));
+    let out2 = out.clone();
+    let app = mount_settled(move |scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        let style = scope.create_element("style");
+        let css = scope.create_text(&format!(
+            "{ROW_CSS} {}",
+            rinch_components::generate_component_css()
+        ));
+        style.append_child(&css);
+        root.append_child(&style);
+        let mut open = std::collections::HashSet::new();
+        let data = open_tree(0, "n", 3, 5, &mut open);
+        let state = UseTreeReturn::new(UseTreeOptions {
+            initial_expanded: open,
+            ..Default::default()
+        });
+        let render_node: RenderTreeNode = Rc::new(
+            |p: &RenderTreeNodePayload, __scope: &mut RenderScope| {
+                let label = p.node.label.clone();
+                let folder = p.has_children;
+                let selected = p.selected_signal;
+                let value = p.node_value.to_string();
+                rsx! { span {
+                    if folder { b { "+" } }
+                    {|| if selected.get().contains(&value) { "*".to_string() } else { String::new() }}
+                    {label.clone()}
+                } }
+            },
+        );
+        let scroller = scope.create_element("div");
+        scroller.set_attribute("class", "scroller");
+        let tree = Tree {
+            data,
+            tree: Some(state),
+            render_node: Some(render_node),
+            ..Default::default()
+        }
+        .render(scope, &[]);
+        scroller.append_child(&tree);
+        root.append_child(&scroller);
+        *out2.borrow_mut() = Some(scroller.clone());
+        root
+    });
+    let scroller = out.borrow().clone().unwrap();
+    (app, scroller)
+}
+
+/// The second wheel notch over an open five-level `Tree` (#1719): paint visits
+/// the rows on screen and the open folders around them, not the 363 rows.
+///
+/// `paints_nothing_without_visit` gave up three levels down, and a tree row is
+/// deeper than that (`li > content > icon > svg > path`); a `display: contents`
+/// wrapper and a `0x0` box answered "visit me" outright. So every row scrolled
+/// out of view was entered, and every open folder around it, and a frame cost
+/// what the open rows cost: **604** visits on main. The question is now bounded
+/// by a count of nodes, a wrapper is looked through, and a box with no area
+/// and nothing to walk paints nothing: **172** — the rows on screen, the
+/// ink-margin band, and the chain of open folders above them.
+///
+/// An open folder's chevron is rotated, so a stacking context of its own; the
+/// hit test built every one's sequence (**129** builds on main). It now prunes
+/// a stacking context that hoists nothing on its flow extent before building
+/// its sequence: **9**. The rotated chevrons are still entered (one visit
+/// each, 135 nodes) — their transform is inverted on entry. The chevrons are
+/// hoisted past the tree's scroller, so its bar is drawn after them, over the
+/// rows (#1717 — the app's tree view): 1 deferred scroller.
+#[test]
+fn a_scrolled_open_tree_paints_the_rows_on_screen() {
+    let (mut app, scroller) = mount_open_tree();
+    let rows = app
+        .doc()
+        .unwrap()
+        .borrow()
+        .tree
+        .nodes
+        .iter()
+        .filter(|(_, n)| n.attributes.get("role").map(String::as_str) == Some("treeitem"))
+        .count();
+    assert_eq!(rows, 363, "positive control: every row is mounted");
+    interaction(&mut app, wheel_notch);
+    let first = scroller.scroll_top();
+    let s = interaction(&mut app, wheel_notch);
+    assert!(
+        scroller.scroll_top() > first && first > 0.0,
+        "positive control: both notches scrolled"
+    );
+    expect_frame(
+        "second wheel notch, open five-level tree",
+        &s,
+        &[
+            (LayoutResolves, 1),
+            (LayoutSkippedPaintOnly, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 122816),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 172),
+            (StackingOrderBuilds, 9),
+            (DeferredScrollbarsPainted, 1),
+            (GlyphAtlasHits, 325),
+            (ClipMasks, 3),
+            (ClipMaskPx, 367044),
+            (HitTests, 1),
+            (HitTestNodesVisited, 135),
+        ],
+    );
+}
+
+/// A 500-row scroller whose rows (and the scroller) are stacking contexts
+/// (`position: relative; z-index: 0`), each holding one in-flow child.
+fn mount_stacking_rows() -> (RinchApp, NodeHandle) {
+    let out: Rc<RefCell<Option<NodeHandle>>> = Rc::new(RefCell::new(None));
+    let out2 = out.clone();
+    let app = mount_settled(move |scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        let scroller = scope.create_element("div");
+        scroller.set_attribute(
+            "style",
+            "width: 300px; height: 400px; overflow-y: auto; position: relative; z-index: 0",
+        );
+        for _ in 0..SCROLL_ROWS {
+            let row = scope.create_element("div");
+            row.set_attribute("style", "height: 20px; position: relative; z-index: 0");
+            let mark = scope.create_element("div");
+            mark.set_attribute(
+                "style",
+                "width: 10px; height: 10px; background: rgb(0, 0, 200)",
+            );
+            row.append_child(&mark);
+            scroller.append_child(&row);
+        }
+        root.append_child(&scroller);
+        *out2.borrow_mut() = Some(scroller.clone());
+        root
+    });
+    let scroller = out.borrow().clone().unwrap();
+    (app, scroller)
+}
+
+/// Rows that are stacking contexts are entries of the scroller's paint
+/// sequence, and neither paint nor hit testing dismissed one without entering
+/// it (#1719). On main the notch visited **524** nodes in paint (each row
+/// culled on arrival by `subtree_is_entirely_outside`), **492** in its hit
+/// test, and built **515** sequences, one per row for the hit test. The loop
+/// now asks paint's question itself, and the hit test prunes a stacking
+/// context that hoists nothing on its flow extent: **45**, **3** and **26**
+/// (the rows paint draws).
+#[test]
+fn stacking_context_rows_are_culled_like_in_flow_rows() {
+    let (mut app, scroller) = mount_stacking_rows();
+    interaction(&mut app, wheel_notch);
+    let first = scroller.scroll_top();
+    let s = interaction(&mut app, wheel_notch);
+    assert!(
+        scroller.scroll_top() > first && first > 0.0,
+        "positive control: both notches scrolled"
+    );
+    expect_frame(
+        "second wheel notch, 500 stacking-context rows",
+        &s,
+        &[
+            (LayoutResolves, 1),
+            (LayoutSkippedPaintOnly, 1),
+            (PaintFrames, 1),
+            (RepaintPartial, 1),
+            (DamageRects, 1),
+            (RepaintedPx, 122816),
+            (SurfacePx, 480000),
+            (PaintNodesVisited, 45),
+            (StackingOrderBuilds, 26),
+            (ClipMasks, 2),
+            (ClipMaskPx, 245640),
+            (HitTests, 1),
+            (HitTestNodesVisited, 3),
+        ],
+    );
+}
+
+// ── A wake whose work changed nothing (#2608) ──────────────────────────────
+
+/// What reads the signal [`mount_signal_reader`] mounts.
+#[derive(Clone, Copy, Debug)]
+enum SignalReader {
+    /// Nothing subscribes to it.
+    Nobody,
+    /// An effect reads it and writes nothing.
+    IdleEffect,
+    /// A memo reads it and answers the same value for 0 and 1 (a tenth of it);
+    /// an effect reads the memo.
+    ConstantMemo,
+    /// The positive control: a text node shows it.
+    Text,
+    /// The second: an effect selects the first two characters of the focused
+    /// `.field` when it changes.
+    Selection,
+}
+
+/// A page of fixed text and a `Signal<u32>` read as `reader` says.
+fn mount_signal_reader(reader: SignalReader) -> (RinchApp, Signal<u32>) {
+    let signal = Signal::new(0_u32);
+    let app = mount_settled(move |scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        root.set_attribute(
+            "style",
+            "font-family: sans-serif; font-size: 14px; line-height: 20px;",
+        );
+        let fixed = scope.create_text("a fixed text");
+        root.append_child(&fixed);
+        match reader {
+            SignalReader::Nobody => {}
+            SignalReader::IdleEffect => {
+                rinch_core::Effect::new(move || {
+                    let _ = signal.get();
+                });
+            }
+            SignalReader::ConstantMemo => {
+                let constant = rinch_core::Memo::new(move || signal.get() / 10);
+                rinch_core::Effect::new(move || {
+                    let _ = constant.get();
+                });
+            }
+            SignalReader::Text => {
+                let shown = scope.create_element("div");
+                let text = scope.create_text("0");
+                shown.append_child(&text);
+                root.append_child(&shown);
+                rinch_core::Effect::new(move || {
+                    text.set_text(&signal.get().to_string());
+                });
+            }
+            SignalReader::Selection => {
+                let style = scope.create_element("style");
+                let css = scope.create_text(ROW_CSS);
+                style.append_child(&css);
+                root.append_child(&style);
+                let input = scope.create_element("input");
+                input.set_attribute("class", "field");
+                input.set_attribute("value", "typed");
+                let on_input = rinch_core::events::register_input_handler(
+                    rinch_core::events::InputCallback::new(|_| {}),
+                );
+                input.set_attribute("data-oninput", &on_input.0.to_string());
+                root.append_child(&input);
+                let field = input.clone();
+                rinch_core::Effect::new(move || {
+                    if signal.get() > 0 {
+                        field.set_selection_range(
+                            0,
+                            2,
+                            rinch_core::dom::SelectionDirection::Forward,
+                        );
+                    }
+                });
+            }
+        }
+        root
+    });
+    (app, signal)
+}
+
+/// One wake of the desktop loop that runs `work` as its queued main-thread
+/// work, the way `RinchRuntime::proxy_wake_up` runs a cross-thread
+/// `Signal::send` (a queued callback that writes the signal on this thread):
+/// the drain, the `ReRender` it queued, the wake's redraw decision
+/// ([`RinchApp::wake_wants_frame`]), then the loop's `AboutToWait`, and the
+/// frame if anything asked for one. Answers whether a frame was asked for, and
+/// the frame's counters (a turn's, when none was).
+fn wake(app: &mut RinchApp, work: impl FnOnce()) -> (bool, FrameStats) {
+    work();
+    let mut asked = app
+        .handle_event(PlatformEvent::UserEvent(UserEvent::ReRender), SIZE, 1.0)
+        .contains(&AppAction::RequestRedraw);
+    asked |= app.wake_wants_frame(false);
+    asked |= about_to_wait(app);
+    let stats = if asked {
+        paint(app)
+    } else {
+        app.end_perf_frame().expect("mounted")
+    };
+    (asked, stats)
+}
+
+/// Issue #2608: a signal written by a wake's work (a `Signal::send` from
+/// another thread) asked for a frame whether or not anything in the document
+/// changed, and the frame presented the cached one again — about 9.3 M
+/// instructions on the software renderer, a Vulkan present on the GPU one.
+/// Nobody reading the signal, an effect that writes nothing and a memo whose
+/// value did not change now cost the effect runs and no frame.
+///
+/// Positive controls: the same wake with a text node showing the signal asks
+/// for the frame and repaints the text, and one whose effect moves a focused
+/// field's selection asks for it too.
+#[test]
+fn a_signal_that_changes_nothing_on_screen_asks_for_no_frame() {
+    for (reader, baseline) in [
+        (SignalReader::Nobody, &[(SignalNotifies, 1)][..]),
+        (
+            SignalReader::IdleEffect,
+            &[(SignalNotifies, 1), (EffectRuns, 1)][..],
+        ),
+        (SignalReader::ConstantMemo, &[(SignalNotifies, 1)][..]),
+    ] {
+        let (mut app, signal) = mount_signal_reader(reader);
+        let (asked, frame) = wake(&mut app, || signal.set(1));
+        expect_frame(&format!("{reader:?}"), &frame, baseline);
+        assert!(
+            !asked,
+            "{reader:?}: a wake that changed nothing asked for a frame"
+        );
+    }
+
+    let (mut app, signal) = mount_signal_reader(SignalReader::Text);
+    let (asked, frame) = wake(&mut app, || signal.set(1));
+    assert!(asked, "the text showing the signal asked for no frame");
+    assert_eq!(frame.get(PaintFrames), 1, "{frame:?}");
+    assert_eq!(frame.get(PaintCachedFrames), 0, "{frame:?}");
+
+    // A selection, applied after the `ReRender`'s resolve.
+    let (mut app, signal) = mount_signal_reader(SignalReader::Selection);
+    interaction(&mut app, |app| click(app, 310.0, 310.0));
+    assert!(
+        matches!(app.focus_target, FocusTarget::Input(_)),
+        "precondition: the input holds the keyboard"
+    );
+    settle(&mut app);
+    let (asked, frame) = wake(&mut app, || signal.set(1));
+    assert!(asked, "the selection the signal moved asked for no frame");
+    assert_eq!(frame.get(PaintFrames), 1, "{frame:?}");
+    assert_eq!(frame.get(PaintCachedFrames), 0, "{frame:?}");
+}
+
+/// A redraw the platform asks for — a Wayland configure (winit asks for one on
+/// every configure, which KWin sends when it activates the window: #2608's
+/// "startup" frame), an expose, a surface to draw again — is served whatever
+/// the wake before it decided: the shell's `RedrawRequested` arm paints and
+/// presents unconditionally, here from the cached frame.
+#[test]
+fn a_platform_redraw_after_a_wake_that_changed_nothing_presents_the_cached_frame() {
+    let (mut app, signal) = mount_signal_reader(SignalReader::IdleEffect);
+    let (asked, _) = wake(&mut app, || signal.set(1));
+    assert!(!asked);
+    // `RedrawRequested`: `ShellWindow::paint_software` with nothing pending.
+    let frame = paint(&mut app);
+    expect_frame("platform redraw", &frame, &[(PaintCachedFrames, 1)]);
+}
+
+/// The wake's decision itself, each half alone (#2608). In the scenarios above
+/// the `ReRender`'s resolve and the `AboutToWait` after it ask for the frame
+/// too, so neither half is seen alone there.
+#[test]
+fn a_wake_wants_a_frame_for_paint_or_layout_left_pending_and_not_for_a_signal() {
+    let (mut app, signal) = mount_signal_reader(SignalReader::IdleEffect);
+    signal.set(1);
+    assert!(
+        !app.wake_wants_frame(false),
+        "a written signal with nothing on screen to show for it"
+    );
+
+    // Paint-only: the scene marked dirty, nothing to lay out.
+    app.request_repaint();
+    assert!(
+        !app.has_pending_layout(),
+        "precondition: nothing to lay out"
+    );
+    assert!(app.wake_wants_frame(false), "a scene marked dirty");
+    paint(&mut app);
+
+    // A DOM write not yet laid out, the scene not yet marked.
+    let held = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let slot = held.clone();
+    let mut app = mount_settled(move |scope: &mut RenderScope| {
+        let root = scope.create_element("div");
+        *slot.borrow_mut() = Some(root.clone());
+        root
+    });
+    held.borrow()
+        .as_ref()
+        .unwrap()
+        .set_attribute("class", "written");
+    assert!(
+        !app.scene_dirty,
+        "precondition: the scene is not yet marked"
+    );
+    assert!(app.wake_wants_frame(false), "a DOM write to lay out");
+    paint(&mut app);
+
+    // Layout owed with no node dirty: what a system font rescan leaves.
+    app.doc.as_ref().unwrap().borrow_mut().tree.layout_dirty = true;
+    assert!(!app.has_dirty_nodes(), "precondition: no node is dirty");
+    assert!(
+        app.wake_wants_frame(false),
+        "a layout owed with no node dirty"
+    );
+    app.doc.as_ref().unwrap().borrow_mut().tree.layout_dirty = false;
+
+    // Work another thread sent the app (#328) asks on its own.
+    assert!(!app.wake_wants_frame(false), "precondition: settled");
+    assert!(app.wake_wants_frame(true), "deferred work ran");
+}
+
+/// #2608 review: a window other than the main one is sent no `ReRender`, so a
+/// `set_selection_range` its effect queued is applied in that window's own
+/// `AboutToWait`, after the wake decided (nothing was pending then: the request
+/// was only queued). Applying it asks for the frame that draws it; before,
+/// only the wake's "a signal changed" did.
+#[test]
+fn a_selection_applied_in_about_to_wait_asks_for_its_frame() {
+    let (mut app, signal) = mount_signal_reader(SignalReader::Selection);
+    interaction(&mut app, |app| click(app, 310.0, 310.0));
+    assert!(
+        matches!(app.focus_target, FocusTarget::Input(_)),
+        "precondition: the input holds the keyboard"
+    );
+    settle(&mut app);
+    signal.set(1);
+    assert!(
+        !app.wake_wants_frame(false),
+        "precondition: the wake sees only a queued request"
+    );
+    assert!(
+        about_to_wait(&mut app),
+        "the selection AboutToWait applied asked for no frame"
+    );
+    let frame = paint(&mut app);
+    assert_eq!(frame.get(PaintFrames), 1, "{frame:?}");
+    assert_eq!(frame.get(PaintCachedFrames), 0, "{frame:?}");
+}

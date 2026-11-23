@@ -1,0 +1,1060 @@
+//! Per-frame performance counters.
+//!
+//! Every [`NodeTree`](crate::NodeTree) carries a [`PerfCounters`] in its
+//! `perf` field: a fixed array of plain `u64` counters, one per [`Counter`],
+//! bumped by the style, layout, text, paint and hit-testing code as it runs.
+//! They are always compiled in — an increment is a load and a store into a
+//! `Cell` the tree already owns, with no allocation and no branch on a flag —
+//! so a performance fix can be proven with a deterministic before/after
+//! number instead of a timing that moves with the host's load.
+//!
+//! The counters are split into a **current frame** and two accumulators.
+//! Whoever owns the frame loop — the desktop shell after each present, the
+//! embed context after each `update`, a test whenever it likes — calls
+//! [`PerfCounters::end_frame`], which folds the current frame into the
+//! running total, keeps it as the last completed frame and starts a new one.
+//! A document driven by nothing (a bare `RinchDocument` in a unit test) never
+//! ends a frame, so [`PerfCounters::frame`] then simply accumulates
+//! everything since the last [`PerfCounters::reset`].
+//!
+//! The `Time*Ns` counters are wall-clock nanoseconds summed over the frame.
+//! They are measured with one `Instant::now()` pair per *phase call* — each
+//! `resolve_styles`, `apply_stylo_styles_to_taffy`, `resolve_layout`, paint
+//! and present — and never per node. A phase can run several times a frame
+//! (every DOM insertion calls the two style phases synchronously), so that is
+//! a handful of clock reads per insertion, not one per frame. They are the only
+//! counters whose values are not deterministic.
+//!
+//! `RINCH_PERF` (any value) prints one summary line per ended frame to
+//! stderr: the phase times and every non-zero counter. The variable is read
+//! once per process ([`perf_env_enabled`]).
+//!
+//! Guide: `docs/src/guide/performance.md`.
+
+use std::cell::Cell;
+use std::fmt;
+use std::sync::OnceLock;
+
+macro_rules! define_counters {
+    ($( $(#[doc = $doc:literal])* $var:ident = $name:literal, )*) => {
+        /// One per-frame performance counter. See the [module docs](self).
+        ///
+        /// The discriminant indexes [`PerfCounters`]' array; `name()` is the
+        /// stable `snake_case` key used in `RINCH_PERF` output and the
+        /// `perf_stats` debug command's JSON.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        #[non_exhaustive]
+        pub enum Counter {
+            $( $(#[doc = $doc])* $var, )*
+        }
+
+        impl Counter {
+            /// Every counter, in declaration (and array) order.
+            pub const ALL: &'static [Counter] = &[$(Counter::$var,)*];
+            /// How many counters there are.
+            pub const COUNT: usize = Self::ALL.len();
+
+            /// The stable `snake_case` name of this counter.
+            pub const fn name(self) -> &'static str {
+                match self {
+                    $(Counter::$var => $name,)*
+                }
+            }
+
+            /// Look a counter up by its [`name`](Self::name).
+            pub fn from_name(name: &str) -> Option<Counter> {
+                match name {
+                    $($name => Some(Counter::$var),)*
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+define_counters! {
+    // ── Style ──────────────────────────────────────────────────────────
+    /// `resolve_styles` calls, including the synchronous ones every DOM
+    /// insertion makes.
+    StyleResolves = "style_resolves",
+    /// Elements that went through a full selector match and cascade.
+    ElementsCascaded = "elements_cascaded",
+    /// Elements cascaded again with the rule node their last match produced,
+    /// no selector matching (#2571): one whose only reason to restyle is an
+    /// inherited value its parent passed down, or a `color` / `font-size`
+    /// animation sample of its own. Not counted in `elements_cascaded`.
+    ElementsRecascaded = "elements_recascaded",
+    /// Nodes the style walk visited, cached ones included. The gap between
+    /// this and `elements_cascaded` is the walk's overhead.
+    StyleNodesVisited = "style_nodes_visited",
+    /// `::before` / `::after` resolution attempts (two per cascaded element).
+    PseudoElementPasses = "pseudo_element_passes",
+    /// Full-document restyle *requests*, any reason. Each is also counted
+    /// under one of the `full_restyle_*` reasons below. Two requests can land
+    /// in one walk (a theme restyle that also changes the root font-size counts
+    /// twice), so this can exceed the number of full walks actually made.
+    FullRestyles = "full_restyles",
+    /// ...because the viewport size changed (`resolve_layout`).
+    /// Only when the resize flipped a media query's result; a resize that
+    /// flips none restyles just the viewport-unit users
+    /// (`viewport_unit_restyles`).
+    FullRestyleViewport = "full_restyle_viewport",
+    /// ...because the theme or another whole-document style input changed
+    /// (`recompute_all_styles_full`).
+    FullRestyleTheme = "full_restyle_theme",
+    /// ...because a stylesheet was added, replaced or removed (`load_css`, a
+    /// `<style>` element) with a rule Stylo's stylesheet invalidation cannot
+    /// target by id, class or tag (`flush_stylist`, #884). A sheet it can
+    /// target restyles only the elements it names and counts nothing here.
+    FullRestyleStylesheet = "full_restyle_stylesheet",
+    /// ...because the device pixel ratio changed.
+    FullRestyleDpr = "full_restyle_dpr",
+    /// ...because the root element's font-size (the `rem` basis) changed.
+    FullRestyleRootFontSize = "full_restyle_root_font_size",
+    /// Elements whose attribute or state change Stylo's invalidator examined
+    /// (one per snapshotted element per resolve).
+    StyleInvalidations = "style_invalidations",
+    /// Elements a media-neutral viewport resize restyled because their last
+    /// cascade resolved a viewport unit (each with its subtree).
+    ViewportUnitRestyles = "viewport_unit_restyles",
+    /// `resolve_styles` walked the whole document from `<html>` because a
+    /// whole-document restyle asked for it or the first layout has not
+    /// completed yet.
+    FullStyleWalks = "full_style_walks",
+    /// Nodes `apply_stylo_styles_to_taffy` processed.
+    TaffyStyleSyncs = "taffy_style_syncs",
+    /// ...of which the resulting Taffy style differed and was written.
+    TaffyStyleChanges = "taffy_style_changes",
+
+    /// IFC roots whose read-only selection highlight (`data-text-sel*`) was
+    /// written by the app: only the roots whose part of a selection changed.
+    ReadOnlySelectionWrites = "read_only_selection_writes",
+
+    /// Text controls whose spelling marks the spellchecker wrote
+    /// (`RinchDocument::set_spelling_marks`, #2862): one per write that
+    /// changed them. Zero in an app whose fields were never checked.
+    SpellingMarkWrites = "spelling_mark_writes",
+
+    // ── Text ───────────────────────────────────────────────────────────
+    /// `RinchDocument::inline_style_props` resolved a span's `font-family`
+    /// through `fonts::parley_font_family` (review of #1326): a generic
+    /// expansion plus a cache lookup and an owned `Cow` clone even on a hit,
+    /// which is not free per span. Pushed only when the element's own
+    /// computed `font_family` differs from the enclosing IFC context's —
+    /// `font-family` is inherited, so an element that does not declare its
+    /// own already carries the right value and needs no per-span override —
+    /// so this counts resolutions actually done, never the common
+    /// unchanged-family case. `perf_regression_scenarios.rs`'s
+    /// `inline_font_family_resolve_scenarios` pins both halves: zero for a
+    /// document of spans that don't change the family, and one per span
+    /// that does.
+    InlineFontFamilyResolves = "inline_font_family_resolves",
+    /// Parley layouts built by the Taffy measure function for an IFC root.
+    ShapeMeasureIfc = "shape_measure_ifc",
+    /// Parley layouts the same measure built a second time, at the width it
+    /// answered (#2425): a box sized by its content whose min-content width
+    /// is wider than the room it was offered is laid out with the lines of
+    /// its own width, not the room's. Not built when the room's lines have
+    /// no soft break and no atomic inline (one line, or every break forced):
+    /// those are already the lines at any wider width (#2540). Not counted
+    /// in `shape_measure_ifc`.
+    IfcRebreakAtWidth = "ifc_rebreak_at_width",
+    /// Parley layouts built by the Taffy measure function for a text leaf.
+    ShapeMeasureText = "shape_measure_text",
+    /// Parley layouts built by `build_ifc_layouts` (the layouts paint uses).
+    ShapeIfcBuild = "shape_ifc_build",
+    /// IFC roots whose kept lines had their `position: relative` inline
+    /// offsets moved without a rebuild (`refresh_relative_spans`, #2412,
+    /// #2457): an inset changed, or the containing block's height did.
+    RelativeSpanRefreshes = "relative_span_refreshes",
+    /// Parley layouts built while sizing an atomic inline
+    /// (`inline-block` / `inline-flex` / `inline-grid`).
+    ShapeAtomicInline = "shape_atomic_inline",
+    /// `text-overflow: ellipsis` rebuilds of an IFC root's layout, one per
+    /// root whose lines overflow.
+    EllipsisBuilds = "ellipsis_builds",
+    /// Parley layouts those rebuilds shaped: the "…" itself, the rebuilt
+    /// layout (again if it had to fall back to hard breaks, and again per
+    /// step back from a cut line's kerning overshoot), and each prefix the
+    /// whole-text binary search tried. The per-line cut of #1091 walks
+    /// the clusters already shaped, so it adds none however many lines it
+    /// cuts.
+    EllipsisShapes = "ellipsis_shapes",
+    /// Parley layouts built by paint itself: every `<input>` / `<textarea>`
+    /// value and `<select>` label, every frame they are painted, plus the
+    /// fallback for text with no cached layout. (Query-time shaping — hit
+    /// testing an input, the MCP text tools — is not counted.)
+    ShapePaint = "shape_paint",
+    /// Parley layouts built to size a closed `<select>`: one per non-empty
+    /// option label, when an auto-width select's labels or font changed
+    /// since it was last sized (#1098). A restyle that moves neither shapes
+    /// none.
+    ShapeSelectLabel = "shape_select_label",
+    /// Parley layouts built to find a text-entry control's primary font —
+    /// the `<input>` or `<textarea>` whose intrinsic width is its `size` or
+    /// `cols` times that font's average character width (#1177). One per
+    /// control when it is first sized and when its font family, weight or
+    /// style changes; a restyle that moves none of them shapes none.
+    ShapeFormControlMetrics = "shape_form_control_metrics",
+    /// Parley layouts built to shape a `submit`/`reset`/`button` `<input>`'s
+    /// label, or a date/time-family/`file` `<input>`'s representative
+    /// picker string (#1195, review of #1302). Cached the same way
+    /// [`ShapeFormControlMetrics`](Counter::ShapeFormControlMetrics) is — one
+    /// per control when it is first sized and when its label, font family,
+    /// weight, style, letter-spacing or word-spacing changes; a restyle that
+    /// moves none of them shapes none.
+    ShapeFormControlLabel = "shape_form_control_label",
+    /// Parley layouts built to scroll a text control: a focused single-line
+    /// `<input>`'s displayed text, unwrapped, for the caret's x and the line's
+    /// width (#1721), and a `<textarea>`'s, wrapped, for the caret's line and
+    /// the text's height — its scroll extent (#827). One per change of that
+    /// text, its wrap width or its font; paint, the IME poll, a click, the
+    /// wheel and the caret rect at an unchanged state reuse it, and a caret
+    /// move in the focused field reads the caret off its kept layout
+    /// (`form_control::displayed_metrics`). An unfocused field keeps no layout,
+    /// so a caret write to one shapes.
+    ShapeInputScroll = "shape_input_scroll",
+    /// IFC measures served from `ifc_measure_cache` without shaping.
+    IfcMeasureCacheHits = "ifc_measure_cache_hits",
+    /// Per-root invalidations of the IFC measure cache by a restyle or a
+    /// content change (`NodeTree::forget_ifc_measures`, O(1) each).
+    IfcMeasureInvalidations = "ifc_measure_invalidations",
+    /// IFC roots the structural pass found new or changed (their content
+    /// signature moved), and so dropped the measures and paint layout of.
+    /// The roots it left alone keep both.
+    IfcSignatureChanges = "ifc_signature_changes",
+    /// Parley layouts (of any of the kinds above) broken a second time to
+    /// hang preserved trailing spaces at a soft wrap, or to move a break
+    /// parley put after a no-break space it hung (#1218)
+    /// (`break_lines_hanging_spaces`, which a text leaf is broken by too). At most one per
+    /// layout, however many lines it fixes — the linearity pin.
+    IfcHangPasses = "ifc_hang_passes",
+    /// Lines those passes broke again: at a widened width to keep their
+    /// spaces and tabs on the line they hang from, or once per line that
+    /// ended after a hung NBSP.
+    IfcHangLines = "ifc_hang_lines",
+    /// Parley layouts broken once more to drop the empty line parley commits
+    /// after an inline box placed by an emergency break (#1050), or after a
+    /// forced break (`<br>`, a preserved newline) that ends the text (#1172)
+    /// (`ifc::phantom_last_line`). Every min-content measure of a paragraph
+    /// that ends in an atomic inline pays one: at width 0 every box takes the
+    /// emergency branch; so does every measure and build of a paragraph
+    /// ending in a forced break. On the `pre-wrap` route it is the second hanging
+    /// pass, which `ifc_hang_passes` does not count again.
+    IfcPhantomRebreaks = "ifc_phantom_rebreaks",
+    /// Breaks of a single line `ifc::unglue` made to move a line break
+    /// parley put after a no-break space it hung (#1218): a few per such
+    /// line — logarithmic, not linear, in the length of an NBSP-glued chain,
+    /// which a search over the line's units keeps it.
+    IfcUnglueRebreaks = "ifc_unglue_rebreaks",
+    /// Builds of a paragraph after its first, made to put its preserved
+    /// tabs at their tab stops (#1122): shaped and broken again with each
+    /// tab widened. One for tabs on lines that do not wrap; at most three.
+    IfcTabRebuilds = "ifc_tab_rebuilds",
+    /// Lines the hanging-space pass asked `ifc::css_line` where CSS ends
+    /// them, each a scan of the line's units (#1426 edge boxes, #1238
+    /// seams, #1243 `pre` spaces): a line whose break parley may have put
+    /// where CSS does not. One per such line of a pass, not per paragraph.
+    IfcCssLineScans = "ifc_css_line_scans",
+
+    // ── Layout ─────────────────────────────────────────────────────────
+    /// `resolve_layout` calls.
+    LayoutResolves = "layout_resolves",
+    /// ...that skipped Taffy because nothing layout-affecting changed and
+    /// no text needed reshaping (paint-only).
+    LayoutSkippedPaintOnly = "layout_skipped_paint_only",
+    /// ...that skipped Taffy but rebuilt dirty IFC text layouts.
+    LayoutSkippedTextOnly = "layout_skipped_text_only",
+    /// IFC structural setup passes, whole-document or scoped
+    /// (`sync_display_contents` + `setup_inline_formatting_contexts` +
+    /// `sync_text_contexts` + atomic-inline sizing). Same semantics as the
+    /// never-reset `NodeTree::ifc_setup_passes` counter (#875), per frame.
+    IfcSetupPasses = "ifc_setup_passes",
+    /// ...of which covered the **whole document**. Each is also counted under
+    /// one `ifc_full_*` reason below. The common route is the scoped pass;
+    /// a full one is the fallback for a change that did not say where it was.
+    IfcFullPasses = "ifc_full_passes",
+    /// ...the first layout of a document.
+    IfcFullInitial = "ifc_full_initial",
+    /// ...a whole-document restyle (`recompute_all_styles_full`: a theme or
+    /// dark-mode change), which re-derives every node's display.
+    IfcFullTheme = "ifc_full_theme",
+    /// ...`NodeTree::ifc_dirty` was written directly, with no reason and no
+    /// seed — a test forcing a pass, or a structural change nobody scoped.
+    IfcFullUnattributed = "ifc_full_unattributed",
+    /// ...of which were **scoped** (`crate::ifc_scope`): only the formatting
+    /// containers a mutation reached were set up again.
+    IfcScopedPasses = "ifc_scoped_passes",
+    /// Formatting containers a scoped pass set up again.
+    IfcScopeContainers = "ifc_scope_containers",
+    /// Nodes in those containers' scope: the containers, every node of their
+    /// inline/`display: contents` region, and the boxes directly under it.
+    IfcScopeNodes = "ifc_scope_nodes",
+    /// Root Taffy computes (`run_taffy_compute`). Mirrors
+    /// `NodeTree::taffy_computes`.
+    TaffyRootComputes = "taffy_root_computes",
+    /// Taffy measure-function invocations during root computes.
+    TaffyMeasureCalls = "taffy_measure_calls",
+    /// Standalone Taffy computes sizing an atomic inline outside the root
+    /// compute.
+    InlineBlockComputes = "inline_block_computes",
+    /// Extra root computes the `calc(%, px)` fixpoint ran.
+    CalcFixpointPasses = "calc_fixpoint_passes",
+    /// Extra root computes run because an absolute box's containing block —
+    /// an ancestor that is not its layout parent — came out of the compute
+    /// at a size the box's Taffy style was not baked for (#386) — or, for a
+    /// containing block that is an inline span, came out of the **lines**
+    /// built after the compute at such a size (#631).
+    AbsContainingBlockPasses = "abs_containing_block_passes",
+    /// Absolute boxes resolved against a containing block Taffy does not
+    /// know — a non-parent ancestor (#386) or the initial containing block
+    /// (#204) — one per box per pass that looks at it: the size check after
+    /// each root compute (ancestor boxes only), the placement as a layout is
+    /// read back, the second placement at the end of a layout in which
+    /// something on the way to a containing block moved late (an atomic
+    /// inline, an anonymous block box, a clamped scroll offset), and the
+    /// placement a scroll runs. A box whose containing block is an inline
+    /// span (#631) is counted once more by the size check that follows the
+    /// lines being built, and makes the second placement run in every layout
+    /// (the lines are what it is placed in). An absolute child of its own
+    /// positioned parent is never counted, and a scroll counts only when the scrolled
+    /// box lies between such a box and its containing block.
+    AbsBoxesVisited = "abs_boxes_visited",
+    /// Inline formatting contexts whose lines were measured for the inline
+    /// spans absolute boxes hang from (#631): once per context per set of
+    /// lines, however many spans it holds.
+    AbsInlineMeasures = "abs_inline_measures",
+    /// What those measurements looked at: the context's entries (and the
+    /// ancestors of each up to the context's root), its line items and
+    /// clusters, and each span's own clusters on its first and last line.
+    /// Linear in the context for any number of sibling spans in it.
+    AbsInlineMeasureSteps = "abs_inline_measure_steps",
+    /// Outside list markers placed beside their item's first line
+    /// (`crate::list_marker`, #1356): one per marker per layout that looks at
+    /// it — a marker newly generated (its item cascaded), or one whose item
+    /// had a box inside it move or resize, or gain new lines. A layout that
+    /// only moves whole items (a box above the list grew) places none.
+    ListMarkersPlaced = "list_markers_placed",
+    /// The notes looked at to find an out-of-flow box's static position in
+    /// its lines (`InlineLayout::out_of_flow`, #632): one per look, however
+    /// many boxes the lines hold — the box carries its note's index.
+    AbsStaticLookupSteps = "abs_static_lookup_steps",
+
+    // ── Paint ──────────────────────────────────────────────────────────
+    /// (span, line) pairs looked at to find what IFC roots draw past their
+    /// line boxes — inline backgrounds and borders, `vertical-align`-shifted
+    /// text, wavy underlines (`paint::text::inline_ink_past_lines`, #1815,
+    /// #1817): by paint, the clip proof, damage and the painted-state refresh.
+    /// A span visits only the lines it is on.
+    InlineSpanLineVisits = "inline_span_line_visits",
+    /// Frames actually painted (a scene or pixel buffer rebuilt).
+    PaintFrames = "paint_frames",
+    /// Redraws served from the cached scene/pixels with nothing dirty.
+    PaintCachedFrames = "paint_cached_frames",
+    /// Frames painted for a hidden window to prepare its next show and not
+    /// presented (`prepare_current_window`, #2633). A frame that counts one
+    /// is printed `[PERF] prepared N:` rather than `[PERF] frame N:`, and
+    /// [`PerfCounters::frames`] does not count it ([`PerfCounters::prepared`]
+    /// does).
+    PreparedFrames = "prepared_frames",
+    /// Software frames copied into the window's surface and presented
+    /// (`SoftbufferRenderer::present_pixels`): one per redraw, except a
+    /// redraw [`Counter::SoftPresentsSkipped`] counts.
+    SoftPresents = "soft_presents",
+    /// Software redraws that presented nothing because the window's surface
+    /// already shows the frame (#2698): no pixel changed since the last
+    /// present to it, and the surface keeps what it was given (Wayland). A
+    /// redraw asked for by something that changed nothing on screen — a
+    /// compositor's configure at the same size, an input method enabled —
+    /// costs no second copy of the same pixels.
+    SoftPresentsSkipped = "soft_presents_skipped",
+    /// Software frames repainted inside a dirty region.
+    RepaintPartial = "repaint_partial",
+    /// Software frames whose scene was marked dirty but whose damage named
+    /// nothing on screen: every change was attributed to nodes or overlays,
+    /// and none of them reached a visible pixel. The previous pixels were kept
+    /// and nothing was painted.
+    RepaintNone = "repaint_none",
+    /// Rects the partial repaints cleared and painted (at most
+    /// `MAX_DAMAGE_RECTS` per frame). Two changes far apart are two rects, not
+    /// the span between them.
+    DamageRects = "damage_rects",
+    /// Full repaints, any reason. Each is also counted under one
+    /// `repaint_full_*` reason below.
+    RepaintFull = "repaint_full",
+    /// ...the first frame (no previous pixels to keep).
+    RepaintFullFirstFrame = "repaint_full_first_frame",
+    /// ...the surface was resized.
+    RepaintFullResize = "repaint_full_resize",
+    /// ...the scene was marked dirty by something that named no damage
+    /// (`RinchApp::mark_scene_dirty`) and nothing else was damaged, so which
+    /// pixels changed is unknown. Every site the framework itself owns names
+    /// its damage; what is left here is an application or embedder calling
+    /// `mark_scene_dirty`, and a window the shell has just re-created. (The
+    /// software `GameViewport` frames were here until #361 painted them inline,
+    /// with the viewport's box as their damage.)
+    RepaintFullUnattributed = "repaint_full_unattributed",
+    /// ...the damage covered half the surface or more (the sum of its rects).
+    RepaintFullRegionTooLarge = "repaint_full_region_too_large",
+    /// ...the whole document was restyled (a stylesheet, the viewport, the
+    /// device pixel ratio or the root font-size changed), which can change any
+    /// node's paint without naming one.
+    RepaintFullRestyle = "repaint_full_restyle",
+    /// ...the theme CSS changed.
+    RepaintFullTheme = "repaint_full_theme",
+    /// ...the previous frame was invalidated for a reason not listed above.
+    RepaintFullInvalidated = "repaint_full_invalidated",
+    /// ...a whole-scene GPU encode (`build_scene`: embed, Android, DevTools;
+    /// the desktop window repaints its damage, #1718).
+    RepaintFullGpu = "repaint_full_gpu",
+    /// Area of the software dirty region repainted, in physical pixels
+    /// (the whole surface for a full repaint).
+    RepaintedPx = "repainted_px",
+    /// Area of the surface, in physical pixels, summed per painted frame —
+    /// `repainted_px / surface_px` is the repainted fraction.
+    SurfacePx = "surface_px",
+    /// Nodes `paint_node` visited.
+    PaintNodesVisited = "paint_nodes_visited",
+    /// Lines of text paint skipped without drawing a glyph, because their
+    /// ink cannot reach the window, the clips the painter has open or a
+    /// partial repaint's damage (#2314; `paint::text::draw_text`). Counted
+    /// per pass: a line skipped by its shadow's pass and its text's counts
+    /// twice. The paint cull works per node, and a long paragraph is one.
+    TextLinesCulled = "text_lines_culled",
+    /// Work a removal (or a move to another parent) did to record the old
+    /// pixels of what it took out (#909): one per node recorded, plus one per
+    /// ancestor the clip-chain walk stepped through for it. Linear in what
+    /// was removed times its depth, never in what else is pending: clearing
+    /// a list row by row went quadratic in #958's first round with no counter
+    /// to show it. Work added to that path belongs in this counter.
+    RemovalDamageSteps = "removal_damage_steps",
+    /// Stacking-order sequences built (`stacking_paint_order`), by paint and
+    /// hit testing alike.
+    StackingOrderBuilds = "stacking_order_builds",
+    /// Scroll containers whose overlay bars a stacking-context sequence drew
+    /// after their positioned descendants (#1717). Bars of a scroller outside
+    /// the window or the damage are not drawn, and not counted.
+    DeferredScrollbarsPainted = "deferred_scrollbars_painted",
+    /// Pixels of blurred `inset` box-shadow built by paint (#974): the
+    /// image each blurred inset shadow is computed over, cropped to what the
+    /// frame can show — render target, open clips and a partial repaint's
+    /// damage. Rebuilt on every paint of the box (no cache), so a small
+    /// repaint inside a large shadowed panel should cost a small number here.
+    InsetShadowMaskPx = "inset_shadow_mask_px",
+    /// Offscreen rasters drawn for a `filter` that moves pixels (`blur()`,
+    /// `drop-shadow()`, #2719): one per filtered box painted, on both
+    /// painters (the GPU painter draws the raster as an image). Rebuilt on
+    /// every paint of the box.
+    FilterRasters = "filter_rasters",
+    /// Pixels of those rasters: the part of the box that can show, grown by
+    /// how far its filter spreads ink, so a small repaint inside a large
+    /// blurred panel should cost a small number here.
+    FilterRasterPixels = "filter_raster_pixels",
+    /// Backdrops painted for a `backdrop-filter` (#2719): one per backdrop
+    /// element painted, each the second paint of what is behind it.
+    BackdropRasters = "backdrop_rasters",
+    /// Pixels of those backdrops: the part of the element's box that shows,
+    /// grown by the filter's reach.
+    BackdropRasterPixels = "backdrop_raster_pixels",
+    /// Backdrops drawn from the one kept from an earlier paint (#2719):
+    /// nothing behind the element, within its reach, changed.
+    BackdropCacheHits = "backdrop_cache_hits",
+    /// Filtered boxes drawn from the raster kept from an earlier paint
+    /// (#2719): nothing in them changed, so no paint and no filter, an
+    /// image draw (on the GPU, of the image Vello already holds).
+    FilterCacheHits = "filter_cache_hits",
+    /// Blurred `text-shadow` masks rasterised and blurred by paint (#980).
+    /// A mask is kept between paints, keyed by what it was rasterised from
+    /// (each glyph by the pixel it lands on), so a repaint of unchanged text
+    /// wholly on screen — a scroll by whole pixels, or by fractions that move
+    /// no glyph to another pixel — rasterises none. A shadow cut by the
+    /// window, a clip or the damage is rasterised again whenever that cut
+    /// moves across it: a fling over a scroller of shadowed text rasterises a
+    /// few masks a frame (3 to 10 in the review of #1020, round 3).
+    TextShadowMasksRasterised = "text_shadow_masks_rasterised",
+    /// Glyphs drawn from the glyph-mask atlas (#2286): a mask already
+    /// rasterised for the glyph's font, size and sub-pixel bucket. Both
+    /// painters draw from one atlas a thread.
+    GlyphAtlasHits = "glyph_atlas_hits",
+    /// Glyphs the atlas had to rasterise (and then kept).
+    GlyphAtlasMisses = "glyph_atlas_misses",
+    /// GPU only: atlas masks a Vello scene drew for the first time, each made
+    /// into the image Vello uploads once and keeps resident while it is drawn.
+    /// Vello's own re-uploads (a new renderer, its atlas short of space) are
+    /// not seen here.
+    GlyphAtlasUploads = "glyph_atlas_uploads",
+    /// Atlas masks evicted to keep within its byte budget.
+    GlyphAtlasEvictions = "glyph_atlas_evictions",
+    /// GPU only: glyphs a Vello scene drew as outlines rather than from the
+    /// atlas: a colour glyph, a device size past `ATLAS_MAX_FONT_PX`, a
+    /// rotation, skew or uneven scale, a synthetic italic, a non-solid brush.
+    GlyphOutlineFallbacks = "glyph_outline_fallbacks",
+    /// Software painter: clip masks pushed.
+    ClipMasks = "clip_masks",
+    /// Software painter: mask pixels those clips were filled and intersected
+    /// over — each clip's own bounds, not the surface; none for a clip that
+    /// fully covers the clip enclosing it, and no intersection for one inside
+    /// the enclosing clip's fully covered area (#907).
+    ClipMaskPx = "clip_mask_px",
+    /// Software painter: opacity layers opened.
+    PaintLayers = "paint_layers",
+    /// Software painter: layer pixels composited back onto their parent —
+    /// the part of each layer something was drawn into.
+    LayerPx = "layer_px",
+    /// Software painter: surface-sized masks and layer pixmaps newly
+    /// allocated rather than reused from its pool. Zero in a steady state.
+    PaintSurfaceAllocs = "paint_surface_allocs",
+    /// Software painter: pooled masks and layer pixmaps released at the end
+    /// of a frame because no recent frame needed that many at once.
+    PaintSurfaceTrims = "paint_surface_trims",
+    /// Software painter: images premultiplied at draw time. A cached `<img>`
+    /// or `background-image` is premultiplied once, on its first software
+    /// paint; a live frame source every draw, unless its producer vouched it
+    /// opaque (then never).
+    ImagePremultiplies = "image_premultiplies",
+    /// Images painted this frame, on either painter (#2769): one per `<img>`
+    /// whose decoded image was drawn, and one per `background-image` `url()`
+    /// layer drawn on an element — **once per element and layer**, however
+    /// many tiles it repeats into or draw calls it takes (a repeating
+    /// pattern is one fill, a `no-repeat` tile drawn tile by tile is still
+    /// one). Counted by the paint walk both painters share, after the cull:
+    /// an image outside the window, the open clips or a partial repaint's
+    /// damage (its tiles' area, for a background) counts nothing, nor does
+    /// an `<img>` still showing its placeholder or a layer not decoded yet.
+    /// SVG files count like raster images, through either their raster or
+    /// their mipmap level. Not counted: gradients, `mask-image`,
+    /// `border-image`, and live frame sources (`RenderSurface`, video,
+    /// `GameViewport`). A cached filter raster drawn again does not redraw
+    /// the images inside it, so they count only in the frame that rasterises
+    /// it.
+    ImageDraws = "image_draws",
+    /// Background layers painted as a repeating pattern whose tile had to be
+    /// rasterised this frame (#468): a new image, gradient or tile size.
+    BackgroundTileRasters = "background_tile_rasters",
+    /// …and those whose rasterised tile came from the cache — a repaint
+    /// that did not change the layer.
+    BackgroundTileCacheHits = "background_tile_cache_hits",
+    /// Software painter: opaque images copied straight into the surface
+    /// instead of sampled through `draw_pixmap` — a frame whose producer
+    /// vouched every pixel opaque, drawn with no rotation or skew, a positive scale, destination edges on whole pixels, and a clip that is fully on or fully off wherever the frame lands (#361). Scaled draws count.
+    OpaqueImageCopies = "opaque_image_copies",
+    /// Software painter: erases done as a plain `Source`-transparent rect fill
+    /// (a `GameViewport` clearing its square box under no rotation, skew or
+    /// clip mask, #1866) instead of a path blended `destination-out`.
+    RectErases = "rect_erases",
+    /// GPU window, split path (#1865): video frames uploaded for the
+    /// compositor. One per new frame of a video the window composites split,
+    /// after paint; a video drawn in the scene uploads none here.
+    SplitFrameUploads = "split_frame_uploads",
+    /// GPU window, split path (#1865 S4): kept regions a partial frame did
+    /// not re-render below over, because every change in them was painted
+    /// after the surface (into its above slices).
+    SplitBelowKept = "split_below_kept",
+    /// GPU window, split path (#1865 S4): nodes the attribution walked to
+    /// find a negatively z-indexed descendant hoisted out of a changed box
+    /// (at most 256 a changed box, on frames with a surface kept split).
+    SplitHoistWalkNodes = "split_hoist_walk_nodes",
+    /// GPU window: Vello renderers built for it (its pipelines; the shader
+    /// translation is cached, #2499). One when the window first presents on
+    /// the GPU. A window hidden and shown again keeps its renderer and makes
+    /// only a new surface (#2545), so a show counts none, unless the kept
+    /// renderer cannot present to the new window and a new one is built.
+    GpuRenderersBuilt = "gpu_renderers_built",
+    /// GPU only: an estimate of the tiles this frame's clips and layers ask
+    /// Vello for, in its 16px tiles. Vello allocates them over a clip's or
+    /// layer's whole bounds, whatever it holds, and its tile and ptcl buffers
+    /// are fixed: past them the frame is dropped, and a transparent window goes
+    /// blank (Pimble's nearly empty window asked for 2.8M). The sum, over each
+    /// clip and layer encoded into a scene, of the tiles its device bounding
+    /// box covers inside that scene's render target. A clip the painter elided
+    /// costs nothing. **Not Vello's `bump.tile`**: fills and glyphs are left
+    /// out, and a clip nested in a smaller one is overstated, since Vello cuts
+    /// it by its parents' bounds and this does not
+    /// (`VelloPainter::clip_tiles`). Added once for each frame that encodes a
+    /// scene, by the pass whose scene is rendered. `0` on a software frame
+    /// (tiny-skia has no tiles; `clip_mask_px` and `layer_px` are its cost) and
+    /// on a cached redraw, which encodes nothing.
+    VelloClipTiles = "vello_clip_tiles",
+
+    // ── Input ──────────────────────────────────────────────────────────
+    /// Hit tests run (`RinchApp::hit_test`).
+    HitTests = "hit_tests",
+    /// Nodes the hit tests visited.
+    HitTestNodesVisited = "hit_test_nodes_visited",
+    /// Subtree extents the hit tester computed so it could skip subtrees
+    /// nowhere near the pointer. Memoised until the tree or its layout
+    /// changes, so a run of pointer moves over a still document computes each
+    /// once.
+    HitExtentsComputed = "hit_extents_computed",
+    /// Nodes visited by the scroll probes: the scrollbar search a press runs
+    /// before it resolves a click (`find_scrollbar_hit`), and the wheel's
+    /// geometric fallback (`find_scroll_container_at_point` and its
+    /// horizontal twin). Each is the hit test's own walk, so it visits what
+    /// a `hit_test` at the same point visits (#2684).
+    ScrollProbeNodesVisited = "scroll_probe_nodes_visited",
+    /// Input regions computed (#2741): a window whose `InputRegion` is
+    /// `Painted` or `Marked` walks its boxes once when its geometry or
+    /// styles changed since the last computation, and not otherwise.
+    InputRegionComputes = "input_region_computes",
+    /// Nodes those computations visited.
+    InputRegionNodesVisited = "input_region_nodes_visited",
+    /// Input regions handed to the windowing system: only a region that
+    /// differs from the one the window has.
+    InputRegionSends = "input_region_sends",
+
+    // ── Reactive (folded in by the shell from rinch-core's counters) ───
+    /// Effect bodies run. A memo's invalidation marker runs through the same
+    /// runner, so each memo invalidated counts one; its lazy recompute does
+    /// not. Per thread: a DevTools window on the same thread
+    /// adds its own effects, and the frame-time signals the shell writes for
+    /// it, to every frame while it is visible.
+    EffectRuns = "effect_runs",
+    /// Signal change notifications.
+    SignalNotifies = "signal_notifies",
+    /// `ReRender` native events queued to the desktop event loop.
+    RerenderEventsQueued = "rerender_events_queued",
+
+    // ── Phase timings (wall clock, nanoseconds) ────────────────────────
+    /// Style resolution and Taffy style sync.
+    TimeStyleNs = "time_style_ns",
+    /// Layout, excluding the style time spent inside it.
+    TimeLayoutNs = "time_layout_ns",
+    /// ...of which the IFC structural setup pass.
+    TimeIfcSetupNs = "time_ifc_setup_ns",
+    /// ...of which root Taffy computes (measure-time shaping included).
+    TimeTaffyComputeNs = "time_taffy_compute_ns",
+    /// ...of which `build_ifc_layouts` (paint-layout shaping).
+    TimeBuildIfcNs = "time_build_ifc_ns",
+    /// Building the scene or pixel buffer.
+    TimePaintNs = "time_paint_ns",
+    /// Presenting: the GPU raster + submit, or the softbuffer copy.
+    TimePresentNs = "time_present_ns",
+}
+
+/// Why a frame was repainted in full. Stored by the shell when it throws its
+/// previous frame away, and turned into the matching `repaint_full_*`
+/// [`Counter`] when the frame is painted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FullRepaintReason {
+    FirstFrame,
+    Resize,
+    Unattributed,
+    RegionTooLarge,
+    Restyle,
+    Theme,
+    Invalidated,
+    Gpu,
+}
+
+impl FullRepaintReason {
+    /// The `repaint_full_*` counter for this reason.
+    pub const fn counter(self) -> Counter {
+        match self {
+            Self::FirstFrame => Counter::RepaintFullFirstFrame,
+            Self::Resize => Counter::RepaintFullResize,
+            Self::Unattributed => Counter::RepaintFullUnattributed,
+            Self::RegionTooLarge => Counter::RepaintFullRegionTooLarge,
+            Self::Restyle => Counter::RepaintFullRestyle,
+            Self::Theme => Counter::RepaintFullTheme,
+            Self::Invalidated => Counter::RepaintFullInvalidated,
+            Self::Gpu => Counter::RepaintFullGpu,
+        }
+    }
+}
+
+/// Why the whole document was restyled; see the `full_restyle_*` counters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FullRestyleReason {
+    Viewport,
+    Theme,
+    Stylesheet,
+    Dpr,
+    RootFontSize,
+}
+
+impl FullRestyleReason {
+    /// The `full_restyle_*` counter for this reason.
+    pub const fn counter(self) -> Counter {
+        match self {
+            Self::Viewport => Counter::FullRestyleViewport,
+            Self::Theme => Counter::FullRestyleTheme,
+            Self::Stylesheet => Counter::FullRestyleStylesheet,
+            Self::Dpr => Counter::FullRestyleDpr,
+            Self::RootFontSize => Counter::FullRestyleRootFontSize,
+        }
+    }
+}
+
+/// A snapshot of every [`Counter`]: one frame's worth, or a running total.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct FrameStats {
+    values: [u64; Counter::COUNT],
+}
+
+impl Default for FrameStats {
+    fn default() -> Self {
+        Self {
+            values: [0; Counter::COUNT],
+        }
+    }
+}
+
+impl FrameStats {
+    /// The value of one counter.
+    #[inline]
+    pub fn get(&self, counter: Counter) -> u64 {
+        self.values[counter as usize]
+    }
+
+    /// Every counter with its value, in declaration order.
+    pub fn iter(&self) -> impl Iterator<Item = (Counter, u64)> + '_ {
+        Counter::ALL.iter().map(|&c| (c, self.get(c)))
+    }
+
+    /// True when every counter is zero.
+    pub fn is_empty(&self) -> bool {
+        self.values.iter().all(|&v| v == 0)
+    }
+
+    /// Add `other` into `self`, counter by counter.
+    pub fn accumulate(&mut self, other: &FrameStats) {
+        for (a, b) in self.values.iter_mut().zip(other.values.iter()) {
+            *a = a.wrapping_add(*b);
+        }
+    }
+
+    /// `self - earlier`, counter by counter (saturating), for a delta
+    /// between two snapshots of the same accumulator.
+    pub fn since(&self, earlier: &FrameStats) -> FrameStats {
+        let mut out = FrameStats::default();
+        for (i, v) in out.values.iter_mut().enumerate() {
+            *v = self.values[i].saturating_sub(earlier.values[i]);
+        }
+        out
+    }
+
+    /// Every counter as a JSON object keyed by [`Counter::name`].
+    pub fn to_json(&self) -> serde_json::Value {
+        let map: serde_json::Map<String, serde_json::Value> = self
+            .iter()
+            .map(|(c, v)| (c.name().to_string(), serde_json::Value::from(v)))
+            .collect();
+        serde_json::Value::Object(map)
+    }
+
+    /// One line: the phase times in milliseconds, then every non-zero
+    /// counter. What `RINCH_PERF` prints per frame.
+    pub fn summary_line(&self) -> String {
+        use std::fmt::Write;
+        let ms = |c: Counter| self.get(c) as f64 / 1e6;
+        let mut s = format!(
+            "style {:.2}ms layout {:.2}ms paint {:.2}ms present {:.2}ms |",
+            ms(Counter::TimeStyleNs),
+            ms(Counter::TimeLayoutNs),
+            ms(Counter::TimePaintNs),
+            ms(Counter::TimePresentNs),
+        );
+        for (c, v) in self.iter() {
+            let headline = matches!(
+                c,
+                Counter::TimeStyleNs
+                    | Counter::TimeLayoutNs
+                    | Counter::TimePaintNs
+                    | Counter::TimePresentNs
+            );
+            if v == 0 || headline {
+                continue;
+            }
+            if c.name().starts_with("time_") {
+                let _ = write!(s, " {}={:.2}ms", c.name(), v as f64 / 1e6);
+            } else {
+                let _ = write!(s, " {}={}", c.name(), v);
+            }
+        }
+        s
+    }
+}
+
+impl fmt::Debug for FrameStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut m = f.debug_map();
+        for (c, v) in self.iter() {
+            if v != 0 {
+                m.entry(&c.name(), &v);
+            }
+        }
+        m.finish()
+    }
+}
+
+/// The counters a [`NodeTree`](crate::NodeTree) carries. See the
+/// [module docs](self).
+///
+/// The current frame lives in `Cell`s so the read-only paths (paint and hit
+/// testing take `&NodeTree`) can count too.
+pub struct PerfCounters {
+    current: [Cell<u64>; Counter::COUNT],
+    last_frame: FrameStats,
+    total: FrameStats,
+    frames: u64,
+    prepared: u64,
+    /// Which window's document this is, in its `RINCH_PERF` lines (#2657):
+    /// `None` for the app's main window, whose lines keep the bare
+    /// `[PERF] frame N:` form; `window 3` for another, `[PERF] window 3 frame
+    /// N:`.
+    label: Option<String>,
+}
+
+impl Default for PerfCounters {
+    fn default() -> Self {
+        Self {
+            current: std::array::from_fn(|_| Cell::new(0)),
+            last_frame: FrameStats::default(),
+            total: FrameStats::default(),
+            frames: 0,
+            prepared: 0,
+            label: None,
+        }
+    }
+}
+
+impl fmt::Debug for PerfCounters {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PerfCounters")
+            .field("frame", &self.frame())
+            .field("frames", &self.frames)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PerfCounters {
+    /// Add one to `counter` in the current frame.
+    #[inline]
+    pub fn bump(&self, counter: Counter) {
+        self.add(counter, 1);
+    }
+
+    /// Add `n` to `counter` in the current frame.
+    #[inline]
+    pub fn add(&self, counter: Counter, n: u64) {
+        let cell = &self.current[counter as usize];
+        cell.set(cell.get().wrapping_add(n));
+    }
+
+    /// Count one full-document restyle under `reason`.
+    #[inline]
+    pub fn full_restyle(&self, reason: FullRestyleReason) {
+        self.bump(Counter::FullRestyles);
+        self.bump(reason.counter());
+    }
+
+    /// Count one full repaint under `reason`.
+    #[inline]
+    pub fn full_repaint(&self, reason: FullRepaintReason) {
+        self.bump(Counter::RepaintFull);
+        self.bump(reason.counter());
+    }
+
+    /// Add the time elapsed since `start` to a `Time*Ns` counter.
+    #[inline]
+    pub fn add_elapsed(&self, counter: Counter, start: web_time::Instant) {
+        self.add(counter, start.elapsed().as_nanos() as u64);
+    }
+
+    /// The current (not yet ended) frame's value of one counter.
+    #[inline]
+    pub fn get(&self, counter: Counter) -> u64 {
+        self.current[counter as usize].get()
+    }
+
+    /// A snapshot of the current (not yet ended) frame.
+    pub fn frame(&self) -> FrameStats {
+        let mut out = FrameStats::default();
+        for (v, c) in out.values.iter_mut().zip(self.current.iter()) {
+            *v = c.get();
+        }
+        out
+    }
+
+    /// The last frame [`end_frame`](Self::end_frame) completed.
+    pub fn last_frame(&self) -> FrameStats {
+        self.last_frame
+    }
+
+    /// Every ended frame plus the current one, since the last
+    /// [`reset`](Self::reset).
+    pub fn total(&self) -> FrameStats {
+        let mut t = self.total;
+        t.accumulate(&self.frame());
+        t
+    }
+
+    /// How many frames have ended since the last [`reset`](Self::reset),
+    /// prepared frames ([`Counter::PreparedFrames`]) aside.
+    pub fn frames(&self) -> u64 {
+        self.frames
+    }
+
+    /// End the current frame: fold it into the total, keep it as
+    /// [`last_frame`](Self::last_frame), zero the current frame, and return
+    /// it. Prints [`FrameStats::summary_line`] to stderr when `RINCH_PERF`
+    /// is set.
+    pub fn end_frame(&mut self) -> FrameStats {
+        let frame = self.frame();
+        for c in &self.current {
+            c.set(0);
+        }
+        self.total.accumulate(&frame);
+        self.last_frame = frame;
+        let line = self.count_frame(&frame);
+        if perf_env_enabled() {
+            eprintln!("{line}");
+        }
+        frame
+    }
+
+    /// Count `frame` as a presented frame, or as a prepared one when it
+    /// counts [`Counter::PreparedFrames`] (#2633), and give its `RINCH_PERF`
+    /// line: `[PERF] frame N: …` or `[PERF] prepared N: …`, each numbered in
+    /// its own sequence.
+    fn count_frame(&mut self, frame: &FrameStats) -> String {
+        let (kind, n) = if frame.get(Counter::PreparedFrames) > 0 {
+            self.prepared += 1;
+            ("prepared", self.prepared)
+        } else {
+            self.frames += 1;
+            ("frame", self.frames)
+        };
+        match &self.label {
+            Some(label) => format!("[PERF] {label} {kind} {n}: {}", frame.summary_line()),
+            None => format!("[PERF] {kind} {n}: {}", frame.summary_line()),
+        }
+    }
+
+    /// Name the window this document is in, for its `RINCH_PERF` lines
+    /// (#2657): `Some("window 3")` makes them `[PERF] window 3 frame N:` and
+    /// `[PERF] window 3 prepared N:`; `None` (the default, the main window's)
+    /// keeps `[PERF] frame N:`. Kept across [`Self::reset`].
+    pub fn set_label(&mut self, label: Option<String>) {
+        self.label = label;
+    }
+
+    /// The label [`Self::set_label`] gave.
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+
+    /// How many prepared frames (painted for a hidden window, not presented,
+    /// [`Counter::PreparedFrames`]) have ended since the last
+    /// [`reset`](Self::reset).
+    pub fn prepared(&self) -> u64 {
+        self.prepared
+    }
+
+    /// Zero everything: the current frame, the last frame, the total and the
+    /// frame count.
+    pub fn reset(&mut self) {
+        let label = self.label.take();
+        *self = Self::default();
+        self.label = label;
+    }
+}
+
+/// Whether `RINCH_PERF` is set. Read once per process and cached.
+pub fn perf_env_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RINCH_PERF").is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Another window's lines name it, and are numbered in its own sequence;
+    /// the main window's keep the bare form (#2657).
+    #[test]
+    fn a_labelled_documents_lines_name_its_window() {
+        let mut main = PerfCounters::default();
+        let mut other = PerfCounters::default();
+        other.set_label(Some("window 3".into()));
+        assert!(
+            main.count_frame(&FrameStats::default())
+                .starts_with("[PERF] frame 1: ")
+        );
+        assert!(
+            other
+                .count_frame(&FrameStats::default())
+                .starts_with("[PERF] window 3 frame 1: ")
+        );
+        assert!(
+            other
+                .count_frame(&FrameStats::default())
+                .starts_with("[PERF] window 3 frame 2: ")
+        );
+        other.bump(Counter::PreparedFrames);
+        let prepared = other.frame();
+        assert!(
+            other
+                .count_frame(&prepared)
+                .starts_with("[PERF] window 3 prepared 1: ")
+        );
+        other.reset();
+        assert_eq!(other.label(), Some("window 3"), "kept across a reset");
+    }
+
+    /// A prepared frame (#2633) has a line and a count of its own, and is
+    /// not one of the presented `frames`.
+    #[test]
+    fn a_prepared_frame_is_counted_and_printed_apart() {
+        let mut p = PerfCounters::default();
+        p.bump(Counter::PaintFrames);
+        p.bump(Counter::PreparedFrames);
+        let frame = p.frame();
+        assert!(p.count_frame(&frame).starts_with("[PERF] prepared 1: "));
+        assert_eq!((p.frames(), p.prepared()), (0, 1));
+        let presented = FrameStats::default();
+        assert!(p.count_frame(&presented).starts_with("[PERF] frame 1: "));
+        assert_eq!((p.frames(), p.prepared()), (1, 1));
+        p.bump(Counter::PreparedFrames);
+        p.end_frame();
+        assert_eq!((p.frames(), p.prepared()), (1, 2));
+    }
+
+    #[test]
+    fn names_are_unique_and_round_trip() {
+        let mut seen = std::collections::HashSet::new();
+        for &c in Counter::ALL {
+            assert!(seen.insert(c.name()), "duplicate counter name {}", c.name());
+            assert_eq!(Counter::from_name(c.name()), Some(c));
+            assert_eq!(Counter::ALL[c as usize], c, "discriminant is the index");
+        }
+    }
+
+    #[test]
+    fn end_frame_moves_the_frame_into_last_and_total() {
+        let mut p = PerfCounters::default();
+        p.add(Counter::ElementsCascaded, 3);
+        p.bump(Counter::HitTests);
+        assert_eq!(p.frame().get(Counter::ElementsCascaded), 3);
+        let f = p.end_frame();
+        assert_eq!(f.get(Counter::ElementsCascaded), 3);
+        assert_eq!(p.frame().get(Counter::ElementsCascaded), 0);
+        assert_eq!(p.last_frame().get(Counter::HitTests), 1);
+        p.add(Counter::ElementsCascaded, 2);
+        assert_eq!(p.total().get(Counter::ElementsCascaded), 5);
+        assert_eq!(p.frames(), 1);
+        p.reset();
+        assert!(p.total().is_empty());
+        assert_eq!(p.frames(), 0);
+    }
+
+    #[test]
+    fn json_has_every_counter() {
+        let mut p = PerfCounters::default();
+        p.bump(Counter::RepaintFullGpu);
+        let j = p.end_frame().to_json();
+        let obj = j.as_object().unwrap();
+        assert_eq!(obj.len(), Counter::COUNT);
+        assert_eq!(obj["repaint_full_gpu"], 1);
+    }
+}

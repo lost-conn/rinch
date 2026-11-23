@@ -39,6 +39,17 @@ struct Parked {
     /// disposed means the component is gone and the callback must not run.
     /// `Owner` is a `Weak`, so this keeps nothing alive.
     owner: Option<crate::reactive::Owner>,
+    /// The document whose code parked this callback (issue #963) and the
+    /// context root it was parked in (issue #1032), re-entered around the
+    /// resume. A resume is driven
+    /// from outside any event dispatch — a timer fire, an http completion
+    /// drained between events, or another embedded context's `update()` — so
+    /// without it the continuation ran under no document, or a borrowed one,
+    /// and an interceptor it registered or cleared reached every document on
+    /// the thread; and without the root it resolved the thread-global store
+    /// namespace, not its embedded context's. Parked outside any document, it
+    /// re-enters none.
+    frame: crate::context::CallbackFrame,
     /// Type-erased `Box<dyn FnOnce(T)>` for the caller's own payload type `T`,
     /// downcast back on resume.
     callback: Box<dyn Any>,
@@ -121,6 +132,7 @@ pub fn park_main_callback<T: 'static>(cb: impl FnOnce(T) + 'static) -> MainCallb
     let boxed: Box<dyn FnOnce(T)> = Box::new(cb);
     let parked = Parked {
         owner: crate::reactive::current_owner(),
+        frame: crate::context::CallbackFrame::current(),
         callback: Box::new(boxed),
     };
     PARKED.with(|p| p.borrow_mut().insert(id, parked));
@@ -135,9 +147,22 @@ pub fn park_main_callback<T: 'static>(cb: impl FnOnce(T) + 'static) -> MainCallb
 /// fresh callback without re-entrancy trouble.
 ///
 /// Also a no-op if the component that parked the callback has since been
-/// unmounted — see [`park_main_callback`]. The callback runs with that component
+/// unmounted — see [`park_main_callback`].
+///
+/// The callback runs under the **document** that parked it (issue #963), as an
+/// effect runs under the document that created it (#295): see
+/// [`current_dispatching_doc`](crate::current_dispatching_doc); and in the
+/// **context root** it was parked in (issue #1032), as an effect does (#136),
+/// so a timer armed in an embedded `RinchContext` resolves that context's
+/// stores. A callback parked outside any document runs under none, at the
+/// thread-global root, wherever it is resumed.
+///
+/// The callback runs with that component
 /// as the ambient owner, so anything it allocates belongs to the component
-/// rather than to whatever the event loop happened to be doing.
+/// rather than to whatever the event loop happened to be doing. A callback
+/// parked outside any render runs under [`unowned`](crate::reactive::unowned)
+/// for the same reason in reverse: it has app lifetime, so what it allocates
+/// must not land on whatever owner this resume happens to be nested inside.
 ///
 /// Call on the main thread. `T` must match the type used at [`park_main_callback`];
 /// a mismatch is a programming error (debug-asserted, ignored in release).
@@ -162,9 +187,13 @@ pub fn resume_main_callback<T: 'static>(id: MainCallbackId, payload: T) {
         );
         return;
     };
+    let _frame = entry.frame.enter();
     match entry.owner {
         Some(owner) => owner.run(move || (*cb)(payload)),
-        None => (*cb)(payload),
+        // Not bare: the owner stack is not an ancestor chain, so a resume nested
+        // inside another owner's `run` would hand this app-lifetime callback's
+        // allocations to that unrelated scope (issue #374).
+        None => crate::reactive::unowned(move || (*cb)(payload)),
     }
 }
 
@@ -176,7 +205,15 @@ pub fn cancel_main_callback(id: MainCallbackId) {
     // Taken out first: the callback closes over arbitrary user state whose
     // `Drop` may itself park or cancel a callback, and dropping it inside the
     // `borrow_mut` would make that a `BorrowMutError`.
-    let entry = PARKED.with(|p| p.borrow_mut().remove(&id.0));
+    //
+    // `try_with`: a cancel can come from a `Drop` at thread exit, after this
+    // registry is gone — a `spawn_local` task still waiting on a `sleep` when the
+    // thread ends (issue #1767). Nothing is parked then, and panicking in a TLS
+    // destructor aborts the process.
+    let entry = PARKED
+        .try_with(|p| p.borrow_mut().remove(&id.0))
+        .ok()
+        .flatten();
     drop(entry);
 }
 
@@ -274,6 +311,119 @@ mod tests {
             escaped.get(),
             "`unowned` must detach the callback from the render that parked it"
         );
+    }
+
+    /// An ownerless continuation resumed from *inside* a live one must not
+    /// allocate under the live one's scope (issue #374, the #373 fix applied to
+    /// this registry). The owner stack is not an ancestor chain: running the
+    /// ownerless callback bare lets the `Signal` it creates land on whatever
+    /// owner the dispatch happens to be nested inside — freed, and panicking on
+    /// the next read, once that unrelated component unmounts.
+    #[test]
+    fn an_ownerless_callback_resumed_inside_a_live_one_does_not_allocate_under_it() {
+        use crate::reactive::{Scope, Signal};
+
+        // Parked from `main`: app lifetime. Creates a signal the app keeps.
+        let kept: Rc<Cell<Option<Signal<u32>>>> = Rc::new(Cell::new(None));
+        let k = kept.clone();
+        let ownerless = park_main_callback::<()>(move |()| k.set(Some(Signal::new(41))));
+
+        // Parked during a render: owned by `component`. Its body synchronously
+        // drives the ownerless resume, so that resume is nested in `owner.run`.
+        let component = Scope::new();
+        let owned = component
+            .run(|| park_main_callback::<()>(move |()| resume_main_callback(ownerless, ())));
+
+        let before = component.owned_counts().signals;
+        resume_main_callback(owned, ());
+        assert_eq!(
+            component.owned_counts().signals,
+            before,
+            "the ownerless callback's signal must not be attributed to the \
+             component whose callback happened to resume it"
+        );
+
+        component.dispose();
+        let signal = kept.get().expect("the ownerless callback ran");
+        assert_eq!(
+            signal.get(),
+            41,
+            "an app-lifetime signal must survive an unrelated component unmounting"
+        );
+    }
+
+    /// A parked continuation runs under the document that parked it (issue
+    /// #963), not under whichever document — or none — happens to be current
+    /// when it resumes. Resumed here from inside document 2, off the fixed point
+    /// where "inherit" and "record" agree: a callback parked in document 1 must
+    /// answer 1, and one parked outside any document must answer none, not 2.
+    #[test]
+    fn a_parked_callback_resumes_under_the_document_that_parked_it() {
+        use crate::context::{current_dispatching_doc, push_dispatching_doc};
+
+        let seen: Rc<RefCell<Vec<Option<u64>>>> = Rc::new(RefCell::new(Vec::new()));
+        let ids: Vec<MainCallbackId> = [1u64, 0]
+            .into_iter()
+            .map(|doc| {
+                let _parker = push_dispatching_doc(doc);
+                let s = seen.clone();
+                park_main_callback::<()>(move |()| s.borrow_mut().push(current_dispatching_doc()))
+            })
+            .collect();
+        {
+            let _resumer = push_dispatching_doc(2);
+            for id in ids {
+                resume_main_callback(id, ());
+            }
+            assert_eq!(
+                current_dispatching_doc(),
+                Some(2),
+                "the resumer's document is restored after each callback"
+            );
+        }
+        assert_eq!(*seen.borrow(), [Some(1), None]);
+    }
+
+    /// A parked continuation re-enters the **context root** it was parked in
+    /// as well as the document (issue #1032), as an effect does (#136): a timer
+    /// or http completion armed inside an embedded `RinchContext` must resolve
+    /// that context's stores, whichever context's `update()` resumes it.
+    /// Resumed from inside root 4 / document 2, off the fixed point where
+    /// "inherit" and "record" agree; one parked at the thread-global root
+    /// resumes there, not in root 4.
+    #[test]
+    fn a_parked_callback_resumes_in_the_context_root_that_parked_it() {
+        type Seen = Rc<RefCell<Vec<(u64, Option<u64>)>>>;
+        use crate::context::{
+            current_context_root, current_dispatching_doc, push_context_root, push_dispatching_doc,
+        };
+
+        let seen: Seen = Rc::new(RefCell::new(Vec::new()));
+        let ids: Vec<MainCallbackId> = [(9u64, 1u64), (0, 0)]
+            .into_iter()
+            .map(|(root, doc)| {
+                let _root = push_context_root(root);
+                let _doc = push_dispatching_doc(doc);
+                let s = seen.clone();
+                park_main_callback::<()>(move |()| {
+                    s.borrow_mut()
+                        .push((current_context_root(), current_dispatching_doc()))
+                })
+            })
+            .collect();
+        {
+            let _root = push_context_root(4);
+            let _doc = push_dispatching_doc(2);
+            for id in ids {
+                resume_main_callback(id, ());
+            }
+            assert_eq!(
+                (current_context_root(), current_dispatching_doc()),
+                (4, Some(2)),
+                "the resumer's root and document are restored after each callback"
+            );
+        }
+        assert_eq!(*seen.borrow(), [(9, Some(1)), (0, None)]);
     }
 
     #[test]

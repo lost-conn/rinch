@@ -26,7 +26,8 @@
 //! 2. The pending queue is drained FIFO, so the order observers were queued in
 //!    is the order they run in. (An effect that writes a signal while running
 //!    queues that signal's observers *behind* the current flush, rather than
-//!    ahead of it.)
+//!    ahead of it — except the running effect itself, which a write flushed
+//!    during its own body skips rather than queues; see [`Effect`], #343.)
 //!
 //! # Liveness
 //!
@@ -73,21 +74,30 @@
 mod bounds;
 mod effect;
 mod memo;
+#[cfg(test)]
+mod memo_cutoff_tests;
 mod poll;
+pub(crate) mod restore;
 mod scope;
+pub(crate) use scope::disposal_available;
 mod scoped;
 mod signal;
 
+/// Ambient-owner hooks for the rest of the crate: `crate::events` attributes
+/// handlers to the scope currently rendering, and `crate::context` ties a
+/// store/context entry to the scope that created it (issue #141).
 pub use bounds::{
     ElementBounds, register_bounds_signal, registered_bounds_nodes, update_bounds_signals,
 };
 pub use effect::Effect;
 pub use memo::Memo;
-pub use poll::{PollRate, drain_polls, next_poll_due, poll_signal};
-pub use scope::{OwnedCounts, Owner, OwnerGuard, Scope, current_owner, on_cleanup, unowned};
-/// Ambient-owner hooks for the rest of the crate: `crate::events` attributes
-/// handlers to the scope currently rendering, and `crate::context` ties a
-/// store/context entry to the scope that created it (issue #141).
+pub use poll::{
+    PollRate, drain_polls, next_poll_due, poll_signal, polls_want_every_frame, set_poll_waker,
+};
+pub use scope::{
+    CleanupHandle, OwnedCounts, Owner, OwnerGuard, Scope, current_owner, on_cleanup,
+    on_cleanup_removable, unowned,
+};
 pub(crate) use scope::{on_cleanup_for_ambient_owner, record_handler};
 pub use scoped::{
     DocScopedSlotMap, clear_doc_scoped_slot, clear_scoped_slot, install_doc_scoped_slot,
@@ -96,9 +106,10 @@ pub use scoped::{
 pub use signal::Signal;
 
 use std::any::Any;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 // The effect-queue drain; both flush sites reach it via `flush_effects_and_notify`.
@@ -138,6 +149,12 @@ pub(crate) struct Runtime {
     /// was written for.
     pub(crate) pending_effects_set: HashSet<ObserverId, effect::ObserverIdBuildHasher>,
 
+    /// The pending observers that were queued by a **signal** they read — as
+    /// opposed to being woken through a memo. These run unconditionally; any
+    /// other pending observer is a "maybe" that `flush_effects` runs only if a
+    /// memo it read moved to a new version (the memo equality cut-off).
+    pub(crate) definite_effects: HashSet<ObserverId, effect::ObserverIdBuildHasher>,
+
     /// Whether we're currently in a batch
     pub(crate) batching: bool,
 
@@ -175,6 +192,7 @@ impl Runtime {
             observer_stack: Vec::new(),
             pending_effects: VecDeque::new(),
             pending_effects_set: HashSet::default(),
+            definite_effects: HashSet::default(),
             batching: false,
             next_id: 0,
             owner_stack: Vec::new(),
@@ -289,6 +307,8 @@ pub fn clear_on_signal_change() {
 /// the [`SignalChangeSubscription`] "dropping detaches the callback" contract
 /// exact even mid-notification.
 pub(crate) fn notify_signal_change() {
+    // Every notification tells every host, so no host change is owed after it.
+    HOST_CHANGE_OWED.with(|c| c.set(false));
     let snapshot: Vec<(u64, Rc<dyn Fn()>)> =
         RUNTIME.with(|rt| rt.borrow().on_signal_change.clone());
     for (id, cb) in snapshot {
@@ -302,8 +322,10 @@ pub(crate) fn notify_signal_change() {
 
 /// Check if any signals have changed since the last call to `clear_signals_changed`.
 ///
-/// This is used by the runtime to avoid redundant re-renders when signals
-/// have already triggered fine-grained updates via Effects.
+/// Rinch's own runtimes no longer read it: whether a wake draws a frame is
+/// asked of the document, since a signal that changed may have changed
+/// nothing on screen (#2608). Kept as public API for hosts and tools that
+/// track "did this handler write state".
 pub fn signals_changed() -> bool {
     RUNTIME.with(|rt| rt.borrow().signals_changed)
 }
@@ -335,6 +357,59 @@ static CROSS_THREAD_DISPATCHER: Mutex<Option<DispatchFn>> = Mutex::new(None);
 /// before any signals are used cross-thread.
 pub fn register_main_thread() {
     MAIN_THREAD_ID.get_or_init(|| std::thread::current().id());
+}
+
+/// Make the current thread a host of its own: a thread where signals may be
+/// written directly, as on the main thread, and that drains the main-thread
+/// callbacks meant for it (issue #2778).
+///
+/// The registered main thread is one per process ([`register_main_thread`]).
+/// A test harness runs one app per test thread instead, several at once in one
+/// binary (`rinch::testing::TestApp` calls this at its mount), so each test
+/// thread is a host of its own:
+///
+/// - [`is_main_thread`] answers `true` here, so `set`, `update` and effects
+///   work whether or not another thread is the registered main thread;
+/// - a closure queued here (a [`run_on_main_thread`] that left this thread, a
+///   [`dispatch_main_callback`]) waits for this thread's own
+///   [`drain_main_callbacks`], not another host's;
+/// - a [`Signal::send`](crate::Signal::send) to a signal created here, from
+///   any thread, is applied here: at once when sent here, else by this
+///   thread's drain. (A signal of a thread that is not a host is written as
+///   before #2778: on the registered main thread.)
+///
+/// Lasts for the thread's life. A real app does not call it: its main thread
+/// is the registered one.
+pub fn mark_host_thread() {
+    QUEUE_THREAD.with(|q| q.host.set(true));
+    SIGNAL_STORE.with(|store| store.borrow_mut().claim_tag());
+    set_host_tag(current_thread_tag(), true);
+}
+
+/// The thread tags of live [host threads](mark_host_thread), one bit each:
+/// the threads a write can be queued for. A signal of any other thread (a
+/// worker that made signals of its own) is written as before #2778.
+static HOST_TAGS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+fn set_host_tag(tag: u32, host: bool) {
+    if tag == 0 {
+        return;
+    }
+    let (word, bit) = ((tag / 64) as usize, 1u64 << (tag % 64));
+    if host {
+        HOST_TAGS[word].fetch_or(bit, Ordering::Relaxed);
+    } else {
+        HOST_TAGS[word].fetch_and(!bit, Ordering::Relaxed);
+    }
+}
+
+fn is_host_tag(tag: u32) -> bool {
+    tag != 0 && HOST_TAGS[(tag / 64) as usize].load(Ordering::Relaxed) & (1u64 << (tag % 64)) != 0
+}
+
+/// Whether [`mark_host_thread`] made this thread a host.
+fn is_host_thread() -> bool {
+    QUEUE_THREAD.try_with(|q| q.host.get()).unwrap_or(false)
 }
 
 /// Register a function that dispatches closures to the main thread.
@@ -371,53 +446,393 @@ pub fn set_cross_thread_dispatcher_if_unset(dispatcher: fn(Box<dyn FnOnce() + Se
 /// `embed`-only build had nowhere to put a cross-thread closure and
 /// [`Signal::send`](crate::Signal::send) panicked in the one mode most likely to
 /// want it (issue #172).
-static MAIN_QUEUE: Mutex<Vec<Box<dyn FnOnce() + Send>>> = Mutex::new(Vec::new());
-
-/// Push `f` onto the shared main-thread queue.
 ///
-/// Returns `true` if the queue was empty before the push — a host's cue to wake
-/// its event loop, which it then does once per batch rather than once per
-/// closure. A host with nothing to wake (an embedded context, whose game loop is
-/// already turning) ignores it.
-pub fn queue_main_callback(f: Box<dyn FnOnce() + Send>) -> bool {
-    let mut queue = MAIN_QUEUE.lock().unwrap();
-    let was_empty = queue.is_empty();
-    queue.push(f);
-    was_empty
+/// Each closure is queued beside the document and context root whose code
+/// queued it and runs in them — see [`queue_main_callback`] — and beside the
+/// thread it is for (issue #2778): a thread drains the entries meant for it and
+/// the untargeted ones, never another thread's.
+static MAIN_QUEUE: Mutex<Vec<QueuedCallback>> = Mutex::new(Vec::new());
+
+/// One closure on [`MAIN_QUEUE`].
+struct QueuedCallback {
+    /// The thread it is for, by [thread tag](QueueThread::tag); `0` for any
+    /// thread that drains the queue.
+    target: u32,
+    frame: crate::context::CallbackFrame,
+    callback: Box<dyn FnOnce() + Send>,
 }
 
-/// Run every queued main-thread callback. Call from the main thread only.
-///
-/// The queue is process-global, so a host that drains it runs the work queued
-/// against every host on the thread. That is correct rather than merely
-/// tolerable: the payload is a `Send` closure that writes its own signals, and
-/// signals are thread-local — not per-document — so it does the same thing
-/// whoever runs it. The document it ultimately touches is still repainted by its
-/// own host, because a signal change notifies every subscriber (issue #134).
-pub fn drain_main_callbacks() {
-    let callbacks: Vec<Box<dyn FnOnce() + Send>> = MAIN_QUEUE.lock().unwrap().drain(..).collect();
-    for callback in callbacks {
-        callback();
+impl QueuedCallback {
+    /// Whether a drain on the thread tagged `here` runs this.
+    fn is_for(&self, here: u32) -> bool {
+        self.target == 0 || self.target == here
     }
 }
 
-/// Drop every queued main-thread callback without running it.
+/// What the main-thread queue knows about the current thread.
+struct QueueThread {
+    /// This thread's tag (`0` until its first signal, and when the tags ran
+    /// out). Every signal created here carries it in its id
+    /// ([`signal_owner`]), so a write from another thread can be queued for
+    /// the thread whose store holds the signal.
+    tag: Cell<u32>,
+    /// Made a host of its own by [`mark_host_thread`].
+    host: Cell<bool>,
+    /// The thread the next [`queue_main_callback`] here is for, set by
+    /// [`dispatch_routed`] around the dispatcher it calls (`0`: none).
+    route: Cell<u32>,
+}
+
+thread_local! {
+    static QUEUE_THREAD: QueueThread = const {
+        QueueThread {
+            tag: Cell::new(0),
+            host: Cell::new(false),
+            route: Cell::new(0),
+        }
+    };
+}
+
+/// This thread's tag, `0` when it has none. Claims nothing.
+fn current_thread_tag() -> u32 {
+    QUEUE_THREAD.try_with(|q| q.tag.get()).unwrap_or(0)
+}
+
+/// A signal id is `tag << TAG_SHIFT | slot`: its thread's tag in the high
+/// bits, its slot index in the low ones. The generation keeps all 32 bits, so
+/// a freed handle is told from its slot's next signal for 2^32 allocations
+/// (with the tag in the generation it was 2^24, and a stale handle revived
+/// after 16 777 215 — review of #2780).
+const TAG_SHIFT: u32 = 24;
+/// The slot index part of a signal id: at most 2^24 signals alive at once on
+/// one thread.
+const SLOT_MASK: u32 = (1 << TAG_SHIFT) - 1;
+/// The most thread tags alive at once (tag `0` is "none").
+const MAX_THREAD_TAG: u32 = u32::MAX >> TAG_SHIFT;
+
+/// The tag of the thread whose store holds the signal with this id, `0` for
+/// none known.
+pub(crate) fn signal_owner(id: u32) -> u32 {
+    id >> TAG_SHIFT
+}
+
+/// Thread tags not in use, each with the generation counter to resume from.
+struct TagPool {
+    /// The next never-used tag.
+    fresh: u32,
+    /// Tags released by threads that ended, oldest first, with where their
+    /// generation counter stopped: the next thread to take one continues
+    /// from there, so a handle to an ended thread's signal never names a
+    /// signal of the new one.
+    free: VecDeque<(u32, u32)>,
+}
+
+static TAG_POOL: Mutex<TagPool> = Mutex::new(TagPool {
+    fresh: 1,
+    free: VecDeque::new(),
+});
+
+/// Take a thread tag and the counter to start from: `(0, 1)` when every tag is
+/// in use (that thread's signals then name no thread, and are written as
+/// before #2778).
+fn claim_thread_tag() -> (u32, u32) {
+    TAG_POOL.lock().unwrap_or_else(|e| e.into_inner()).claim()
+}
+
+impl TagPool {
+    /// See [`claim_thread_tag`].
+    fn claim(&mut self) -> (u32, u32) {
+        if let Some(reused) = self.free.pop_front() {
+            return reused;
+        }
+        if self.fresh <= MAX_THREAD_TAG {
+            let tag = self.fresh;
+            self.fresh += 1;
+            return (tag, 1);
+        }
+        (0, 1)
+    }
+
+    /// See [`release_thread_tag`].
+    fn release(&mut self, tag: u32, counter: u32) {
+        if tag != 0 {
+            self.free.push_back((tag, counter));
+        }
+    }
+}
+
+/// Give a thread's tag back when its signal store is dropped (the thread is
+/// ending). Entries still queued for it are drained by the next thread that
+/// takes the tag; their signals are gone, so their writes find nothing.
+fn release_thread_tag(tag: u32, counter: u32) {
+    set_host_tag(tag, false);
+    TAG_POOL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .release(tag, counter);
+}
+
+/// Dispatch `f` through `dispatch`, for the thread tagged `owner` (`0`: as
+/// unrouted). The tag reaches [`queue_main_callback`] through a thread-local
+/// set around the call, so a dispatcher keeps its one-argument shape: every
+/// host's dispatcher queues on the thread that calls it.
+fn dispatch_routed(
+    owner: u32,
+    f: Box<dyn FnOnce() + Send>,
+    dispatch: fn(Box<dyn FnOnce() + Send>),
+) {
+    if owner == 0 {
+        dispatch(f);
+        return;
+    }
+    let previous = QUEUE_THREAD.try_with(|q| q.route.replace(owner)).ok();
+    dispatch(f);
+    if let Some(previous) = previous {
+        let _ = QUEUE_THREAD.try_with(|q| q.route.set(previous));
+    }
+}
+
+/// Push `f` onto the shared main-thread queue.
+///
+/// Returns `true` if the queue was empty before the push. No host keys its wake
+/// on it any more: a desktop paint can drain the wake it asked for without
+/// running the queue (issue #1540), so the shell asks for a coalesced
+/// `ReRender` on every push instead. A host with nothing to wake (an embedded
+/// context, whose game loop is already turning) ignores it.
+///
+/// `f` will run under the document current **here**, on the thread that queues
+/// it (issue #963): the document whose code queued it on the main thread, and
+/// none for a closure queued from a worker thread, which is no document's code.
+/// The drain runs between events, or inside another embedded context's
+/// `update()`, so without this a closure queued by one document's handler ran
+/// under no document or a borrowed one. It also runs in the **context root**
+/// current here (issue #1032), so a closure queued by an embedded
+/// `RinchContext`'s code resolves that context's stores, as an effect does
+/// (#136); one queued from a worker thread runs at the thread-global root.
+///
+/// Which thread drains it (issue #2778): a [`Signal::send`](crate::Signal::send)
+/// write to a signal a [host thread](mark_host_thread) created is for that
+/// thread; any other closure queued on a host thread is for that thread; the rest (a
+/// worker's [`run_on_main_thread`], everything in an app with one main thread)
+/// are for whichever thread drains first, as before.
+pub fn queue_main_callback(f: Box<dyn FnOnce() + Send>) -> bool {
+    let frame = crate::context::CallbackFrame::current();
+    let target = QUEUE_THREAD
+        .try_with(|q| match q.route.replace(0) {
+            0 if q.host.get() => q.tag.get(),
+            routed => routed,
+        })
+        .unwrap_or(0);
+    let mut queue = MAIN_QUEUE.lock().unwrap();
+    let was_empty = queue.is_empty();
+    queue.push(QueuedCallback {
+        target,
+        frame,
+        callback: f,
+    });
+    was_empty
+}
+
+/// Run every queued main-thread callback meant for this thread. Call from the
+/// main thread, or a [host thread](mark_host_thread), only: called on any other
+/// thread it runs nothing, leaves the queue for the threads it is for, and logs
+/// one warning (#2637).
+///
+/// The queue is process-global, and every host on this thread drains the same
+/// entries, so a host that drains it runs the work queued against every host on
+/// the thread. That is correct rather than merely tolerable: the payload is a
+/// `Send` closure that writes its own signals, and signals are thread-local —
+/// not per-document — so it does the same thing whoever on the thread runs it.
+/// The document it ultimately touches is still repainted by its own host,
+/// because a signal change notifies every subscriber (issue #134).
+///
+/// What it does not run is another thread's (issue #2778): a write to a signal
+/// another thread created, or a closure another host thread queued, waits for
+/// that thread's drain. Signal ids alias across thread-local stores, so run
+/// here such a write would land in this thread's signal of the same id.
+pub fn drain_main_callbacks() {
+    // Off the main thread the queue is not this thread's to run (#2637): an
+    // embedded context updated on a worker took the main thread's work — a
+    // fired timer among it — and ran it where its parked callback was not, so
+    // the timer was lost and a `sleep` loop on it stopped for good. It stays
+    // queued for the main thread's own drain. A host thread (#2778: one per
+    // `TestApp`) answers `is_main_thread` and drains the entries meant for it.
+    if !is_main_thread() {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                "rinch: the main-thread queue was drained off the main thread (an embedded \
+                 RinchContext updated on a worker?); it is left for the main thread (#2637)"
+            );
+        }
+        return;
+    }
+    let here = current_thread_tag();
+    let callbacks: Vec<QueuedCallback> = MAIN_QUEUE
+        .lock()
+        .unwrap()
+        .extract_if(.., |entry| entry.is_for(here))
+        .collect();
+    // One transaction per callback, not one for the whole drain: callbacks are
+    // queued independently (a `Signal::send`, a timer, a parked continuation),
+    // and a later one may rely on an earlier one's effects having run. Each runs
+    // under the document that queued it (issue #963), in its context root
+    // (issue #1032).
+    for QueuedCallback {
+        frame, callback, ..
+    } in callbacks
+    {
+        let _frame = frame.enter();
+        batch(callback);
+    }
+}
+
+/// Whether any main-thread callback is queued that
+/// [`drain_main_callbacks`] would run on this thread.
+///
+/// For a host that coalesces its wakes: a callback queued while the host was
+/// between emptying this queue and re-arming its own wake signal can have had
+/// its wake folded into the one being served (issue #988), so the host asks
+/// this after re-arming and wakes itself again.
+pub fn main_callbacks_pending() -> bool {
+    let here = current_thread_tag();
+    MAIN_QUEUE
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|entry| entry.is_for(here))
+}
+
+/// Drop every queued main-thread callback [`drain_main_callbacks`] would run
+/// on this thread, without running it (another host thread's stay queued).
 ///
 /// For host shutdown only: a queued closure typically captures app state that is
 /// about to be torn down, so running it there would be worse than losing it.
+///
+/// The closures are dropped **after** the queue's lock is released (issue
+/// #1061): a closure's captures may queue main-thread work from their own
+/// `Drop` — a render surface's lease releasing itself, a user type calling
+/// `Signal::send` — and the lock is not re-entrant, so dropping under it
+/// deadlocked shutdown. What such a drop queues is pending work like any other,
+/// so the queue is emptied again until it stays empty, up to
+/// `MAX_CLEAR_ROUNDS` rounds (a `Drop` that queues a closure whose `Drop`
+/// queues another, without end, would otherwise never let shutdown finish).
 pub fn clear_main_callbacks() {
-    MAIN_QUEUE.lock().unwrap().clear();
+    const MAX_CLEAR_ROUNDS: usize = 16;
+    for _ in 0..MAX_CLEAR_ROUNDS {
+        // The guard is a temporary of this statement, released before the drop.
+        let here = current_thread_tag();
+        let dropped: Vec<QueuedCallback> = MAIN_QUEUE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extract_if(.., |entry| entry.is_for(here))
+            .collect();
+        if dropped.is_empty() {
+            return;
+        }
+        drop(dropped);
+    }
+    tracing::warn!(
+        "clear_main_callbacks: queued closures kept queueing more from their Drop \
+         after {MAX_CLEAR_ROUNDS} rounds; leaving the rest queued"
+    );
 }
 
 /// Check if the current thread is the main (UI) thread.
 ///
 /// Returns `true` if `register_main_thread()` hasn't been called yet
-/// (backwards compatibility for tests and non-rinch usage).
-pub(crate) fn is_main_thread() -> bool {
+/// (backwards compatibility for tests and non-rinch usage), and on a
+/// [host thread](mark_host_thread).
+pub fn is_main_thread() -> bool {
     match MAIN_THREAD_ID.get() {
-        Some(id) => std::thread::current().id() == *id,
+        Some(id) => std::thread::current().id() == *id || is_host_thread(),
         None => true,
     }
+}
+
+/// Which thread a cross-thread write ([`Signal::send`](crate::Signal::send),
+/// [`Signal::update_send`](crate::Signal::update_send)) is being made on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WriteThread {
+    /// The registered main thread, or a [host thread](mark_host_thread): apply
+    /// the write here (if the signal is this thread's, see [`route_write`]).
+    Main,
+    /// Another thread, with a main thread registered: dispatch it.
+    Other,
+    /// No host has registered a main thread yet (issue #1541).
+    Unregistered,
+}
+
+/// Classify the current thread for a cross-thread write. Costs what
+/// [`is_main_thread`] costs; only the [`WriteThread::Unregistered`] answer
+/// leaves the caller anything more to decide.
+pub(crate) fn write_thread() -> WriteThread {
+    match MAIN_THREAD_ID.get() {
+        Some(id) if std::thread::current().id() == *id => WriteThread::Main,
+        Some(_) if is_host_thread() => WriteThread::Main,
+        Some(_) => WriteThread::Other,
+        None if is_host_thread() => WriteThread::Main,
+        None => WriteThread::Unregistered,
+    }
+}
+
+/// Where a cross-thread write ([`Signal::send`](crate::Signal::send),
+/// [`Signal::update_send`](crate::Signal::update_send)) to the signal with
+/// id `id` goes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WriteRoute {
+    /// Apply it here, now.
+    Here,
+    /// Queue it through the registered dispatcher (which must exist), for the
+    /// thread tagged `owner` (`0`: whichever main thread drains).
+    Dispatch { owner: u32 },
+    /// Queue it through [`dispatch_main_callback`] (no dispatcher needed),
+    /// for the thread tagged `owner`; with `owner == 0` it is applied only if
+    /// drained on the registered main thread (issue #1541).
+    Queue { owner: u32 },
+}
+
+/// Decide [`WriteRoute`] for a write made on this thread (issue #2778).
+///
+/// A signal names the thread that created it ([`signal_owner`]). When that is
+/// a [host thread](mark_host_thread), the write is applied here if this is
+/// that thread, and is otherwise queued for its drain. Any other signal (an
+/// app's main thread's, a worker's own) is routed as before #2778: to the
+/// registered main thread. Nothing is queued for a thread that never drains;
+/// a main thread's drain of a write to a worker's signal finds no such signal
+/// in its own store (the id names the worker's tag) and drops it with the
+/// warning that it was made on a thread that hosts no app (issue #2889),
+/// where it used to write the main thread's signal of
+/// the same slot. On a main thread with no host threads in the process this
+/// costs one relaxed atomic load more than before.
+pub(crate) fn route_write(id: u32) -> WriteRoute {
+    let tag = signal_owner(id);
+    let owner = if is_host_tag(tag) { tag } else { 0 };
+    let ours = owner != 0 && owner == current_thread_tag();
+    match write_thread() {
+        WriteThread::Main if owner == 0 || ours => WriteRoute::Here,
+        WriteThread::Main => WriteRoute::Queue { owner },
+        WriteThread::Other => WriteRoute::Dispatch { owner },
+        WriteThread::Unregistered if ours => WriteRoute::Here,
+        WriteThread::Unregistered if owner == 0 && unregistered_write_is_local() => {
+            WriteRoute::Here
+        }
+        WriteThread::Unregistered => WriteRoute::Queue { owner },
+    }
+}
+
+/// With no main thread registered, whether a cross-thread write made on this
+/// thread is this thread's to apply (issue #1541).
+///
+/// A thread that has never allocated a signal cannot own the one being
+/// written — signals live in a thread-local store — so it is a worker
+/// writing ahead of the host (a thread spawned in `main()` before
+/// `App::run`), and the write is queued for the main thread instead of being
+/// applied to this thread's empty store and dropped. A thread that has
+/// allocated signals keeps the old behaviour (apply here): the main thread
+/// of a test or of `rinch-web`, which registers no main thread at all.
+pub(crate) fn unregistered_write_is_local() -> bool {
+    SIGNAL_STORE.with(|store| store.borrow().has_allocated())
 }
 
 /// Dispatch a closure to the main thread via the registered dispatcher.
@@ -430,14 +845,68 @@ pub(crate) fn is_main_thread() -> bool {
 /// direct `set()`. Registering both is the contract; the panic is what catches a
 /// host that forgot (issue #172).
 pub(crate) fn dispatch_to_main_thread(f: Box<dyn FnOnce() + Send>) {
-    let dispatcher = CROSS_THREAD_DISPATCHER.lock().unwrap();
-    if let Some(dispatch) = *dispatcher {
-        dispatch(f);
+    dispatch_to_main_thread_for(0, f);
+}
+
+/// [`dispatch_to_main_thread`], with the closure queued for the thread tagged
+/// `owner` (issue #2778; `0` for whichever main thread drains).
+pub(crate) fn dispatch_to_main_thread_for(owner: u32, f: Box<dyn FnOnce() + Send>) {
+    // Copied out so the dispatcher runs with the lock released: a dispatcher
+    // may drop `f`, and a `Drop` in `f`'s captures may dispatch again from this
+    // same thread (issue #1061), as in `dispatch_main_callback`.
+    let dispatcher = *CROSS_THREAD_DISPATCHER.lock().unwrap();
+    if let Some(dispatch) = dispatcher {
+        dispatch_routed(owner, f, dispatch);
     } else {
         panic!(
             "Signal::send() called but no cross-thread dispatcher is registered. \
              Ensure the rinch runtime is initialized before using send() from background threads."
         );
+    }
+}
+
+/// Queue `f` for the main thread through the registered dispatcher, from any
+/// thread, without panicking for a missing dispatcher.
+///
+/// For a caller that must not panic and must not run `f` inline — a `Drop`,
+/// which may run on any thread, inside a borrow `f` needs, or at thread exit.
+/// Where a dispatcher is registered it gets `f` exactly as a `Signal::send`
+/// would, so a host that wakes its loop for a closure queued onto an empty
+/// queue (the desktop shell, Android) wakes for this one too. Where none is,
+/// `f` is queued plainly: there is no host to wake, and whatever drains the
+/// queue will run it.
+///
+/// Why not [`queue_main_callback`] from such a caller: a closure pushed past
+/// the dispatcher gets no wake of its own and waits for the next sender's. A
+/// host whose dispatcher wakes only for a push onto an empty queue (the
+/// desktop shell's rule until #1540) strands it for good: the next sender
+/// finds the queue non-empty and asks for no wake either (issue #1035).
+///
+/// The dispatcher is called with its lock released, so a dispatcher that drops
+/// something whose `Drop` dispatches in turn does not deadlock, and a poisoned
+/// lock is read through rather than propagated. That is this function's own
+/// guarantee, not its callees': the queue itself ([`queue_main_callback`]) and
+/// the desktop dispatcher still `unwrap` their locks, so either would panic if
+/// its lock were poisoned (nothing panics while holding them).
+pub fn dispatch_main_callback(f: Box<dyn FnOnce() + Send>) {
+    dispatch_main_callback_for(0, f);
+}
+
+/// [`dispatch_main_callback`], with the closure queued for the thread tagged
+/// `owner` (issue #2778; `0` as unrouted).
+pub(crate) fn dispatch_main_callback_for(owner: u32, f: Box<dyn FnOnce() + Send>) {
+    let dispatcher = *CROSS_THREAD_DISPATCHER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match dispatcher {
+        Some(dispatch) => dispatch_routed(owner, f, dispatch),
+        None => {
+            let previous = QUEUE_THREAD.try_with(|q| q.route.replace(owner)).ok();
+            queue_main_callback(f);
+            if let Some(previous) = previous {
+                let _ = QUEUE_THREAD.try_with(|q| q.route.set(previous));
+            }
+        }
     }
 }
 
@@ -478,8 +947,18 @@ pub(crate) struct ObserverId(pub(crate) usize);
 /// `run_effect` that finds nothing to run.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum DepKey {
-    Signal { id: u32, generation: u32 },
-    Memo { id: u32, generation: u32 },
+    Signal {
+        id: u32,
+        generation: u32,
+    },
+    /// `seen` is the memo's version as of the read that took the
+    /// subscription out — what `flush_effects` compares against to decide
+    /// whether an observer woken through this memo really has to run.
+    Memo {
+        id: u32,
+        generation: u32,
+        seen: u64,
+    },
 }
 
 impl DepKey {
@@ -495,11 +974,11 @@ impl DepKey {
     pub(crate) fn unsubscribe(self, observer: ObserverId) {
         match self {
             DepKey::Signal { id, generation } => SIGNAL_STORE.with(|store| {
-                if let Some(slot) = store.borrow_mut().get_slot_mut(id, generation) {
-                    slot.subscribers.remove(&observer);
+                if let Some(inner) = store.borrow().get_inner(id, generation) {
+                    inner.subscribers.borrow_mut().remove(&observer);
                 }
             }),
-            DepKey::Memo { id, generation } => {
+            DepKey::Memo { id, generation, .. } => {
                 MEMO_STORE.with(|store| store.borrow().unsubscribe(id, generation, observer));
             }
         }
@@ -518,21 +997,52 @@ thread_local! {
     static SIGNAL_STORE: RefCell<SignalStore> = RefCell::new(SignalStore::new());
 }
 
-pub(crate) struct SignalSlot {
-    pub(crate) value: Box<dyn Any>,
+/// A signal's value and subscriber set, each in its **own** `RefCell` —
+/// separate from the `RefCell<SignalStore>` that the slot vec itself lives in
+/// (issue #546).
+///
+/// Every read/write first clones this `Rc` out of `SIGNAL_STORE` under a
+/// brief, shared `borrow()`, then drops the store borrow and operates on
+/// `value`/`subscribers` alone. That is what lets a nested read of a
+/// *different* signal — `a.with(|av| b.get())` — work both in and out of an
+/// effect: `b`'s `track()` no longer needs `SIGNAL_STORE.borrow_mut()` while
+/// `a`'s closure is running, because `a`'s own borrow was never taken on the
+/// store in the first place; it is taken on `a`'s own `SignalCell`, which is a
+/// different `RefCell` from `b`'s. Only a signal reading or writing *itself*
+/// from inside its own `with`/`update` closure still panics — genuine
+/// reentrancy on one `RefCell`, not an artifact of sharing the whole store.
+///
+/// This mirrors `Memo`'s existing shape (`MemoInner` is reached the same way,
+/// through an `Rc<dyn Any>` cloned out of `MEMO_STORE`), which is why memos
+/// never had this bug.
+pub(crate) struct SignalCell {
+    pub(crate) value: RefCell<Box<dyn Any>>,
     /// Observers to notify, ordered. `BTreeSet` (not `HashSet`) so iteration
     /// yields ascending `ObserverId` = registration order; see the module-level
     /// "Execution order" docs.
-    pub(crate) subscribers: BTreeSet<ObserverId>,
-    pub(crate) generation: u32,
+    pub(crate) subscribers: RefCell<BTreeSet<ObserverId>>,
+}
+
+/// One entry in [`SignalStore`]'s slot vec: the generation that names it, plus
+/// the `Rc<SignalCell>` callers clone out to reach the value/subscribers
+/// without holding the store borrow.
+struct SignalSlot {
+    inner: Rc<SignalCell>,
+    generation: u32,
 }
 
 pub(crate) struct SignalStore {
     slots: Vec<Option<SignalSlot>>,
     /// Indices of freed slots available for reuse.
     free_list: Vec<u32>,
-    /// Generation counter, incremented on each allocation.
+    /// Generation counter, incremented on each allocation, never 0.
     next_gen: u32,
+    /// This thread's tag, in an id's high bits (issue #2778): every id is
+    /// `tag_bits | slot`, so a signal names its thread. An id with other tag
+    /// bits names no signal here.
+    tag_bits: u32,
+    /// Whether this store has taken a thread tag yet (at its first signal).
+    tagged: bool,
 }
 
 impl SignalStore {
@@ -541,10 +1051,26 @@ impl SignalStore {
             slots: Vec::new(),
             free_list: Vec::new(),
             next_gen: 1, // Start at 1 so generation=0 is never valid
+            tag_bits: 0,
+            tagged: false,
         }
     }
 
+    /// Take this thread's tag, once: at the first signal, so a thread that
+    /// only asks [`Self::has_allocated`] takes none.
+    pub(crate) fn claim_tag(&mut self) {
+        if self.tagged {
+            return;
+        }
+        self.tagged = true;
+        let (tag, counter) = claim_thread_tag();
+        self.tag_bits = tag << TAG_SHIFT;
+        self.next_gen = counter;
+        let _ = QUEUE_THREAD.try_with(|q| q.tag.set(tag));
+    }
+
     pub(crate) fn alloc<T: 'static>(&mut self, value: T) -> (u32, u32) {
+        self.claim_tag();
         let generation = self.next_gen;
         self.next_gen = self.next_gen.wrapping_add(1);
         if self.next_gen == 0 {
@@ -552,33 +1078,56 @@ impl SignalStore {
         }
 
         let slot = SignalSlot {
-            value: Box::new(value),
-            subscribers: BTreeSet::new(),
+            inner: Rc::new(SignalCell {
+                value: RefCell::new(Box::new(value)),
+                subscribers: RefCell::new(BTreeSet::new()),
+            }),
             generation,
         };
 
         if let Some(idx) = self.free_list.pop() {
             self.slots[idx as usize] = Some(slot);
-            (idx, generation)
+            (self.tag_bits | idx, generation)
         } else {
             let idx = self.slots.len() as u32;
+            assert!(
+                idx <= SLOT_MASK,
+                "more than {} signals alive at once on one thread",
+                SLOT_MASK as u64 + 1
+            );
             self.slots.push(Some(slot));
-            (idx, generation)
+            (self.tag_bits | idx, generation)
         }
     }
 
-    pub(crate) fn get_slot(&self, id: u32, generation: u32) -> Option<&SignalSlot> {
-        self.slots
-            .get(id as usize)?
-            .as_ref()
-            .filter(|s| s.generation == generation)
+    /// The slot index `id` names in this store, or `None` when its tag is
+    /// another thread's (issue #2778): ids of two threads' stores never alias.
+    fn slot_of(&self, id: u32) -> Option<usize> {
+        (id & !SLOT_MASK == self.tag_bits).then_some((id & SLOT_MASK) as usize)
     }
 
-    pub(crate) fn get_slot_mut(&mut self, id: u32, generation: u32) -> Option<&mut SignalSlot> {
+    /// Whether `id` was made on another thread: its tag is not this store's,
+    /// so no slot here can hold it (issue #2889 tells this drop from a freed
+    /// slot's).
+    pub(crate) fn is_foreign(&self, id: u32) -> bool {
+        self.slot_of(id).is_none()
+    }
+
+    /// Whether this store has ever allocated a signal (slots are never
+    /// removed, only emptied, so a freed signal still counts).
+    fn has_allocated(&self) -> bool {
+        !self.slots.is_empty()
+    }
+
+    /// The slot's `SignalCell`, cloned out under a shared borrow of the store
+    /// alone — the store borrow is gone by the time the caller touches
+    /// `value` or `subscribers`.
+    pub(crate) fn get_inner(&self, id: u32, generation: u32) -> Option<Rc<SignalCell>> {
         self.slots
-            .get_mut(id as usize)?
-            .as_mut()
+            .get(self.slot_of(id)?)?
+            .as_ref()
             .filter(|s| s.generation == generation)
+            .map(|s| Rc::clone(&s.inner))
     }
 
     /// Free a slot, **returning** its value rather than dropping it in place.
@@ -587,14 +1136,40 @@ impl SignalStore {
     /// a value whose `Drop` touches a signal would otherwise `BorrowMutError`
     /// (issue #141, SD4). Returns `None` if the slot was already freed or the
     /// generation does not match.
+    ///
+    /// The per-signal `Rc<SignalCell>` is `try_unwrap`'d here rather than
+    /// dropped as-is: nothing but the store itself normally holds a clone at
+    /// dispose time, so this succeeds in the overwhelming common case and the
+    /// caller gets the same `Box<dyn Any>` contract as before #546. If some
+    /// in-flight borrow elsewhere still holds a clone — reentrant disposal
+    /// from inside this very signal's own `with`/`update` closure, which is
+    /// not a shape any caller is expected to construct — the value is simply
+    /// not parked for the deterministic end-of-fixpoint drop; it drops
+    /// whenever that other clone's last reference goes away instead, same as
+    /// any other `Rc`.
     fn free(&mut self, id: u32, generation: u32) -> Option<Box<dyn Any>> {
-        let slot = self.slots.get_mut(id as usize)?;
+        let index = self.slot_of(id)?;
+        let slot = self.slots.get_mut(index)?;
         if !slot.as_ref().is_some_and(|s| s.generation == generation) {
             return None;
         }
-        let taken = slot.take();
-        self.free_list.push(id);
-        taken.map(|s| s.value)
+        let taken = slot.take()?;
+        self.free_list.push(index as u32);
+        match Rc::try_unwrap(taken.inner) {
+            Ok(cell) => Some(cell.value.into_inner()),
+            Err(_still_shared) => None,
+        }
+    }
+}
+
+impl Drop for SignalStore {
+    /// The thread is ending: its tag is free for another thread, which
+    /// continues its generation counter (see [`TagPool`]).
+    fn drop(&mut self) {
+        if self.tag_bits != 0 {
+            let _ = QUEUE_THREAD.try_with(|q| q.tag.set(0));
+            release_thread_tag(self.tag_bits >> TAG_SHIFT, self.next_gen);
+        }
     }
 }
 
@@ -626,6 +1201,10 @@ thread_local! {
 
 struct MemoSlot {
     inner: Rc<dyn Any>, // Type-erased Rc<MemoInner<T>>
+    /// The same allocation as `inner`, as the runtime's type-erased memo
+    /// interface: the version check in `flush_effects` starts from a
+    /// [`DepKey`] and has to refresh the memo without knowing its `T`.
+    node: Rc<dyn memo::MemoNode>,
     /// The memo's dirty-marker effect, which holds the *second* strong
     /// reference to the same `MemoInner`. Recorded here because the slot is
     /// type-erased: freeing a memo has to remove the marker's `EFFECTS` entry
@@ -659,6 +1238,7 @@ impl MemoStore {
     pub(crate) fn alloc(
         &mut self,
         inner: Rc<dyn Any>,
+        node: Rc<dyn memo::MemoNode>,
         observer: ObserverId,
         subscribers: Rc<RefCell<BTreeSet<ObserverId>>>,
     ) -> (u32, u32) {
@@ -670,6 +1250,7 @@ impl MemoStore {
 
         let slot = MemoSlot {
             inner,
+            node,
             observer,
             subscribers,
             generation,
@@ -691,6 +1272,16 @@ impl MemoStore {
             .as_ref()
             .filter(|s| s.generation == generation)
             .map(|s| Rc::clone(&s.inner))
+    }
+
+    /// The memo in this slot as a [`MemoNode`](memo::MemoNode), if the slot
+    /// still holds the memo the caller recorded.
+    pub(crate) fn get_node(&self, id: u32, generation: u32) -> Option<Rc<dyn memo::MemoNode>> {
+        self.slots
+            .get(id as usize)?
+            .as_ref()
+            .filter(|s| s.generation == generation)
+            .map(|s| Rc::clone(&s.node))
     }
 
     /// Remove an observer from a memo's subscriber set, if this slot still
@@ -761,6 +1352,47 @@ pub(crate) fn free_memo(id: u32, generation: u32) {
 }
 
 // ============================================================================
+// Memo staleness
+// ============================================================================
+
+/// The memo a registered observer stands for, if it is a memo's marker.
+fn memo_node_of(observer: ObserverId) -> Option<Rc<dyn memo::MemoNode>> {
+    effect::EFFECTS.with(|effects| {
+        effects
+            .borrow()
+            .get(&observer)
+            .and_then(|inner| inner.memo.clone())
+    })
+}
+
+/// Mark stale, synchronously, every memo among a written signal's
+/// `subscribers` (`Dirty`), and every memo downstream of those (`Check`).
+///
+/// This is the *push* half of the memo model: it is what lets a read made
+/// straight after a write — inside a [`batch`], inside an event handler that
+/// has not returned yet — see the new value, where a memo invalidated only
+/// when its queued marker ran would answer from its cache until the flush.
+/// It computes nothing. The walk stops at a memo that was already stale,
+/// because a stale memo's dependents were marked when it became stale.
+pub(crate) fn mark_memos_stale(subscribers: &[ObserverId]) {
+    let mut to_check: Vec<ObserverId> = Vec::new();
+    for &observer in subscribers {
+        if let Some(node) = memo_node_of(observer)
+            && node.mark_dirty()
+        {
+            to_check.extend(node.subscriber_snapshot());
+        }
+    }
+    while let Some(observer) = to_check.pop() {
+        if let Some(node) = memo_node_of(observer)
+            && node.mark_check()
+        {
+            to_check.extend(node.subscriber_snapshot());
+        }
+    }
+}
+
+// ============================================================================
 // Batching
 // ============================================================================
 
@@ -786,24 +1418,11 @@ impl BatchGuard {
 
 impl Drop for BatchGuard {
     fn drop(&mut self) {
-        // `try_with`: TLS may already be torn down at thread exit.
-        let _ = RUNTIME.try_with(|rt| {
-            if let Ok(mut rt) = rt.try_borrow_mut() {
-                rt.batching = self.prev;
-            } else {
-                // Unreachable today: if a caller held the borrow, `raise()`
-                // would have panicked before a guard existed, and unwinding
-                // releases inner `RefMut`s before this frame drops. But a
-                // *silent* skip here would latch `batching = true` for the
-                // rest of the thread's life — the #232 freeze this guard
-                // exists to prevent, now unrecoverable because nothing
-                // clears the flag unconditionally anymore. Fail loud.
-                tracing::error!(
-                    "BatchGuard could not restore the batching flag (runtime already \
-                     borrowed); reactive updates may stop flushing"
-                );
-            }
-        });
+        // A borrowed runtime is logged, not skipped silently: that would latch
+        // `batching = true` for the rest of the thread's life — the #232
+        // freeze this guard exists to prevent.
+        let prev = self.prev;
+        let _ = restore::with_runtime_on_drop("the batching flag", |rt| rt.batching = prev);
     }
 }
 
@@ -826,10 +1445,27 @@ impl Drop for BatchGuard {
 /// batch with an RAII window (raise flag → batch writes → drop flag) and
 /// needs observers to run inside the window must account for this case.
 ///
-/// Until the flush, nothing has run: inside the closure — including after a
-/// *nested* `batch()` returns — effects have not executed, and [`Memo::get`]
-/// still returns the pre-batch value (a memo is re-marked dirty by a queued
-/// marker effect, which is itself deferred by the batch).
+/// Until the flush, no effect has run: inside the closure — including after a
+/// *nested* `batch()` returns — effects have not executed. [`Memo::get`] is
+/// current all the same: a write marks the memos that read it stale
+/// synchronously, and the read recomputes (see `memo`'s module docs).
+///
+/// Event-handler dispatch runs inside one (`events::dispatch_event` and its
+/// siblings, the keyboard and paste interceptors, the dismiss stack, `Drag`
+/// callbacks, each drained main-thread callback, each timer — the guide's
+/// "Event handlers run as batches" has the exact list, and what is left out),
+/// so a handler that writes several signals flushes once. A `NodeHandle`
+/// operation inside the batch runs the effects queued so far first
+/// ([`flush_pending_effects`]), so the DOM a handler touches is never behind the
+/// writes it already made.
+///
+/// An outermost batch that wrote no signal, finds no [host
+/// change](note_host_change) owed and no effect queued at its exit does
+/// nothing there: no flush, and no signal-change callback — so a handler that
+/// wrote nothing requests no re-render. A batch that wrote runs
+/// the callbacks once at its exit even when its effects already ran mid-batch,
+/// and a batch that wrote nothing still flushes (and notifies for) effects an
+/// earlier batch left queued.
 ///
 /// # Panics
 ///
@@ -858,18 +1494,240 @@ pub fn batch<R>(f: impl FnOnce() -> R) -> R {
     let guard = BatchGuard::raise();
     let outermost = !guard.prev;
 
+    // An outermost batch is its own flush context, even when it is opened from
+    // inside an effect body (an effect that dispatches a handler, a web
+    // `focus()` that fires one synchronously). The effect depth that makes
+    // `flush_pending_effects` a no-op inside effect bodies is set aside for its
+    // duration, so a DOM call in the batch still sees the batch's own writes.
+    // Library suppression (`suppress_effect_flush`) is deliberately NOT set
+    // aside: a borrow the library holds is still held.
+    let _depth = outermost.then(DepthSetAside::enter);
+    // What suppression the outermost batch was opened under (library code can
+    // legitimately open one while holding a guard), so its exit can check that
+    // nothing taken inside it outlived it.
+    let suppressed_at_entry = outermost.then(|| FLUSH_SUPPRESSED.with(|s| s.get()));
+    // How many signal writes this thread had made when the outermost batch
+    // opened, so its exit can tell a batch that wrote nothing (issue #234).
+    let writes_at_entry = outermost.then(|| SIGNAL_NOTIFIES.with(|c| c.get()));
+
     let result = f();
+
+    // A leaked `suppress_effect_flush` guard (`mem::forget`, a guard stashed
+    // in a struct that outlives the handler) would silently switch the
+    // mid-batch flush off on this thread for good, and nothing else would ever
+    // notice: every handler would just lose program order again.
+    if let Some(at_entry) = suppressed_at_entry {
+        debug_assert_eq!(
+            FLUSH_SUPPRESSED.with(|s| s.get()),
+            at_entry,
+            "a suppress_effect_flush() guard taken inside this batch outlived it; \
+             mid-batch flushing would stay off on this thread"
+        );
+    }
 
     // Restore the flag *before* flushing: `Signal::set` inside a flushed
     // effect must see `batching = false` again, and a `batch()` opened there
     // must count as a fresh outermost batch.
     drop(guard);
 
-    if outermost {
-        flush_effects_and_notify();
+    // An outermost batch that wrote no signal and left nothing queued has
+    // nothing to run and nothing to tell the host (issue #234): every event
+    // dispatch is a batch, so a handler that wrote nothing used to post a
+    // desktop `ReRender` and dirty every embedded context for a no-op. Both
+    // halves of the test matter. A write whose effects already ran mid-batch
+    // (`flush_pending_effects`) leaves the queue empty and still owes the host
+    // its notification; and effects an earlier batch left queued — one whose
+    // closure panicked and was caught, see `# Panics` — are run, and notified
+    // for, by the next batch, written to or not.
+    //
+    // A host change ([`note_host_change`] — the thread-global theme slot is
+    // one) that no notification has delivered yet is owed too, whether it was
+    // made inside this batch or outside any: the hosts pick it up only from
+    // this notification.
+    if let Some(at_entry) = writes_at_entry {
+        let wrote = SIGNAL_NOTIFIES.with(|c| c.get()) != at_entry;
+        if wrote || host_change_owed() || has_pending_effects() {
+            flush_effects_and_notify();
+        }
     }
 
     result
+}
+
+thread_local! {
+    /// Set by [`note_host_change`], cleared by every signal-change notification
+    /// (each one tells every host), and read by [`batch`]'s exit.
+    static HOST_CHANGE_OWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn host_change_owed() -> bool {
+    HOST_CHANGE_OWED.with(|c| c.get())
+}
+
+/// Record a change to state the **hosts** read outside the signal graph, so
+/// the batch it is made in still calls the signal-change callbacks.
+///
+/// An outermost [`batch`] that wrote no signal calls no signal-change callback
+/// (issue #234), and those callbacks are how a host learns something changed:
+/// the desktop shell's `ReRender`, an embedded context's dirty flag, the web
+/// backend's theme `<style>` refresh. A piece of state that is not a
+/// [`Signal`], that code may change from a handler, and that a host reads
+/// only when told — `set_current_theme_css` (`rinch::update_theme`) is the one
+/// in rinch today — calls this when it changes, and the enclosing batch's exit
+/// notifies as if a signal had been written. Made outside any batch, it
+/// notifies nothing at once and is owed to the next notification: the next
+/// outermost batch notifies for it whether or not that batch writes anything
+/// (so the user's next click of any kind delivers it, as before #234), and any
+/// other notification — an unbatched signal write — pays it along the way.
+///
+/// State a host polls on its own (a dirty DOM node, a pending focus request,
+/// the editor's owed overlay pass, a finished image decode, a queued
+/// `NodeHandle::scroll_into_view` / `scroll_to_fraction` request — #1145)
+/// does not need it.
+pub fn note_host_change() {
+    HOST_CHANGE_OWED.with(|c| c.set(true));
+}
+
+/// Whether any effect is queued on this thread. Answers `true` when the
+/// runtime is borrowed — unreachable at a batch's exit (see `BatchGuard::drop`),
+/// and `true` keeps the unconditional flush that was there before #234.
+fn has_pending_effects() -> bool {
+    RUNTIME.with(|rt| {
+        rt.try_borrow()
+            .map(|rt| !rt.pending_effects.is_empty())
+            .unwrap_or(true)
+    })
+}
+
+thread_local! {
+    /// How many effect bodies and memo computations are running on this thread
+    /// right now (nested runs count once each). See [`flush_pending_effects`].
+    static REACTIVE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Saves [`REACTIVE_DEPTH`], zeroes it, and puts it back on drop — for an
+/// outermost [`batch`], which is a flush context of its own.
+struct DepthSetAside {
+    _restore: restore::RestoreCell<ReactiveDepthSlot>,
+}
+
+restore::restore_slot!(ReactiveDepthSlot: u32 = REACTIVE_DEPTH);
+
+impl DepthSetAside {
+    fn enter() -> Self {
+        DepthSetAside {
+            _restore: restore::RestoreCell::replace(0),
+        }
+    }
+}
+
+thread_local! {
+    /// Open [`suppress_effect_flush`] guards on this thread.
+    static FLUSH_SUPPRESSED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// While the returned guard lives, [`flush_pending_effects`] — and therefore
+/// every `NodeHandle` operation — runs no effects.
+///
+/// For **library code that touches the DOM while it holds a borrow of its own
+/// state**. A `NodeHandle` operation made inside a batch runs the effects the
+/// batch has queued so far, and a user effect is free to call back into the
+/// library — which, under a held `RefCell` borrow, is a `BorrowMutError`. The
+/// editor is the shape: `EditorHandle::command` holds its core mutably while
+/// the view patches the DOM, and a toolbar effect reading
+/// `is_mark_active` would run in the middle of it. Take the guard *with* the
+/// borrow and drop it after; the pending effects run at the next DOM access
+/// outside it, or when the batch ends.
+///
+/// Library code should also call [`flush_pending_effects`] **before** taking
+/// such a borrow, so that the caller's earlier writes have reached the DOM the
+/// library is about to work on (program order, as for any DOM access).
+///
+/// Unlike the effect depth, suppression is not set aside by a [`batch`]
+/// opened inside it: a batch does not release the borrow.
+#[must_use = "the suppression ends when the guard is dropped"]
+pub fn suppress_effect_flush() -> EffectFlushSuppressed {
+    FLUSH_SUPPRESSED.with(|s| s.set(s.get() + 1));
+    EffectFlushSuppressed {
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+/// The guard [`suppress_effect_flush`] returns.
+pub struct EffectFlushSuppressed {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for EffectFlushSuppressed {
+    fn drop(&mut self) {
+        let _ = FLUSH_SUPPRESSED.try_with(|s| s.set(s.get().saturating_sub(1)));
+    }
+}
+
+/// Marks an effect body or memo computation as running, for
+/// [`flush_pending_effects`]. RAII, so a panicking body cannot strand it.
+pub(crate) struct ReactiveDepthGuard;
+
+impl ReactiveDepthGuard {
+    pub(crate) fn enter() -> Self {
+        REACTIVE_DEPTH.with(|d| d.set(d.get() + 1));
+        ReactiveDepthGuard
+    }
+}
+
+impl Drop for ReactiveDepthGuard {
+    fn drop(&mut self) {
+        let _ = REACTIVE_DEPTH.try_with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Run, now, the effects the current [`batch`] has queued so far — the flush it
+/// would otherwise run when it exits — and leave the batch open.
+///
+/// This is what keeps an event handler's **program order** intact although
+/// the handler is a batch: every `NodeHandle` operation calls it first, so
+/// `open.set(true); field.focus()` focuses *after* the dialog's effects have
+/// run (and after the dialog's own focus request, which the handler's then
+/// overrides), and `rows.update(..); list.scroll_to_bottom()` scrolls to the
+/// new last row. It is the analogue of a browser flushing pending style when
+/// script asks for layout. Call it yourself before handing control to code
+/// that reads the DOM some other way.
+///
+/// The flush is an ordinary one: the batching flag is lowered while it runs,
+/// so the effects see exactly what the end-of-batch flush would show them
+/// (a write inside one flushes synchronously; a `batch()` inside one flushes
+/// before returning), and raised again afterwards so the handler's later writes
+/// are batched as before. Order is the queue's, so the #154 contract holds.
+///
+/// A no-op outside a batch (writes there have already flushed), when nothing
+/// is queued, while an effect body or memo computation is running — those
+/// run *inside* a flush, and draining the queue from one would run effects
+/// queued behind it ahead of their turn (an outermost `batch` opened inside
+/// one is its own context again) — and under [`suppress_effect_flush`]. The signal-change callbacks (the
+/// host's re-render request) are not called here; the batch's own exit calls
+/// them once.
+pub fn flush_pending_effects() {
+    if REACTIVE_DEPTH.with(|d| d.get()) > 0 || FLUSH_SUPPRESSED.with(|s| s.get()) > 0 {
+        return;
+    }
+    let pending = RUNTIME.with(|rt| {
+        rt.try_borrow()
+            .map(|rt| rt.batching && !rt.pending_effects.is_empty())
+            .unwrap_or(false)
+    });
+    if !pending {
+        return;
+    }
+    /// Lowers the flag for the flush and raises it again — on unwind too.
+    struct Lowered;
+    impl Drop for Lowered {
+        fn drop(&mut self) {
+            let _ = restore::with_runtime_on_drop("the batching flag", |rt| rt.batching = true);
+        }
+    }
+    RUNTIME.with(|rt| rt.borrow_mut().batching = false);
+    let _raise = Lowered;
+    flush_effects();
 }
 
 /// Run every pending effect, then the UI re-render callbacks.
@@ -885,6 +1743,162 @@ pub(crate) fn flush_effects_and_notify() {
 }
 
 // ============================================================================
+// Performance counters
+// ============================================================================
+
+/// Cumulative reactive-runtime counters, since the thread started (or since a
+/// document began to be counted). Monotonic: a consumer that wants per-frame
+/// numbers keeps the last snapshot and subtracts (the desktop shell folds the
+/// deltas into the document's `rinch_dom::perf` counters at the end of each
+/// frame).
+///
+/// [`reactive_counters`] reads the thread's: every document's work and
+/// everybody else's. A document [counted on its own](count_doc_reactive_work)
+/// is read with [`doc_reactive_counters`], and the work of no counted document
+/// with [`unattributed_reactive_counters`] (#2798). An effect's run is the
+/// document it was created in (the one its reactive frame re-enters), and a
+/// signal write the document current where it is written (an effect's, or
+/// the one dispatching).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReactiveCounters {
+    /// Effect bodies run (an effect skipped as disposed or re-entered is not
+    /// counted).
+    pub effect_runs: u64,
+    /// `Signal` change notifications (`set`, `update`, and the other writers).
+    pub signal_notifies: u64,
+}
+
+thread_local! {
+    static EFFECT_RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Not only a counter: [`batch`] compares it across an outermost batch to
+    /// tell whether the batch wrote anything (issue #234), so every signal
+    /// write must keep bumping it.
+    static SIGNAL_NOTIFIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A snapshot of this thread's [`ReactiveCounters`]: all of its work,
+/// whichever document it was for.
+pub fn reactive_counters() -> ReactiveCounters {
+    ReactiveCounters {
+        effect_runs: EFFECT_RUNS.with(|c| c.get()),
+        signal_notifies: SIGNAL_NOTIFIES.with(|c| c.get()),
+    }
+}
+
+/// The reactive work of each document counted on its own, and of nobody
+/// else (#2798).
+#[derive(Debug)]
+pub(crate) struct DocReactiveCounters {
+    /// Each counted document's counters. A thread has a few documents (a
+    /// window each, DevTools), so a scan beats a map on the path every
+    /// effect run and signal write takes.
+    docs: Vec<(u64, ReactiveCounters)>,
+    /// Work under no document, or under one nobody counts.
+    unattributed: ReactiveCounters,
+}
+
+impl DocReactiveCounters {
+    const fn new() -> Self {
+        Self {
+            docs: Vec::new(),
+            unattributed: ReactiveCounters {
+                effect_runs: 0,
+                signal_notifies: 0,
+            },
+        }
+    }
+
+    #[inline]
+    fn of(&mut self, doc: u64) -> &mut ReactiveCounters {
+        if doc != 0
+            && let Some(i) = self.docs.iter().position(|(d, _)| *d == doc)
+        {
+            return &mut self.docs[i].1;
+        }
+        &mut self.unattributed
+    }
+}
+
+impl crate::doc_keyed::ForgetDoc for DocReactiveCounters {
+    fn take_doc(&mut self, doc: u64) -> crate::doc_keyed::Removed {
+        self.docs.retain(|(d, _)| *d != doc);
+        Vec::new()
+    }
+
+    fn entries_for_doc(&self, doc: u64) -> usize {
+        self.docs.iter().filter(|(d, _)| *d == doc).count()
+    }
+}
+
+crate::doc_keyed! {
+    /// Each counted document's reactive work; its sweep stops counting it.
+    static DOC_COUNTERS: DocReactiveCounters = DocReactiveCounters::new();
+}
+
+/// Count document `doc_key`'s reactive work on its own from now on, from
+/// zero, until the document is forgotten ([`forget_doc`](crate::forget_doc)).
+/// What a performance consumer (the shell's window, an embedded context)
+/// calls when it mounts the document, so the document's frames can carry
+/// its own work rather than the thread's (#2798). `0` (no document) and a
+/// document already counted change nothing.
+pub fn count_doc_reactive_work(doc_key: u64) {
+    if doc_key == 0 {
+        return;
+    }
+    DOC_COUNTERS.with_mut(|c| {
+        if !c.docs.iter().any(|(d, _)| *d == doc_key) {
+            c.docs.push((doc_key, ReactiveCounters::default()));
+        }
+    });
+}
+
+/// Document `doc_key`'s reactive work since it began to be counted
+/// ([`count_doc_reactive_work`]); zero for a document not counted.
+pub fn doc_reactive_counters(doc_key: u64) -> ReactiveCounters {
+    DOC_COUNTERS
+        .try_with(|c| c.docs.iter().find(|(d, _)| *d == doc_key).map(|(_, r)| *r))
+        .flatten()
+        .unwrap_or_default()
+}
+
+/// The thread's reactive work under no counted document: under no document
+/// at all (a write from `main`, a worker's queued closure, a test), or under
+/// one nobody counts, since the thread started.
+pub fn unattributed_reactive_counters() -> ReactiveCounters {
+    DOC_COUNTERS
+        .try_with(|c| c.unattributed)
+        .unwrap_or_default()
+}
+
+/// How many documents this thread counts on its own.
+pub fn counted_doc_count() -> usize {
+    DOC_COUNTERS.try_with(|c| c.docs.len()).unwrap_or(0)
+}
+
+/// One effect body run, for document `doc` (the raw key its frame re-entered;
+/// `0` for none).
+#[inline]
+pub(crate) fn count_effect_run(doc: u64) {
+    EFFECT_RUNS.with(|c| c.set(c.get().wrapping_add(1)));
+    let _ = DOC_COUNTERS.try_with_mut(|c| {
+        let r = c.of(doc);
+        r.effect_runs = r.effect_runs.wrapping_add(1);
+    });
+}
+
+/// One signal write, for the document current where it is written.
+#[inline]
+pub(crate) fn count_signal_notify() {
+    SIGNAL_NOTIFIES.with(|c| c.set(c.get().wrapping_add(1)));
+    let doc = crate::context::current_doc_raw();
+    let _ = DOC_COUNTERS.try_with_mut(|c| {
+        let r = c.of(doc);
+        r.signal_notifies = r.signal_notifies.wrapping_add(1);
+    });
+}
+
+// ============================================================================
 // Utility functions
 // ============================================================================
 
@@ -892,7 +1906,7 @@ pub(crate) fn flush_effects_and_notify() {
 ///
 /// This is a convenience function that creates a memo and returns it
 /// as a signal-like value.
-pub fn derived<T: Clone + 'static>(f: impl Fn() -> T + 'static) -> Memo<T> {
+pub fn derived<T: Clone + PartialEq + 'static>(f: impl Fn() -> T + 'static) -> Memo<T> {
     Memo::new(f)
 }
 
@@ -921,16 +1935,8 @@ pub fn untracked<R>(f: impl FnOnce() -> R) -> R {
     impl Drop for RestoreObserver {
         fn drop(&mut self) {
             if let Some(obs) = self.observer.take() {
-                // `try_with`: TLS may already be torn down at thread exit.
-                let _ = RUNTIME.try_with(|rt| {
-                    if let Ok(mut rt) = rt.try_borrow_mut() {
-                        rt.observer_stack.push(obs);
-                    } else {
-                        tracing::error!(
-                            "untracked() could not restore the observer (runtime already \
-                             borrowed); an effect may silently stop subscribing"
-                        );
-                    }
+                let _ = restore::with_runtime_on_drop("the observer untracked() popped", |rt| {
+                    rt.observer_stack.push(obs)
                 });
             }
         }
@@ -945,11 +1951,168 @@ pub fn untracked<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Run an app's callback with **no** observer in view (issues #285, #931).
+///
+/// Call this wherever framework or library code invokes a callback the *app*
+/// supplied — an event handler, a hook, an observer, a dismiss handler — from a
+/// place that may be inside a running effect. Handlers respond to events;
+/// effects respond to signals. Without it, every signal the callback reads is
+/// recorded as a dependency of whichever effect happened to make the call, and
+/// that effect re-runs on the app's writes to state it never read itself.
+///
+/// Every app-callback type's `invoke` ([`Callback`](crate::Callback),
+/// [`ValueCallback`](crate::ValueCallback), [`InputCallback`](crate::InputCallback),
+/// [`FileDropCallback`](crate::FileDropCallback),
+/// [`ScrollCallback`](crate::events::ScrollCallback)) goes through here, and so
+/// do the selection and selection-sync callbacks, the keyboard and paste
+/// interceptors, the dismiss stack,
+/// [`Drag::cancel`](crate::events::Drag::cancel)'s `on_cancel`, the child
+/// observers ([`on_child_inserted`](crate::dom::on_child_inserted) — which every
+/// `for` reconcile reaches from inside its effect) and the rich-text editor's
+/// `EditorHandle` hooks.
+///
+/// This suspends the **whole** observer stack, not just its top as
+/// [`untracked`] does: an effect created inside another running effect sits
+/// two frames deep, and popping one frame would hand the callback's reads to
+/// the outer effect instead (#932). Effects that *run* inside `f` (a callback's
+/// write flushing outside a batch, an effect the callback creates) push their
+/// own observer onto the emptied stack and track normally. The stack is
+/// restored on the way out, including while unwinding.
+///
+/// Only tracking changes. Batching, the owner stack and effect flushing are
+/// untouched: a callback's writes flush exactly when a bare call's would, and a
+/// signal it creates belongs to whatever owner is ambient — combine with
+/// [`Owner::run`] or [`unowned`] for that.
+///
+/// Do **not** use it around code that is the caller's own synchronous work,
+/// such as the closure handed to `EditorHandle::update`: an effect that reads a
+/// signal there does mean to depend on it.
+pub fn untracked_handler<R>(f: impl FnOnce() -> R) -> R {
+    let _suspended = scope::SuspendObservers::take();
+    f()
+}
+
+/// [`untracked_handler`] as a guard: the whole observer stack is suspended
+/// from this call until the returned value is dropped (issue #943).
+///
+/// For library code that runs app-supplied code under a borrow it holds in a
+/// guard of its own, where a closure cannot span the region — the rich-text
+/// editor's `EditorHandle` holds one beside every borrow of its core, so the
+/// plugin methods the handle itself runs (`apply`, `decorations`,
+/// `handle_paste`, a plugin's command) are untracked. Everything
+/// [`untracked_handler`] says applies, including its warning: the caller's
+/// own synchronous code must run with the guard dropped — and so plugin code
+/// the caller's code calls in that window (an `update` closure calling
+/// `state.apply(..)`) is tracked, as the caller's.
+///
+/// Drop guards in the reverse order they were taken, as scoped guards are, and
+/// on the thread that took them: the guard is `!Send` and `!Sync`, because the
+/// observer stack it restores is thread-local.
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>(_: T) {}
+/// assert_send(rinch_core::reactive::suspend_tracking());
+/// ```
+#[must_use = "tracking resumes as soon as the guard is dropped"]
+pub struct TrackingSuspended {
+    _suspended: scope::SuspendObservers,
+    /// `!Send` + `!Sync`: dropped on another thread it would restore this
+    /// thread's observers onto that thread's stack.
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl std::fmt::Debug for TrackingSuspended {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TrackingSuspended")
+    }
+}
+
+/// Suspend dependency tracking until the returned guard is dropped; see
+/// [`TrackingSuspended`].
+pub fn suspend_tracking() -> TrackingSuspended {
+    TrackingSuspended {
+        _suspended: scope::SuspendObservers::take(),
+        _not_send: std::marker::PhantomData,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
+
+    /// #2778: a thread tag given back is taken again with the generation
+    /// counter where its last thread left it, so a handle to the ended
+    /// thread's signal never names the new thread's signal in the same slot;
+    /// past the last tag, threads go untagged.
+    #[test]
+    fn a_reused_thread_tag_continues_its_generation_counter() {
+        let mut pool = TagPool {
+            fresh: 1,
+            free: VecDeque::new(),
+        };
+        assert_eq!(pool.claim(), (1, 1));
+        assert_eq!(pool.claim(), (2, 1));
+        pool.release(1, 40);
+        pool.release(0, 99); // untagged: nothing to give back
+        assert_eq!(pool.claim(), (1, 40), "tag 1 again, counting on from 40");
+        assert_eq!(pool.claim(), (3, 1));
+        pool.fresh = MAX_THREAD_TAG + 1;
+        assert_eq!(pool.claim(), (0, 1), "no tag left");
+    }
+
+    /// #2778: a signal's id names the thread whose store holds it, and a
+    /// store finds nothing for another thread's id in the same slot.
+    #[test]
+    fn a_signals_id_names_its_thread() {
+        let here = Signal::new(5u8);
+        let tag = current_thread_tag();
+        assert_ne!(tag, 0, "this thread took a tag at its first signal");
+        assert_eq!(signal_owner(here.identity().0), tag);
+        let (id, generation) = here.identity();
+        let there = std::thread::spawn(move || {
+            let s = Signal::new(0u8);
+            let alias = SIGNAL_STORE.with(|store| store.borrow().get_inner(id, generation));
+            (
+                signal_owner(s.identity().0),
+                current_thread_tag(),
+                alias.is_none(),
+            )
+        })
+        .join()
+        .unwrap();
+        assert_eq!(there.0, there.1);
+        assert_ne!(there.1, tag, "two live threads never share a tag");
+        assert!(there.2, "another thread's id names no signal here");
+    }
+
+    /// Review of #2780: the generation keeps its 32 bits — the tag does not
+    /// shorten its period. A slot freed and reused at the old 2^24 period's
+    /// wrap point still tells its stale handle from the new signal.
+    /// (`tests/stale_handle_wrap_2780.rs` does it the long way, `--ignored`.)
+    #[test]
+    fn a_signals_generation_keeps_its_32_bits() {
+        let mut store = SignalStore::new();
+        // Untagged, so this scratch store takes no thread tag (its `Drop`
+        // would give it back under the thread's own store).
+        store.tagged = true;
+        let (a, gen_a) = store.alloc(1u8);
+        assert_eq!(gen_a, 1, "a fresh store's first generation");
+        drop(store.free(a, gen_a));
+        // As if 2^24 - 3 allocations had run since `a`; then reuse the slot
+        // across the old period's wrap point, one allocation at a time.
+        store.next_gen = (1 << 24) - 2;
+        for _ in 0..4 {
+            let (b, gen_b) = store.alloc(2u8);
+            assert_eq!(b, a, "the same slot, reused");
+            assert!(
+                store.get_inner(a, gen_a).is_none(),
+                "the stale handle stays dead (generation {gen_b:#x})"
+            );
+            drop(store.free(b, gen_b));
+        }
+    }
 
     /// How many observers each ordering test registers.
     ///
@@ -1228,6 +2391,153 @@ mod tests {
         sig.set(2);
         assert_eq!(legacy.get(), 1, "cleared legacy callback does not fire");
         assert_eq!(guard.get(), 2, "guard-based subscriber survives the clear");
+    }
+
+    /// Counts the notifications that reach the host — the signal-change
+    /// callback is what the desktop shell turns into a `ReRender` and an
+    /// embedded context into its dirty flag.
+    fn count_notifies() -> (Rc<Cell<u32>>, SignalChangeSubscription) {
+        let hits = Rc::new(Cell::new(0));
+        let h = hits.clone();
+        let sub = subscribe_signal_change(move || h.set(h.get() + 1));
+        (hits, sub)
+    }
+
+    /// An outermost batch that wrote nothing tells the host nothing (issue
+    /// #234, item 2). Every event dispatch is a batch, so before this a click
+    /// on a handler that wrote no signal — or a timer, or a drained main-thread
+    /// callback that changed nothing — posted a desktop `ReRender` and dirtied
+    /// every embedded context for a no-op.
+    ///
+    /// The positive control is a write to a signal **nobody observes**: it
+    /// queues no effect and leaves the queue as empty as the no-op batch does,
+    /// so the only thing telling the two apart is whether a write happened.
+    #[test]
+    fn an_outermost_batch_that_writes_nothing_does_not_notify() {
+        let (hits, _sub) = count_notifies();
+        let sig = Signal::new(0);
+
+        batch(|| {});
+        assert_eq!(hits.get(), 0, "an empty batch does not notify");
+
+        batch(|| batch(|| {}));
+        assert_eq!(hits.get(), 0, "nor does an empty batch nested in one");
+
+        batch(|| sig.get());
+        assert_eq!(hits.get(), 0, "a read is not a write");
+
+        batch(|| sig.set(1));
+        assert_eq!(
+            hits.get(),
+            1,
+            "a write with no observer still notifies, once, at the batch's exit"
+        );
+
+        batch(|| {
+            batch(|| sig.set(2));
+        });
+        assert_eq!(
+            hits.get(),
+            2,
+            "a write in a nested batch reaches the outer exit"
+        );
+    }
+
+    /// A batch that changed host state outside the signal graph notifies like
+    /// one that wrote a signal (PR #1134's review, F1: `update_theme` from a
+    /// handler that wrote nothing stopped restyling every host). Off the
+    /// one-change point: two changes in one batch still notify once.
+    #[test]
+    fn a_batch_that_notes_a_host_change_notifies_once() {
+        let (hits, _sub) = count_notifies();
+        batch(note_host_change);
+        assert_eq!(hits.get(), 1, "a host change owes the host a notification");
+        batch(|| {
+            note_host_change();
+            batch(note_host_change);
+        });
+        assert_eq!(hits.get(), 2, "once per outermost batch, nested or not");
+        batch(|| {});
+        assert_eq!(
+            hits.get(),
+            2,
+            "and an empty batch after it still owes nothing"
+        );
+    }
+
+    /// A host change made outside any batch is owed to the next batch, which
+    /// notifies for it once, written to or not (PR #1134 round-2 review, N1).
+    /// Any notification pays the debt: after one, an empty batch owes nothing.
+    #[test]
+    fn a_host_change_outside_a_batch_is_owed_to_the_next_batch() {
+        let (hits, _sub) = count_notifies();
+        note_host_change();
+        assert_eq!(
+            hits.get(),
+            0,
+            "outside a batch it notifies nothing by itself"
+        );
+        batch(|| {});
+        assert_eq!(hits.get(), 1, "the next batch pays it");
+        batch(|| {});
+        assert_eq!(hits.get(), 1, "once");
+
+        note_host_change();
+        Signal::new(0).set(1); // an unbatched write notifies, and pays it too
+        assert_eq!(hits.get(), 2);
+        batch(|| {});
+        assert_eq!(hits.get(), 2, "nothing left owed after that notification");
+    }
+
+    /// A batch whose writes were already flushed mid-batch still notifies at
+    /// its exit: the queue is empty by then, but the writes happened and the
+    /// host has not been told (`flush_pending_effects` never calls the
+    /// signal-change callbacks). A gate on "is anything queued" alone would
+    /// drop this re-render.
+    #[test]
+    fn a_batch_whose_writes_flushed_mid_batch_still_notifies() {
+        let (hits, _sub) = count_notifies();
+        let sig = Signal::new(0);
+        let seen = Rc::new(Cell::new(-1));
+        let s = seen.clone();
+        let _effect = Effect::new(move || s.set(sig.get()));
+
+        batch(|| {
+            sig.set(7);
+            flush_pending_effects();
+            assert_eq!(seen.get(), 7, "the mid-batch flush ran the effect");
+            assert_eq!(hits.get(), 0, "and told the host nothing yet");
+        });
+        assert_eq!(hits.get(), 1, "the batch's exit notifies for the write");
+    }
+
+    /// An empty batch still flushes, and notifies for, effects an earlier
+    /// batch left queued — the documented recovery for a `batch()` whose
+    /// closure panicked and was caught (issue #234, item 1, decided as "keep
+    /// today's behaviour": no flush is scheduled on unwind, the next flush
+    /// runs them). Every event dispatch is a batch, so the next handler of
+    /// any kind is that next flush; a gate on "was anything written in *this*
+    /// batch" alone would strand them until a write.
+    #[test]
+    fn an_empty_batch_flushes_effects_a_panicked_batch_left_queued() {
+        let sig = Signal::new(0);
+        let seen = Rc::new(Cell::new(-1));
+        let s = seen.clone();
+        let _effect = Effect::new(move || s.set(sig.get()));
+
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            batch(|| {
+                sig.set(5);
+                panic!("boom");
+            })
+        }));
+        assert!(caught.is_err(), "the batch closure panicked");
+        assert_eq!(seen.get(), 0, "nothing flushed on the way out");
+
+        let (hits, _sub) = count_notifies();
+        batch(|| {});
+        assert_eq!(seen.get(), 5, "the next batch ran the stranded effect");
+        assert_eq!(hits.get(), 1, "and told the host about the write it showed");
     }
 
     #[test]
@@ -1732,5 +3042,35 @@ mod tests {
         count.set(5);
         assert_eq!(a.get(), 10);
         assert_eq!(b.get(), 10);
+    }
+}
+
+#[cfg(test)]
+mod drain_batching_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    /// Each drained main-thread callback is its own transaction, **not** one
+    /// for the whole drain: callbacks are queued independently, and a later one
+    /// may rely on an earlier one's effects having run. Here the second reads a
+    /// signal an effect derives from the first one's write. With the drain as a
+    /// single batch it read the pre-drain value.
+    ///
+    /// The only test in this crate that drains the process-global queue, so no
+    /// other test's callbacks can land on this thread.
+    #[test]
+    fn each_drained_callback_sees_the_effects_of_the_ones_before_it() {
+        let source = Signal::new(0i32);
+        let derived = Signal::new(0i32);
+        let _derive = Effect::new(move || derived.set(source.get() * 10));
+
+        let seen = Arc::new(AtomicI32::new(i32::MIN));
+        let s = Arc::clone(&seen);
+        queue_main_callback(Box::new(move || source.set(5)));
+        queue_main_callback(Box::new(move || s.store(derived.get(), Ordering::SeqCst)));
+        drain_main_callbacks();
+
+        assert_eq!(seen.load(Ordering::SeqCst), 50);
     }
 }

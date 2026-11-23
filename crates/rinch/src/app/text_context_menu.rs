@@ -45,8 +45,9 @@ use rinch_core::dom::NodeId;
 ///
 /// **All three clipboard flags are `false` when `rinch` was built without the
 /// `clipboard` feature**: there is no clipboard for Copy or Paste to reach, and
-/// an enabled Cut would delete text it never copied. (The chord's own
-/// no-clipboard Cut is pre-existing and tracked as #823.)
+/// an enabled Cut would delete text it never copied. The chord and
+/// [`RinchApp::perform_text_edit`] agree: without the feature, Cut on an
+/// `<input>`/`<textarea>` does nothing (issue #823), as it does in the editor.
 ///
 /// A `disabled` field never takes the keyboard (issue #315), so it never
 /// reaches here; a `readonly` one does, with `can_cut` and `can_paste` off —
@@ -139,9 +140,9 @@ pub enum TextContextMenuPresentation {
 /// `remove_node` (#723) — and every later layout walked the dead panels
 /// (measured by #817's review: 37x on the layout pass after 1000 opens).
 pub(crate) struct TextMenuPanel {
-    pub panel_id: usize,
+    pub panel_id: u64,
     /// `(action, row node id)` in menu order.
-    pub rows: Vec<(TextEditAction, usize)>,
+    pub rows: Vec<(TextEditAction, u64)>,
 }
 
 /// The open DOM menu: which target, the rows' states at open, the highlight.
@@ -150,7 +151,7 @@ pub(crate) struct OpenTextMenu {
     /// as this target holds the keyboard.
     pub target: FocusTarget,
     /// The panel showing — [`TextMenuPanel::panel_id`], copied for the readers.
-    pub panel_id: usize,
+    pub panel_id: u64,
     /// The item rows, in menu order.
     pub items: Vec<TextMenuRow>,
     /// The highlighted row, if any. None until the pointer or an arrow key
@@ -160,18 +161,39 @@ pub(crate) struct OpenTextMenu {
 
 pub(crate) struct TextMenuRow {
     pub action: TextEditAction,
-    pub node_id: usize,
+    pub node_id: u64,
     pub enabled: bool,
 }
 
 /// A text target under a press.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TextTarget {
+pub(super) enum TextTarget {
     /// A text-like `<input>` or a `<textarea>`.
-    Input(usize),
+    Input(u64),
     /// A rich-text editor, by container node id.
-    #[cfg(feature = "desktop")]
-    Editor(usize),
+    #[cfg(feature = "windowing")]
+    Editor(u64),
+}
+
+/// An editor context press resolved on the tree as it was pressed — see
+/// [`RinchApp::resolve_editor_context_press`].
+#[cfg(feature = "windowing")]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct EditorContextPress {
+    /// The editor's container node id.
+    pub(crate) container: u64,
+    /// What the press pointed at; `None` when it missed every textblock.
+    pub(crate) at: Option<EditorPressAt>,
+}
+
+/// What an [`EditorContextPress`] pointed at.
+#[cfg(feature = "windowing")]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum EditorPressAt {
+    /// An image or rule: the node selection a press on it makes.
+    Node(rinch_editor_core::Selection),
+    /// A document position in a textblock.
+    Pos(rinch_editor_core::Pos),
 }
 
 /// Where a press lands relative to the open menu.
@@ -189,9 +211,9 @@ const TEXT_CONTEXT_MENU_CSS: &str = r#"
     position: fixed;
     z-index: 9999;
     box-sizing: border-box;
-    /* Explicit: a `width: auto` fixed block fills the viewport (the `<select>`
-       popup sizes itself the same way), and rinch lays `max-content` out as
-       `auto` (#626). */
+    /* Explicit (the `<select>` popup sizes itself the same way): a `width:
+       auto` fixed block shrinks to fit its rows since #893, and the fixed
+       width is kept so the panel does not change size. */
     width: 200px;
     padding: 4px;
     background: var(--rinch-color-body, #ffffff);
@@ -280,22 +302,35 @@ impl RinchApp {
                     )
                 };
                 let (start, end) = (state.selection.start().0, state.selection.end().0);
+                let head = state.selection.head.0;
                 let anchor = {
                     let d = doc.borrow();
+                    // The head is drawn with its affinity: an upstream caret
+                    // at a soft wrap ends the upper line (#941).
+                    let head_affinity = d
+                        .tree
+                        .get(node_id)
+                        .map(rinch_dom::form_control::caret_affinity)
+                        .unwrap_or_default();
                     let mut caret = |offset: usize| {
-                        Self::input_caret_rect_for_offset(
+                        Self::input_caret_rect_with_affinity(
                             &d.tree,
                             &mut self.hit_test_font_cx,
                             &mut self.hit_test_layout_cx,
                             node_id,
                             offset,
+                            if offset == head {
+                                head_affinity
+                            } else {
+                                rinch_core::dom::CaretAffinity::Downstream
+                            },
                         )
                     };
                     // Clipped to the field's own box. Paint does not clip there:
                     // it draws a `<textarea>`'s first-line caret 1px above the
-                    // box (measured: caret top y 24, box top 25), and a long
-                    // `<input>` value wraps and overflows the box (#827). A
-                    // toolbar anchored to the field should not overhang it.
+                    // box (measured: caret top y 24, box top 25), and a
+                    // `<textarea>`'s text can overflow it (#827). A toolbar
+                    // anchored to the field should not overhang it.
                     match (caret(start), caret(end)) {
                         (Some(a), Some(b)) => Some(clip_rect(
                             union_of_caret_rects(a, b),
@@ -305,9 +340,9 @@ impl RinchApp {
                     }
                 };
                 // An empty field has no layout to measure: the IME candidate
-                // box's approximation (the text origin, full height) stands in.
+                // box's old approximation (the text origin, full height) stands in.
                 let anchor = anchor
-                    .or_else(|| self.input_caret_area(node_id))
+                    .or_else(|| self.input_text_origin_area(node_id))
                     .unwrap_or_else(|| painted_element_box(&doc.borrow().tree, node_id));
                 // None of the three is ever decided by reading the clipboard —
                 // see the type's doc — and all three are off without one.
@@ -320,7 +355,7 @@ impl RinchApp {
                     anchor,
                 })
             }
-            #[cfg(feature = "desktop")]
+            #[cfg(feature = "windowing")]
             FocusTarget::Editor(container) => {
                 let handle = crate::editor::editor_for_doc(self.doc_key(), container)?;
                 let selection = handle.selection();
@@ -340,7 +375,7 @@ impl RinchApp {
                 // A read-only editor (`EditorHandle::set_read_only`) is a
                 // `readonly` field: it copies and selects, and offers neither
                 // Cut (copy plus a delete it would refuse) nor Paste.
-                let writable = !handle.is_read_only();
+                let writable = !handle.refuses_edits();
                 Some(TextEditState {
                     can_cut: can_copy && writable,
                     can_copy,
@@ -372,13 +407,15 @@ impl RinchApp {
                 match action {
                     TextEditAction::Cut => self.handle_cut(),
                     TextEditAction::Copy => self.handle_copy(),
-                    TextEditAction::Paste => self.handle_paste(),
+                    TextEditAction::Paste => {
+                        self.handle_paste();
+                    }
                     TextEditAction::SelectAll => self.handle_select_all(),
                 }
                 self.scene_dirty = true;
                 vec![AppAction::RequestRedraw]
             }
-            #[cfg(feature = "desktop")]
+            #[cfg(feature = "windowing")]
             FocusTarget::Editor(container) => {
                 let Some(handle) = crate::editor::editor_for_doc(self.doc_key(), container) else {
                     return Vec::new();
@@ -413,8 +450,8 @@ impl RinchApp {
     }
 
     /// A context-menu gesture at `(x, y)`: if the press lands on a text target,
-    /// run the ordinary right-press path (focus, `data-rid`, the #316 claim
-    /// rule) and then apply the **caret rule** — a press outside the current
+    /// run the ordinary right-press path (focus and the #316 claim rule; a
+    /// right press clicks no `data-rid`, #1093) and then apply the **caret rule** — a press outside the current
     /// selection moves the caret to the press point, a press inside it keeps
     /// the selection — and answer the target's state. `None` when the press is
     /// not on a text target, or when the target refused the keyboard (a
@@ -422,12 +459,12 @@ impl RinchApp {
     ///
     /// This is the half a shell with its own toolbar still needs; the DOM menu
     /// is [`Self::open_text_context_menu`], and
-    /// [`Self::text_context_menu_gesture`] is the two composed. Actions the
+    /// `Self::text_context_menu_gesture` is the two composed. Actions the
     /// click path produced are appended to `actions`.
     ///
     /// **Side effects when it answers `Some`, and when it answers `None` on a
     /// text target**: the click path has run. The caller must not run it
-    /// again — [`Self::text_context_menu_gesture`] reports that with its own
+    /// again — `Self::text_context_menu_gesture` reports that with its own
     /// return value.
     pub fn prepare_text_context_target(
         &mut self,
@@ -437,14 +474,30 @@ impl RinchApp {
         vp_h: f32,
         actions: &mut Vec<AppAction>,
     ) -> Option<TextEditState> {
+        // A shell may call this outside `handle_event`, which is where the
+        // shared hit-test memo is otherwise dropped (#908): a tick since the
+        // last event may have moved a transform without moving the generation.
+        self.hit_memo.set(None);
         let target = self.text_target_at(x, y)?;
-        self.prepare_target(target, x, y, vp_w, vp_h, actions)
+        self.prepare_target(
+            target,
+            x,
+            y,
+            vp_w,
+            vp_h,
+            actions,
+            #[cfg(feature = "windowing")]
+            None,
+        )
     }
 
     /// The whole gesture: [`Self::prepare_text_context_target`], then the
     /// presentation the shell asked for. Returns whether the press landed on a
     /// text target — in which case the click path has run and the caller must
     /// not run it again, whether or not a menu opened.
+    ///
+    /// `press` is an editor press already resolved on the tree as it was
+    /// pressed ([`Self::resolve_editor_context_press`]); `None` resolves it here.
     pub(crate) fn text_context_menu_gesture(
         &mut self,
         x: f32,
@@ -452,12 +505,22 @@ impl RinchApp {
         vp_w: f32,
         vp_h: f32,
         actions: &mut Vec<AppAction>,
+        #[cfg(feature = "windowing")] press: Option<EditorContextPress>,
     ) -> bool {
         let Some(target) = self.text_target_at(x, y) else {
             return false;
         };
         if self
-            .prepare_target(target, x, y, vp_w, vp_h, actions)
+            .prepare_target(
+                target,
+                x,
+                y,
+                vp_w,
+                vp_h,
+                actions,
+                #[cfg(feature = "windowing")]
+                press,
+            )
             .is_none()
         {
             return true;
@@ -505,16 +568,23 @@ impl RinchApp {
 
     /// The text target under `(x, y)`: the nearest text-like field or editor
     /// container on the hit node's ancestor chain.
-    fn text_target_at(&self, x: f32, y: f32) -> Option<TextTarget> {
+    pub(super) fn text_target_at(&self, x: f32, y: f32) -> Option<TextTarget> {
         let doc = self.doc.as_ref()?;
         let d = doc.borrow();
-        let mut cur = hit_test(&d.tree, x, y);
+        let hit = self.shared_hit(&d, x, y);
+        let mut cur = hit;
         while let Some(nid) = cur {
             let node = d.tree.get(nid)?;
             if Self::is_text_like_field(node) {
                 return Some(TextTarget::Input(nid));
             }
-            #[cfg(feature = "desktop")]
+            // Past a node view's host from inside its component: the press is the
+            // component's, not the editor's.
+            #[cfg(feature = "windowing")]
+            if Some(nid) != hit && node.attributes.contains_key(crate::editor::NODE_VIEW_ATTR) {
+                return None;
+            }
+            #[cfg(feature = "windowing")]
             if node.attributes.get("data-pm-editor").map(String::as_str) == Some("true") {
                 return Some(TextTarget::Editor(nid));
             }
@@ -523,47 +593,81 @@ impl RinchApp {
         None
     }
 
-    /// Apply the editor caret rule for a context press at `(x, y)` **before** an
-    /// app's `data-oncontextmenu` is dispatched, so a handler that draws its own
-    /// menu (a spellchecker's suggestions, say) can read the word under the pointer
-    /// off `EditorHandle::selection`.
+    /// Resolve what a context press at `(x, y)` points at in an editor — the
+    /// node it selects (an image, a rule) or the document position it lands on
+    /// — **before** anything moves the caret.
     ///
-    /// The web backend already does this: its `mousedown` path places the caret for
-    /// a right press and only *then* decides whether an app handler claims the menu
-    /// (`rinch-web`'s `editor_input`). Desktop used to place it inside
-    /// [`Self::prepare_target`], which a claimed press never reaches — so the same
-    /// right-click gave the app a stale selection on one backend and the right one
-    /// on the other. Idempotent: the unclaimed path runs the same rule again.
+    /// Resolve once, apply later, because applying can invalidate the geometry
+    /// the resolution read. A plugin whose decoration depends on the selection (a
+    /// spellchecker that withdraws its squiggle once the caret enters the word)
+    /// re-renders the pressed run the moment the caret moves, and nothing lays
+    /// the document out again before the next read: a second resolution from
+    /// `(x, y)` then maps the point against a text node with no layout and lands
+    /// at the block start (review of #836, finding 2). So the press is resolved
+    /// here, on the tree as it was pressed, and [`Self::apply_editor_context_press`]
+    /// applies it — from the claimed path and the built-in menu's path alike.
     ///
-    /// A no-op unless the press lands inside an editor.
-    #[cfg(feature = "desktop")]
-    pub(crate) fn apply_editor_context_caret(&mut self, x: f32, y: f32) {
+    /// `None` unless the press lands inside an editor.
+    #[cfg(feature = "windowing")]
+    pub(crate) fn resolve_editor_context_press(
+        &self,
+        x: f32,
+        y: f32,
+    ) -> Option<EditorContextPress> {
         let Some(TextTarget::Editor(container)) = self.text_target_at(x, y) else {
-            return;
+            return None;
         };
-        let Some(handle) = crate::editor::editor_for_doc(self.doc_key(), container) else {
-            return;
-        };
-        use rinch_editor_core::Selection;
-        if let Some(leaf) = self.editor_leaf_at(x, y)
+        let handle = crate::editor::editor_for_doc(self.doc_key(), container)?;
+        let at = if let Some(leaf) = self.editor_leaf_at(x, y)
             && let Some(node_sel) = handle.node_selection_at_host(leaf)
         {
-            if handle.selection() != node_sel {
-                handle.set_selection(node_sel);
-            }
-        } else if let Some((c, textblock, ifc_byte)) = self.editor_point_address(x, y)
-            && c == container
-            && let Some(pressed) = handle.pos_at(textblock, ifc_byte)
+            Some(EditorPressAt::Node(node_sel))
+        } else if let Some(hit) = self.editor_point(x, y)
+            && hit.container == container
+            && let Some(pressed) = hit.pos(&handle)
         {
-            let selection = handle.selection();
-            let inside =
-                !selection.is_empty() && selection.from() <= pressed && pressed <= selection.to();
-            if !inside {
-                handle.set_selection(Selection::cursor(pressed));
-            }
-        }
+            Some(EditorPressAt::Pos(pressed))
+        } else {
+            None
+        };
+        Some(EditorContextPress { container, at })
     }
 
+    /// Apply the **caret rule** for a press [resolved](Self::resolve_editor_context_press)
+    /// earlier: a press on an image or rule selects the node (unless it is the
+    /// node already selected), a press outside the selection moves the caret to
+    /// the press point, a press inside it keeps the selection, and a press that
+    /// missed every textblock keeps it too. Answers the handle, or `None` when
+    /// the editor is gone.
+    #[cfg(feature = "windowing")]
+    pub(crate) fn apply_editor_context_press(
+        &mut self,
+        press: &EditorContextPress,
+    ) -> Option<crate::editor::EditorHandle> {
+        let handle = crate::editor::editor_for_doc(self.doc_key(), press.container)?;
+        match &press.at {
+            Some(EditorPressAt::Node(node_sel)) => {
+                if handle.selection() != *node_sel {
+                    handle.set_selection(node_sel.clone());
+                }
+            }
+            Some(EditorPressAt::Pos(pressed)) => {
+                let selection = handle.selection();
+                let inside = !selection.is_empty()
+                    && selection.from() <= *pressed
+                    && *pressed <= selection.to();
+                if !inside {
+                    handle.set_selection(rinch_editor_core::Selection::cursor(*pressed));
+                }
+            }
+            None => {}
+        }
+        Some(handle)
+    }
+
+    /// `press` is the editor press the caller already resolved on the tree as it
+    /// was pressed, if any; `None` resolves it here, before the click path runs.
+    #[allow(clippy::too_many_arguments)]
     fn prepare_target(
         &mut self,
         target: TextTarget,
@@ -572,6 +676,7 @@ impl RinchApp {
         vp_w: f32,
         vp_h: f32,
         actions: &mut Vec<AppAction>,
+        #[cfg(feature = "windowing")] press: Option<EditorContextPress>,
     ) -> Option<TextEditState> {
         match target {
             TextTarget::Input(node_id) => {
@@ -608,17 +713,19 @@ impl RinchApp {
                 };
                 // The ordinary right-press path, unchanged: it focuses the
                 // field (or refuses a disabled one), places the caret at the
-                // press, commits a blurred field's `onchange`, dispatches an
-                // ancestor `data-rid`. `scale_factor` is unused by it.
+                // press, commits a blurred field's `onchange`. It clicks no
+                // `data-rid` above the field: a right press is not a click
+                // (#1093). `scale_factor` is unused by it.
                 let click_actions =
                     self.handle_click_with_button(x, y, 1.0, MouseButton::Right, vp_w, vp_h);
                 actions.extend(click_actions);
                 if self.focus_target != FocusTarget::Input(node_id) {
                     return None;
                 }
-                // The click path dispatched a `data-rid` above the field, and
-                // that handler may have written the field's `value`: take the
-                // write in before anything syncs the state back over it.
+                // The click path used to click a `data-rid` above the field
+                // here (#1093 took that away). The adoption stays so that a
+                // write made by any user code the click path does run is taken
+                // in before anything syncs the state back over it.
                 self.adopt_focused_input_value_from_dom();
                 // The caret rule's other half: a press inside the selection
                 // keeps it. The click path collapsed it, so put it back — unless
@@ -637,41 +744,25 @@ impl RinchApp {
                 }
                 self.text_edit_state()
             }
-            #[cfg(feature = "desktop")]
+            #[cfg(feature = "windowing")]
             TextTarget::Editor(container) => {
-                let handle = crate::editor::editor_for_doc(self.doc_key(), container)?;
-                // The ordinary right-press path first (a `data-rid` above the
-                // editor, the blur of whatever else held the keyboard), then
-                // the claim the left press would have made. Re-checked after,
-                // because a handler is user code and may have re-rendered the
-                // editor away.
+                // Resolved before anything below can re-render the editor.
+                let press = press
+                    .filter(|p| p.container == container)
+                    .or_else(|| self.resolve_editor_context_press(x, y))
+                    .filter(|p| p.container == container)?;
+                // The ordinary right-press path first (the blur of whatever
+                // else held the keyboard, whose `onchange` commit is user
+                // code), then the claim the left press would have made.
+                // Re-checked after, because that code may have re-rendered the
+                // editor away. A right press clicks no `data-rid` (#1093).
                 let click_actions =
                     self.handle_click_with_button(x, y, 1.0, MouseButton::Right, vp_w, vp_h);
                 actions.extend(click_actions);
                 crate::editor::editor_for_doc(self.doc_key(), container)?;
                 self.set_focus_target(FocusTarget::Editor(container));
                 self.editor_goal_x = None;
-                use rinch_editor_core::Selection;
-                if let Some(leaf) = self.editor_leaf_at(x, y)
-                    && let Some(node_sel) = handle.node_selection_at_host(leaf)
-                {
-                    // A press on an image or rule selects the node, as a left
-                    // click does — unless it is the node already selected.
-                    if handle.selection() != node_sel {
-                        handle.set_selection(node_sel);
-                    }
-                } else if let Some((c, textblock, ifc_byte)) = self.editor_point_address(x, y)
-                    && c == container
-                    && let Some(pressed) = handle.pos_at(textblock, ifc_byte)
-                {
-                    let selection = handle.selection();
-                    let inside = !selection.is_empty()
-                        && selection.from() <= pressed
-                        && pressed <= selection.to();
-                    if !inside {
-                        handle.set_selection(Selection::cursor(pressed));
-                    }
-                }
+                self.apply_editor_context_press(&press)?;
                 // A press that missed every textblock keeps the selection.
                 self.refresh_editor_overlays();
                 self.resolve_and_repaint(vp_w, vp_h);
@@ -683,7 +774,7 @@ impl RinchApp {
     /// The box spanned by the caret rects at the selection's two ends, in
     /// window px — a single-line selection's rect, and for a multi-line one
     /// the box from the first caret to the last.
-    #[cfg(feature = "desktop")]
+    #[cfg(feature = "windowing")]
     fn editor_selection_anchor(
         &self,
         handle: &crate::editor::EditorHandle,
@@ -719,10 +810,10 @@ impl RinchApp {
     /// is laid out again each pass (#826; +0.05 ms a pass, release, measured
     /// on a themed page). `visibility: hidden` would not, and was tried: set
     /// through `set_style` it does not reach the rows (#508), and set by a
-    /// stylesheet rule it hides the rows but not their text, which paint
-    /// draws whatever the IFC root's visibility (#829). Not exempted from the
-    /// scroll lock (#474): the panel declares no `overflow`, so it is no scroll
-    /// container and the lock has nothing to refuse on it.
+    /// stylesheet rule it hid the rows but not their text, which paint drew
+    /// whatever the IFC root's visibility until #829 fixed that half. Not
+    /// exempted from the scroll lock (#474): the panel declares no `overflow`,
+    /// so it is no scroll container and the lock has nothing to refuse on it.
     pub fn open_text_context_menu(&mut self, x: f32, y: f32, vp_w: f32, vp_h: f32) -> bool {
         let Some(state) = self.text_edit_state() else {
             return false;
@@ -893,7 +984,7 @@ impl RinchApp {
             return false;
         };
         let d = doc.borrow();
-        let in_document = |id: usize| {
+        let in_document = |id: u64| {
             let mut cur = Some(id);
             while let Some(nid) = cur {
                 if nid == d.tree.root_id {
@@ -904,10 +995,14 @@ impl RinchApp {
             false
         };
         match open.target {
+            // A field disabled under the menu closes it: its rows would act
+            // on a control that refuses them (#822).
             FocusTarget::Input(id) => {
-                d.tree.get(id).is_some_and(Self::is_text_like_field) && in_document(id)
+                d.tree.get(id).is_some_and(Self::is_text_like_field)
+                    && in_document(id)
+                    && !Self::node_is_disabled_in_tree(&d.tree, id)
             }
-            #[cfg(feature = "desktop")]
+            #[cfg(feature = "windowing")]
             FocusTarget::Editor(id) => {
                 in_document(id) && crate::editor::editor_for_doc(self.doc_key(), id).is_some()
             }
@@ -924,22 +1019,73 @@ impl RinchApp {
             return MenuHit::Outside;
         };
         let d = doc.borrow();
-        let mut cur = hit_test(&d.tree, x, y);
+        let mut cur = self.shared_hit(&d, x, y);
+        // A row is a `data-tcm-item` **inside the panel**: one anywhere else
+        // (pasted into a document, an app's own markup) is no row of this menu.
+        let mut row = None;
         while let Some(nid) = cur {
             let Some(node) = d.tree.get(nid) else { break };
-            if let Some(idx) = node
-                .attributes
-                .get("data-tcm-item")
-                .and_then(|s| s.parse::<usize>().ok())
-            {
-                return MenuHit::Item(idx);
+            if row.is_none() {
+                row = node
+                    .attributes
+                    .get("data-tcm-item")
+                    .and_then(|s| s.parse::<usize>().ok());
             }
             if nid == open.panel_id {
-                return MenuHit::InsidePanel;
+                return row.map_or(MenuHit::InsidePanel, MenuHit::Item);
             }
             cur = node.parent;
         }
         MenuHit::Outside
+    }
+
+    /// What an open **runtime popup** — this menu, or the native `<select>`
+    /// popup — does with the events that are neither a pointer event nor a
+    /// key (issue #822). The rule, decided once for both: a popup owns the
+    /// input while it is open, as a native popup menu does, and closes when
+    /// the window changes under it.
+    ///
+    /// - **A resize closes it** (Chrome closes its menus and its `<select>`
+    ///   popup on a bounds change): its panel was placed against the old
+    ///   window, and would otherwise hang off the new edge until closed. The
+    ///   `<select>` hands the keyboard back to its control, as Escape does.
+    /// - **An OS file drag closes it**, and goes on to the page: the user is
+    ///   doing something else now, and dropping their file silently would be
+    ///   worse than a closed menu.
+    /// - **Composition is the menu's while it is open**: the input method is
+    ///   off ([`Self::ime_state`]), and a preedit or commit that was already
+    ///   on its way is swallowed, as every plain key is. `Enabled`/`Disabled`
+    ///   and surrounding-text edits pass, so the field's composition state is
+    ///   still cleared.
+    ///
+    /// Returns `true` when the event is consumed.
+    pub(crate) fn runtime_popup_intercept(
+        &mut self,
+        event: &PlatformEvent,
+        vp_w: f32,
+        vp_h: f32,
+        actions: &mut Vec<AppAction>,
+    ) -> bool {
+        let menu = self.open_text_menu.is_some();
+        let select = self.is_select_open();
+        if !menu && !select {
+            return false;
+        }
+        match event {
+            PlatformEvent::Resized { .. }
+            | PlatformEvent::FileHoverEnter { .. }
+            | PlatformEvent::FileDropped { .. } => {
+                self.close_text_context_menu();
+                if select {
+                    self.close_select_popup_returning_focus();
+                }
+                self.resolve_and_repaint(vp_w, vp_h);
+                actions.push(AppAction::RequestRedraw);
+                false
+            }
+            PlatformEvent::Ime(ImeEvent::Preedit { .. } | ImeEvent::Commit(_)) => menu,
+            _ => false,
+        }
     }
 
     /// Pointer events while the menu is open, ahead of every other pointer
@@ -955,6 +1101,19 @@ impl RinchApp {
     ) -> Option<Vec<AppAction>> {
         self.open_text_menu.as_ref()?;
         match *event {
+            // A **secondary** press outside closes this menu and goes on, so
+            // it opens the context menu of whatever it landed on — this one
+            // again at the new point on a field — as GTK and Chrome do (#822).
+            // Other presses outside are swallowed.
+            PlatformEvent::MouseDown {
+                x,
+                y,
+                button: MouseButton::Right,
+            } if matches!(self.text_menu_hit(x, y), MenuHit::Outside) => {
+                self.close_text_context_menu();
+                self.resolve_and_repaint(vp_w, vp_h);
+                None
+            }
             PlatformEvent::MouseDown { x, y, .. } => {
                 match self.text_menu_hit(x, y) {
                     MenuHit::Item(idx) => self.run_text_menu_item(idx),

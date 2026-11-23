@@ -12,6 +12,8 @@
 //! association (`assoc`) and deletion-tracking semantics match exactly, because
 //! selection mapping, history, and collaborative rebase all depend on them.
 
+use std::rc::Rc;
+
 /// `pos` falls inside content that was deleted, on the side **before** it.
 const DEL_BEFORE: u8 = 1;
 /// `pos` falls inside content that was deleted, on the side **after** it.
@@ -22,7 +24,7 @@ const DEL_ACROSS: u8 = 4;
 const DEL_SIDE: u8 = DEL_BEFORE | DEL_AFTER;
 
 /// An opaque token (produced by [`StepMap::map_result`], consumed by the *mirror*
-/// map's [`StepMap::recover`]) that records where, inside a step's replaced range,
+/// map's `StepMap::recover`) that records where, inside a step's replaced range,
 /// a position sat — so the inverse map can restore it precisely.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Recover {
@@ -61,17 +63,157 @@ impl MapResult {
     }
 }
 
+thread_local! {
+    static STEP_MAP_CLONES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many [`StepMap`]s this thread has cloned. A work counter the history's
+/// cost pins read (#1249): an undo copies the maps of the event it reverts, not
+/// every map a [`Mapping`] holds. Not part of the API.
+#[doc(hidden)]
+pub fn __step_map_clones() -> u64 {
+    STEP_MAP_CLONES.with(|c| c.get())
+}
+
+/// Where a mirrored map's range lands in this map ([`StepMap::with_mirror_index`]):
+/// this map's range and the offset its content starts at, or `None`.
+type MirrorRange = Option<(usize, usize)>;
+
 /// A map of the positions affected by a single step: a flat list of
 /// `[start, old_size, new_size]` triples (sorted by `start`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct StepMap {
     /// Flattened `[start, old_size, new_size]` triples.
     ranges: Vec<usize>,
     /// When true, the map is read in the inverse direction (new ↔ old).
     inverted: bool,
+    /// For a map mirrored with one whose ranges are not its own range for
+    /// range: for each of that map's ranges, this map's range holding its
+    /// content and where in that range's new side the content starts (`None`:
+    /// it has none). `None` here means range for range. The history sets it on
+    /// a mapped [`BatchStep`]'s map, which loses the ranges a later change
+    /// deleted across and joins the ones it brings to meet (#1940): the ranges
+    /// it kept still recover a position, the lost ones map it through both.
+    ///
+    /// [`BatchStep`]: crate::transform::BatchStep
+    mirror_index: Option<Rc<[MirrorRange]>>,
+}
+
+impl Clone for StepMap {
+    fn clone(&self) -> StepMap {
+        STEP_MAP_CLONES.with(|c| c.set(c.get() + 1));
+        StepMap {
+            ranges: self.ranges.clone(),
+            inverted: self.inverted,
+            mirror_index: self.mirror_index.clone(),
+        }
+    }
 }
 
 impl StepMap {
+    /// Whether the map moves no position (a mark or attribute step's).
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    /// The flat `[start, old_size, new_size]` triples.
+    pub fn ranges(&self) -> &[usize] {
+        &self.ranges
+    }
+
+    /// Whether the map is read in the inverse direction ([`StepMap::invert`]): its
+    /// [`ranges`](Self::ranges) then describe the map it inverts, so a triple's
+    /// `start` is in the document **after** this map and its sizes are swapped.
+    pub fn is_inverted(&self) -> bool {
+        self.inverted
+    }
+
+    /// `self` followed by `next`, as one map, when that maps every position as
+    /// the two in turn do, and neither is inverted; `None` otherwise. Ranges of the
+    /// two that overlap or touch (in the coordinates between them) become one
+    /// range, and each such range is checked position by position against the two
+    /// maps: the mapped position and every flag a step reads (`deleted`,
+    /// `deleted_after`, `deleted_across`) must agree. A run of insertions folds; an
+    /// insertion beside a deletion, or two deletions side by side, do not (the
+    /// position between them would become a deleted range's inside). The history
+    /// folds a run of a peer's typing into one map this way (#1249). A range over
+    /// 64 positions is not checked, and not folded.
+    pub fn compose_exact(&self, next: &StepMap) -> Option<StepMap> {
+        const MAX_CHECKED: usize = 64;
+        if self.inverted || next.inverted {
+            return None;
+        }
+        // Every range as an interval in the coordinates between the two maps:
+        // `(start, end, growth, from_self)`.
+        let mut ivs: Vec<(usize, usize, isize, bool)> = Vec::new();
+        let mut d: isize = 0;
+        for r in self.ranges.chunks(3) {
+            let (s0, o, n) = (r[0] as isize, r[1] as isize, r[2] as isize);
+            ivs.push(((s0 + d) as usize, (s0 + d + n) as usize, n - o, true));
+            d += n - o;
+        }
+        for r in next.ranges.chunks(3) {
+            ivs.push((r[0], r[0] + r[1], r[2] as isize - r[1] as isize, false));
+        }
+        ivs.sort_by_key(|iv| (iv.0, iv.1));
+        let mut out = Vec::new();
+        // Old-coordinate ranges of the groups both maps contribute to.
+        let mut mixed: Vec<(usize, usize)> = Vec::new();
+        // `self`'s growth over the ranges wholly before the current group.
+        let mut before: isize = 0;
+        let mut i = 0;
+        while i < ivs.len() {
+            let (a, mut b) = (ivs[i].0, ivs[i].1);
+            let (mut self_growth, mut next_growth) = (0isize, 0isize);
+            let (mut has_self, mut has_next) = (false, false);
+            while i < ivs.len() && ivs[i].0 <= b {
+                b = b.max(ivs[i].1);
+                if ivs[i].3 {
+                    self_growth += ivs[i].2;
+                    has_self = true;
+                } else {
+                    next_growth += ivs[i].2;
+                    has_next = true;
+                }
+                i += 1;
+            }
+            let in_a = a as isize - before;
+            let in_b = b as isize - before - self_growth;
+            let new_size = (b - a) as isize + next_growth;
+            out.extend([in_a as usize, (in_b - in_a) as usize, new_size as usize]);
+            if has_self && has_next {
+                if (in_b - in_a) as usize > MAX_CHECKED {
+                    return None;
+                }
+                mixed.push((in_a as usize, in_b as usize));
+            }
+            before += self_growth;
+        }
+        let composed = StepMap::new(out);
+        for (lo, hi) in mixed {
+            for pos in lo..=hi {
+                for assoc in [-1, 1] {
+                    let first = self.map_full(pos, assoc);
+                    let second = next.map_full(first.pos, assoc);
+                    let seq = MapResult {
+                        pos: second.pos,
+                        del_info: first.del_info | second.del_info,
+                        recover: None,
+                    };
+                    let one = composed.map_full(pos, assoc);
+                    if one.pos != seq.pos
+                        || one.deleted() != seq.deleted()
+                        || one.deleted_after() != seq.deleted_after()
+                        || one.deleted_across() != seq.deleted_across()
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(composed)
+    }
+
     /// Build a step map from a flat list of `[start, old_size, new_size]` triples.
     pub fn new(ranges: Vec<usize>) -> StepMap {
         debug_assert!(
@@ -81,6 +223,7 @@ impl StepMap {
         StepMap {
             ranges,
             inverted: false,
+            mirror_index: None,
         }
     }
 
@@ -90,6 +233,7 @@ impl StepMap {
         StepMap {
             ranges: Vec::new(),
             inverted: false,
+            mirror_index: None,
         }
     }
 
@@ -98,6 +242,44 @@ impl StepMap {
         StepMap {
             ranges: self.ranges.clone(),
             inverted: !self.inverted,
+            mirror_index: self.mirror_index.clone(),
+        }
+    }
+
+    /// This map, to be mirrored with a map that has `index.len()` ranges:
+    /// `index[i]` is this map's range holding the content of that map's range
+    /// `i` and the offset that content starts at in its new side, `None` when it
+    /// has none. A position the mirror deleted in a range of the second kind
+    /// is not recovered, and maps through both maps instead (#1940).
+    pub(crate) fn with_mirror_index(mut self, index: Vec<MirrorRange>) -> StepMap {
+        self.mirror_index = Some(index.into());
+        self
+    }
+
+    /// This map's range and offset for its mirror's range `shared`, if it has
+    /// one.
+    fn own_index(&self, shared: usize) -> Option<(usize, usize)> {
+        match &self.mirror_index {
+            None => Some((shared, 0)),
+            Some(ix) => ix.get(shared).copied().flatten(),
+        }
+    }
+
+    /// The mirror's range for this map's range `own`, when that is all of it
+    /// (a range two of the mirror's became recovers nothing into the mirror).
+    fn shared_index(&self, own: usize) -> Option<usize> {
+        match &self.mirror_index {
+            None => Some(own),
+            Some(ix) => {
+                let mut of = ix
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| e.is_some_and(|(k, _)| k == own));
+                match (of.next(), of.next()) {
+                    (Some((i, Some((_, 0)))), None) => Some(i),
+                    _ => None,
+                }
+            }
         }
     }
 
@@ -173,14 +355,24 @@ impl StepMap {
 
     /// Recover the absolute position encoded by a [`Recover`] token (produced by
     /// this map's mirror). Used by [`Mapping`] to skip a deletion/re-insertion pair.
-    fn recover(&self, rec: Recover) -> usize {
+    /// A mirror index's start offset is measured on its range's new side, so
+    /// this assumes a map that carries one is never read inverted (the history
+    /// sets one only on a map it applied, which nothing inverts).
+    /// `None` when this map has no range for it ([`StepMap::with_mirror_index`]),
+    /// or its index is past this map's ranges (a mirror relation between maps
+    /// that are not each other's image, which panicked: #1935).
+    fn recover(&self, rec: Recover) -> Option<usize> {
+        let (index, start) = self.own_index(rec.index)?;
+        if index * 3 >= self.ranges.len() {
+            return None;
+        }
         let mut diff: isize = 0;
         if !self.inverted {
-            for i in 0..rec.index {
+            for i in 0..index {
                 diff += self.ranges[i * 3 + 2] as isize - self.ranges[i * 3 + 1] as isize;
             }
         }
-        (self.ranges[rec.index * 3] as isize + diff + rec.offset as isize) as usize
+        Some((self.ranges[index * 3] as isize + diff + (start + rec.offset) as isize) as usize)
     }
 }
 
@@ -193,9 +385,11 @@ impl StepMap {
 /// in the mirror map instead of being clamped.
 #[derive(Clone, Debug, Default)]
 pub struct Mapping {
-    maps: Vec<StepMap>,
+    /// Shared with every [`slice`](Mapping::slice) of this mapping: a slice copies
+    /// no map (it used to copy them all, once per step an undo mapped, #1249).
+    maps: Rc<Vec<StepMap>>,
     /// Flat pairs `[a, b, a, b, …]` meaning map `a` mirrors map `b`.
-    mirror: Vec<usize>,
+    mirror: Rc<Vec<usize>>,
     from: usize,
     to: usize,
 }
@@ -204,8 +398,8 @@ impl Mapping {
     /// An empty mapping.
     pub fn new() -> Mapping {
         Mapping {
-            maps: Vec::new(),
-            mirror: Vec::new(),
+            maps: Rc::new(Vec::new()),
+            mirror: Rc::new(Vec::new()),
             from: 0,
             to: 0,
         }
@@ -242,18 +436,19 @@ impl Mapping {
 
     /// Append a step map to the pipeline.
     pub fn append_map(&mut self, map: StepMap) {
-        self.maps.push(map);
+        Rc::make_mut(&mut self.maps).push(map);
         self.to = self.maps.len();
     }
 
     /// Append a step map that mirrors (is the inverse of) the map at index
     /// `mirror`.
     pub fn append_map_mirrored(&mut self, map: StepMap, mirror: usize) {
-        self.maps.push(map);
+        Rc::make_mut(&mut self.maps).push(map);
         self.to = self.maps.len();
         let n = self.maps.len() - 1;
-        self.mirror.push(n);
-        self.mirror.push(mirror);
+        let pairs = Rc::make_mut(&mut self.mirror);
+        pairs.push(n);
+        pairs.push(mirror);
     }
 
     /// Append all of `mapping`'s maps (preserving mirror relations).
@@ -338,8 +533,10 @@ impl Mapping {
                 && let Some(corr) = self.get_mirror(i)
                 && corr > i
                 && corr < self.to
+                && let Some(index) = self.maps[i].shared_index(rec.index)
+                && let Some(recovered) = self.maps[corr].recover(Recover { index, ..rec })
             {
-                pos = self.maps[corr].recover(rec);
+                pos = recovered;
                 i = corr + 1;
                 continue;
             }
@@ -352,5 +549,30 @@ impl Mapping {
             del_info,
             recover: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A token from a map with a mirror index recovers into its mirror only
+    /// from a range that is exactly one of the mirror's, at offset 0 (#1940).
+    #[test]
+    fn shared_index_recovers_only_from_a_range_that_is_one_of_the_mirrors() {
+        // B deleted 5 at 2, the content of A's two inserts (3 and 2) joined.
+        let a = StepMap::new(vec![2, 0, 3, 5, 0, 2]);
+        let b = StepMap::new(vec![2, 5, 0]).with_mirror_index(vec![Some((0, 0)), Some((0, 3))]);
+        let mut m = Mapping::new();
+        m.append_map(b);
+        m.append_map_mirrored(a.clone(), 0);
+        // 6 is inside B's joined range: no recovery, through both maps.
+        assert_eq!(m.map(6, 1), 2 + 3);
+        // B kept only A's second range: recovered into it.
+        let b = StepMap::new(vec![2, 2, 0]).with_mirror_index(vec![None, Some((0, 0))]);
+        let mut m = Mapping::new();
+        m.append_map(b);
+        m.append_map_mirrored(a, 0);
+        assert_eq!(m.map(3, 1), 5 + 3 + 1);
     }
 }

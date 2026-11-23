@@ -186,9 +186,9 @@ fn th_is_bold_and_centred_and_td_is_not() {
 /// | `text-align: justify` | `justify` | `justify` |
 /// | `text-align: start` | `center` | `start` |
 ///
-/// rinch folds the physical `left`/`right` onto `Start`/`End`
-/// (`text_align_from_stylo`), an LTR-only simplification that predates this
-/// change, so those two rows are asserted as `Start`/`End`.
+/// rinch keeps the physical `left`/`right` apart from `start`/`end` since the
+/// parley 0.12 upgrade gave a `direction: rtl` block its direction (they used
+/// to be folded onto `Start`/`End`, an LTR-only simplification).
 ///
 /// The `start` row is not redundant: `start` **is** the initial value, so the
 /// condition still holds and the cell centres. It separates "the parent
@@ -201,13 +201,13 @@ fn a_th_inherits_an_alignment_its_parent_declares() {
         ("", TextAlignValue::Center, TextAlignValue::Start),
         (
             "text-align: right",
-            TextAlignValue::End,
-            TextAlignValue::End,
+            TextAlignValue::Right,
+            TextAlignValue::Right,
         ),
         (
             "text-align: left",
-            TextAlignValue::Start,
-            TextAlignValue::Start,
+            TextAlignValue::Left,
+            TextAlignValue::Left,
         ),
         (
             "text-align: justify",
@@ -290,13 +290,13 @@ fn the_th_alignment_condition_reads_the_parent_not_an_ancestor() {
     );
     assert_eq!(
         align(&doc, th_inherits),
-        TextAlignValue::End,
+        TextAlignValue::Right,
         "control: with nothing resetting it, the same <th> inherits the \
          right-alignment (Chrome: right)"
     );
     assert_eq!(
         align(&doc, th_author),
-        TextAlignValue::Start,
+        TextAlignValue::Left,
         "an author declaration on the <th> beats the UA rule in either context"
     );
 }
@@ -309,7 +309,7 @@ fn the_th_alignment_condition_reads_the_parent_not_an_ancestor() {
 /// value would fall back to something arbitrary rather than laying a table out.
 /// If rinch ever grows tables, this test is the one to delete on purpose.
 #[test]
-fn the_th_rule_does_not_claim_a_table_display() {
+fn a_th_and_a_td_are_both_table_cells() {
     use rinch_dom::computed_style::values::DisplayValue;
     let mut doc = RinchDocument::new();
     let body = doc.body();
@@ -323,8 +323,8 @@ fn the_th_rule_does_not_claim_a_table_display() {
     assert_eq!(disp(th), disp(td), "<th> and <td> still lay out alike");
     assert_eq!(
         disp(th),
-        DisplayValue::Inline,
-        "rinch leaves table cells at Stylo's default `inline`"
+        DisplayValue::Block,
+        "a table cell is a block container"
     );
 }
 
@@ -357,7 +357,7 @@ fn an_author_declaration_beats_the_new_ua_heading_rules() {
         font_size(&doc, twelve)
     );
     assert_eq!(weight(&doc, th_normal), 400.0, "and on <th> too");
-    assert_eq!(align(&doc, th_left), TextAlignValue::Start, "`left` wins");
+    assert_eq!(align(&doc, th_left), TextAlignValue::Left, "`left` wins");
 }
 
 /// An author `font-size` moves the margins with it, because the UA margin is
@@ -469,7 +469,8 @@ fn the_ua_heading_rules_survive_a_restyle() {
 /// agreeing is not the same claim as the layout moving, and at HEAD both the
 /// gap and the offset below were 0.
 ///
-/// Both shapes are measured in Chrome 150, and rinch is asserted against
+/// Both shapes are measured in Chrome 150 (re-measured in Chrome 153 with a
+/// line of text in each heading, same numbers), and rinch is asserted against
 /// **Chrome's numbers**, including the margin collapsing that makes the two
 /// differ:
 ///
@@ -503,6 +504,16 @@ fn the_heading_margins_reach_layout() {
         let c = el(&mut doc, body, "div", container_style);
         let first = el(&mut doc, c, "h1", "line-height: 20px");
         let second = el(&mut doc, c, "h1", "line-height: 20px");
+        // Each heading holds a line. An **empty** one is 0 tall (#296), and its
+        // margins then collapse *through* it: Chrome 153 puts two empty `<h1>`s
+        // at one y with no gap at all. The numbers in the table are the
+        // one-line headings'. This fixture used to hold empty headings and
+        // lean, without saying so, on rinch's one-line floor for childless
+        // blocks to stand in for the line.
+        for h in [first, second] {
+            let t = doc.create_text("x");
+            doc.append_child(h, t);
+        }
         doc.resolve_layout(800.0, 600.0);
 
         let y = |id: NodeId| doc.tree.get(id.0).unwrap().layout.y;

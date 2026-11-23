@@ -1,0 +1,1018 @@
+# Layout and style invalidation, text caches, scoped IFC pass
+
+Read this page when your task touches: layout_dirty/ifc_dirty, typography invalidation, atomic inlines, resize restyle, style invalidation, text caches.
+
+Moved verbatim from `CLAUDE.md` on 2026-10-22 (the index there points here). New mechanism notes for this area go on this page, not in `CLAUDE.md`. A code comment that cites a `CLAUDE.md` section by name means a section now on one of these pages: `grep -rn '<name>' docs/internals/`.
+
+**Layout invalidation: three paths, two flags.** `resolve_layout` early-returns
+when `tree.layout_dirty` is false (styles resolve, dirty Parley layouts rebuild,
+**no Taffy compute**), and runs the inline-formatting-context setup passes only
+when a structural change is pending — **scoped** to where it happened
+(`tree.ifc_seeds`), or over the whole document when `tree.ifc_dirty` asks for
+the fallback (see **The structural pass is scoped** below). Both gates are
+load-bearing for frame cost and both used to be closed on changes that move a
+box:
+
+- **A typography change is a layout change (#678).** `font-family`,
+  `font-weight`, `font-style`, `line-height`, `letter-spacing`, `word-spacing`,
+  `text-transform`, `white-space`, `overflow-wrap` and `text-indent` are not Taffy properties —
+  and neither is **`font-size`**, for a box whose own sizes are in `px`, since it
+  reaches the Taffy style only through a value that *uses* it. Any of them
+  re-wraps the text, so `ComputedStyle::same_measured_text_inputs` sets
+  `layout_dirty` for them. That predicate is deliberately **narrower** than
+  `same_text_layout_inputs` (#654), which decides whether the *glyphs* must be
+  re-shaped: `color` is baked into the glyphs and moves no box, so a
+  `:hover { color }` on IFC text still takes the cheap path — pinned by
+  `frozen_box_remeasure_tests::a_colour_only_restyle_still_skips_taffy`, which
+  reads `tree.taffy_computes`, the counter that exists because nothing else
+  distinguishes "took the cheap path" from "recomputed and got the same answer".
+  A text **leaf** — a flex or grid item's own text, in a block-level container
+  or inside an `inline-flex` / `inline-grid` such as a `Button` label — is
+  cheaper still: it is painted from the layout its *measure* built
+  (`Node::cached_text_parley`), which only a compute rebuilds, so paint draws it
+  in its parent's **current** computed colour instead of the brush it was shaped
+  with (`render_text`'s `color` override, #904). A colour change or a colour
+  transition frame on it re-shapes nothing and runs no compute
+  (`perf_regression_scenarios::a_colour_hover_on_*`); it used to leave a
+  block-level flex item's label in its old colour. Nor does a flex or grid
+  container's own text take its `text-overflow: ellipsis`: that text is an
+  anonymous item, which does not clip, and Chrome 153 draws it clipped with no
+  "…" (`DisplayValue::is_flex_or_grid_container`, #904).
+  Cost, measured on 500 rows: a whole-document typography swap goes 7.4 → 16.1ms,
+  a one-row hover 0.60 → 0.70ms.
+  **Being in that list is necessary and was not sufficient** (#698):
+  `letter-spacing` and `word-spacing` sat in both predicates while reaching no
+  Parley producer but `build_parley_layout`, whose only callers are two MCP
+  debug tools — so they invalidated correctly and then re-shaped the text
+  without themselves. They now reach the IFC root, the per-span properties, the
+  `TextMeasure` context and both of its consumers, the `text-overflow:
+  ellipsis` rebuild (an IFC root's; a text leaf's was deleted in #982) and
+  paint's on-demand fallback. The **form-control** text path (`<input>`,
+  `<textarea>`, the closed `<select>`'s label) reads them too since #320 /
+  #789: `form_control::field_text_layout` and `select::select_label_layout`
+  are `ComputedStyle::build_parley_layout` itself, so paint, the press map,
+  the caret rects and the measure take one layout, and their caches key on
+  `ComputedStyle::hash_text_layout_inputs`, the list of what that builder
+  reads. A
+  percentage `letter-spacing`/`word-spacing` resolves against the element's
+  own `font-size` (#743, `typography::letter_spacing_from_stylo`/
+  `word_spacing_from_stylo`) — measured in Chrome 153, not against either
+  property's glyph-level reading of the spec (a space's own advance, for
+  `word-spacing`): `50%` at `font-size: 20px` adds 10px per affected cluster
+  on either property, and doubling `font-size` doubles it, where 50% of the
+  font's own (much narrower) glyph advance would not. `font_size` is already
+  one of the fields `same_text_layout_inputs`/`same_measured_text_inputs`
+  compare, so a later `font-size` change still re-shapes this text with no
+  change needed there.
+- **An atomic inline is sized by its own passes and no compute (#661).**
+  `inline-block`, `inline-flex` and `inline-grid` boxes are detached from their
+  parent's Taffy child list so the enclosing IFC can measure them as Parley
+  `InlineBox`es, so the **root compute never reaches one**. All four sizers go
+  through `measure_inline_blocks`: `compute_inline_block_layouts` on an
+  `ifc_dirty` pass, `measure_scoped_atomic_inlines` — its share of a scoped
+  structural pass, sizing only the scope's regions — on every other structural
+  pass, `resolve_percentage_inline_blocks` after the root compute
+  for any width that needs the containing block's — a percentage, a
+  `fit-content`/`stretch` keyword (#691), or `auto`, which is shrink-to-fit
+  (#658; an `auto` box measured as `auto` that fits is skipped by one
+  comparison; not a replaced element with a natural width, #2442: its
+  `auto` width is the natural one clamped by its own `max-width`, its
+  padding and margins outside that, so `<img style="max-width: 100%;
+  padding: 5%">` in 300px is 330 wide as in Chrome, not fitted to 300;
+  `replaced::has_natural_width`) — which is also what makes such a box track a viewport
+  resize, on a pass with no `ifc_dirty` and an empty dirty set, and —
+  since #661 —
+  `remeasure_dirty_atomic_inlines`. (`resolve_percentage_inline_blocks` also
+  measures the min-content size of an `auto` box a measure asked for, #1476,
+  and runs alternately with the root compute until it changes nothing, at
+  most four times — see **Common Issues**, the sizing-keyword entry.) `ifc_dirty` is left false by a style-only
+  restyle and by a `set_text_content` alike, so before that last pass the box
+  was measured once and frozen at `225x20` while paint drew six lines. It
+  re-measures the ones a change actually reached, off a **dirty set**
+  (`tree.dirty_atomic_inlines`) rather than a flag: measured, re-measuring the
+  whole document instead costs
+  +47% on a one-row text edit in a 500-row document carrying 500 chips.
+  **A box `resolve_percentage_inline_blocks` resolved is recorded at the
+  containing-block width it resolved it against**, and skipped while that
+  width stands: `keyword_inline_cb_width` for a `fit-content`/`stretch`/`auto`
+  box (#1281's review), `percent_inline_cb_width` for one with a percentage
+  `width`/`min-width`/`max-width` (#2136; until then a percentage box was laid
+  out twice after **every** root compute, whatever moved — a `max-width: 100%`
+  pill on each of 430 grid cards was 860 `inline_block_computes` and 860
+  re-shapes a layout). Both records are dropped by any measure of the box as
+  `auto` (`measure_inline_blocks` with no containing-block width: a change
+  inside the box or to its own style, a structural pass, phase 1's reset of
+  the boxes inside one being resolved) and when the node is freed. They are
+  two maps because the first also tells the measure "lined up at a resolved,
+  not its natural, size" (`AtomicContributions`), which a percentage box has
+  never meant.
+  **The box's own values an in-flow child resolves against its parent are
+  pinned as lengths** (`ifc.rs::pin_containing_block_sizes`, #1277, #1420,
+  #1480): a detached root's percentage basis is the available space it is
+  computed under, which is max-content on the block axis always and on the
+  inline axis for an `auto` box that fits. So whenever the box is measured
+  with a containing-block width (`resolve_percentage_inline_blocks`, and a
+  phase-2 relayout at its own width), a percentage or `calc()`
+  `height`/`min-height`/`max-height` and `height: stretch` resolve against
+  the IFC containing block's content height where the last layout took it as
+  **definite** (`Node::containing_block_height_definite`, #2427; otherwise
+  `auto`, a `calc()` too) **and does not come from its content**, and a
+  percentage padding against its width. That block's last layout holds the
+  box at its pinned size, so feeding a content-sized height back grew it on
+  every layout (a `<td height=200>` picture at `height: 100%` was 200, 204,
+  208, … — review of #2519). So `containing_block_inner_height` takes a
+  table cell's own specified `height` (a content height; none means `auto`,
+  even in a taller row — Chrome's; a cell of a `<table height>` is `auto`
+  too, where Chrome resolves it), a block's laid-out height only when its
+  `height` is not `auto`, and an `auto`-height one only when its parent
+  fixes it (an item of a flex or grid container with a non-`auto` height, an
+  absolute box with `top` and `bottom`); a stretched item of an
+  `auto`-height container is `auto` (not Chrome's).
+  `the_basis_never_holds_the_box_and_relayouts_move_nothing` lays each out
+  five times. A
+  length `height` is then the root's known height, so a percentage inside the
+  box resolves against it. Such a box is never skipped by the fit test, its
+  record carries the height it was resolved against
+  (`NodeTree::atomic_cb_height`, dropped with the width records), and a box
+  with a percentage padding is not plain shrink-to-fit
+  (`plain_shrink_to_fit_margins`): its natural sizes were measured with no
+  basis for the padding, so it is lined up at the size it has. Measured as
+  `auto` (before the root compute) nothing is pinned, as for a percentage
+  width. Not covered: a mixed `calc()` on a box *inside* an atomic inline
+  (#1412, `resolve_layout_calcs` does not reach a detached compute).
+  **The box's own percentages are resolved by rinch, not Taffy** (#2140,
+  #2146): a detached root resolves its own `width`/`min-width`/`max-width`
+  percentages against the available space it is computed under, and
+  `measure_inline_blocks` widens that space (pass B never hands a box less
+  than a width resolved for it; pass C recomputes at the box's used width). So
+  `own_percentage_widths` writes each one, plain or in a mixed `calc()`, into
+  the Taffy style as a length of the containing block's inner width for the
+  measure, and puts the declared style back afterwards. Before that, a
+  `max-width: 100%` over content wider than the block was resolved against
+  the content and capped nothing (Chrome caps the box and the content
+  overflows), a `max-width: 50%` was resolved twice and came out at 25%, and a
+  `calc()` size, whose Taffy form is only its length part and which
+  `resolve_layout_calcs` does not reach on a detached root, laid out
+  `calc(50% + 10px)` at `10px`. Measured with no containing-block width, a
+  `calc()` size is `auto`, as a plain percentage is under max-content space.
+  So a `calc()` box inside an `auto` box counts as `auto` toward that box's
+  width. A new path that changes what sizes such a box without
+  measuring it as `auto` must drop its entry. Pins:
+  `tests/percent_atomic_inline_record_2136_tests.rs` (each history against a
+  fresh layout), `perf_regression_scenarios::percentage_pills_in_a_grid_*`.
+- **A transition or animation writes `computed_style` directly**, so it reaches
+  none of the cascade's invalidation; `tick_transitions` and `tick_animations`
+  each invalidate the text measure of the nodes they are interpolating
+  (`TransitionProperty::changes_text_measure`). `font-size` is the only
+  animatable property in that set today, and the `All` arm of that predicate is
+  unreachable — a transition map is always keyed by the concrete property — so
+  `transition: all`, which `Checkbox` and `Radio` both declare, pays nothing per
+  frame. **Their Taffy re-sync marks atomic inlines separately**, because that
+  pre-pass fires only for `font-size` while a `transition: width` on a box
+  *inside* an `inline-block` is #661's own symptom reached without the cascade
+  (found by the review of #694). **A running `color` frame re-shapes nothing, for a leaf or an IFC**
+  (the frame that ends the run rebuilds an IFC's paint layout once, below).
+  Paint colours a text leaf from the live style (#904). An IFC's `text_layout`
+  carries each run's colour as a brush, so paint asks every text range for its
+  colour again (#679): `ifc::text_color` — the `color` of the text node's DOM
+  parent — recorded at the build as `IfcTextRange::color` (the root's own as
+  `InlineLayout::root_color`), and `paint::text::LiveColours` draws the ranges that
+  answer differently in the new colour, glyph by glyph where two ranges share a
+  Parley run. An underline or line-through follows only where it was
+  `currentcolor` (no `text-decoration-color` from the range's element up to the
+  IFC root); a wavy underline and an inline element's background rectangle and border
+  (colour, padding, radius; its horizontal extent from its edge boxes, #1426) are read from their owner's style on every paint
+  (`ifc::wavy_underline_color`, `ifc::inline_background_span`). Two things a
+  tick still rebuilds a paint layout for, with no Taffy compute
+  (`settle_ticked_text`): the frame an inline element's background **appears**
+  on (the layout holds a span only for an element that had one), and the frame
+  a colour **stops** moving — a finished transition, an ended or fill-settled
+  animation — so later paints are back on the layout's own brushes rather than
+  recolouring stretch by stretch for good; every paint of an IFC still makes
+  the comparison, one pass over its text ranges
+  (`perf_regression_scenarios::a_colour_transition_frame_on_ifc_text_shapes_nothing`,
+  `the_frame_that_ends_a_colour_transition_rebuilds_one_layout`). An animation
+  paused by a restyle is re-shaped at its frozen colour by that restyle's
+  cascade (`rv_e_paused_animation`). A split inline's (#513) text is drawn by
+  its container's boxes, so `compute_damage` names each text child's `ifc_root`
+  for a paint-dirty split inline — without it the software renderer kept such
+  text in its start colour until the run ended (`rv_m5_damage_split_inline`).
+  Pins: `crates/rinch-dom/tests/animated_text_brush_679_tests.rs`; a span on a
+  line cut by `text-overflow: ellipsis` follows too, since the cut keeps its
+  lines and text ranges (#1451, #1100, `rv_b1_span_on_ellipsis_line_mid_run`). Not covered: the text of an ellipsis
+  line laid out by an anonymous block box keeps a stale colour, after a plain
+  class change too (#1450, older than #679; the four `rv_a*` fixtures are
+  `#[ignore]`d on it; its "…" takes the container's colour since #1100); a `padding` frame on an inline element still runs a
+  Taffy compute and a shape (#1437). A `color` sample that reaches an element
+  child goes through the cascade (#777, `style_resolution/animated_cascade.rs`),
+  which restyles the node and its inheriting children each frame; the colour
+  difference that restyle finds re-shapes nothing either (`colour_is_moving`:
+  the node or an ancestor was cascaded with a sample), and the frame that ends
+  the run re-shapes once
+  (`perf_regression_scenarios::an_inherited_colour_transition_frame_shapes_nothing`).
+- **A `display: contents` wrapper's Taffy style is `sync_display_contents`'s,
+  not the cascade's.** That pass stores it as `Display::None`
+  (`node::display_contents_taffy_style`), while `to_taffy_style` maps `contents`
+  to `Display::Flex`; every pass that rebuilds a Taffy style from computed
+  values and compares it (`apply_stylo_styles_to_taffy`, both tick re-syncs)
+  substitutes the stored form when `Node::taffy_style_owned_by_contents_splice`
+  says so. Before that, any re-cascade of a wrapper — `rsx!` emits one per
+  reactive text and per if/for/match/component site, and a hover re-cascades a
+  whole subtree — read as a display change and ran the whole-document
+  `ifc_dirty` pass: 91ms for a colour-only hover over 2000 rows, 0.18ms after.
+  `frozen_box_remeasure_tests` pins both halves through `tree.ifc_setup_passes`.
+- **A `Calc` layout value is compared resolved.** The stored Taffy style holds
+  the length `resolve_layout_calcs` resolved a mixed `calc()` to; a style
+  rebuilt from computed values carries only its length part (the seed). The
+  same three passes compare a copy of the rebuilt style resolved by
+  `patch_layout_calcs` (the per-node step of `resolve_layout_calcs`, against
+  the last layout's bases; `taffy_style_for_compare`), and store the seeded
+  style as before. Storing the resolved copy instead laid a box out unlike a
+  fresh layout where `resolve_layout_calcs` does not reach it (inside an atomic
+  inline, #1412; `review_1477_fixtures`' H5 `calc(5px + 2%)` margin).
+  Unresolved, a new `calc()` whose length part equalled
+  the old resolved length compared equal and the layout was skipped:
+  `calc(50% + 10px)` → `calc(10% + 160px)` stayed 160 wide in 300px, and an
+  animation frame `calc(6.25% + 150px)` after a frame resolved to 150 stayed
+  at 150 (#767; `calc_width_restyle_to_a_length_part_equal_to_the_old_width`,
+  `a_calc_frame_whose_length_part_is_the_last_resolved_width_lays_out`). No
+  transition produces a `Calc` frame yet (#2051), so the transition tick's
+  copy has no fixture of its own.
+
+`RinchDocument::invalidate_text_measure_for_node` is the one place that knows
+what a typography change owes: the IFC's Parley layout, the box of any atomic
+inline above it, and the `NodeContext::Text` a text child is measured through
+when it is a flex or grid item — plus the Taffy `mark_dirty` beside that last
+one, since Taffy caches a leaf measure per available space and serves the stale
+one back otherwise. Such a leaf is painted from the layout its measure built:
+the root compute's for a block-level container and the detached atomic
+compute's (`measure_inline_blocks`, which keeps them in
+`NodeTree::atomic_leaf_layouts` until `copy_cached_text_layouts`, filed under
+the width they were wrapped at and picked by the box's **unrounded** width) for
+an `inline-flex` / `inline-grid`; before #904 the latter kept none, and paint
+re-shaped every such label on every frame.
+
+**A resize restyles only what the size reaches** (`RinchDocument::restyle_for_viewport_change`).
+`Stylist::set_device` answers which stylesheet origins' media-query results
+flipped; only such a flip rebuilds the cascade data and re-cascades the whole
+document (`full_restyle_viewport`). Otherwise the only restyled elements are the
+ones whose last cascade resolved a viewport unit — Stylo's
+`USES_VIEWPORT_UNITS`, copied onto `Node::uses_viewport_units` by the cascade,
+`::before`/`::after` included — each with its subtree
+(`viewport_unit_restyles`). Two rinch-side inputs ride along without a cascade:
+every `position: fixed`/`absolute` box is queued for a Taffy re-sync, because
+`out_of_flow` bakes the viewport size into its Taffy style. The first layout no
+longer re-cascades everything either, which is what used to hide another
+non-cascade input of `apply_stylo_styles_to_taffy`: an unstyled `<select>`'s
+widest-option width (`note_select_content_changed`). (A childless block's
+one-line floor was a second, re-synced by `note_first_child`; both are gone
+since #296 — see **An empty `<div>` is 0 tall** under Common Issues.) `resolve_styles` walks the whole document
+only when a whole-document restyle asks (`NodeTree::full_style_walk`) — an
+empty `style_roots` means nothing to do, not "walk everything". **Nor does "no
+layout has completed yet" ask for one** (#1247): `resolve_styles` and the
+insertion fast path `resolve_inserted_subtree` used to read
+`!transitions_enabled` that way, so every insertion of an app's initial render
+walked the whole document — N rows visited about N²/2 nodes, and 36,000 took
+about 15.5 s to build in release (150 ms after). Only `full_style_walk` asks now
+(it is set at construction, so the very first resolve still walks everything
+once). **The behaviour change that follows**: before the first layout, an
+append no longer applies pending style changes elsewhere in the document on
+the spot; they wait for the next resolve or layout, exactly as after the first
+layout. (An append *under* an element with a pending change still resolves it
+first.) So a spinner hidden and shown again before the first layout, with only
+unrelated appends in between, keeps its animation clock — never having been
+cascaded hidden — which is what a browser does, since it styles nothing
+between the two writes. `style_invalidation_twin_tests.rs` checks the
+pre-layout targeted walk against a fresh document, a full re-cascade and a
+forced-full-walk twin (`random_pre_layout_*`, `named_pre_layout_shapes_*`).
+`crates/rinch-dom/tests/sibling_scaling_tests.rs` asserts that no counter grows
+faster than the row count between 1,000 and 4,000 rows.
+`crates/rinch-dom/tests/viewport_restyle_tests.rs` is the twin oracle.
+
+**Style invalidation: what a change restyles** (`style_resolution/invalidation.rs`,
+`resolve.rs`). An attribute, class, id or `:hover`/`:focus`/`:active` change used
+to re-cascade the element's whole subtree whatever the selectors said, and never
+a sibling — so `+`, `~`, `:nth-child`, `:first-/:last-/:only-child` and `:empty`
+went stale on class toggles, insertions and removals. Now:
+
+- **Attributes and state go through Stylo's own invalidator.** `set_attribute`,
+  `remove_attribute`, `set_styles` and `update_hover`/`update_focus`/
+  `update_active`/`set_focus_visible` take a `ServoElementSnapshot` **before**
+  the change (`note_attribute_change` / `note_state_change`, once per element
+  per resolve — except that a subtree re-inserted and cascaded on the spot
+  mid-frame, `resolve_inserted_subtree`, forgets its elements' snapshots, so a
+  later change in the frame snapshots the state that cascade saw: kept, a class
+  added, the element moved, the class removed read as no change, #956);
+  `resolve_styles` runs Stylo's `StateAndAttrInvalidationProcessor`
+  over all of them (`process_snapshots`), which marks exactly the elements a
+  selector's answer changed for — self, descendants (e.g. `.card:hover .title`)
+  or later siblings — with restyle hints. One change from Stylo's own: the
+  descendants of a `display: none` element are processed too
+  (`EveryDescendant`), because rinch styles hidden subtrees and a change made
+  while hidden must land (#703). `:checked` is element state
+  (`stylo_impl::element_state`); `:disabled`/`:enabled`/`:link` are read from
+  attributes, so `disabled` and `href` force self + subtree + later siblings.
+  `style`, `rows` (textarea), `start` (ol), `value` (li) and any attribute on an
+  element with generated content force what they feed. So does any attribute on
+  an element whose style or `::before`/`::after` substitutes `attr()`: since
+  stylo 0.21 `attr()` is a substitution function (in any property, not only
+  `content`) that the cascade resolves through `TElement::get_attr`, and that
+  call flags the element (`Node::content_reads_attrs`, cleared before each
+  cascade of the element). `:nth-child(… of S)` needs nothing extra: Stylo's maps record the
+  selectors inside `of S`.
+- **Stylesheet changes use Stylo's stylesheet invalidation** (#884,
+  `style_resolution/sheets.rs`). `load_css`, `set_theme_css` and a `<style>`
+  element's sheet coming, going or changing text record the sheet on the
+  Stylist without forcing the origin dirty, so Stylo keeps the
+  `StylesheetInvalidationSet` it collects (each selector's rightmost
+  id/class/tag, or the outermost one left of a descendant combinator for a
+  subtree). `flush_stylist` (both flush sites: `resolve_styles` and
+  `resolve_inserted_subtree`, which flushes before cascading the inserted
+  subtree so a later flush never invalidates it; what the flush queues reaches
+  that function's existing declines — `full_style_walk`, or an ancestor with a
+  restyle hint or `style_dirty_descendants` — so it needs no check of its own)
+  passes
+  `<html>` to `Stylist::flush` while `sheet_invalidations_pending` is set, so
+  the matching elements get restyle hints and `<html>` is pushed as a style
+  root for the walk to follow them. A rule matching nothing restyles nothing
+  and does not relayout. A selector Stylo cannot bucket (`*`, `:root`, a bare
+  pseudo-class), a `@keyframes` (the servo `Device` says every name may be
+  referenced), `@property` or an `@layer a, b;` statement mark `<html>`'s
+  subtree: that is the old whole-document restyle (`full_restyle_stylesheet`).
+  An `@layer x { … }` block is bucketed by its inner rules. The viewport, DPR and
+  theme full restyles still force origins dirty and flush with no document
+  element, so they never take this path. Forcing `Author` dirty in
+  `load_stylo_css` is what made a `load_css` after the first layout restyle
+  nothing: it emptied the invalidation set, and the flush had no element to
+  apply it to anyway. **A targeted late sheet starts CSS transitions**, as in browsers:
+  the elements it restyles keep their old style data, so a changed
+  transitioned property animates (a late `.leaf { width: 300px }` under
+  `.leaf { transition: width 10s }` transitions). Before #884 a `<style>`
+  append cleared all style data, so nothing transitioned; a whole-document
+  late sheet (`:root`, `*`, …) still clears it and starts none. Theme switches still
+  go through `recompute_all_styles_full` with transitions off.
+- **`<style>` elements apply while connected, in tree order, after every
+  `load_css` sheet** (which are the web's `<head>` sheets: `inject_style`).
+  `create_element("style")` registers the id; `note_style_elements_moved`
+  (called from `note_child_list_changed_with` and after `remove_node` unlinks —
+  it ran while still linked) marks the sheets stale when a registered
+  element's connectedness differs from what is installed or a `<style>`'s own
+  children changed, `note_style_subtree_inserted` (from `note_child_inserted`,
+  every insertion verb) also when a connected `<style>` is in the inserted
+  subtree — a move of a connected `<style>` or of an ancestor, with no remove
+  first, which changes no connectedness (#2694: before, its sheet kept its old
+  place) — and `maybe_load_style_css` on a text edit.
+  `sync_style_element_sheets`, at the next flush, keeps every installed sheet
+  whose element is still connected with the same text, removes the ones that
+  left and inserts each new one before the next sheet that stayed
+  (`Stylist::insert_stylesheet_before`; appended when none follows), so Stylo
+  invalidates for the changed sheets only (#2636: it used to re-add every
+  sheet after the first difference, and one `*` or `:root` rule in a later
+  `<style>` made an `HtmlView` swap restyle the whole window). When the
+  staying sheets are out of tree order (an element moved past another) the
+  longest run of them still in order stays and the others are removed and
+  re-inserted at their new places (#2694; it used to keep only the common
+  prefix), re-using a parsed sheet whose element and text are unchanged, so a
+  move re-invalidates the moved sheets' rules and no others. A
+  document with no `<style>` element pays nothing. Before #884 a `<style>`'s
+  text was loaded the moment it was appended, connected or not, never unloaded,
+  and every text edit appended another sheet.
+- **A sheet change that reorders the cascade layers re-invalidates the layers
+  that moved** (#2694). Layers are ordered by where each name first appears
+  across all author sheets, so a sheet naming `a` added ahead of one with
+  `@layer b { … } @layer a { … }` (a `<style>` inserted before it, a
+  `load_css` sheet, a removal or a text edit) puts `a` before `b`. Stylo's
+  invalidation collects only the changed sheet's rules, so the other sheets'
+  layered rules kept their old order on the elements already styled (Chrome
+  157 and Firefox 155 have the same gap: an element styled before the insert
+  keeps the old winner while a new one beside it gets the new one; rinch
+  follows the spec). `flush_stylist` keeps the author layer order from the
+  last sheet change (`author_layer_order`, computed the way Stylo registers
+  layers: effective rules, dotted names by prefix, sub-layers before their
+  parent, anonymous layers by rule); when it changed, the layers outside a
+  longest run that kept its relative order have every `@layer` block (and
+  layered `@import`) naming them passed to `Stylist::rule_changed`, which
+  collects their inner rules' invalidations. Unlayered rules and layers that
+  kept their place are not touched. The walk runs only on a flush with a sheet
+  change, and only over the sheets that declare a layer (`layered_sheets`,
+  recorded when a sheet is parsed), so a document whose sheets declare none
+  pays nothing. A media flip can reorder layers with no sheet change (an
+  `@layer` inside `@media`): the viewport restyle (`restyle_for_viewport_change`,
+  when Stylo reports affected origins) and `set_device_pixel_ratio` restyle the
+  whole document and refresh the saved order, so the next sheet change compares
+  against the order in effect (review of #2699).
+- **Child-list changes use selector flags.** Matching runs with
+  `NeedsSelectorFlags::Yes`; `note_child_list_changed` restyles the siblings the
+  parent's `HAS_SLOW_SELECTOR*` / `HAS_EDGE_CHILD_SELECTOR` /
+  `HAS_EMPTY_SELECTOR` flags say an insertion or removal can reach, and an
+  `<ol>`'s later `<li>` markers. `:empty` follows the spec: no element child
+  (generated boxes aside) and no non-empty text.
+- **The sibling sweep marks each child once per frame, not once per change**
+  (#2627). `HAS_SLOW_SELECTOR*` restyles every child from the change on
+  (`RinchDocument::mark_children_from`), and it used to visit them all on
+  every insertion and removal (after cloning the child list), so discarding
+  N of 2N rows one call at a time under `li:nth-child(odd)` visited about
+  3N²/2 children. A sweep now stamps each child it marks
+  (`Node::later_siblings_marked`, the current sibling-mark epoch), meaning
+  "this child and every one after it carry the subtree restyle", and the next
+  sweep stops at the first stamped child after the change; the child at the
+  change itself is always marked, so a stamped row moved within its list (#914,
+  no re-cascade) cannot vouch for the rows it now precedes, and an inserted
+  child arrives unstamped (`note_child_inserted`): a sweep from 0
+  (`:nth-last-child` and the other `HAS_SLOW_SELECTOR`s) must not stop on a
+  stamp a row earned in another list. The epoch
+  (`node::invalidate_sibling_marks`, thread-wide) moves on whenever a hint can
+  come off or what a mark queued can be consumed: each `resolve_styles` (before
+  and after), element data created, replaced or dropped (so every insertion
+  that re-cascades, and every cascade of a node without data), every
+  `style_roots.clear()`, and `take_dirty_nodes`. **A new place that takes a restyle hint off an element,
+  or consumes `style_roots` or `dirty_nodes`, must move the epoch too**, or a
+  sweep can skip a child that needs marking. `NodeTree::sibling_mark_steps`
+  counts the children swept (`crates/rinch-dom/tests/discard_churn_tests.rs`;
+  `structural_restyle_differential_tests.rs` checks random churn against a
+  fresh build).
+  An insertion that re-cascades still sweeps in full, so building a list one
+  row at a time at its front under such a selector is still quadratic.
+- **An inserted child stays between the generated boxes** (#1629). A
+  `::before` (or list marker) is generated as its element's first child and an
+  `::after` as its last when the element is cascaded, and inserting a child
+  does not re-cascade the element, so `append_child`, `insert_before` and
+  `insert_child` clamp the position they computed between the two
+  (`RinchDocument::clamp_between_generated`, which reads the first and last
+  child only; `Node::is_generated_after` says which end a generated box
+  belongs to). `get_children` and `next_sibling` still list the generated
+  boxes, so an index or reference read from them names a real slot: an insert
+  before the `::before` box lands after it. An append used to land after the
+  `::after` box — every `rsx!` row added after its parent was attached.
+  `set_text_content` / `set_inner_html` replace the element's own children
+  only (`RinchDocument::own_children_range`) and keep its generated boxes
+  (#1630); they used to drop them until the element was next re-cascaded.
+- **A move within one parent keeps its style and its own text layout** (#914)
+  — a keyed `for` reorder, which moves a live row with `insert_before`. Its
+  ancestor chain is unchanged, so only a positional selector can see the move,
+  and the two `note_child_list_changed` calls (old index, new index) mark the
+  moved node itself whenever the parent's flags say one can
+  (`keeps_style_across_move`). Nor does a move drop the node's **own** IFC
+  layout, only the one it was a member of (`invalidate_ifc_left_by`): a
+  typography change its new position brings arrives through the cascade's
+  text-input comparison like any other. A move to **another** parent still
+  re-cascades the subtree. Before, every moved row was re-cascaded and
+  re-shaped — twice per row on a reversed list.
+- **The cascade propagates, it does not blanket.** `resolve_styles_recursive`
+  cascades a node that has no style or a hint, then asks `child_cascade(old,
+  new)`: children follow when an inherited struct, a custom property, the
+  inherited flags, zoom, writing mode or `display` moved; only
+  `INHERITS_RESET_STYLE` children when just reset properties moved; none when
+  nothing did. It descends elsewhere only along `style_dirty_descendants`. A
+  colour-only `:hover` cascades **one** element. The `*_sensitive` flags are no
+  longer cleared on re-cascade (a card re-cascaded alone would lose the flag its
+  descendants' matching set).
+- **A cascade that only inherits does not match** (#2571; Stylo's
+  `RECASCADE_SELF` without `RESTYLE_SELF`). An element with a style, no hint of
+  its own beyond `RECASCADE_SELF`, and a parent asking `Cascade` /
+  `IfInheritReset` (not `Subtree`) keeps the rule node of its last match and is
+  cascaded again against the new parent style (`reuse` in
+  `resolve_styles_recursive`; counted as `elements_recascaded`, not
+  `elements_cascaded`). A node whose `color` / `font-size` sample a tick moved
+  is marked `RECASCADE_SELF` (`mark_recascade`), so it recascades too; its
+  un-animated rules are `Node::base_style`'s, and the samples go back on at
+  the animation levels as on any cascade. This is sound because every input
+  matching reads reaches the element as a hint of its own, as a subtree hint on
+  an ancestor (the parent then asks `Subtree`, which the `reuse` guard
+  excludes), or by clearing its style: attributes and state through the
+  invalidator; sheets through `sheets.rs` (a `<style>` change or a sheet add
+  whose selector is invalidated as a subtree, or any sheet change while
+  `<html>` already has `RESTYLE_DESCENDANTS`, reaches descendants through that
+  subtree hint in `flush_stylist`); moves, isolation, `:lang`, a disabled
+  fieldset and the `:empty` / `:first-child` marks as subtree hints; the
+  viewport, DPR and theme full restyles by clearing the data. The
+  one write that replaces a matched input with no restyle is the inset fast
+  path's new inline `style` block, so `cache_inline_style` sets
+  `Node::inline_style_unmatched` and the next cascade of that element matches.
+  Container queries, the one matching input a parent's *style* can feed, are
+  not implemented; when they are, a style-query container's change must give
+  its descendants a hint. Generated `::before`/`::after` boxes still match on
+  each cascade of their element. A 1000-child colour animation tick went from
+  1001 matches to none (`perf_counter_baselines.rs`,
+  `colour_animation_over_1000_children`).
+- **Non-cascade inputs of `apply_stylo_styles_to_taffy` are re-synced
+  explicitly**: a node that starts or stops being a containing block re-syncs its
+  absolute descendants (ICB sizing), alongside the resize/floor/select re-syncs
+  above.
+- **Per-element cost**: a bloom filter of the ancestors (pushed and popped by
+  the walk) rejects descendant combinators early.
+- **`query_selector` uses the cascade's matcher, without its flags** (#1796,
+  `crate::query`). `NodeHandle::query_selector{,_all}` and
+  `DomDocument::query_selector{,_all}` parse with Stylo's `SelectorParser`
+  (author origin) and match with `matches_selector_list` over `RinchNode`, so a
+  query sees every selector the cascade does. It matches with
+  `NeedsSelectorFlags::No` and no bloom filter: a query must not record
+  selector flags, which are invalidation state (a flag set by a query would make
+  later insertions restyle siblings no stylesheet asks for). It reads the tree
+  and nothing else — no cascade, no layout, no counter. Generated pseudo-element
+  nodes are skipped with their subtrees. The MCP tool's matcher,
+  `testing::query_selector`, is the same matcher from `<body>` (included), with
+  the old one-simple-selector matcher as the fallback for a string CSS rejects.
+
+`crates/rinch-dom/tests/style_invalidation_twin_tests.rs` is the oracle (named
+scenarios plus a seeded random differential, `RINCH_TWIN_SEEDS=n` for more).
+
+**Two text caches survive across frames, and nothing drops either wholesale.**
+Each IFC root keeps its paint layout (`Node::text_layout`) and the sizes the
+measure function returned for it (`NodeTree::ifc_measure_cache`, keyed **by
+root**, one size per available width, at most 8, removed when
+`NodeTree::remove_subtree` frees the node). Exactly two rules drop them, and between them they must cover every
+input a shaped layout is built from:
+
+- **A restyle drops only what changed.** The cascade compares each re-cascaded
+  node's old and new text inputs (`same_text_layout_inputs`: font size, weight,
+  family, style, line height, letter/word spacing, colour — it is baked into the
+  glyphs' brush — text-align, decoration, underline offset, transform,
+  white-space, overflow-wrap, `text-indent`, text-overflow, `overflow-x`, whether `display` is
+  a flex or grid container — it decides the ellipsis, #1046 — and an inline
+  box's background/padding) and calls `invalidate_text_measure_for_node` for the one
+  that moved. An inherited change reaches every descendant that re-cascades,
+  and each is compared on its own. There is **no** eager drop any more:
+  `invalidate_descendant_styles`, `set_attribute`/`remove_attribute` and
+  `set_style` used to drop every text layout under the restyled node, so a
+  colour-only hover re-shaped all of it; now it re-shapes nothing and takes
+  the paint-only path. The whole-document restyle a theme change runs
+  (`recompute_all_styles_full`) is no exception (#913): it re-cascades every
+  element and the same comparison decides, so a dark-mode toggle whose
+  variables reach no text re-shapes nothing, anonymous block boxes included:
+  a structural IFC pass (whole-document or scoped) re-mints a box for the same
+  run (same container, same members) into the old box's slab entry and keeps
+  its paint layout and measures, as a box outside the pass's scope keeps them;
+  a container restyle drops them through `run_boxes`, and the content
+  signature drops them for a changed run (#964, `RetiredAnonBoxes`). Generated content that is minted or freed (a `::before`/`::after` that
+  starts or stops being generated, or whose text changed, and every list
+  marker, which is regenerated on each cascade of its `<li>`) is the one
+  restyle that invalidates regardless, because the nodes an inline layout
+  names were freed and minted again; a `::before`/`::after` box that still
+  generates is kept and restyled in place (#1023), so a hover on its
+  originator re-shapes nothing it did not change.
+- **A structural pass drops only the roots whose content moved**
+  (`refresh_ifc_signatures`, after the atomic inlines are sized; a scoped pass
+  signs only its own containers' roots). It hashes
+  each root's members — id, parent, sibling index, text, tag, `display` mode,
+  `position`, generated-ness, and an atomic inline's just-computed size and
+  baseline (`Node::atomic_baseline`; the baseline since #896) — and a
+  root whose signature is new or different loses its measures and paint layout
+  and is marked in Taffy. It used to clear the whole measure cache, which
+  re-shaped every paragraph to measure one appended row (41 shapes on a 40-row
+  list; now 1). The signature is also a second net under the mutation verbs,
+  whose invalidation reaches only the changed node's *parent*: text appended
+  inside a `<span>` inside a paragraph, and a chip resized during a structural
+  pass, both left the paragraph painting its old line before it.
+  **A chip resized outside a structural pass marks its root's signature
+  stale** (`IfcRootMeasures::stale`, set by `forget_ifc_measures_and_signature`
+  from `remeasure_dirty_atomic_inlines` and `invalidate_ifc_of_atomic_inline`):
+  the root is measured again at the new size while its signature still hashes
+  the old one, so a chip that went back to that size made the next pass's
+  signature match and the sizes measured in between were served. The next
+  pass that signs the root treats it as changed (review of #1627). A new path
+  that moves an atomic inline's size and drops its root's sizes must use that
+  call, not `forget_ifc_measures`. **`remeasure_dirty_atomic_inlines` counts a
+  moved baseline as a change too** (#896): an edit inside a chip can keep its
+  size and move where it lines up — an `inline-flex` whose first item lost its
+  only line takes its baseline from the next item — and the line around it was
+  kept, 15px taller than a fresh layout's. **A root's recorded line baselines
+  go with its sizes**: `NodeTree::atomic_line_baselines` keeps a few per root,
+  by the content size each was measured at, and the chip's baseline is read
+  from the one nearest the root's box. `forget_ifc_measures` and a moved
+  signature mark its baselines superseded (`forget_line_baselines`), and the
+  next record replaces them: kept beside it, an old 110x80 entry was nearer a
+  `width: 110px` item than the new 35x20 one its one-line text was measured
+  at, and the chip stood 60px low. Not the per-compute drop of
+  `dirty_ifc_text_roots`' sizes (a root stays in that set for every compute
+  of a layout): a later compute that measured only the root's min-content
+  replaced the entry the final size had been recorded at by the first.
+- **A node that stops being an IFC root loses its `InlineRoot` context**
+  (`setup_inline_formatting_contexts`' stale-context sweep, #466 and #896).
+  One with Taffy children gets `NodeContext::Element` in place (dead data:
+  Taffy measures only a leaf). A **childless** one — a block emptied by
+  `set_inner_html("")`, or whose only text was removed — was left with the
+  context, so Taffy measured it as an IFC with no members: one empty line, and
+  the sizes and baselines cached from when it had content. A fresh layout of
+  the same tree has a plain empty leaf (no context, `0x0`, no baseline). Its
+  context is now cleared through `set_node_context`, which dirties it.
+  `tests/incremental_matches_fresh_tests.rs` compares each case with a fresh
+  layout of the final tree.
+- **`invalidate_ifc_root` marks the root in Taffy on every route** (and its
+  #466 measure leaf). An inline member is detached from Taffy, so a drop that
+  came through one — a `span`'s own font change, `set_text_content` on text in a
+  `display: contents` wrapper — marked nothing the compute walks, and Taffy
+  served the root its old size (**#878**).
+- **A text run's IFC root can be a box no element holds.** Beside a
+  block-level sibling a run is laid out by an anonymous block box, and inside a
+  split inline (#513) by the box around its fragment — neither is in the
+  element tree, so no ancestor walk from the restyled element finds it, and a
+  text node is never cascaded on its own. `invalidate_text_measure_for_node`
+  therefore also drops each **text child's own `ifc_root`**; without it a font
+  change on `div > ["t", li]` left the box at its old line height and glyphs.
+  Such a box takes its `text-overflow: ellipsis` from its block container —
+  its `parent`, for a split span's runs too — because it carries only the
+  inherited properties and neither `text-overflow` nor `overflow` is
+  (`ellipsis_style_owner`, #1071; Chrome 153 draws the container's "…" on
+  text beside a block child). So a restyle of the container also drops every
+  box in its **`run_boxes`**: a split span holds its runs' text, and does not
+  re-cascade when the container's non-inherited properties change.
+  **The "…" is decided per line, not by `white-space`** (#1091): each line
+  whose content is wider than the content box after wrapping is cut and ends
+  in "…", the others are kept — an unbreakable word under `white-space:
+  normal`, a `nowrap` span in a wrapping root and every long line of `pre`
+  text, where Chrome 153 draws one too. It used to need the root's own
+  `nowrap`/`pre`. An
+  inline element's `nowrap`/`pre` reaches parley as `TextWrapMode::NoWrap`
+  (it used to wrap), and so does the root's own (#1212): a `nowrap`/`pre`
+  root is broken at the container's width whenever some element holding a
+  text run or an atomic inline in it wraps, however deep
+  (`ifc::wraps_anywhere`; the boxes and the depth since #1238), so a `normal` span
+  inside a `pre` root wraps, a `normal` span of inline-blocks breaks between
+  them, and only an IFC with no wrapping content at all is broken
+  unconstrained. Such a paragraph is still **aligned within the content box**
+  (#1237): with no width parley aligns each line within the paragraph's own
+  widest line (a right-aligned `a` in a 50px `nowrap` box sat at 0, Chrome
+  41.02), so its paint layout is broken line by line with the content width
+  set as each line's alignment width (`ifc::break_unwrapped`, through
+  `set_prior_line_width`; the content box itself, not the pixel of auto-width
+  slack `ifc_paint_max_width` breaks with — except that an auto-width root
+  whose paragraph is within a pixel of its content width, a shrink-to-fit
+  box rounded from that paragraph, is aligned within the paragraph's own
+  width, `ifc::AlignWidth`), and an overflowing line keeps parley's start
+  alignment, as CSS does. Since a line's `inline_max_coord` is then the
+  box's width, an overflowing line's content passes it: what reads a line's
+  horizontal extent for ink takes its placed content too
+  (`paint::text::line_reach`), and the paint layout is rebuilt when the
+  alignment width changes as well as the break width
+  (`InlineLayout::align_width`; an auto-width root and a declared one a pixel
+  wider break at the same width). It is not broken *at* that width:
+  parley marks a break opportunity after every inline box whatever the wrap
+  mode, so a `nowrap` paragraph with a chip would wrap after it. **Soft wraps
+  next to atomic inlines follow `white-space`** (#1238): parley allows
+  a break after every inline box, and before one whenever the character
+  before it wraps. Chrome 155 asks the `white-space` of the element the box
+  (or text) is in — not the inline-block's own, which styles its contents —
+  and, at an element's end, of the element it closes into: the opportunity
+  after a leaf (a text run or a box) is allowed when any element from its
+  parent up to the nearest one that also holds the next leaf wraps
+  (`ifc::WrapSeams`). So `aa<span normal>[1][2][3]</span>cc` in a `nowrap`
+  root breaks after each box but not between `aa` and `[1]`, a chip in
+  `nowrap` text does not wrap after itself, and boxes in a `nowrap` span
+  inside a wrapping root stay together. **A run of spaces is decided by the
+  spaces' own `white-space`** (`ifc::wrap_allowed_after`, review of #1878):
+  `<span nowrap>abc def </span>[box]` has no break after its space, though
+  the span closes into a wrapping root. Spaces that do not wrap break
+  *before* the run where the items before them give them an opportunity
+  (`aa<span normal>hello</span> ccc` in a `nowrap` or `pre` root: Chrome
+  keeps a `pre` space at the start of line 2; #2238, `ifc::IfcText::last_wraps`,
+  `ifc::UnhungSpaces::space_breaks`): text or a box whose element wraps gives
+  one and one whose element does not takes it away, an element's end passes
+  it on (and gives one where an element that does not wrap closes into one
+  that does), and an element's start gives one when it wraps and takes it
+  away when it does not, even an empty one (`<span normal>ccc<span nowrap>
+  mm</span>` and `…hello</span><span></span> ccc` do not break; end padding
+  on the span does not stop the break, nor does a plain span closing around
+  it). An end inside a `display: contents` element closes into the nearest
+  boxed ancestor, text that does not wrap in a contents element whose boxed
+  ancestor wraps takes the opportunity away, and `<wbr>` gives one that
+  elements after it do not take away; the box seams pass through contents
+  elements too, and an atomic inline in one takes its boxed ancestor's
+  `white-space` (`ifc::wraps_between`, review of #2258). A
+  collapsible such space is handed to parley as wrapping
+  (`IfcText::wrap_spaces`) and counts as wrapping in the seams and edge-box
+  passes; a preserved one keeps its own `white-space` there and takes the
+  break before it. A wrapping space followed by a
+  non-wrapping one breaks between them. An element's end padding right
+  after hanging spaces hangs with them (Chrome
+  fits `<span padding:0 3px>[B]q-r </span>` before a `<br>` in 71.5px, its
+  content less the space and the end padding). A paragraph broken at a width that
+  holds atomic inlines and any element that does not wrap gets the seams
+  (`UnhungSpaces::seams`), and the hang pass re-breaks a line of it where
+  CSS ends it (`ifc::css_line`, the #1426 edge-box re-break generalised:
+  `LineUnit::wrap_after`) when parley's break follows a leaf `white-space`
+  allows no wrap after (`wrap_allowed_after`), in a paragraph with `pre`
+  seams (#1243, below) at every soft wrap that can reach a `pre` space
+  (`ifc::NearPre`), when the line overflows (`line_overflows`: parley appends a
+  box after text that does not wrap where CSS breaks before it), or when
+  parley took its emergency break after a box too wide for the line that
+  `white-space` glues to what follows (Chrome: `[B]cc` stays together) — not
+  an `overflow-wrap` line. Inside text a re-broken line asks
+  `ifc::TextBreaks`, the segmenter parley uses (`LineSegmenter::new_dictionary`,
+  so Thai, Lao, Khmer and Burmese keep their word breaks), less a break
+  between a complex-context (`SA`) character and a letter or digit, which
+  ICU4X reports and UAX #14 (and Chrome) does not. ICU4X's dictionaries
+  still split some words Chrome's keep whole (`ខ្មែរ|ភាសា`, `ລາວ|ພາສາ`), so a
+  re-broken line can break inside them. Pins:
+  `tests/atomic_inline_soft_wrap_1238_tests.rs` (Chrome 155) and
+  `tests/atomic_inline_soft_wrap_1238_differential.rs`, a checked-in Chrome
+  155 corpus of 437 random trees (`tests/soft_wrap_1238/chrome155.tsv`, its
+  known differences pinned). Only for `right`,
+  `center` and `end` in a left-to-right block, and only in the paint layout
+  (`build_inline_layout`'s `align_width`; a measure takes only sizes from its layout).
+  Parley takes a break's wrap mode from the cluster before it,
+  so `pre` text then a `normal` span has no break at their seam, as in
+  Chrome 153. A `pre` element's preserved spaces at a line's end are
+  aligned as content: parley 0.12 hangs them only as far as they overflow,
+  so an overflowing right-aligned line starts at 0 as in Chrome (rinch
+  narrowed the alignment width for them until then, `align_unhung_trailing`). On a left-to-right line aligned `right`,
+  `center` or `end`, every space before the hanging run at the line's end
+  counts too, whatever its `white-space` (#1042, below). A paragraph
+  broken at a width that holds a `pre` element's spaces or tabs
+  (`RinchDocument::any_pre_space`) takes the seams path above as well when
+  parley's breaks can be wrong there (#1243; `ifc::pre_seams_needed`, asked
+  once parley has broken it, `UnhungSpaces::pre_seams`): a `pre` run that
+  starts with a space right after text that wraps, or a soft-wrapped line
+  parley ended in a `pre` space or right before `pre` text. parley has no
+  break between a wrapping run of spaces and a `pre` one (UAX #14 has none
+  between two spaces), and it hung the one `pre` space that overflowed,
+  breaking the `pre` run after it. A paragraph whose `pre` spaces nothing
+  wrapping touches pays no pass for them
+  (`perf_regression_scenarios::pre_spaces_nothing_wrapping_touches_pay_no_pass`),
+  and one that takes the seams scans only the lines that can reach a `pre`
+  space (`ifc_css_line_scans`,
+  `a_pre_wrap_paragraph_with_pre_spaces_scans_only_lines_near_them`).
+  Chrome 155 breaks between the two runs — the first hangs, the `pre`
+  spaces start the next line — but how depends on the text nodes the
+  wrapping run lies in (`ifc::pre_seam`): an ordinary break when the
+  wrapping spaces' element closes there into one that does not wrap, when
+  the run starts in the word's text node and goes on into another, or when
+  the run is collapsible spaces right after an element that closes there
+  (`<span>dd</span> <span pre>    dd</span>` in a `normal` root); only when
+  what is before it fits when the run ends the word's text node
+  (`aaaa  <span pre>  </span>bbbb` breaks in 50px,
+  `hhhhhhh  <span pre>  </span>bbbb` does not); and only when the line
+  overflows before the `pre` spaces when the run is a text node of its own
+  (`aaaa<span pre-wrap>  </span><span pre>  dd</span>` does not break,
+  `hhhhhhh<span pre-wrap>  </span>…` does). In such a paragraph only, a
+  wrapping space then a `break-spaces` one break between them too, in
+  `css_line`'s scan; a paragraph with no `pre` spaces is laid out as before
+  #1243. A line whose trailing run of spaces has `pre` spaces before the
+  part that hangs is aligned with them as content (parley's since 0.12). A text node whose spaces collapsed away
+  between the wrapping run and the `pre` spaces counts as the run going on
+  into another text node when the run's element closes into it
+  (`<span>dd </span> <span pre>`; `UnhungSpaces::collapsed`), not when it
+  is a second text node of the same element, a sibling element's, or after
+  a comment (rsx makes adjacent text nodes; Chrome 155 does not break
+  there). The seams' break
+  opportunities (`ifc::TextBreaks`, ICU4X's segmenter, the one parley uses)
+  are Chrome's where they differ for ASCII: no break between `!`, `/`, `|`
+  or `}` and a letter or digit after it (`<span pre>cccc!</span>dddd`
+  stays whole), on the #1238 box seams and the #1426 edge-box path too
+  (the review's no-`pre` corpora: 128 of 4,500 cases now match Chrome that
+  did not, none stopped matching). Since #2369 they and parley's own
+  breaks read one function, Blink's whole ASCII pair table
+  (`ifc::chrome_break`; `docs/internals/dependencies.md`). Pins: `tests/pre_space_seams_1243_tests.rs` and
+  `tests/pre_space_seams_1243_differential.rs`, a checked-in Chrome 155
+  corpus (`tests/pre_space_seams_1243/chrome155.tsv`, its known differences
+  pinned). Not Chrome's yet (#1898): in the review's family corpus,
+  8 of 78 `pre-wrap` and 11 of 42 `break-spaces` base cases, a word of a
+  `pre` element before the run, six random cases with an inline-block whose
+  breaks differ and three whose line after an inline box starts at the
+  box line's far end, and on a right-to-left line a
+  mixed run is still narrowed by its final `pre` part only. **The "…" is cut at paint time, over the lines as laid out**
+  (#1100; `ifc::ellipsis_cut`, `node::EllipsisCut`, `InlineLayout::ellipsis`):
+  on each overflowing line everything whose visual extent passes the point
+  where the "…" still fits before the line's end edge is hidden — each
+  grapheme whole, a ligature with every cluster its glyph covers (paint
+  draws a glyph with its first cluster, so a cut inside one drew the whole
+  glyph under the "…"), through every `TextMask` an IFC paint draws with
+  (text, decorations, shadows, wavy underlines: `TextMask::cut`), and each
+  atomic inline whole — and the "…" is drawn right after what is kept, in the
+  block container's font and current colour, undecorated, casting its
+  `text-shadow` (an anonymous block box's container's, #1071). Inline
+  backgrounds and borders are not cut: a pill keeps its extent and the
+  root's clip cuts it at the padding edge, where Chrome 155 draws it, with
+  the "…" over it. The end edge is the side the line leaves the box by: the
+  right, or the left for an overflowing right-to-left line (parley infers
+  the direction from the text; `direction` is not read, #1666), which parley
+  aligns left of the box; an unconstrained (`nowrap`/`pre`) right-to-left
+  line is not aligned against the box (it starts at the box's left edge)
+  and leaves by the right, so its "…" goes there and what shows is its
+  visual left, where Chrome under `direction: rtl` shows its logical start.
+  Nothing but the "…" is shaped, so `ellipsis_shapes` is 1 per layout
+  however many lines are cut. A paint walks a line cut at its right only up
+  to the cut (`EllipsisMark::hidden_past`, `paint::text::shown_clusters`:
+  the glyph collection, the hidden-glyph cursor and the shadow extent stop
+  there; the limits are by line index, since parley's text ranges wrap past
+  65,535 bytes, #1267), so the glyphs collected do not grow with the hidden
+  text (`paint::take_text_glyphs_collected`); parley's own `Line::items`
+  still walks each run's glyphs once per collection, and a line cut at its
+  left is walked whole. Text offsets, carets, hit testing and span
+  fragments read the lines, so they are those of the uncut text: a press
+  past the cut maps to the hidden text under it, and a hidden atomic
+  inline keeps its box, which hit testing is not told is hidden (#1864). The clip proof
+  measures an ellipsised root's text no wider than its box
+  (`InlineLayout::painted_width`), so a plain ellipsised title still elides
+  its clip (`clip_elision_tests`). Until #1100 the "…" was drawn by
+  rebuilding the paragraph as flat text in the root's style, which lost
+  every span's font, background and decoration and every chip, so a
+  paragraph whose rebuild would not have been the same picture was clipped
+  with no "…". Pins: `tests/ellipsis_paint_cut_1100_tests.rs` (Chrome 155
+  pixels), `ellipsis_overflowing_line_tests.rs`.
+- **An atomic inline is two roots' business.** An `inline-block` / `-flex` /
+  `-grid` holding text is a member of the IFC around it *and* the root of its
+  own, so `invalidate_ifc_for_node` drops both: reaching only the outer one
+  left a `<button>`'s label in its old colour after a class change. A chip the
+  structural pass finds **changed** is queued for `remeasure_dirty_atomic_inlines`
+  at the end of that pass, because `compute_inline_block_layouts` sized it
+  earlier in the pass with no sign its content had moved — and so is every
+  atomic inline *containing* a root the pass found changed (a paragraph in an
+  `inline-block`, a flex item's IFC in an `inline-flex`), for the same reason.
+- **A node that stops being an IFC root loses its `text_layout`** in the same
+  pass. Caret rects, layer bounds and the ancestor walk read that field as "is a
+  root".
+- `build_ifc_layouts` rebuilds a root that is dirty, has no layout, or has one
+  built at another width — **every** time. It used to skip every non-dirty root
+  before the width check whenever any root was dirty, so a flex item narrowed by
+  a sibling's text edit kept its glyphs broken at the old width.
+
+**The structural pass is scoped** (`crates/rinch-dom/src/ifc_scope.rs`, module
+doc). An append, removal, reorder, `if` toggle, component re-render or
+`display`/`position` flip no longer re-runs the IFC setup over the whole
+document. The mutation verbs record **seeds** — `NodeTree::seed_ifc(node,
+IfcSeed::Children | IfcSeed::Subtree)` — and the next layout re-sets-up only the
+**formatting containers** they reach, with their **regions**: a formatting
+container is any node that is not *transparent* (`display: contents`, or a
+non-atomic `display: inline` element — exactly what
+`recompute_contributes_in_flow_block`, `collect_run_units` and
+`mark_inline_descendants` walk *through*), and its region is everything reached
+from its children through transparent nodes, down to and including the **stop
+nodes** (the formatting containers directly beneath it). Every decision the
+passes make — splices, contributes/hoisting, anonymous boxes, splits, measure
+leaves, roots, marks, stale contexts, signatures — is taken by one container
+from its region alone, and a container's own role never depends on its content.
+So everything outside the scope keeps its state *and its Taffy cache*. The one
+fact that crosses a container boundary is an **atomic inline's size**: the pass
+queues every atomic inline at or above a scope container, and
+`remeasure_dirty_atomic_inlines` sizes them innermost-first, one at a time,
+re-queueing the atomic inlines around any IFC whose chip changed size. A
+`Subtree` seed sets up the whole subtree (a moved subtree has had its marks
+cleared by the verb that moved it). A seed on a node **not connected to the
+document** is dropped: detached subtrees are no longer set up at all, and
+attaching one re-seeds it (#628's optimisation, half-landed — the
+`ifc_classifier_tests` detached-route fixtures now force the whole-document pass,
+which still walks detached subtrees). **Nor is a detached subtree measured or
+shaped.** Every verb that takes a subtree out of the document clears its
+`ifc_root` marks with `clear_ifc_root_recursive` — `set_text_content`'s orphans
+included since #1073; it orphans without freeing, and its orphans used to keep
+their marks, so their roots were shaped (#1069) and their atomic inlines sized
+(#1040) while out. Two filters remain for what the whole-document pass marks
+again: the three sizers that read the registries or the dirty set
+(`compute_inline_block_layouts`, `resolve_percentage_inline_blocks`,
+`remeasure_dirty_atomic_inlines`) skip an entry `depth_if_connected` says is out
+of the document — the fourth, `measure_scoped_atomic_inlines`, sizes only its
+scope's regions, and a scope holds no disconnected node — and
+`build_ifc_layouts` drops a disconnected root's layout and registration instead
+of shaping it. Anonymous boxes, splits and measure leaves
+whose owner left the slab (`set_inner_html`, pseudo-element churn) are swept as
+orphans at a scoped pass's start. **`tree.ifc_dirty` is now "run the
+whole-document pass"** — the first layout (`ifc_full_initial`),
+`recompute_all_styles_full` (`ifc_full_theme`), or any direct write
+(`ifc_full_unattributed`) — so a site that still sets `ifc_dirty` directly is
+slow, never wrong; call `NodeTree::request_full_ifc(reason)` to say why. A site
+that changes structure and does **neither** is silently wrong: nothing sets the
+regions it touched up again (the pseudo-element regeneration in `resolve.rs`
+writes `children` directly and seeds its node itself — pinned by
+`scoped_ifc_scenario_tests::probe_pseudo_content_removed_from_a_mixed_container`).
+Every verb that moves or removes a subtree also takes each of its nodes out of
+the anonymous box whose run it was in (`clear_ifc_root_recursive`), because a
+scoped pass reaches the old container only while it is still in the document.
+The virtualized editor's block collapse/materialise (`virtual_window.rs`) seeds
+the toggled block instead of forcing a whole-document pass per scroll. Counters:
+`ifc_scoped_passes`, `ifc_scope_containers`, `ifc_scope_nodes`,
+`ifc_full_passes` and its reasons. The registries `ifc_root_registry` and
+`atomic_inline_registry` replace the slab scans `build_ifc_layouts`,
+`inline_block_measure_roots` and `resolve_percentage_inline_blocks` did every
+layout; each is a superset filtered at use by the predicate the scan applied.
+`copy_cached_text_layouts` walks the measure cache's nodes, not the slab. The
+measure function no longer bypasses the IFC measure cache for a dirty root: it
+drops that root's old sizes at the start of the compute and reuses what it
+shapes itself (one shape for a new row where there were four).
+`crates/rinch-dom/tests/scoped_ifc_oracle_tests.rs` is the oracle: every
+mutation shape in 17 contexts, plus a lockstep randomized differential, each
+comparing the scoped pass with the whole-document pass on the same history and
+both with a fresh layout; its module doc lists what it found.
+
+**A `display: contents` splice that comes out the same is left alone**
+(#2136, `sync_display_contents`). A scoped structural pass reaches every
+wrapper in its containers' regions, and a grid built by a keyed `for` holds a
+wrapper per item, so an append, a removal or a reorder in that grid put the
+grid in `affected_parents` once per wrapper. Each rebuild used to
+`set_children` the grid and `mark_dirty` **every** item, clearing all their
+Taffy caches: one card appended to Playweft's 430-card asset grid measured
+every card's text again (10,892 `shape_measure_text`). The rebuild now
+compares the new list with Taffy's: an unchanged list is skipped, and only an
+item that was not in the list is dirtied (one that stays, reordered or not,
+keeps its cache — Taffy keys an entry on the inputs its parent passes, and the
+parent is dirtied by `set_children`). The root is marked only when a list
+changed. Pin: `perf_regression_scenarios::a_structural_change_in_a_grid_of_contents_wrappers_measures_only_what_moved`.
+
+**`<body>`'s flex basis is `0` when its height cannot depend on it** (#1260,
+`node::body_taffy_overrides`): `<html>` is a fixed viewport-sized flex column and
+`<body>` its only item, so the UA sheet's `overflow-y: auto` body (a scroll
+container, auto minimum `0`) with `height`/`flex-basis` auto and `flex-shrink`
+above zero ends at the viewport's height less its margins, clamped by
+`min-height`/`max-height`, whatever its basis. Measuring that basis was a whole
+`ComputeSize` pass over everything in `<body>` per compute — every row of a
+500-row list probed a second time per edit, about 22% of `rinch-bench`'s
+`append_row`. `tests/body_flex_basis_tests.rs` pins the box.
+
+Still not done, and measured by `perf_counter_baselines`: appending a row still
+has Taffy *ask* every sibling row for its size once (a leaf's final-layout cache
+entry is keyed on the available space, which changes when the column grows —
+Taffy's, answered from rinch's measure cache); the per-pass walks
+`read_layout_results`, `clamp_scroll_offsets`, `resolve_layout_calcs` and
+`request_background_image_loads` are still O(document). A colour-only restyle
+still drops the root's cached measures along with its glyphs. (`set_style` of an
+**inherited** property used to reach no descendant with a cached style; the
+cascade now re-cascades the children of any element whose inherited style moved
+— see **Style invalidation** above.)
+`crates/rinch-dom/tests/incremental_text_layout_oracle_tests.rs` is the pin:
+each input above against a fresh layout of the final state, with the mutant
+that kills it named in the PR.
+
+**Style isolation: `isolate_styles` (#2357).** `NodeHandle::isolate_styles`
+stops the document's style sheets (author origin: the theme, component CSS,
+an app's own `<style>`s) matching the node's **descendants**, as a shadow
+root stops the page's sheets in a browser; `rinch_html::HtmlView` calls it on
+its view unless `app_styles` is set. Below the node only user-agent rules,
+presentational hints and `style` attributes apply; inheritance is untouched,
+so the host's `font-*` / `line-height` still reach the content. The node
+itself keeps matching author rules (it is the shadow *host*), which is why
+the view's own `<style>` (rules on `.rinch-html-view`) still works. That
+sheet comes and goes with every view, so each of its selectors names
+`.rinch-html-view` where Stylo's stylesheet invalidation can bucket it, and
+its weak rules (`user-select`, `paper`) sit in `@layer rinch-html-view`, not
+in `:where()`: Stylo buckets nothing inside `:where()`/`:is()`, so a
+`:where(.rinch-html-view)` rule made every view mount and unmount a
+whole-window restyle (#2636).
+
+- **Desktop** uses Stylo's own gate for native anonymous content:
+  `Node::style_isolated` is set on the node, and
+  `TElement::matches_user_and_content_rules` answers `false` for any element
+  with an isolated ancestor. That answer is O(1): `resolve_styles_recursive`
+  sets `Node::under_isolated` from the parent's (`style_isolated ||
+  under_isolated`) as it visits each element, top-down, before the cascade,
+  and the check reads it; a node moved under or out of a view is restyled,
+  so visited again. The walk keeps the flag on every visit, also while
+  `NodeTree::isolated_nodes` (raised by `isolate_styles`, lowered by
+  `remove_subtree` freeing such a node) is 0, when the check answers `true`
+  without reading it: a subtree detached from a view, re-inserted after the
+  view was freed and so styled at count 0, would otherwise keep a stale
+  `true` that a later view's count made the check read (review of #2366,
+  round 3; `style_isolation_flag_2357_tests`). Stylo asks once per
+  cascade, per pseudo-element and per invalidation; the first version walked
+  the ancestors each time, which cost 15 full restyles of 6,040 elements 40
+  deep +3.7% (review of #2366). With it false, `RuleCollector::collect_all` skips user and
+  document author rules but still collects UA rules, presentational hints
+  and the style attribute; Stylo also leaves such an element out of the
+  style-sharing cache and of document-rule invalidation
+  (`each_applicable_non_document_style_rule_data`). rinch-dom calls
+  `Stylist::push_applicable_declarations`, which builds that collector, so
+  pseudo-elements follow their originating element. The node also gets the
+  `rinch-style-isolated` attribute, which the UA sheet's
+  `[rinch-style-isolated] a[href]` rule keys on to give links Chrome's
+  `a:-webkit-any-link` look (`#0000ee`, underline, pointer): the UA sheet
+  has no link rule otherwise, and an app's own links must stay as they were.
+  `[rinch-style-isolated] :focus-visible { outline: auto 1px #101010 }` is
+  Chrome's UA focus ring, since a theme's `:focus-visible` rule no longer
+  reaches a link in mail (`auto` draws solid).
+- **Web** attaches an open shadow root to the node; `WebDocument` puts
+  children added afterwards into it (`children_of`), answers the host as a
+  shadow child's `parent_node` (`parent_of`), and walks it when registering
+  or forgetting nodes. Children the node had before stay in the light tree,
+  unrendered (the view's `<style>` is one: still a document sheet). At the
+  document, an event from inside is retargeted to the host, which carries
+  the view's `data-rid`, so handler lookup is unchanged; the link helpers
+  (`link_in`, `claimed_link`) read `composedPath()[0]` (`deep_target`) and
+  cross shadow boundaries (`closest_composed`, `contains_composed`), or a
+  link click would navigate the tab. A synthetic event in a test needs
+  `composed: true` to leave the shadow root, as the browser's own do.
+  Where the browser stops at the shadow root and desktop does not, the web
+  side walks it: `trap_focusables` (a `data-trap-focus` trap's Tab stops,
+  through `focusables_composed` when the trap holds a
+  `[rinch-style-isolated]` host), `deep_active_element` (the trap's Tab
+  start and its focus check) and `DomDocument::active_element` follow
+  `shadowRoot.activeElement`, `text_content` includes shadow text after the
+  host's light children's, and `get_children` / `insert_child` list and
+  index a host's light children, then its shadow root's (desktop's order).
+  `query_selector*` and `query_selector*_in` do **not** see into it (a
+  browser selector cannot cross a shadow boundary, and emulating one was not
+  cheap): query from the view's body (reached through `get_children`) or
+  below, which works on both.
+- **Why not a CSS reset** (`:where(.rinch-html-body *) { all: revert }`):
+  `revert` in the author origin rolls back to the user-agent origin and so
+  also drops presentational hints, measured in Chrome 156 (a `<td width=300
+  bgcolor=red>` under it is 24px wide and transparent); mail is made of
+  them. A zero-specificity reset also loses to any app rule with a type or
+  class selector.
+- **Not isolated**: an app rule that names the view's own element still
+  reaches it (it is the host). A `<style>` put into the view through
+  `html:` (which wants cleaned HTML, and `clean` drops `<style>`) differs:
+  on desktop it joins the document's sheets, styling the app and not the
+  mail; on the web it stays in the shadow root, styling the mail only.
+- **Colour**: the view sets no `color` / `background-color` of its own
+  (it was black on white until the review of #2366), so the host's colour
+  inherits, as in Chrome; `HtmlView { paper: true }` restores black on white
+  through a zero-specificity class rule.

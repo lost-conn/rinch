@@ -5,10 +5,16 @@
 //! structure validation.
 
 pub mod content_match;
+pub mod data_attrs;
 pub mod mark;
 pub mod node;
 pub mod validation;
 
+pub use data_attrs::{
+    MAX_DATA_ATTR_NAME, MAX_DATA_ATTR_VALUE, MAX_DATA_ATTRS, RESERVED_DATA_ATTR_PREFIXES,
+    RESERVED_DATA_ATTRS, app_data_attrs, is_app_data_attr, is_data_attr_name,
+    is_reserved_data_attr, kept_data_attrs,
+};
 pub use mark::{MarkSpec, MarkSpecBuilder};
 pub use node::{AttrSpec, MarkSet, NodeSpec, NodeSpecBuilder};
 
@@ -38,6 +44,12 @@ pub struct Schema {
     /// `group name -> set of node-type names` in that group (for content matching).
     groups: HashMap<String, HashSet<Box<str>>>,
 }
+
+/// The widest an image's `width` attr is written or shown, in CSS pixels:
+/// the HTML import clamps an `<img width>` to it, and the HTML writer and the
+/// view clamp a model value above it. A bound of our own, as the import's
+/// `colspan` cap of 1000 is Chrome's; Chrome has none for `width`.
+pub const IMAGE_MAX_WIDTH: i64 = 65535;
 
 impl Schema {
     /// Create a new empty schema with "doc" as the top node.
@@ -94,6 +106,7 @@ impl Schema {
                 .content("inline*")
                 .group("block")
                 .attr("level", AttrSpec::optional(AttrValue::Int(1)))
+                .defining(true)
                 .attr("indent", AttrSpec::optional(AttrValue::Int(0)))
                 // Horizontal text alignment — see the paragraph node above.
                 .attr("text_align", AttrSpec::optional("left"))
@@ -114,6 +127,7 @@ impl Schema {
             NodeSpec::builder("blockquote")
                 .content("block+")
                 .group("block")
+                .defining(true)
                 .parse_html(vec!["blockquote".into()])
                 .build(),
         );
@@ -126,6 +140,8 @@ impl Schema {
                 .group("block")
                 .marks(MarkSet::None)
                 .attr("language", AttrSpec::optional(""))
+                .defining(true)
+                .code(true)
                 .parse_html(vec!["pre".into()])
                 .build(),
         );
@@ -156,6 +172,7 @@ impl Schema {
             "list_item",
             NodeSpec::builder("list_item")
                 .content("block+")
+                .defining(true)
                 .parse_html(vec!["li".into()])
                 .build(),
         );
@@ -174,6 +191,7 @@ impl Schema {
             "task_item",
             NodeSpec::builder("task_item")
                 .content("block+")
+                .defining(true)
                 .attr("checked", AttrSpec::optional(AttrValue::Bool(false)))
                 .build(),
         );
@@ -183,6 +201,20 @@ impl Schema {
             let mut spec = NodeSpec::atom("horizontal_rule");
             spec.group = Some("block".into());
             spec.parse_html_tags = vec!["hr".into()];
+            spec
+        });
+
+        // embed — a block an app draws itself (a sheet, a canvas, a counter: a
+        // node view). The document holds the atom and the app's own `data-*`
+        // attributes, which are what the app keys its state to. It has no HTML
+        // tag of its own: it is written as `<div data-pm-type="embed" data-…>`
+        // and read back from that element (`serialize::html`), and an app can
+        // give the HTML export markup to put inside it
+        // (`serialize::set_html_fallback`).
+        builder = builder.node("embed", {
+            let mut spec = NodeSpec::atom("embed");
+            spec.group = Some("block".into());
+            spec.data_attrs = true;
             spec
         });
 
@@ -209,6 +241,16 @@ impl Schema {
             spec.attrs.insert("src".into(), AttrSpec::required());
             spec.attrs.insert("alt".into(), AttrSpec::optional(""));
             spec.attrs.insert("title".into(), AttrSpec::optional(""));
+            // `width` is the width the picture is shown at, in whole CSS
+            // pixels, at most `IMAGE_MAX_WIDTH` (absent or not positive: its
+            // natural width — the editor's stylesheet does not cap it).
+            spec.attrs.insert("width".into(), AttrSpec::optional(0i64));
+            // An app's own `data-*` attributes (an annotation id, a reference
+            // into its store): kept through edits, HTML, `DocNode` and
+            // collaboration, and written on the host `<img>`. A GFM image
+            // `![alt](src)` carries neither them nor `width`; an image in a
+            // table written as HTML keeps both.
+            spec.data_attrs = true;
             spec.parse_html_tags = vec!["img".into()];
             spec
         });
@@ -305,6 +347,9 @@ impl Schema {
         link_attrs.insert("target".into(), AttrSpec::optional(""));
         let mut link = MarkSpec::with_attrs("link", link_attrs);
         link.parse_html_tags = vec!["a".into()];
+        // Non-inclusive, as ProseMirror's own example schema and tiptap's Link have
+        // it: text typed right after a link is not part of it.
+        link.inclusive = false;
         builder = builder.mark("link", link);
 
         // highlight
@@ -448,6 +493,13 @@ impl SchemaBuilder {
 
     /// Build the schema, compiling interned node/mark-type handles and the
     /// per-type content matches.
+    ///
+    /// # Panics
+    ///
+    /// When a node type that is not a leaf (one with content) sets
+    /// [`NodeSpec::data_attrs`]: app data attributes are carried through HTML
+    /// only on an element that holds none of the document's content (a void
+    /// element, or a block atom's `<div>`).
     pub fn build(self) -> Schema {
         let groups = compute_groups(&self.nodes);
         // A node-type name must not collide with a group name, or content
@@ -457,6 +509,15 @@ impl SchemaBuilder {
             "a node-type name collides with a group name"
         );
         let node_types = compile_node_types(&self.nodes, &groups);
+        // App data attributes go through HTML only on a leaf's element, so a
+        // container that kept them would lose them on every copy and paste.
+        for (name, spec) in &self.nodes {
+            assert!(
+                !spec.data_attrs || node_types[name.as_str()].is_leaf(),
+                "node type `{name}` sets `data_attrs`, which only a leaf node type \
+                 (an atom such as `image`) may"
+            );
+        }
         let mark_types = compile_mark_types(&self.marks);
         Schema {
             nodes: self.nodes,
@@ -548,6 +609,7 @@ mod tests {
             "task_list",
             "task_item",
             "horizontal_rule",
+            "embed",
             "hard_break",
             "text",
             "image",
@@ -776,6 +838,12 @@ mod tests {
         let image = schema.node("image").unwrap();
         assert!(image.attrs["src"].required);
         assert!(!image.attrs["alt"].required);
+        assert_eq!(image.attrs["width"].default, Some(AttrValue::Int(0)));
+        assert!(
+            image.data_attrs,
+            "the image keeps an app's data-* attributes"
+        );
+        assert!(!schema.node("paragraph").unwrap().data_attrs);
     }
 
     #[test]
@@ -784,6 +852,16 @@ mod tests {
         let link = schema.mark("link").unwrap();
         assert!(link.attrs["href"].required);
         assert!(!link.attrs["title"].required);
+        assert!(
+            !link.inclusive,
+            "a link does not extend over text typed after it"
+        );
+        for name in ["bold", "italic", "underline", "strike", "code", "highlight"] {
+            assert!(
+                schema.mark(name).unwrap().inclusive,
+                "{name} stays inclusive"
+            );
+        }
     }
 
     #[test]

@@ -7,6 +7,25 @@ pub struct DebugCommand {
     pub response_tx: mpsc::Sender<DebugResult>,
 }
 
+/// The unit of a [`DebugCommandKind::Scroll`] delta (mirrored in
+/// `rinch-mcp-server`'s client in lockstep).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScrollUnit {
+    /// Pixels, injected as a pixel `MouseWheel` (a trackpad): scrolls at once.
+    #[default]
+    Pixel,
+    /// Wheel notches, injected as `MouseWheelLines` (a mouse wheel): the
+    /// default scroll glides over about 200 ms.
+    Line,
+}
+
+impl ScrollUnit {
+    fn is_pixel(&self) -> bool {
+        *self == ScrollUnit::Pixel
+    }
+}
+
 /// The different commands the debug server can receive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
@@ -18,7 +37,7 @@ pub enum DebugCommandKind {
         #[serde(default)]
         max_depth: Option<u32>,
         #[serde(default)]
-        root_id: Option<usize>,
+        root_id: Option<u64>,
         /// Include each node's computed styles. Defaults to `false` so existing
         /// clients keep the compact tree; the visual-regression harness needs
         /// them to rebuild the screen as HTML/CSS.
@@ -28,15 +47,23 @@ pub enum DebugCommandKind {
     #[serde(rename = "query_selector")]
     QuerySelector { selector: String },
     #[serde(rename = "get_node")]
-    GetNode { id: usize },
+    GetNode { id: u64 },
     #[serde(rename = "get_text_content")]
-    GetTextContent { id: usize },
+    GetTextContent { id: u64 },
     #[serde(rename = "click")]
     Click {
         x: f32,
         y: f32,
         #[serde(default)]
         button: Option<String>,
+        /// Modifier names held for this click, in the shape `key_press`
+        /// accepts (folded by [`fold_modifier_names`]; unknown names are an
+        /// error). The runtime emits `ModifiersChanged` with exactly these
+        /// before the press and restores the previous state after the
+        /// release. Absent: the click sees whatever modifier state the app
+        /// already holds, as before this field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modifiers: Option<Vec<String>>,
     },
     #[serde(rename = "type_text")]
     TypeText { text: String },
@@ -45,7 +72,7 @@ pub enum DebugCommandKind {
     #[serde(rename = "close_app")]
     CloseApp,
     #[serde(rename = "get_computed_styles")]
-    GetComputedStyles { id: usize },
+    GetComputedStyles { id: u64 },
     #[serde(rename = "mouse_move")]
     MouseMove { x: f32, y: f32 },
     #[serde(rename = "mouse_down")]
@@ -54,6 +81,11 @@ pub enum DebugCommandKind {
         y: f32,
         #[serde(default)]
         button: Option<String>,
+        /// Modifier names to hold from this press on (see `Click`). They stay
+        /// held — through `mouse_move`s, for a Shift- or Alt-drag — until the
+        /// next `mouse_up`, which restores the state from before this press.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modifiers: Option<Vec<String>>,
     },
     #[serde(rename = "mouse_up")]
     MouseUp {
@@ -61,6 +93,11 @@ pub enum DebugCommandKind {
         y: f32,
         #[serde(default)]
         button: Option<String>,
+        /// Modifier names held for this release (see `Click`). Whether or not
+        /// it is given, a `mouse_up` after a `mouse_down` that set modifiers
+        /// restores the state from before that press, after the release.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modifiers: Option<Vec<String>>,
     },
     #[serde(rename = "scroll")]
     Scroll {
@@ -68,6 +105,10 @@ pub enum DebugCommandKind {
         y: f32,
         delta_x: f64,
         delta_y: f64,
+        /// `"pixel"` (the default; also what a request without the field
+        /// means) or `"line"`: notches of a mouse wheel, which glide.
+        #[serde(default, skip_serializing_if = "ScrollUnit::is_pixel")]
+        unit: ScrollUnit,
     },
     #[serde(rename = "key_press")]
     KeyPress {
@@ -83,6 +124,46 @@ pub enum DebugCommandKind {
         #[serde(default)]
         modifiers: Vec<String>,
     },
+    /// Press a key WITHOUT releasing it — the `key_press` of #485's
+    /// `key_down`/`key_up` pair, mirroring `mouse_down`/`mouse_up`: a
+    /// `KeyPress` always ends in a matching release (so it reads as one
+    /// physical keystroke), but a held key — "is W still held", a chord that
+    /// ends on release, a drag armed by a key — needs the press and the
+    /// release as two separate commands. Goes through the same menu-shortcut
+    /// check `key_press` does (issue #533): a chord a menu owns is consumed
+    /// here and dispatches no `PlatformEvent::KeyDown` at all, exactly as a
+    /// real press would never reach the app either.
+    #[serde(rename = "key_down")]
+    KeyDown {
+        key: String,
+        #[serde(default)]
+        shift: bool,
+        #[serde(default)]
+        ctrl: bool,
+        #[serde(default)]
+        alt: bool,
+        /// See [`KeyPress::modifiers`](DebugCommandKind::KeyPress).
+        #[serde(default)]
+        modifiers: Vec<String>,
+    },
+    /// Release a key previously held with `key_down` (issue #485). Translates
+    /// to a `PlatformEvent::KeyUp` with the same `key`/`logical_key`
+    /// resolution `key_down`/`key_press` use, so a consumer pairing a press
+    /// with its release by that string sees them match. Does **not** check
+    /// menu shortcuts — a real release never fires one either.
+    #[serde(rename = "key_up")]
+    KeyUp {
+        key: String,
+        #[serde(default)]
+        shift: bool,
+        #[serde(default)]
+        ctrl: bool,
+        #[serde(default)]
+        alt: bool,
+        /// See [`KeyPress::modifiers`](DebugCommandKind::KeyPress).
+        #[serde(default)]
+        modifiers: Vec<String>,
+    },
     #[serde(rename = "ime")]
     Ime {
         /// One of `"enable"`, `"preedit"`, `"commit"`, `"disable"`.
@@ -95,9 +176,26 @@ pub enum DebugCommandKind {
         cursor: Option<(usize, usize)>,
     },
     #[serde(rename = "get_caret_position")]
-    GetCaretPosition { node_id: usize, byte_offset: usize },
+    GetCaretPosition { node_id: u64, byte_offset: usize },
     #[serde(rename = "get_glyph_bounds")]
-    GetGlyphBounds { node_id: usize, byte_offset: usize },
+    GetGlyphBounds { node_id: u64, byte_offset: usize },
+    /// The document's performance counters (`rinch_dom::perf`): the last
+    /// completed frame, the frame in progress, the running total and the
+    /// frame count, each counter keyed by its `snake_case` name. `reset`
+    /// zeroes them all after they are read.
+    #[serde(rename = "perf_stats")]
+    PerfStats {
+        #[serde(default)]
+        reset: bool,
+    },
+    /// Drop files on the window at `(x, y)` (logical px, as `click`), as the
+    /// OS delivers a file drop (#1806): a `FileHoverEnter` per path at the
+    /// point, then a `FileDropped` with every path. The paths are handed over
+    /// verbatim — not checked, not made absolute — so a missing file reaches
+    /// the app exactly as one deleted between an OS drop and its read would.
+    /// An empty list is an error and dispatches nothing.
+    #[serde(rename = "drop_files")]
+    DropFiles { x: f32, y: f32, paths: Vec<String> },
 }
 
 /// Result of a debug command.
@@ -133,6 +231,11 @@ pub struct Response {
 pub struct HandshakeRequest {
     pub protocol: String,
     pub version: u32,
+    /// The token from the app's discovery file (#2481). A server refuses a
+    /// handshake without the right one; a server from before #2481 ignores
+    /// the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// Handshake response from server.
@@ -144,7 +247,8 @@ pub struct HandshakeResponse {
     pub pid: u32,
 }
 
-/// Fold a `key_press` `modifiers` name array into flat modifier booleans.
+/// Fold a `modifiers` name array (`key_press`, `click`, `mouse_down`,
+/// `mouse_up`) into flat modifier booleans.
 ///
 /// Recognized names (case-insensitive): `"ctrl"`/`"control"`, `"shift"`,
 /// `"alt"`/`"option"`, `"meta"`/`"cmd"`/`"super"`. Returns the offending name
@@ -176,13 +280,26 @@ pub fn write_frame(stream: &mut impl std::io::Write, data: &[u8]) -> std::io::Re
     stream.flush()
 }
 
+/// The largest frame an authenticated client may send or receive (a
+/// screenshot is the big one).
+pub const MAX_FRAME: usize = 64 * 1024 * 1024;
+
+/// The largest frame accepted before the token has been checked (#2515): a
+/// handshake is a few hundred bytes.
+pub const MAX_HANDSHAKE_FRAME: usize = 4 * 1024;
+
 /// Read a length-prefixed frame (4-byte big-endian length + JSON payload).
 pub fn read_frame(stream: &mut impl std::io::Read) -> std::io::Result<Vec<u8>> {
+    read_frame_max(stream, MAX_FRAME)
+}
+
+/// [`read_frame`] with a cap of `max` bytes, checked on the declared length
+/// before anything is allocated (#2515).
+pub fn read_frame_max(stream: &mut impl std::io::Read, max: usize) -> std::io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 64 * 1024 * 1024 {
-        // 64MB safety limit
+    if len > max {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "Frame too large",
@@ -222,6 +339,59 @@ mod key_press_modifiers_tests {
         fold_modifier_names(&modifiers, &mut shift, &mut ctrl, &mut alt, &mut meta).unwrap();
         assert!(ctrl);
         assert!(!shift && !alt && !meta);
+    }
+
+    #[test]
+    fn scroll_unit_defaults_to_pixel_and_round_trips() {
+        // An old client sends no `unit`: pixel, as before.
+        let req: Request = serde_json::from_str(
+            r#"{"id":1,"method":"scroll","params":{"x":1.0,"y":2.0,"delta_x":0.0,"delta_y":5.0}}"#,
+        )
+        .unwrap();
+        let DebugCommandKind::Scroll { unit, delta_y, .. } = req.command else {
+            panic!("expected Scroll");
+        };
+        assert_eq!(unit, ScrollUnit::Pixel);
+        assert_eq!(delta_y, 5.0);
+
+        // Line round-trips; pixel is left off the wire so an old server still reads it.
+        let line = Request {
+            id: 2,
+            command: DebugCommandKind::Scroll {
+                x: 1.0,
+                y: 2.0,
+                delta_x: 0.0,
+                delta_y: 1.0,
+                unit: ScrollUnit::Line,
+            },
+        };
+        let json = serde_json::to_string(&line).unwrap();
+        assert!(json.contains(r#""unit":"line""#), "{json}");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        let DebugCommandKind::Scroll { unit, .. } = back.command else {
+            panic!("expected Scroll");
+        };
+        assert_eq!(unit, ScrollUnit::Line);
+
+        let pixel = Request {
+            id: 3,
+            command: DebugCommandKind::Scroll {
+                x: 1.0,
+                y: 2.0,
+                delta_x: 0.0,
+                delta_y: 1.0,
+                unit: ScrollUnit::Pixel,
+            },
+        };
+        assert!(!serde_json::to_string(&pixel).unwrap().contains("unit"));
+
+        // An unknown unit fails loud instead of scrolling the wrong way.
+        assert!(
+            serde_json::from_str::<Request>(
+                r#"{"id":4,"method":"scroll","params":{"x":1.0,"y":2.0,"delta_x":0.0,"delta_y":1.0,"unit":"page"}}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -297,5 +467,150 @@ mod key_press_modifiers_tests {
         )
         .unwrap();
         assert!(s && c && a && m);
+    }
+}
+
+#[cfg(test)]
+mod pointer_modifiers_tests {
+    use super::*;
+
+    fn modifiers_of(command: DebugCommandKind) -> Option<Vec<String>> {
+        match command {
+            DebugCommandKind::Click { modifiers, .. }
+            | DebugCommandKind::MouseDown { modifiers, .. }
+            | DebugCommandKind::MouseUp { modifiers, .. } => modifiers,
+            other => panic!("not a pointer command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn click_mouse_down_and_mouse_up_take_a_modifiers_array() {
+        for method in ["click", "mouse_down", "mouse_up"] {
+            let req: Request = serde_json::from_str(&format!(
+                r#"{{"id":1,"method":"{method}","params":{{"x":1,"y":2,"modifiers":["ctrl","Shift"]}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(
+                modifiers_of(req.command),
+                Some(vec!["ctrl".to_string(), "Shift".to_string()]),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_modifiers_field_is_none_and_is_not_sent() {
+        for method in ["click", "mouse_down", "mouse_up"] {
+            let req: Request = serde_json::from_str(&format!(
+                r#"{{"id":1,"method":"{method}","params":{{"x":1,"y":2}}}}"#
+            ))
+            .unwrap();
+            // Written back without the field, so a client that never asks for
+            // modifiers sends exactly the bytes it sent before.
+            let json = serde_json::to_string(&req).unwrap();
+            assert!(!json.contains("modifiers"), "{json}");
+            assert_eq!(modifiers_of(req.command), None, "{method}");
+        }
+    }
+
+    #[test]
+    fn an_empty_modifiers_array_is_not_an_absent_one() {
+        let req: Request = serde_json::from_str(
+            r#"{"id":1,"method":"click","params":{"x":1,"y":2,"modifiers":[]}}"#,
+        )
+        .unwrap();
+        assert_eq!(modifiers_of(req.command), Some(vec![]));
+    }
+}
+
+#[cfg(test)]
+mod key_down_up_485_tests {
+    //! Issue #485: `key_down`/`key_up` are new wire commands, so their shape
+    //! needs the same round-trip coverage `key_press` has — a typo in a
+    //! `#[serde(rename = ...)]` or a missing `#[serde(default)]` would be
+    //! silent otherwise (a request that just fails to deserialize at all).
+
+    use super::*;
+
+    #[test]
+    fn key_down_deserializes_with_only_key_required() {
+        let req: Request =
+            serde_json::from_str(r#"{"id":1,"method":"key_down","params":{"key":"w"}}"#).unwrap();
+        let DebugCommandKind::KeyDown {
+            key,
+            shift,
+            ctrl,
+            alt,
+            modifiers,
+        } = req.command
+        else {
+            panic!("expected KeyDown");
+        };
+        assert_eq!(key, "w");
+        assert!(!shift && !ctrl && !alt);
+        assert!(modifiers.is_empty());
+    }
+
+    #[test]
+    fn key_up_round_trips_with_modifiers() {
+        let original = Request {
+            id: 9,
+            command: DebugCommandKind::KeyUp {
+                key: "w".into(),
+                shift: false,
+                ctrl: true,
+                alt: false,
+                modifiers: vec!["ctrl".into()],
+            },
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("\"method\":\"key_up\""));
+        let back: Request = serde_json::from_str(&json).unwrap();
+        let DebugCommandKind::KeyUp { key, ctrl, alt, .. } = back.command else {
+            panic!("expected KeyUp");
+        };
+        assert_eq!(key, "w");
+        assert!(ctrl && !alt);
+    }
+}
+
+#[cfg(test)]
+mod drop_files_1806_tests {
+    //! #1806: `drop_files` is a new wire command; a misspelt rename or a
+    //! field shape that does not round-trip would only show as a request that
+    //! fails to deserialize in a live session.
+
+    use super::*;
+
+    #[test]
+    fn drop_files_round_trips_with_its_paths_in_order() {
+        let original = Request {
+            id: 3,
+            command: DebugCommandKind::DropFiles {
+                x: 12.5,
+                y: 40.0,
+                paths: vec!["/tmp/b.glb".into(), "relative/a.png".into()],
+            },
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("\"method\":\"drop_files\""), "{json}");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        let DebugCommandKind::DropFiles { x, y, paths } = back.command else {
+            panic!("expected DropFiles");
+        };
+        assert_eq!((x, y), (12.5, 40.0));
+        assert_eq!(paths, vec!["/tmp/b.glb", "relative/a.png"]);
+    }
+
+    #[test]
+    fn drop_files_deserializes_from_the_wire_shape() {
+        let req: Request = serde_json::from_str(
+            r#"{"id":1,"method":"drop_files","params":{"x":1,"y":2,"paths":["/x"]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            req.command,
+            DebugCommandKind::DropFiles { ref paths, .. } if paths == &["/x"]
+        ));
     }
 }

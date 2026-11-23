@@ -71,6 +71,13 @@
 
 /// The HTML boolean-attribute set and the truthiness rule for it (issue #551).
 mod bool_attr;
+mod freed_nodes;
+
+/// HTML's rules for parsing dimension values, for `width`/`height` (#684).
+mod html_dimension;
+
+/// HTML's rules for parsing integers, for integer attributes (#1138, #1153).
+mod html_integer;
 
 /// Declaration-level arithmetic on an inline `style` attribute (issue #647).
 mod inline_style;
@@ -86,8 +93,13 @@ pub mod traits;
 pub use bool_attr::{
     attr_is_truthy, data_attr_is_on, is_boolean_attribute, is_presence_reflected_attribute,
 };
+#[doc(hidden)]
+pub use freed_nodes::{FreedNodesListener, on_nodes_freed};
+pub use html_dimension::{HtmlDimension, parse_html_dimension};
+pub use html_integer::{parse_html_integer, parse_html_non_negative_integer};
 pub use inline_style::{
-    StyleProp, normalize_property_name, serialize_declarations, split_declarations,
+    StyleProp, collapse_declarations_where, is_important, normalize_property_name,
+    serialize_declarations, split_declarations, split_declarations_keeping_duplicates,
 };
 pub use late_child::{on_child_inserted, on_child_removed};
 pub use render_scope::*;
@@ -202,9 +214,198 @@ pub fn has_render_scope() -> bool {
 // NodeId and NodeHandle
 // ============================================================================
 
-/// Unique identifier for a DOM node.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct NodeId(pub usize);
+/// Unique identifier for a DOM node: a slot **index** and a **generation**,
+/// packed into one `u64` on every target (issue #723).
+///
+/// The low 32 bits are the slot the backend stores the node in, the high 32
+/// bits the generation of that slot. A backend that reuses a slot after
+/// freeing it gives the new node a higher generation, so an id held from
+/// before the free names *nothing* rather than the slot's new occupant:
+/// `rinch-dom`'s checked node storage answers `None` for it, as the browser
+/// backend does for an id it has retired.
+///
+/// The field is public and holds the packed bits. An id of generation 0 is
+/// just its index, so `NodeId(4)` is slot 4, generation 0, and prints as
+/// `NodeId(4)` everywhere it printed before (`Debug`, the debug server's
+/// wire ids, DevTools). A non-zero generation prints as `NodeId(4@g1)`.
+/// Build an id from parts with [`NodeId::new`] or [`NodeId::from_index`], and
+/// read them back with [`NodeId::index`] and [`NodeId::generation`]; do not
+/// treat [`NodeId::to_raw`] as an index.
+///
+/// A backend's generations wrap after 2^21 (`rinch-dom`'s
+/// `node_slab::GENERATION_BITS`), so every id is below 2^53 and survives a
+/// JSON number parsed as an `f64` (the debug protocol, the MCP server,
+/// `rinch-web`'s `__nid` expando): issue #723's wire decision.
+///
+/// The order (`Ord`) is that of the packed bits: generation first, then index.
+/// It is a total order fit for sorted containers, not document order.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NodeId(pub u64);
+
+impl NodeId {
+    /// The id of slot `index` at `generation`.
+    #[inline]
+    pub const fn new(index: u32, generation: u32) -> Self {
+        NodeId(((generation as u64) << 32) | index as u64)
+    }
+
+    /// The id of slot `index` at generation 0 — what a backend that has not
+    /// reused the slot hands out, and what a test literal means.
+    ///
+    /// # Panics
+    ///
+    /// If `index` does not fit in 32 bits.
+    #[inline]
+    pub fn from_index(index: usize) -> Self {
+        let index = u32::try_from(index).expect("NodeId index exceeds 32 bits");
+        NodeId::new(index, 0)
+    }
+
+    /// The id whose packed bits are `raw` (the inverse of [`NodeId::to_raw`]).
+    #[inline]
+    pub const fn from_raw(raw: u64) -> Self {
+        NodeId(raw)
+    }
+
+    /// The packed bits: generation in the high 32, index in the low 32. Stable
+    /// across a process, so fit for a wire id or a map key.
+    #[inline]
+    pub const fn to_raw(self) -> u64 {
+        self.0
+    }
+
+    /// The slot index.
+    #[inline]
+    pub const fn index(self) -> usize {
+        (self.0 & 0xFFFF_FFFF) as usize
+    }
+
+    /// The generation of the slot this id was issued for.
+    #[inline]
+    pub const fn generation(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+}
+
+impl std::fmt::Debug for NodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.generation() == 0 {
+            write!(f, "NodeId({})", self.index())
+        } else {
+            write!(f, "NodeId({}@g{})", self.index(), self.generation())
+        }
+    }
+}
+
+/// Whether writing or removing the attribute `name` on the **focused** element
+/// can make a browser blur it inside the write (issue #1478): `hidden`,
+/// `tabindex` and `contenteditable`, ASCII case-insensitively. See
+/// [`DomDocument::before_attribute_write`], the only thing this gates.
+pub fn is_focus_revoking_attribute(name: &str) -> bool {
+    // Three lengths no other common attribute name shares, so the hot path
+    // (`class`, `style`, `data-rid`) is one length compare.
+    match name.len() {
+        6 => name.eq_ignore_ascii_case("hidden"),
+        8 => name.eq_ignore_ascii_case("tabindex"),
+        15 => name.eq_ignore_ascii_case("contenteditable"),
+        _ => false,
+    }
+}
+
+/// Run what the backend wants done before an attribute write that may cost
+/// the focused element its focus, with the document **not** borrowed
+/// ([`DomDocument::before_attribute_write`]).
+fn before_attribute_write(
+    doc: &Rc<RefCell<dyn DomDocument>>,
+    node: NodeId,
+    name: &str,
+    value: Option<&str>,
+) {
+    if !is_focus_revoking_attribute(name) {
+        return;
+    }
+    // A statement of its own: the borrow ends before the work runs.
+    let work = doc.borrow().before_attribute_write(node, name, value);
+    if let Some(work) = work {
+        work();
+    }
+}
+
+/// How many times a mutation verb asks the backend to let the focus go before
+/// it mutates anyway: once for the focus that was there, and again while a
+/// listener keeps putting one back inside the part that is going.
+const FOCUS_RELEASE_ROUNDS: usize = 4;
+
+/// Run whatever the backend wants done before a mutation takes `node` (or,
+/// with `children_only`, what is under it) out of place, with the document
+/// **not** borrowed ([`DomDocument::release_focus_within`], issue #1478).
+///
+/// On the web that is a `blur()` of the focused element inside the part that
+/// goes: the browser would otherwise run its focus listeners inside the DOM
+/// call, under the caller's `borrow_mut`, and rinch's listeners touch the
+/// document. Asked again after each release, because a listener is app code
+/// and may focus something else in there. For a listener that does so every
+/// time, the last round's work also keeps the focus from coming back (on the
+/// web it holds the part that goes `inert` for the length of that blur), so
+/// the mutation never runs a listener under its borrow. That matters beyond
+/// the one panic: wasm does not unwind, and a listener aborted there left the
+/// reactive runtime's flush guard set, so later signal writes stopped reaching
+/// the DOM.
+///
+/// `will_run` says whether the mutation is one the backend will carry out
+/// **and that takes the focus with it**. It is asked only once the backend has
+/// something to release (so not at all on desktop, and on the web only with
+/// the focus in the part named): an insertion a browser refuses moves nothing
+/// and must not cost the focus, and neither must a move the backend makes in
+/// place ([`moves_in`], issue #1483).
+fn release_focus_within(
+    doc: &Rc<RefCell<dyn DomDocument>>,
+    node: NodeId,
+    children_only: bool,
+    will_run: impl Fn(&dyn DomDocument) -> bool,
+) {
+    for round in 0..FOCUS_RELEASE_ROUNDS {
+        // The last time, the backend also keeps a listener from putting the
+        // focus back in there, so the mutation never runs one under its borrow.
+        let last = round + 1 == FOCUS_RELEASE_ROUNDS;
+        // A statement of its own: the borrow ends before the work runs.
+        let work = {
+            let doc = doc.borrow();
+            doc.release_focus_within(node, children_only, last)
+                .filter(|_| round > 0 || will_run(&*doc))
+        };
+        match work {
+            Some(work) => work(),
+            None => return,
+        }
+    }
+}
+
+/// Whether putting `child` under `parent` displaces the focus inside `child`:
+/// the backend will carry the insertion out ([`can_take`]) and does not make
+/// it as a move in place, which keeps the focus where it is and dispatches
+/// nothing ([`DomDocument::moves_keeping_focus`]: the web's `moveBefore`,
+/// issue #1483).
+fn moves_in(doc: &dyn DomDocument, parent: NodeId, child: NodeId) -> bool {
+    can_take(doc, parent, child) && !doc.moves_keeping_focus(parent, child)
+}
+
+/// Whether `parent` can take `child` as a child: it is still a node of the
+/// document, and it is not `child` or inside it (a browser refuses that
+/// insertion with a `HierarchyRequestError`).
+fn can_take(doc: &dyn DomDocument, parent: NodeId, child: NodeId) -> bool {
+    if doc.is_retired(parent) {
+        return false;
+    }
+    let mut at = Some(parent);
+    while let Some(id) = at {
+        if id == child {
+            return false;
+        }
+        at = doc.parent_node(id);
+    }
+    true
+}
 
 /// A stable handle to a DOM node for surgical updates.
 ///
@@ -230,6 +431,31 @@ impl NodeHandle {
         Self { node_id, doc }
     }
 
+    /// The document, for an operation on it — after running any effects the
+    /// current batch has queued.
+    ///
+    /// **Program order across a batch.** An event handler runs inside a
+    /// [`batch`](crate::reactive::batch), which defers effects to the end of
+    /// the handler. A handler that writes a signal and then touches the DOM
+    /// itself — `open.set(true); field.focus()`, `rows.update(..);
+    /// list.scroll_to_bottom()`, `cls.set(..); node.get_attribute("class")` —
+    /// wrote that code assuming the write had already reached the DOM, as it
+    /// always had. So every `NodeHandle` operation first runs the effects the
+    /// batch has queued so far ([`flush_pending_effects`]), the way a browser
+    /// flushes pending style before answering a layout query. A handler that
+    /// only writes signals still flushes once, at the end; one that interleaves
+    /// writes and DOM calls flushes at each DOM call that has something
+    /// pending, which is exactly the order it would have seen unbatched.
+    ///
+    /// Outside a batch, and inside an effect or memo computation (where the
+    /// queue is the flush's own business), this is a no-op.
+    ///
+    /// [`flush_pending_effects`]: crate::reactive::flush_pending_effects
+    fn accessed_doc(&self) -> Option<Rc<RefCell<dyn DomDocument>>> {
+        crate::reactive::flush_pending_effects();
+        self.doc.upgrade()
+    }
+
     /// Get the underlying node ID.
     pub fn node_id(&self) -> NodeId {
         self.node_id
@@ -238,6 +464,23 @@ impl NodeHandle {
     /// Check if this handle still points to a valid node.
     pub fn is_valid(&self) -> bool {
         self.doc.upgrade().is_some()
+    }
+
+    /// Whether this node is in its document's tree: its parent chain reaches
+    /// the root ([`DomDocument::is_connected`]). `false` once the document is
+    /// gone. Runs no pending effects, unlike the accessors that read the
+    /// document for an operation.
+    ///
+    /// It asks about the node this handle's id names, and an id carries its
+    /// slot's generation ([`NodeId::new`]): a backend that bumps the
+    /// generation when it reuses a slot answers `false` for a handle to the
+    /// slot's earlier node. The desktop backend reuses slots at generation 0
+    /// today (#723's second half), so there a handle to a freed node whose
+    /// slot went to a new, attached node answers `true`.
+    pub fn is_connected(&self) -> bool {
+        self.doc
+            .upgrade()
+            .is_some_and(|doc| doc.borrow().is_connected(self.node_id))
     }
 
     /// This node's document identity (see [`DomDocument::doc_key`]), or `0` if
@@ -258,16 +501,44 @@ impl NodeHandle {
     /// Set the text content of this node.
     ///
     /// For text nodes, this updates the text directly.
-    /// For element nodes, this replaces all children with a single text node.
+    /// For element nodes, this replaces all children with a single text node:
+    /// the children are detached as [`remove`](Self::remove) detaches one (a
+    /// handle to one still re-inserts), and an [`on_child_removed`] observer
+    /// above this node is told they left (issue #1440).
+    ///
+    /// A child **this element's own render built** — minted by the
+    /// [`RenderScope`] that minted this element, or by one descended from it —
+    /// is filed under that scope (or, if it is gone, its nearest live
+    /// ancestor) and discarded when that scope goes, if it is still detached
+    /// then (issue #1487): nothing else could ever reclaim it. Putting it into
+    /// a tree again with any insertion verb (`append_child`, `insert_before`,
+    /// `insert_after`, `replace_with`) unfiles it, so from then on it is like
+    /// any other node — kept at the scope's end if it is in a tree then, and
+    /// discarded with the scope if it was `remove()`d again ([`remove`](Self::remove),
+    /// issue #1508). A child the render was handed (another scope's, a
+    /// [`cache_scope`](RenderScope::cache_scope)'s), or with no owner on
+    /// record, is never filed.
     #[doc(hidden)]
     pub fn set_text(&self, text: &str) {
-        if let Some(doc) = self.doc.upgrade() {
+        if let Some(doc) = self.accessed_doc() {
             tracing::debug!(
                 "NodeHandle::set_text(node={}, text_len={})",
                 self.node_id.0,
                 text.len()
             );
+            release_focus_within(&doc, self.node_id, true, |_| true);
+            // On an element the text replaces the child list, and a container
+            // above that counts its children has to hear they left (issue
+            // #1440). `None` — and no read — unless a removal observer is
+            // registered and this node has children.
+            let at_stake = late_child::children_at_stake(self);
+            // The children this element's own render built: once the text
+            // has orphaned them nothing can show them again, and no hide will
+            // ever walk to them (issue #1487).
+            let built = render_scope::orphans_at_stake(self, &doc);
             doc.borrow_mut().set_text_content(self.node_id, text);
+            render_scope::file_orphans(self, built);
+            late_child::notify_children_replaced(self, at_stake);
         } else {
             tracing::warn!(
                 "NodeHandle::set_text FAILED - doc Weak reference is dead (node={})",
@@ -282,7 +553,8 @@ impl NodeHandle {
     /// May panic if called on a non-element node.
     #[doc(hidden)]
     pub fn set_attribute(&self, name: &str, value: &str) {
-        if let Some(doc) = self.doc.upgrade() {
+        if let Some(doc) = self.accessed_doc() {
+            before_attribute_write(&doc, self.node_id, name, Some(value));
             doc.borrow_mut().set_attribute(self.node_id, name, value);
         }
     }
@@ -336,15 +608,56 @@ impl NodeHandle {
 
     /// Remove an attribute from this element.
     pub fn remove_attribute(&self, name: &str) {
-        if let Some(doc) = self.doc.upgrade() {
+        if let Some(doc) = self.accessed_doc() {
+            before_attribute_write(&doc, self.node_id, name, None);
             doc.borrow_mut().remove_attribute(self.node_id, name);
         }
     }
 
     /// Get an attribute value from this element.
     pub fn get_attribute(&self, name: &str) -> Option<String> {
-        let doc = self.doc.upgrade()?;
+        let doc = self.accessed_doc()?;
         doc.borrow().get_attribute(self.node_id, name)
+    }
+
+    /// Give this element a fresh backing element under the same handle
+    /// ([`DomDocument::renew_element`]): on the web, a new `<canvas>` for one
+    /// whose context kind is spent (#1768). Whether the backend did.
+    #[doc(hidden)]
+    pub fn renew_element(&self) -> bool {
+        self.accessed_doc()
+            .is_some_and(|doc| doc.borrow_mut().renew_element(self.node_id))
+    }
+
+    /// This element's border-box size as laid out, before a CSS transform on
+    /// it or an ancestor scales it ([`DomDocument::layout_size`]); compare
+    /// [`Self::bounding_rect`], the painted box. `None` without a layout.
+    pub fn layout_size(&self) -> Option<(f32, f32)> {
+        self.accessed_doc()
+            .and_then(|doc| doc.borrow().layout_size(self.node_id))
+    }
+
+    /// Every attribute of this element as (name, value) pairs, in no promised
+    /// order ([`DomDocument::attribute_list`]). Empty for a text node, a node
+    /// that is gone, or a host that cannot list them.
+    pub fn attributes(&self) -> Vec<(String, String)> {
+        self.accessed_doc()
+            .map(|doc| doc.borrow().attribute_list(self.node_id))
+            .unwrap_or_default()
+    }
+
+    /// The text this form control holds **right now** (issue #238) — the live
+    /// text the user sees and edits, which on the web is the element's `.value`
+    /// property and not the `value` attribute
+    /// [`get_attribute`](Self::get_attribute) reads.
+    ///
+    /// Use it, not `get_attribute("value")`, whenever the question is "what
+    /// does the field say?": the two agree on desktop and part ways in a
+    /// browser as soon as the user types. See [`DomDocument::live_value`] for
+    /// each backend's answer and what `None` means.
+    pub fn live_value(&self) -> Option<String> {
+        let doc = self.accessed_doc()?;
+        doc.borrow().live_value(self.node_id)
     }
 
     /// Append a child node to this element.
@@ -354,17 +667,32 @@ impl NodeHandle {
         // from has lost a child (issue #745). Read before the document changes,
         // and `None` unless something on the thread is watching for removals.
         let vacated = late_child::vacated_parent(child);
-        if let Some(doc) = self.doc.upgrade() {
+        if let Some(doc) = self.accessed_doc() {
+            let (parent, moved) = (self.node_id, child.node_id);
+            render_scope::note_retired_insertion(&*doc.borrow(), moved);
+            release_focus_within(&doc, moved, false, |d| moves_in(d, parent, moved));
             doc.borrow_mut().append_child(self.node_id, child.node_id);
         }
+        render_scope::unfile(child);
         late_child::notify_vacated(vacated.as_ref(), self);
         late_child::notify_inserted(self, child);
     }
 
     /// Remove a child node from this element.
     pub fn remove_child(&self, child: &NodeHandle) {
-        if let Some(doc) = self.doc.upgrade() {
+        if let Some(doc) = self.accessed_doc() {
+            let (parent, gone) = (self.node_id, child.node_id);
+            release_focus_within(&doc, gone, false, |d| d.parent_node(gone) == Some(parent));
             doc.borrow_mut().remove_child(self.node_id, child.node_id);
+            // Detached as `remove()` detaches: filed under its minting scope
+            // the same way (issue #1508).
+            let (detached, doc_key) = {
+                let d = doc.borrow();
+                (d.parent_node(gone).is_none(), d.doc_key())
+            };
+            if detached {
+                render_scope::file_removed(child, doc_key);
+            }
         }
         // This node *is* the parent that lost a child, so there is nothing to
         // capture beforehand (issue #745).
@@ -374,13 +702,19 @@ impl NodeHandle {
     /// Insert a child before a reference node.
     pub fn insert_before(&self, child: &NodeHandle, reference: &NodeHandle) {
         let vacated = late_child::vacated_parent(child);
-        if let Some(doc) = self.doc.upgrade() {
+        if let Some(doc) = self.accessed_doc() {
+            let (parent, moved, before) = (self.node_id, child.node_id, reference.node_id);
+            render_scope::note_retired_insertion(&*doc.borrow(), moved);
+            release_focus_within(&doc, moved, false, |d| {
+                d.parent_node(before) == Some(parent) && moves_in(d, parent, moved)
+            });
             doc.borrow_mut()
                 .insert_before(self.node_id, child.node_id, reference.node_id);
         }
         // A keyed `for` reorder relocates a row with this verb, and the row's
         // parent does not change; `notify_vacated` declines that case, so a
         // reorder still fires one notification and not two (issue #745).
+        render_scope::unfile(child);
         late_child::notify_vacated(vacated.as_ref(), self);
         late_child::notify_inserted(self, child);
     }
@@ -389,15 +723,45 @@ impl NodeHandle {
     pub fn replace_with(&self, replacement: &NodeHandle) {
         let parent = self.parent_node();
         let vacated = late_child::vacated_parent(replacement);
-        if let Some(doc) = self.doc.upgrade() {
+        if let Some(doc) = self.accessed_doc() {
+            // Both nodes leave where they are, when there is a place to
+            // replace this one in and the replacement can go there.
+            let (old, new) = (self.node_id, replacement.node_id);
+            render_scope::note_retired_insertion(&*doc.borrow(), new);
+            let replaces = move |d: &dyn DomDocument| {
+                old != new
+                    && d.parent_node(old)
+                        .is_some_and(|parent| can_take(d, parent, new))
+            };
+            release_focus_within(&doc, old, false, replaces);
+            release_focus_within(&doc, new, false, replaces);
             doc.borrow_mut()
                 .replace_node(self.node_id, replacement.node_id);
+            // The displaced node is detached as `remove()` detaches it, and
+            // filed the same way (issue #1508).
+            let (displaced, doc_key) = {
+                let d = doc.borrow();
+                (
+                    old != new && parent.is_some() && d.parent_node(old).is_none(),
+                    d.doc_key(),
+                )
+            };
+            if displaced {
+                render_scope::file_removed(self, doc_key);
+            }
         }
         if let Some(parent) = parent {
             // Two nodes move: this one is displaced out of `parent`, and the
             // replacement may have come from somewhere else (issue #745).
             late_child::notify_removed(&parent);
             late_child::notify_vacated(vacated.as_ref(), &parent);
+            // Unfiled only when it actually went in (issue #1508).
+            if replacement
+                .parent_node()
+                .is_some_and(|p| p.node_id == parent.node_id)
+            {
+                render_scope::unfile(replacement);
+            }
             late_child::notify_inserted(&parent, replacement);
         }
     }
@@ -408,14 +772,29 @@ impl NodeHandle {
     /// and the whole thing comes back (issue #719). Use it when the node may be
     /// shown again — a branch that toggles a captured handle.
     ///
+    /// It stays re-insertable **for as long as the [`RenderScope`] that minted
+    /// it lives** (issue #1508). A node still detached when that scope goes —
+    /// the branch hides, the row leaves, the component unmounts, the
+    /// [`Cached`] entry is dropped — is discarded then, subtree and all (a node
+    /// another scope minted, nested inside, is only detached). Putting it back
+    /// with any insertion verb (`append_child`, `insert_before`,
+    /// `insert_after`, `replace_with`) before then makes it an ordinary node
+    /// again: kept at the scope's end if it is in a tree. A node with no
+    /// minting scope on record (raw backend access) is never discarded this
+    /// way. Content that must outlive the scope that is rendering is built
+    /// through [`RenderScope::build_cached`].
+    ///
     /// When you are finished with the subtree for good, call
-    /// [`discard`](Self::discard) instead, or the backend keeps it alive for the
-    /// life of the document. See [`DomDocument::remove_node`] and
-    /// [`DomDocument::discard_node`] for what each backend reclaims.
+    /// [`discard`](Self::discard) instead, which releases it now. See
+    /// [`DomDocument::remove_node`] and [`DomDocument::discard_node`] for what
+    /// each backend reclaims.
     pub fn remove(&self) {
         let vacated = late_child::vacated_parent(self);
-        if let Some(doc) = self.doc.upgrade() {
+        if let Some(doc) = self.accessed_doc() {
+            release_focus_within(&doc, self.node_id, false, |_| true);
             doc.borrow_mut().remove_node(self.node_id);
+            let doc_key = doc.borrow().doc_key();
+            render_scope::file_removed(self, doc_key);
         }
         if let Some(vacated) = vacated {
             late_child::notify_removed(&vacated);
@@ -426,14 +805,10 @@ impl NodeHandle {
     /// every descendant — you are finished with the subtree for good.
     ///
     /// Treat this handle, and every handle into the subtree, as **dead**: do not
-    /// re-attach it, build a fresh node instead. A backend that retires makes
-    /// every operation on it a silent no-op — `rinch-web` and
-    /// [`MockDomDocument`](mock::MockDomDocument) both do, so the mistake fails
-    /// `cargo test` as well as a browser.
-    ///
-    /// What a discard actually reclaims differs by backend and is **not**
-    /// guaranteed: on `rinch-dom` today it is exactly [`remove`](Self::remove)
-    /// and the node still re-inserts (issue #723). See
+    /// re-attach it, build a fresh node instead. Every backend retires it,
+    /// making every operation on it a silent no-op: `rinch-dom` frees its slab
+    /// slots and Taffy nodes (issue #723), `rinch-web` drops it from its node
+    /// maps, and `MockDomDocument` forgets it. See
     /// [`DomDocument::discard_node`] for the full contract.
     pub fn discard(&self) {
         // Before the backend lets go: a discarded id may be handed to the next
@@ -441,13 +816,34 @@ impl NodeHandle {
         // then fire for a container that no longer exists (issue #716). Read the
         // parent here too, for the same reason — afterwards this node is
         // detached and may be retired (issue #745).
+        let mut none = Vec::new();
+        render_scope::unfile(self);
+        render_scope::sweep_for_discard(self, None, &mut none);
+        self.discard_swept();
+    }
+
+    /// [`discard`](Self::discard) for a subtree whose ownership records
+    /// `render_scope::sweep_for_discard` has already dropped (issue #732).
+    pub(crate) fn discard_swept(&self) {
         late_child::forget_node(self);
         let vacated = late_child::vacated_parent(self);
-        if let Some(doc) = self.doc.upgrade() {
+        if let Some(doc) = self.accessed_doc() {
+            release_focus_within(&doc, self.node_id, false, |_| true);
             doc.borrow_mut().discard_node(self.node_id);
         }
         if let Some(vacated) = vacated {
             late_child::notify_removed(&vacated);
+        }
+    }
+
+    /// Let go of any keyboard focus inside this subtree before a caller that
+    /// holds the document itself takes it out ([`release_focus_within`]): the
+    /// web's `RootHandle::unmount`. Every `NodeHandle` verb that removes or
+    /// moves a node does this itself.
+    #[doc(hidden)]
+    pub fn release_focus_before_detach(&self) {
+        if let Some(doc) = self.doc.upgrade() {
+            release_focus_within(&doc, self.node_id, false, |_| true);
         }
     }
 
@@ -456,8 +852,102 @@ impl NodeHandle {
     /// This sets the element as the currently focused element, allowing it to
     /// receive keyboard input. For input/textarea elements, this enables text input.
     pub fn focus(&self) {
-        if let Some(doc) = self.doc.upgrade() {
-            doc.borrow_mut().focus_element(self.node_id);
+        self.focus_op(|doc, id| doc.focus_element(id));
+    }
+
+    /// Run a focus-moving backend call, then whatever it left to run once the
+    /// document is no longer borrowed ([`DomDocument::take_after_borrow`]).
+    ///
+    /// A browser runs its focus listeners synchronously inside `focus()`, and
+    /// those listeners touch the document; run under the borrow, they panic.
+    fn focus_op(&self, op: impl FnOnce(&mut dyn DomDocument, NodeId)) {
+        let Some(doc) = self.accessed_doc() else {
+            return;
+        };
+        let after = {
+            let mut doc = doc.borrow_mut();
+            op(&mut *doc, self.node_id);
+            doc.take_after_borrow()
+        };
+        if let Some(after) = after {
+            after();
+        }
+    }
+
+    /// Select a `[start, end)` range of this text control's text, in
+    /// **UTF-16 code units** — matching the DOM's
+    /// `HTMLInputElement.setSelectionRange(start, end, direction)` exactly
+    /// (issue #552), so one offset pair means the same thing whether this
+    /// handle's document is the desktop backend or `rinch-web`.
+    ///
+    /// Applied now if this node already holds the keyboard; otherwise stashed
+    /// for the next time it gains it — a `setSelectionRange()` call on an
+    /// unfocused control works the same way in a browser. A no-op before this
+    /// handle is mounted, like [`focus`](Self::focus).
+    ///
+    /// ```ignore
+    /// // A rename box that opens with its text selected, so the first
+    /// // keystroke replaces it rather than appending to it:
+    /// input.focus();
+    /// input.set_selection_range(0, name.encode_utf16().count(), SelectionDirection::Forward);
+    /// ```
+    ///
+    /// See [`DomDocument::set_selection_range`] for the backend contract.
+    pub fn set_selection_range(&self, start: usize, end: usize, direction: SelectionDirection) {
+        if let Some(doc) = self.accessed_doc() {
+            doc.borrow_mut()
+                .set_selection_range(self.node_id, start, end, direction);
+        }
+    }
+
+    /// This text control's selection, `(start, end, direction)` in **UTF-16
+    /// code units** with `start <= end` — the DOM's `selectionStart` /
+    /// `selectionEnd` / `selectionDirection` (issue #1678), and the read half
+    /// of [`set_selection_range`](Self::set_selection_range): what it sets is
+    /// what this reads back, on both backends, before the control is focused
+    /// as well as after.
+    ///
+    /// `None` for a node that is not an `<input>`/`<textarea>`, or before this
+    /// handle is mounted. See [`DomDocument::text_selection_range`].
+    pub fn selection_range(&self) -> Option<(usize, usize, SelectionDirection)> {
+        let doc = self.accessed_doc()?;
+        doc.borrow().text_selection_range(self.node_id)
+    }
+
+    /// Where this text control's caret is drawn: a rect of width 0 at the
+    /// selection's head, in logical window px on desktop and client px on the
+    /// web — the space `EditorHandle::caret_rect` answers in (issue #1678).
+    /// What a popup anchored at the caret (a `[[` link picker, an `@` list)
+    /// is placed from.
+    ///
+    /// Ask after layout — from an effect, a timer, or a key handler for a
+    /// caret that the key did not move — since the desktop answer is the
+    /// layout the field was last painted with. See
+    /// [`DomDocument::text_caret_rect`].
+    pub fn caret_rect(&self) -> Option<crate::reactive::ElementBounds> {
+        let doc = self.accessed_doc()?;
+        doc.borrow_mut().text_caret_rect(self.node_id, None)
+    }
+
+    /// [`caret_rect`](Self::caret_rect) for a caret at UTF-16 offset `offset`
+    /// of the control's value rather than at the selection's head — the start
+    /// of a `[[` trigger, say, so the popup does not follow the caret as the
+    /// query is typed. An offset past the value is clamped to its end.
+    pub fn caret_rect_at(&self, offset: usize) -> Option<crate::reactive::ElementBounds> {
+        let doc = self.accessed_doc()?;
+        doc.borrow_mut().text_caret_rect(self.node_id, Some(offset))
+    }
+
+    /// Select this text control's **entire** text — the DOM's
+    /// `HTMLInputElement.select()` (issue #552). Equivalent to
+    /// `set_selection_range(0, <the control's UTF-16 length>,
+    /// SelectionDirection::Forward)`, and subject to the same "applied now or
+    /// stashed for the next focus" rule.
+    ///
+    /// See [`DomDocument::select_text`] for the backend contract.
+    pub fn select(&self) {
+        if let Some(doc) = self.accessed_doc() {
+            doc.borrow_mut().select_text(self.node_id);
         }
     }
 
@@ -473,9 +963,20 @@ impl NodeHandle {
     /// focused*: on the web an element rinch did not create (and so carries no
     /// `__nid`) cannot be named here. See [`DomDocument::active_element`].
     pub fn active_element(&self) -> Option<NodeHandle> {
-        let doc = self.doc.upgrade()?;
+        let doc = self.accessed_doc()?;
         let id = doc.borrow().active_element()?;
         Some(NodeHandle::new(id, self.doc.clone()))
+    }
+
+    /// Whether this node is on screen as far as CSS is concerned — connected,
+    /// no `display: none` on it or an ancestor, and not `visibility: hidden` /
+    /// `collapse`. See [`DomDocument::is_rendered`]; `false` once the document
+    /// is gone.
+    pub fn is_rendered(&self) -> bool {
+        match self.accessed_doc() {
+            Some(doc) => doc.borrow().is_rendered(self.node_id),
+            None => false,
+        }
     }
 
     /// Move keyboard focus into this subtree the way a browser's `showModal()`
@@ -485,9 +986,7 @@ impl NodeHandle {
     /// See [`DomDocument::focus_into`], including why desktop applies it after
     /// the next layout rather than immediately.
     pub fn focus_into(&self, policy: FocusIntoPolicy) {
-        if let Some(doc) = self.doc.upgrade() {
-            doc.borrow_mut().focus_into(self.node_id, policy);
-        }
+        self.focus_op(|doc, id| doc.focus_into(id, policy));
     }
 
     /// Give the keyboard back now that this overlay has closed, or let it go
@@ -497,10 +996,8 @@ impl NodeHandle {
     /// moment an effect calls this: see [`DomDocument::restore_focus`] for the
     /// three questions and why a `blur()` verb would not have been enough.
     pub fn restore_focus(&self, opener: Option<&NodeHandle>) {
-        if let Some(doc) = self.doc.upgrade() {
-            doc.borrow_mut()
-                .restore_focus(opener.map(|o| o.node_id), self.node_id);
-        }
+        let opener = opener.map(|o| o.node_id);
+        self.focus_op(|doc, id| doc.restore_focus(opener, id));
     }
 
     /// Lock or unlock document-level scrolling, with **this node as the locking
@@ -517,14 +1014,14 @@ impl NodeHandle {
     /// [`RenderScope::body_handle`](super::RenderScope::body_handle) instead:
     /// on the web that is `<div id="rinch-body">`, not the page.
     pub fn set_scroll_locked(&self, locked: bool) {
-        if let Some(doc) = self.doc.upgrade() {
+        if let Some(doc) = self.accessed_doc() {
             doc.borrow_mut().set_scroll_locked(locked, self.node_id);
         }
     }
 
     /// Get the children of this node as NodeHandles.
     pub fn children(&self) -> Vec<NodeHandle> {
-        if let Some(doc) = self.doc.upgrade() {
+        if let Some(doc) = self.accessed_doc() {
             let child_ids = doc.borrow().get_children(self.node_id);
             child_ids
                 .into_iter()
@@ -546,14 +1043,23 @@ impl NodeHandle {
 
     /// Get the parent node.
     pub fn parent_node(&self) -> Option<NodeHandle> {
-        let doc = self.doc.upgrade()?;
+        let doc = self.accessed_doc()?;
         let parent_id = doc.borrow().parent_node(self.node_id)?;
         Some(NodeHandle::new(parent_id, self.doc.clone()))
     }
 
+    /// A handle to another node of this handle's document, by id — for an id
+    /// an event reported, such as [`WheelEvent::target`]. Like any handle, it
+    /// answers as an absent node does if no node has that id.
+    ///
+    /// [`WheelEvent::target`]: crate::events::WheelEvent::target
+    pub fn handle_for(&self, id: NodeId) -> NodeHandle {
+        NodeHandle::new(id, self.doc.clone())
+    }
+
     /// Get the next sibling node.
     pub fn next_sibling(&self) -> Option<NodeHandle> {
-        let doc = self.doc.upgrade()?;
+        let doc = self.accessed_doc()?;
         let sibling_id = doc.borrow().next_sibling(self.node_id)?;
         Some(NodeHandle::new(sibling_id, self.doc.clone()))
     }
@@ -562,10 +1068,26 @@ impl NodeHandle {
     pub fn insert_after(&self, new_node: &NodeHandle) {
         let vacated = late_child::vacated_parent(new_node);
         let mut inserted_into = None;
-        if let Some(doc) = self.doc.upgrade() {
+        if let Some(doc) = self.accessed_doc() {
+            // Asked before the anchor's parent: a retired node handed in after
+            // a retired anchor (a cached row after another) is still a loss
+            // (issue #1456).
+            render_scope::note_retired_insertion(&*doc.borrow(), new_node.node_id);
             let parent_id = doc.borrow().parent_node(self.node_id);
             if let Some(parent_id) = parent_id {
-                let next = doc.borrow().next_sibling(self.node_id);
+                let moved = new_node.node_id;
+                release_focus_within(&doc, moved, false, |d| moves_in(d, parent_id, moved));
+                let mut next = doc.borrow().next_sibling(self.node_id);
+                // Already right after `self`: the anchor is then `new_node`'s
+                // own next sibling — the DOM's `insertBefore` rule ("if child
+                // is node, set child to node's next sibling"). Handed to a
+                // backend as `insert_before(n, n)`, the mock dropped the node
+                // from its parent's child list and rinch-dom appended it at the
+                // end; the browser alone got it right (issue #356, where a
+                // parked row made the shape reachable from a `for` reconcile).
+                if next == Some(new_node.node_id) {
+                    next = doc.borrow().next_sibling(new_node.node_id);
+                }
                 if let Some(next_id) = next {
                     doc.borrow_mut()
                         .insert_before(parent_id, new_node.node_id, next_id);
@@ -578,6 +1100,7 @@ impl NodeHandle {
         if let Some(parent_id) = inserted_into {
             let parent = NodeHandle::new(parent_id, self.doc.clone());
             late_child::notify_vacated(vacated.as_ref(), &parent);
+            render_scope::unfile(new_node);
             late_child::notify_inserted(&parent, new_node);
         }
     }
@@ -585,7 +1108,7 @@ impl NodeHandle {
     /// Set a CSS style property.
     #[doc(hidden)]
     pub fn set_style(&self, property: &str, value: &str) {
-        if let Some(doc) = self.doc.upgrade() {
+        if let Some(doc) = self.accessed_doc() {
             doc.borrow_mut().set_style(self.node_id, property, value);
         }
     }
@@ -594,9 +1117,26 @@ impl NodeHandle {
     /// More efficient than calling `set_style` multiple times because it only
     /// parses the style string once.
     pub fn set_styles(&self, properties: &[(&str, &str)]) {
-        if let Some(doc) = self.doc.upgrade() {
+        if let Some(doc) = self.accessed_doc() {
             doc.borrow_mut().set_styles(self.node_id, properties);
         }
+    }
+
+    /// Paint this positioned box as a highlight of `owner`'s content: over its
+    /// backgrounds, under its text ([`DomDocument::set_highlight_owner`],
+    /// #2666). `None` returns it to its own place in the stacking order.
+    pub fn set_highlight_owner(&self, owner: Option<NodeId>) {
+        if let Some(doc) = self.accessed_doc() {
+            doc.borrow_mut().set_highlight_owner(self.node_id, owner);
+        }
+    }
+
+    /// Name the text this highlight box covers, for a host that paints the
+    /// highlight on the text itself ([`DomDocument::set_highlight_text`],
+    /// #2667). `None`: it covers no text. Whether the host paints it there.
+    pub fn set_highlight_text(&self, text: Option<HighlightText<'_>>) -> bool {
+        self.accessed_doc()
+            .is_some_and(|doc| doc.borrow_mut().set_highlight_text(self.node_id, text))
     }
 
     /// Lay an author-written inline style string **over** this node's own,
@@ -634,7 +1174,7 @@ impl NodeHandle {
     /// came off again.
     #[doc(hidden)]
     pub fn add_class(&self, class: &str) {
-        if let Some(doc) = self.doc.upgrade() {
+        if let Some(doc) = self.accessed_doc() {
             // Get current class attribute (borrow ends here)
             let current = doc.borrow().get_attribute(self.node_id, "class");
             let new_class = match current {
@@ -668,7 +1208,7 @@ impl NodeHandle {
     /// verbatim: a padded `class` now serialises padded.
     #[doc(hidden)]
     pub fn remove_class(&self, class: &str) {
-        if let Some(doc) = self.doc.upgrade() {
+        if let Some(doc) = self.accessed_doc() {
             // Get current class attribute (borrow ends here)
             let existing = doc.borrow().get_attribute(self.node_id, "class");
             if let Some(existing) = existing {
@@ -689,7 +1229,7 @@ impl NodeHandle {
 
     /// Toggle a class on the element.
     pub fn toggle_class(&self, class: &str) {
-        if let Some(doc) = self.doc.upgrade() {
+        if let Some(doc) = self.accessed_doc() {
             // Get current class attribute (borrow ends here)
             let has_class = doc
                 .borrow()
@@ -709,7 +1249,7 @@ impl NodeHandle {
     /// Set the vertical scroll position of this element.
     /// For elements with overflow: auto/scroll, this sets the vertical scroll offset.
     pub fn set_scroll_top(&self, scroll_top: f64) {
-        if let Some(doc) = self.doc.upgrade() {
+        if let Some(doc) = self.accessed_doc() {
             doc.borrow_mut().set_scroll_top(self.node_id, scroll_top);
         }
     }
@@ -717,8 +1257,7 @@ impl NodeHandle {
     /// Get the vertical scroll position of this element.
     /// Equivalent to `element.scrollTop` in the web DOM.
     pub fn scroll_top(&self) -> f64 {
-        self.doc
-            .upgrade()
+        self.accessed_doc()
             .map(|doc| doc.borrow().scroll_top(self.node_id))
             .unwrap_or(0.0)
     }
@@ -726,8 +1265,7 @@ impl NodeHandle {
     /// Get the horizontal scroll position of this element.
     /// Equivalent to `element.scrollLeft` in the web DOM.
     pub fn scroll_left(&self) -> f64 {
-        self.doc
-            .upgrade()
+        self.accessed_doc()
             .map(|doc| doc.borrow().scroll_left(self.node_id))
             .unwrap_or(0.0)
     }
@@ -735,7 +1273,7 @@ impl NodeHandle {
     /// Set the horizontal scroll position of this element.
     /// Equivalent to `element.scrollLeft = value` in the web DOM.
     pub fn set_scroll_left(&self, scroll_left: f64) {
-        if let Some(doc) = self.doc.upgrade() {
+        if let Some(doc) = self.accessed_doc() {
             doc.borrow_mut().set_scroll_left(self.node_id, scroll_left);
         }
     }
@@ -743,8 +1281,7 @@ impl NodeHandle {
     /// Get the total scrollable content height.
     /// Equivalent to `element.scrollHeight` in the web DOM.
     pub fn scroll_height(&self) -> f64 {
-        self.doc
-            .upgrade()
+        self.accessed_doc()
             .map(|doc| doc.borrow().scroll_height(self.node_id))
             .unwrap_or(0.0)
     }
@@ -752,8 +1289,7 @@ impl NodeHandle {
     /// Get the total scrollable content width.
     /// Equivalent to `element.scrollWidth` in the web DOM.
     pub fn scroll_width(&self) -> f64 {
-        self.doc
-            .upgrade()
+        self.accessed_doc()
             .map(|doc| doc.borrow().scroll_width(self.node_id))
             .unwrap_or(0.0)
     }
@@ -761,8 +1297,7 @@ impl NodeHandle {
     /// Get the visible content area height (layout height minus padding and border).
     /// Equivalent to `element.clientHeight` in the web DOM.
     pub fn client_height(&self) -> f64 {
-        self.doc
-            .upgrade()
+        self.accessed_doc()
             .map(|doc| doc.borrow().client_height(self.node_id))
             .unwrap_or(0.0)
     }
@@ -770,16 +1305,34 @@ impl NodeHandle {
     /// Get the visible content area width (layout width minus padding and border).
     /// Equivalent to `element.clientWidth` in the web DOM.
     pub fn client_width(&self) -> f64 {
-        self.doc
-            .upgrade()
+        self.accessed_doc()
             .map(|doc| doc.borrow().client_width(self.node_id))
             .unwrap_or(0.0)
+    }
+
+    /// Whether a wheel moving `(dx, dy)` would scroll this element itself: it
+    /// is a scroll container on an axis whose delta is non-zero (a computed
+    /// `overflow` of `auto`/`scroll` with content overflowing its box), no
+    /// `lock_scroll` overlay locks it out, and its offset is not yet at the end
+    /// of its range in that direction. Only the signs count, the DOM's way
+    /// round: positive scrolls down / right, as
+    /// [`WheelEvent`](crate::events::WheelEvent)'s deltas do. Either axis
+    /// answering yes is a yes. `false` once the document is gone.
+    ///
+    /// A wheel handler on an element that holds scrollable content (a canvas
+    /// whose nodes hold lists) asks it of each element from
+    /// [`WheelEvent::target`](crate::events::WheelEvent::target) up to its
+    /// own, and declines the wheel when one can move, so that scroller
+    /// scrolls — the browser's scroll chaining. See [`DomDocument::can_scroll_toward`].
+    pub fn can_scroll_toward(&self, dx: f64, dy: f64) -> bool {
+        self.accessed_doc()
+            .is_some_and(|doc| doc.borrow().can_scroll_toward(self.node_id, dx, dy))
     }
 
     /// Scroll this element so its bottom content is visible.
     /// Convenience method: sets `scroll_top` to `scroll_height - client_height`.
     pub fn scroll_to_bottom(&self) {
-        if let Some(doc) = self.doc.upgrade() {
+        if let Some(doc) = self.accessed_doc() {
             let sh = doc.borrow().scroll_height(self.node_id);
             let ch = doc.borrow().client_height(self.node_id);
             let max = (sh - ch).max(0.0);
@@ -787,13 +1340,50 @@ impl NodeHandle {
         }
     }
 
-    /// Request that this element be scrolled into view.
+    /// Request that this element be scrolled into view — the minimal
+    /// ("nearest") scroll: an element already in view does not move.
     ///
-    /// The scroll is deferred until after the next layout pass, since the
-    /// element's position must be known relative to its scroll container.
+    /// Both backends move **every** scroll container the element is in,
+    /// innermost first and the page last, on both axes, each just far enough to
+    /// bring the element (as the scrollers inside it have placed it) into its
+    /// padding box; nothing outside a `position: fixed` ancestor moves. They
+    /// differ in when:
+    /// - **desktop** (`rinch-dom`) defers the scroll until after the next layout
+    ///   pass, since the element's position must be known relative to its scroll
+    ///   containers (#842 made it move every one, as the web does).
+    /// - **web** (`rinch-web`) scrolls immediately, with the browser's
+    ///   `scrollIntoView({block: "nearest", inline: "nearest"})`. Until the
+    ///   editor's caret scroll (#837) it was a silent no-op there.
+    /// - the test `MockDomDocument` only queues the request.
     pub fn scroll_into_view(&self) {
-        if let Some(doc) = self.doc.upgrade() {
+        if let Some(doc) = self.accessed_doc() {
             doc.borrow_mut().request_scroll_into_view(self.node_id);
+        }
+    }
+
+    /// Request that this element be scrolled to a set place in its scroll
+    /// container: its top `fraction` of the way down the container's visible
+    /// height (clamped to `0.0..=1.0`), kept at least `margin` px inside either
+    /// edge, and the scroll clamped to what the content allows — so an element
+    /// near the top of the content stays near the top. It moves even an element
+    /// already in view.
+    ///
+    /// The place is in the nearest **vertical** scroll container (the page's, when
+    /// no ancestor scrolls); every scroller further out, and the other axis, then
+    /// bring the element into view the way [`Self::scroll_into_view`] does.
+    /// - **desktop** (`rinch-dom`) defers it until after the next layout pass.
+    /// - **web** (`rinch-web`) sets that scroller's `scrollTop` at once, then
+    ///   calls the browser's `scrollIntoView` for the rest.
+    /// - the test `MockDomDocument` only queues the request.
+    pub fn scroll_to_fraction(&self, fraction: f32, margin: f32) {
+        let fraction = if fraction.is_nan() {
+            0.0
+        } else {
+            fraction.clamp(0.0, 1.0)
+        };
+        if let Some(doc) = self.accessed_doc() {
+            doc.borrow_mut()
+                .request_scroll_to_fraction(self.node_id, fraction, margin.max(0.0));
         }
     }
 
@@ -801,25 +1391,80 @@ impl NodeHandle {
     ///
     /// This atomically removes all existing children and replaces them with
     /// the DOM tree produced by parsing `html`. The underlying document
-    /// implementation handles parsing and insertion.
+    /// implementation handles parsing and insertion: the browser's parser on
+    /// the web, and on desktop rinch-dom's, which decodes character
+    /// references in text and attribute values as the HTML standard does
+    /// (`&#8203;`, `&#x200B;`, every named one; [`crate::html_entities`],
+    /// #2239) and leaves the text of HTML's raw text elements (`<style>`,
+    /// `<script>`, `<xmp>`, …) as written, but not in SVG or MathML.
+    ///
+    /// The existing children are **gone for good**, as after
+    /// [`discard`](Self::discard). An [`on_child_removed`] observer above this
+    /// node is told they left, and observers registered on them are dropped
+    /// (issue #1440), as is a focus target registered on one (#1509); the
+    /// parsed nodes are not reported to [`on_child_inserted`].
     pub fn set_inner_html(&self, html: &str) {
-        if let Some(doc) = self.doc.upgrade() {
+        // The replaced children are gone from the backend's point of view; so
+        // are their ownership records (issue #732).
+        render_scope::purge_descendants(self);
+        if let Some(doc) = self.accessed_doc() {
+            release_focus_within(&doc, self.node_id, true, |_| true);
+            // Read before the write frees them: the children that are about to
+            // leave, and any observer registered on one (issue #1440).
+            let at_stake = late_child::children_at_stake(self);
+            late_child::forget_descendants(self);
+            // And the registries outside this crate keyed by node id (#1509).
+            freed_nodes::forget_descendants(self);
             doc.borrow_mut().set_inner_html(self.node_id, html);
+            // Not compared with the list afterwards, as `set_text` does: the
+            // children there were are freed, and `rinch-dom` hands their ids
+            // straight to the nodes it parses.
+            if at_stake.is_some() {
+                late_child::notify_removed(self);
+            }
         }
     }
 
-    /// Query a single child node matching the selector.
+    /// Stop the app's style sheets (its theme, component and own CSS)
+    /// matching this node's descendants, as a shadow root does in a browser
+    /// (#2357). Below this node only the user-agent sheet, presentational
+    /// attributes and `style` attributes apply; inherited properties
+    /// (`color`, `font-*`, `line-height`, …) still inherit from it, and the
+    /// node itself is styled as before. `rinch_html::HtmlView` does this for
+    /// a document someone else wrote.
+    ///
+    /// One-way. Give the node its rendered children afterwards: on the web
+    /// this attaches a shadow root and children added later go into it,
+    /// while children it already has stay in the light tree, unrendered (a
+    /// `<style>` among them still applies, to the document).
+    pub fn isolate_styles(&self) {
+        if let Some(doc) = self.accessed_doc() {
+            doc.borrow_mut().isolate_styles(self.node_id);
+        }
+    }
+
+    /// The first element under this node matching the CSS `selector`, as
+    /// `Element.querySelector`: descendants only, in document order, the
+    /// selector matched against the whole tree, `:scope` this node (#1796).
+    /// Any selector the backend parses works — combinators, compounds, lists,
+    /// `:not()`, attribute operators, the pseudo-classes it matches. An invalid
+    /// selector answers `None` (a browser throws a `SyntaxError`) and logs one
+    /// `tracing::warn!` per distinct string.
+    ///
+    /// Until #1796 this searched the whole document whatever the node.
     pub fn query_selector(&self, selector: &str) -> Option<NodeHandle> {
-        let doc = self.doc.upgrade()?;
-        let node_id = doc.borrow().query_selector(selector)?;
+        let doc = self.accessed_doc()?;
+        let node_id = doc.borrow().query_selector_in(self.node_id, selector)?;
         Some(NodeHandle::new(node_id, self.doc.clone()))
     }
 
-    /// Query all child nodes matching the selector.
+    /// Every element under this node matching the CSS `selector`, in
+    /// document order, as `Element.querySelectorAll`; see
+    /// [`query_selector`](Self::query_selector). Empty for an invalid selector.
     pub fn query_selector_all(&self, selector: &str) -> Vec<NodeHandle> {
-        if let Some(doc) = self.doc.upgrade() {
+        if let Some(doc) = self.accessed_doc() {
             doc.borrow()
-                .query_selector_all(selector)
+                .query_selector_all_in(self.node_id, selector)
                 .into_iter()
                 .map(|id| NodeHandle::new(id, self.doc.clone()))
                 .collect()
@@ -836,9 +1481,9 @@ impl NodeHandle {
     /// # Returns
     /// Some((x, y)) if the node has text layout and the offset is valid, None otherwise
     pub fn query_caret_position(&self, byte_offset: usize) -> Option<(f32, f32)> {
-        let doc = self.doc.upgrade()?;
+        let doc = self.accessed_doc()?;
         doc.borrow()
-            .query_caret_position(self.node_id.0 as u64, byte_offset)
+            .query_caret_position(self.node_id.0, byte_offset)
     }
 
     /// Query the bounding box of a glyph cluster at the given byte offset.
@@ -849,17 +1494,63 @@ impl NodeHandle {
     /// # Returns
     /// Some(GlyphBounds) if the node has text layout and the offset is valid, None otherwise
     pub fn query_glyph_bounds(&self, byte_offset: usize) -> Option<GlyphBounds> {
-        let doc = self.doc.upgrade()?;
-        doc.borrow()
-            .query_glyph_bounds(self.node_id.0 as u64, byte_offset)
+        let doc = self.accessed_doc()?;
+        doc.borrow().query_glyph_bounds(self.node_id.0, byte_offset)
     }
 
     /// Get the layout bounds of this node relative to its parent.
     ///
     /// Returns (x, y, width, height) if the node has been laid out.
+    /// For where the node is on screen, use [`Self::bounding_rect`].
     pub fn get_layout_bounds(&self) -> Option<(f32, f32, f32, f32)> {
-        let doc = self.doc.upgrade()?;
-        doc.borrow().query_node_layout(self.node_id.0 as u64)
+        let doc = self.accessed_doc()?;
+        doc.borrow().query_node_layout(self.node_id.0)
+    }
+
+    /// Where this element is **now**: the box it is painted in, in
+    /// viewport-relative logical pixels — the frame of
+    /// [`crate::events::ClickContext::element_x`] and of
+    /// [`Self::bounds_signal`], so a CSS transform on the element or an
+    /// ancestor moves and scales it, and a `position: fixed` element reports
+    /// its viewport box (issue #1779).
+    ///
+    /// Synchronous, for an event handler: on the web it is the element's
+    /// `getBoundingClientRect()`; on desktop it is the box as of the **last
+    /// layout** (a style the same handler just wrote is reflected from the next
+    /// frame on, where a browser lays out to answer). Any effects the handler
+    /// queued run first, as for every `NodeHandle` operation.
+    ///
+    /// An inline element (`<span>`, `<a>`, `<strong>`) answers the union of
+    /// the fragments it has on its lines — a wrapped one, the box around all
+    /// of them — as `getBoundingClientRect()` does. `None` for a text node, a
+    /// node no longer in the document, or one whose document is gone. An
+    /// element under `display: none`, or one that is `display: contents`,
+    /// generates no box and answers a zero rect. On desktop an inline that
+    /// holds a block-level child, or sits in a line cut by
+    /// `text-overflow: ellipsis`, answers its own (zero-size) box instead.
+    pub fn bounding_rect(&self) -> Option<crate::reactive::ElementBounds> {
+        let doc = self.accessed_doc()?;
+        doc.borrow_mut().bounding_rect(self.node_id)
+    }
+
+    /// The viewport's size in logical pixels, in the frame of
+    /// [`Self::bounding_rect`] (issue #1764). On desktop it is the size of the
+    /// last layout; on the web `documentElement.clientWidth/clientHeight`.
+    /// `None` when the document is gone, before its first layout, or for a
+    /// host with no geometry.
+    pub fn viewport_size(&self) -> Option<(f32, f32)> {
+        let doc = self.accessed_doc()?;
+        doc.borrow().viewport_size()
+    }
+
+    /// Whether this node's document has changes its geometry does not show
+    /// yet ([`DomDocument::layout_pending`]): when `true`, what
+    /// [`Self::bounding_rect`] answers is the box before those changes. The
+    /// browser lays out on demand and always answers `false`.
+    pub fn layout_pending(&self) -> bool {
+        self.accessed_doc()
+            .map(|doc| doc.borrow().layout_pending())
+            .unwrap_or(false)
     }
 
     /// Reactive bounds signal for this element, refreshed by the runtime after
@@ -880,7 +1571,16 @@ impl NodeHandle {
     /// layout pass completes.
     ///
     /// Initial value is `ElementBounds::default()` (zero rect). The first real
-    /// bounds arrive after the next layout pass.
+    /// bounds arrive after the next layout pass — on the web, the next frame:
+    /// rinch-web refreshes the signal from `getBoundingClientRect()` when the
+    /// element resizes, the DOM changes, something scrolls, the window resizes,
+    /// an image or font loads, or a transition or animation ends (issue #1781).
+    ///
+    /// Calls for this node from the same owner (the component rendering, the
+    /// effect running, or none) return the **same** signal, so asking per event
+    /// costs nothing after the first call; another owner gets its own, freed
+    /// with its own scope. To ask where the element is once — from an event
+    /// handler, say — use [`Self::bounding_rect`].
     ///
     /// Typical use: derive zoom / scroll / domain-coordinate math from a
     /// strip's measured pixel width without hand-rolling a polling thread.
@@ -902,18 +1602,27 @@ impl NodeHandle {
         // across documents (issue #134). A handle whose document is already
         // gone registers under key 0 (matches no live document), yielding a
         // signal that simply keeps its zero rect.
-        crate::reactive::register_bounds_signal(self.doc_key(), self.node_id.0 as u64)
+        let signal = crate::reactive::register_bounds_signal(self.doc_key(), self.node_id.0);
+        // Asked on every call, not only for a new entry: a call made while the
+        // document is borrowed cannot reach the backend, and the next one must
+        // still start the watch (a backend ignores a node it already watches).
+        if let Some(doc) = self.doc.upgrade()
+            && let Ok(mut doc) = doc.try_borrow_mut()
+        {
+            doc.watch_bounds(self.node_id);
+        }
+        signal
     }
 
     /// Get the tag name of this node (if it's an element).
     pub fn tag_name(&self) -> Option<String> {
-        let doc = self.doc.upgrade()?;
+        let doc = self.accessed_doc()?;
         doc.borrow().tag_name(self.node_id)
     }
 
     /// Get the node type (1 = element, 3 = text, 8 = comment).
     pub fn node_type(&self) -> Option<u16> {
-        let doc = self.doc.upgrade()?;
+        let doc = self.accessed_doc()?;
         doc.borrow().node_type(self.node_id)
     }
 
@@ -921,7 +1630,7 @@ impl NodeHandle {
     ///
     /// For text nodes: returns the text. For elements: returns concatenated descendant text.
     pub fn text_content(&self) -> Option<String> {
-        let doc = self.doc.upgrade()?;
+        let doc = self.accessed_doc()?;
         doc.borrow().text_content(self.node_id)
     }
 }
@@ -938,6 +1647,57 @@ impl std::fmt::Debug for NodeHandle {
 // ============================================================================
 // reactive_component_dom
 // ============================================================================
+
+/// One call into a re-rendering component's **site bundle** (issue #1190).
+///
+/// `rsx!` compiles a component that re-renders for a reactive struct prop, and
+/// that carries reactive root bindings (`style:`, `class:`, a style shorthand,
+/// a hyphenated attribute), into a single closure — a [`SiteFn`] — that both
+/// renders the component and evaluates each binding. Everything the caller's
+/// tokens name is captured by that one closure, exactly once, as it was when
+/// the bindings were evaluated inside the render closure; the bindings
+/// themselves run in effects owned by the render, which call back into the
+/// bundle with [`SiteCall::Binding`]. Generated code only.
+#[doc(hidden)]
+pub enum SiteCall<'a> {
+    /// Render into the per-render child scope. The second field is the bundle
+    /// itself, so a binding effect created during the render can hold it.
+    Render(&'a mut RenderScope, &'a Rc<SiteFn>),
+    /// Evaluate the root binding with this index.
+    Binding(u32),
+}
+
+/// What a [`SiteFn`] answers: a [`SiteCall::Render`] a node, a
+/// [`SiteCall::Binding`] a string. Generated code only.
+#[doc(hidden)]
+pub enum SiteOut {
+    /// The rendered component root.
+    Node(NodeHandle),
+    /// A binding's value.
+    Str(String),
+}
+
+impl SiteOut {
+    /// The node of a [`SiteCall::Render`].
+    pub fn into_node(self) -> NodeHandle {
+        match self {
+            SiteOut::Node(node) => node,
+            SiteOut::Str(_) => unreachable!("a site render answered a string"),
+        }
+    }
+
+    /// The string of a [`SiteCall::Binding`].
+    pub fn into_string(self) -> String {
+        match self {
+            SiteOut::Str(s) => s,
+            SiteOut::Node(_) => unreachable!("a site binding answered a node"),
+        }
+    }
+}
+
+/// A re-rendering component's site bundle; see [`SiteCall`].
+#[doc(hidden)]
+pub type SiteFn = dyn Fn(SiteCall<'_>) -> SiteOut;
 
 /// Re-render a component whenever signals read inside `render_fn` change.
 ///
@@ -956,12 +1716,22 @@ impl std::fmt::Debug for NodeHandle {
 /// generated `render_fn` does exactly that: prop closures tracked, children +
 /// `Component::render` untracked.
 ///
+pub(crate) use render_scope::sweep_for_discard;
+
+/// **Test-only.** `(retired nodes handed to an insertion verb, warnings
+/// logged)` on this thread so far (issues #733, #1456). See
+/// `render_scope::note_retired_insertion`.
+#[doc(hidden)]
+pub fn __retired_insertions() -> (u64, usize) {
+    render_scope::__retired_insertion_counts()
+}
+
 /// Release the scratch container an `rsx!` component site builds its children
 /// in (issue #719).
 ///
 /// A component site mints a `<template>`, renders the site's children into it,
 /// reads them back out with [`NodeHandle::children`] and hands them to
-/// [`Component::render`], which re-parents the ones it adopts into its own tree.
+/// `Component::render`, which re-parents the ones it adopts into its own tree.
 /// The container is then dead — and it is dead in the one way scope ownership
 /// cannot see: **it is in no subtree**, never having been attached to anything,
 /// so the recursive discard of a branch's content root never reaches it. One
@@ -972,19 +1742,70 @@ impl std::fmt::Debug for NodeHandle {
 /// by the same ownership rule the reactive helpers use, applied one level down:
 /// a leftover the site built is discarded, a leftover the site was *handed*
 /// (`Card { {captured.clone()} }` where `Card` ignores its children) is only
-/// detached, so a caller's subtree is never retired out from under it.
+/// detached, so a caller's subtree is never retired out from under it. A
+/// leftover the site built may itself hold a captured handle nested further
+/// in (issue #732), which is detached before the leftover is discarded.
 ///
 /// Call it **after** `Component::render`, so the children it adopted have
 /// already been re-parented out.
 pub fn release_scratch_container(scope: &RenderScope, container: &NodeHandle) {
     for leftover in container.children() {
         if scope.created(leftover.node_id()) {
-            leftover.discard();
+            let mut captured = Vec::new();
+            sweep_for_discard(&leftover, Some(scope.id()), &mut captured);
+            for node in captured {
+                node.remove();
+            }
+            leftover.discard_swept();
         } else {
             leftover.remove();
         }
     }
     container.discard();
+}
+
+/// What `ref: target` on an element in `rsx!` does (issue #1779): hand the app
+/// the element's [`NodeHandle`] through `target`, and take it back when the
+/// element goes.
+///
+/// `target` is set to `Some(node)` now — `rsx!` calls this once the element's
+/// attributes and children are built, before it is appended to its parent — and
+/// to `None` when `scope` is disposed: the branch it was in is hidden, its `for`
+/// row is removed, its component re-renders or unmounts. The clear happens only
+/// while `target` still holds **this** node, so an element that replaced it (a
+/// re-shown branch, a component's next render) is not cleared by the old one's
+/// cleanup, whichever order the two run in; and only while `target` is alive.
+/// It is made untracked, so a cleanup that runs inside an effect subscribes
+/// that effect to nothing.
+///
+/// The set runs a reader at once when no batch is open (a mount, an effect
+/// re-rendering a branch): the node is not attached to its parent yet, so
+/// [`NodeHandle::bounding_rect`] answers `None` there — read the handle from
+/// an event handler, or after mount. A `target` named by two elements holds
+/// the last one built and is cleared when **that** one goes, even if the other
+/// is still mounted.
+///
+/// On a component, `rsx!` binds the component's **root** element.
+pub fn bind_node_ref(
+    scope: &mut RenderScope,
+    target: crate::reactive::Signal<Option<NodeHandle>>,
+    node: &NodeHandle,
+) {
+    let (doc, node_id) = (node.doc.clone(), node.node_id);
+    target.set(Some(node.clone()));
+    scope.on_cleanup(move || {
+        crate::reactive::untracked_handler(|| {
+            let holds_this = target
+                .try_with(|held| {
+                    held.as_ref()
+                        .is_some_and(|h| h.node_id == node_id && Weak::ptr_eq(&h.doc, &doc))
+                })
+                .unwrap_or(false);
+            if holds_this {
+                target.set(None);
+            }
+        });
+    });
 }
 
 /// A `render_fn` that **memoises** — one that hands back a subtree it built
@@ -1010,6 +1831,9 @@ where
     let current_scope: Rc<RefCell<Option<RenderScope>>> = Rc::new(RefCell::new(None));
     let doc_weak = scope.doc_weak();
     let parent_id = parent.node_id();
+    // Every output scope names the scope this call was made from as its
+    // parent (issue #732) — see the matching note in `show_dom`.
+    let creator_scope_id = scope.id();
 
     let cc = current_content.clone();
     let cs = current_scope.clone();
@@ -1027,12 +1851,18 @@ where
         // creates it through this scope, so the previous output is `discard`ed
         // and the backend lets go of it. A `render_fn` that memoises and hands
         // back a subtree it built once is supported too: that node is not this
-        // scope's, so it is only detached and the next run re-inserts it.
+        // scope's, so it is only detached and the next run re-inserts it. A
+        // *nested* captured handle (issue #732) has to be found while `old` can
+        // still answer `created`, before it is disposed below.
+        let mut captured: Vec<NodeHandle> = Vec::new();
         let doomed: Vec<(NodeHandle, bool)> = cc
             .borrow_mut()
             .drain(..)
             .map(|node| {
                 let owned = old.as_ref().is_some_and(|s| s.created(node.node_id()));
+                if owned && let Some(s) = old.as_ref() {
+                    sweep_for_discard(&node, Some(s.id()), &mut captured);
+                }
                 (node, owned)
             })
             .collect();
@@ -1040,19 +1870,24 @@ where
         if let Some(old) = old {
             old.dispose();
         }
+        // Detach every captured descendant before any discard below can reach
+        // it (issue #732).
+        for node in captured {
+            node.remove();
+        }
         // Removal of either kind cancels the subtree's transitions and
         // animations in the document implementation (#699); stamping inline
         // `transition: none` here disarmed it permanently (#704).
         for (node, owned) in doomed {
             if owned {
-                node.discard();
+                node.discard_swept();
             } else {
                 node.remove();
             }
         }
         // Render fresh
         if let Some(doc) = doc_weak.upgrade() {
-            let mut child_scope = RenderScope::new(doc, parent_id);
+            let mut child_scope = RenderScope::with_parent(doc, parent_id, Some(creator_scope_id));
             // The component's own resources belong to its own scope, not to the
             // effect that re-renders it (issue #141). This is the deepest reach
             // of the ambient owner: `render_fn` runs arbitrary user
@@ -1074,41 +1909,123 @@ where
 // Tests
 // ============================================================================
 
+/// How many distinct invalid selectors [`warn_invalid_selector`] reports
+/// before it stops.
+pub const MAX_WARNED_SELECTORS: usize = 32;
+
+/// Report that `selector` is not a valid CSS selector (#1796): a backend's
+/// `query_selector` answers nothing for it where a browser throws a
+/// `SyntaxError`. One `tracing::warn!` per distinct string, for the first
+/// [`MAX_WARNED_SELECTORS`] strings in the process; the backends call it.
+#[doc(hidden)]
+pub fn warn_invalid_selector(selector: &str) {
+    use std::collections::HashSet;
+    use std::sync::{LazyLock, Mutex};
+    static WARNED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+    let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    if warned.len() < MAX_WARNED_SELECTORS && warned.insert(selector.to_owned()) {
+        tracing::warn!(
+            selector,
+            "query_selector: not a valid CSS selector, so it matches nothing \
+             (a browser throws a SyntaxError)"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mock::MockDomDocument;
 
-    /// A falsey write of `checked` / `selected` reaches the backend even when
-    /// the content attribute is already absent (issue #687).
+    /// `NodeId` packs a 32-bit slot and a 32-bit generation into one `u64` on
+    /// every target (#723), sampled off the fixed point: a generation of 0
+    /// would let a packing that drops the high half pass.
+    #[test]
+    fn a_node_id_packs_slot_and_generation_into_64_bits() {
+        let id = NodeId::new(0xABCD_1234, 0x0000_0007);
+        assert_eq!(id.index(), 0xABCD_1234);
+        assert_eq!(id.generation(), 7);
+        assert_eq!(id.to_raw(), (7u64 << 32) | 0xABCD_1234);
+        assert_eq!(NodeId::from_raw(id.to_raw()), id);
+        assert_eq!(std::mem::size_of::<NodeId>(), 8);
+        // A generation-0 id is just its slot: what every test literal means
+        // and what the debug server's wire ids still print.
+        assert_eq!(NodeId::from_index(4), NodeId(4));
+        assert_eq!(NodeId::new(4, 0).to_raw(), 4);
+        assert_ne!(NodeId::new(4, 1), NodeId(4), "the generation is identity");
+        assert_eq!(format!("{:?}", NodeId(4)), "NodeId(4)");
+        assert_eq!(format!("{:?}", NodeId::new(4, 3)), "NodeId(4@g3)");
+    }
+
+    /// `a.insert_after(b)` with `b` already `a`'s next sibling leaves `b` where
+    /// it is (issue #356) — the DOM's `insertBefore` rule. Handed to the mock as
+    /// `insert_before(parent, b, b)` it unlinked `b` and then could not find the
+    /// reference, dropping `b` from the child list while keeping its parent
+    /// pointer. `rinch-dom`'s twin is `insert_after_in_place_tests`.
+    #[test]
+    fn inserting_a_node_after_the_node_it_already_follows_leaves_it_there() {
+        let doc: Rc<RefCell<dyn DomDocument>> = Rc::new(RefCell::new(MockDomDocument::new()));
+        let weak = Rc::downgrade(&doc);
+        let (a, b) = {
+            let mut d = doc.borrow_mut();
+            let body = d.body();
+            let mut ids = Vec::new();
+            for name in ["a", "b", "c"] {
+                let id = d.create_element("div");
+                d.set_attribute(id, "data-name", name);
+                d.append_child(body, id);
+                ids.push(id);
+            }
+            (ids[0], ids[1])
+        };
+        let a = NodeHandle::new(a, weak.clone());
+        let b = NodeHandle::new(b, weak);
+
+        a.insert_after(&b);
+
+        let names: Vec<String> = a
+            .parent_node()
+            .expect("a is mounted")
+            .children()
+            .iter()
+            .filter_map(|n| n.get_attribute("data-name"))
+            .collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    /// A falsey write of `checked` / `selected` / `muted` reaches the backend
+    /// even when the content attribute is already absent (issues #687, #754).
     ///
     /// `write_attribute`'s removal is otherwise guarded on the attribute being
     /// present, which reads as "already off" — true for every attribute whose
-    /// whole state is the attribute, and false for these two on the web, where
-    /// a user toggle moves the live IDL property and leaves the attribute
-    /// behind. Only the backend can see that property, so the writer must call
-    /// it; whether the call is worth making is not the writer's question.
+    /// whole state is the attribute, and false for these three on the web,
+    /// where a user toggle (or, for `muted`, a `<video controls>`'s own mute
+    /// button) moves the live IDL property and leaves the attribute behind.
+    /// Only the backend can see that property, so the writer must call it;
+    /// whether the call is worth making is not the writer's question.
     ///
     /// The mock records every mutation as a dirty node, so "did the call reach
-    /// the backend" is observable here without a browser. Three mutants die:
-    /// restoring the guard for the pair (row 1 and row 2), listing only
-    /// `checked` in it (row 2), and dropping the guard for *everything* (row 3,
+    /// the backend" is observable here without a browser. Four mutants die:
+    /// restoring the guard for the trio (rows 1-3), listing only `checked` in
+    /// it (row 2 or row 3), and dropping the guard for *everything* (row 4,
     /// which would restyle a node on every falsey write of any boolean
     /// attribute).
     #[test]
-    fn a_falsey_write_of_the_presence_pair_always_reaches_the_backend() {
+    fn a_falsey_write_of_the_presence_trio_always_reaches_the_backend() {
         let doc = Rc::new(RefCell::new(MockDomDocument::new()));
         let body = doc.borrow().body();
         let mut scope = RenderScope::new(doc.clone(), body);
 
         let input = scope.create_element("input");
         let option = scope.create_element("option");
+        let video = scope.create_element("video");
         let dirtied = |doc: &Rc<RefCell<MockDomDocument>>, n: &NodeHandle| {
             doc.borrow_mut().take_dirty_nodes().contains(&n.node_id())
         };
         doc.borrow_mut().take_dirty_nodes(); // drop the creation noise
 
-        // Neither attribute is present, so the guard would skip both writes.
+        // None of the three attributes is present, so the guard would skip
+        // every write.
         input.write_attribute("checked", "false");
         assert!(
             dirtied(&doc, &input),
@@ -1118,12 +2035,18 @@ mod tests {
         option.write_attribute("selected", "false");
         assert!(
             dirtied(&doc, &option),
-            "`selected` is the other half of the pair — an option's selectedness              goes dirty the same way"
+            "`selected` is another member of the trio — an option's selectedness              goes dirty the same way"
+        );
+
+        video.write_attribute("muted", "false");
+        assert!(
+            dirtied(&doc, &video),
+            "`muted` joined the trio in #754 — a media element's live `.muted`              can move with no attribute write at all, same as checked/selected"
         );
 
         // The name is ASCII case-insensitive, like every HTML attribute name
         // (#688). `is_boolean_attribute` folds, so an uppercase spelling reaches
-        // the falsey branch; the pair check has to fold with it or `CHECKED:
+        // the falsey branch; the trio check has to fold with it or `CHECKED:
         // {|| false}` keeps the bug. Sampled off the fixed point on purpose —
         // with the attribute *present* the guard finds it either way, because
         // `get_attribute` folds too.
@@ -1442,6 +2365,98 @@ mod tests {
         );
     }
 
+    /// A batch carries **property writes only** (issue #756). The match has no
+    /// wildcard on purpose: a variant added to `DomUpdate` stops this compiling,
+    /// and a structural one (append, insert, remove, replace) must not come
+    /// back — `apply` is handed a `&mut dyn DomDocument` and cannot reach the
+    /// late-child registry the `NodeHandle` verbs notify.
+    #[test]
+    fn a_dom_update_is_a_property_write_and_nothing_else() {
+        fn kind(update: &DomUpdate) -> &'static str {
+            match update {
+                DomUpdate::SetText { .. } => "text",
+                DomUpdate::SetAttribute { .. } => "attribute",
+                DomUpdate::RemoveAttribute { .. } => "attribute",
+                DomUpdate::SetStyle { .. } => "style",
+            }
+        }
+        let node = NodeId(1);
+        let all = [
+            DomUpdate::SetText {
+                node,
+                text: String::new(),
+            },
+            DomUpdate::SetAttribute {
+                node,
+                name: String::new(),
+                value: String::new(),
+            },
+            DomUpdate::RemoveAttribute {
+                node,
+                name: String::new(),
+            },
+            DomUpdate::SetStyle {
+                node,
+                property: String::new(),
+                value: String::new(),
+            },
+        ];
+        assert_eq!(
+            all.iter().map(kind).collect::<Vec<_>>(),
+            ["text", "attribute", "attribute", "style"]
+        );
+    }
+
+    /// Every arm of `UpdateBatch::apply` lands, in push order (the last write
+    /// of one attribute wins, and a removal after a write removes).
+    #[test]
+    fn an_update_batch_applies_each_property_write_in_order() {
+        let mut doc = MockDomDocument::new();
+        let text = doc.create_text("old");
+        let el = doc.create_element("div");
+
+        let mut batch = UpdateBatch::new();
+        batch.push(DomUpdate::SetText {
+            node: text,
+            text: "new".to_string(),
+        });
+        batch.push(DomUpdate::SetAttribute {
+            node: el,
+            name: "title".to_string(),
+            value: "first".to_string(),
+        });
+        batch.push(DomUpdate::SetAttribute {
+            node: el,
+            name: "title".to_string(),
+            value: "second".to_string(),
+        });
+        batch.push(DomUpdate::SetAttribute {
+            node: el,
+            name: "lang".to_string(),
+            value: "en".to_string(),
+        });
+        batch.push(DomUpdate::RemoveAttribute {
+            node: el,
+            name: "lang".to_string(),
+        });
+        batch.push(DomUpdate::SetStyle {
+            node: el,
+            property: "color".to_string(),
+            value: "red".to_string(),
+        });
+        assert_eq!(batch.len(), 6);
+        batch.apply(&mut doc);
+
+        assert_eq!(doc.text_content(text), Some("new".to_string()));
+        assert_eq!(doc.get_attribute(el, "title"), Some("second".to_string()));
+        assert_eq!(doc.get_attribute(el, "lang"), None);
+        let style = doc.get_attribute(el, "style").unwrap_or_default();
+        assert!(
+            style.contains("color") && style.contains("red"),
+            "{style:?}"
+        );
+    }
+
     /// `on_cleanup` must fire when a `RenderScope` is merely dropped, not only
     /// when the by-value `dispose()` is called (issue #141).
     ///
@@ -1535,5 +2550,42 @@ mod tests {
         // Positive control: a write the re-render effect legitimately tracks.
         rev.set(2);
         assert_eq!(renders.get(), renders_before + 1);
+    }
+
+    /// `NodeHandle::select()`/`set_selection_range()` route to the backend's
+    /// `DomDocument::select_text`/`set_selection_range` with this handle's own
+    /// node id (issue #552) — the same shape `focus()` already has. A mutant
+    /// passing the *parent* node's id instead of `self.node_id` would still
+    /// pass a test that only checks "a selection was recorded", so this one
+    /// asserts the node too.
+    #[test]
+    fn select_and_set_selection_range_reach_the_backend_for_this_node() {
+        let doc = Rc::new(RefCell::new(MockDomDocument::new()));
+        let weak: std::rc::Weak<RefCell<dyn DomDocument>> = Rc::downgrade(&doc) as _;
+        let (input, other) = {
+            let mut d = doc.borrow_mut();
+            let body = d.body();
+            let input = d.create_element("input");
+            d.set_attribute(input, "value", "hello");
+            d.append_child(body, input);
+            let other = d.create_element("input");
+            d.append_child(body, other);
+            (input, other)
+        };
+        let handle = NodeHandle::new(input, weak.clone());
+        let other_handle = NodeHandle::new(other, weak);
+
+        handle.set_selection_range(1, 3, SelectionDirection::Backward);
+        assert_eq!(
+            doc.borrow().__selection_range(),
+            Some((input, 1, 3, SelectionDirection::Backward))
+        );
+
+        // A different handle's select() must not be attributed to `input`.
+        other_handle.select();
+        assert_eq!(
+            doc.borrow().__selection_range().map(|(n, ..)| n),
+            Some(other)
+        );
     }
 }

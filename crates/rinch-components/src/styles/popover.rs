@@ -26,12 +26,66 @@ pub fn styles() -> String {
     z-index: var(--rinch-popover-z-index, 100);
     opacity: 0;
     visibility: hidden;
-    transition: opacity 150ms ease, visibility 150ms ease, transform 150ms ease;
+    /* Closing: the fade runs with the panel still visible, and it hides once
+       the 150ms are up — `visibility 0s linear 150ms` (#759; the note on
+       `.rinch-drawer__root--hidden` in `styles/drawer.rs` has the reasoning).
+       Opening is instant and cancels a pending hide: the opened rule below
+       declares no `visibility` transition. */
+    transition: opacity 150ms ease, visibility 0s linear 150ms, transform 150ms ease;
 }
 
-.rinch-popover--opened .rinch-popover__dropdown {
+/* #778: this used to be a plain descendant rule, `.rinch-popover--opened
+   .rinch-popover__dropdown`, which a descendant combinator matches through
+   ANY ancestor carrying `--opened` — so an open Popover revealed every closed
+   Popover nested inside its own dropdown (measured on desktop: the inner
+   panel read back `visibility: Visible`, `opacity: 1`, and took pointer
+   input, although its own root carried no `--opened`).
+
+   A plain child combinator (`.rinch-popover--opened > .rinch-popover__dropdown`,
+   the fix `DropdownMenu`'s **backdrop** uses, below) is wrong here for the same
+   reason the review of #774 found for `DropdownMenu`'s **panel**: the dropdown
+   is a caller's child, and `rsx!` is not always handing it over as a direct
+   child. A `{Option<NodeHandle>}` child, every branch of an `if` after the
+   first, a reactive-prop component inside an `if`, and a helper component
+   whose body is control flow each get a `display: contents` wrapper of the
+   macro's own, and a caller may wrap it in a plain `div` too — under `>` a
+   popover built any of those ways never opens.
+
+   So this is the same descendant-rule-with-an-exclusion `DropdownMenu`'s panel
+   rule uses: reveal a dropdown under an open ancestor UNLESS a *closed*
+   `.rinch-popover` root sits between that open ancestor and the dropdown. For
+   the outer popover's own (possibly wrapped) dropdown there is no such root in
+   between, so it still opens; for a closed popover nested inside an open one's
+   dropdown, its own root is exactly that intervening closed root, so its
+   dropdown stays hidden. Same known limit as `DropdownMenu`'s (an open popover
+   C inside the *target* of a closed popover B inside an open popover A stays
+   hidden, because B sits between A and C's panel) — not re-measured here
+   since the mechanism is identical; `css_hook_778_tests` pins the shape that
+   is. */
+/* `inherit`, not `visible` (#936): a declared `visible` overrides an inherited
+   `hidden`, so an open popover inside a closed `Drawer` or a closed outer
+   popover's dropdown showed through its closed container. `inherit` is
+   `visible` under a visible container and `hidden` under a hidden one, and the
+   #759 hand-down reads it as inherited, so the panel stays on screen while a
+   drawer around it slides closed. */
+.rinch-popover--opened .rinch-popover__dropdown:not(.rinch-popover--opened .rinch-popover:not(.rinch-popover--opened) .rinch-popover__dropdown) {
     opacity: 1;
-    visibility: visible;
+    visibility: inherit;
+    transition: opacity 150ms ease, transform 150ms ease;
+}
+
+/* Paused while closed (#912) — the closed dropdown is `visibility: hidden`,
+   which is rendered, so an animation inside it would run and keep the app
+   awake. The long note on `.rinch-drawer__root--hidden *` in `styles/drawer.rs`
+   has the reasoning, the `!important`, the `*`, and why no pseudo-elements.
+
+   The `:not()` is the exact complement of the rule above (#778 widened both
+   together), so the pause lands on precisely the dropdowns that rule leaves
+   hidden — a closed popover nested in an open one's dropdown included.
+   Resumes on open; the dropdown's 150ms fade-out (#759) shows the spinner
+   stopped, on both backends. */
+.rinch-popover__dropdown:not(.rinch-popover--opened .rinch-popover__dropdown:not(.rinch-popover--opened .rinch-popover:not(.rinch-popover--opened) .rinch-popover__dropdown)) * {
+    animation-play-state: paused !important;
 }
 
 /* Backdrop — the invisible overlay that catches outside clicks when
@@ -58,77 +112,98 @@ pub fn styles() -> String {
     display: none;
 }
 
-/* Positions */
+/* Positions.
+
+   The gap from the target is a margin on the side facing it, not a
+   `translate` (#1764): the dropdown is flipped to the opposite side by
+   swapping this class when it does not fit (`floating.rs`), and a transform
+   that changed with the side would run the dropdown's `transform` transition
+   on every flip — a 16px slide as it opens.
+
+   Nor is the centring a transform (#1372): a `translate(-50%)` made the
+   dropdown the containing block of the `position: fixed` dismiss backdrop of
+   any `Select`, `DropdownMenu`, `ColorInput` or nested `Popover` inside it, in
+   a browser as in rinch, so a tap outside the inner menu closed this popover.
+   A centred dropdown starts at `50%` here and `floating.rs` centres it from
+   its measured size on every open, before the frame is painted. */
 .rinch-popover--bottom .rinch-popover__dropdown {
     top: 100%;
     left: 50%;
-    transform: translateX(-50%) translateY(var(--rinch-popover-offset, 8px));
+    margin-top: var(--rinch-popover-offset, 8px);
 }
 
 .rinch-popover--bottom-start .rinch-popover__dropdown {
     top: 100%;
     left: 0;
-    transform: translateY(var(--rinch-popover-offset, 8px));
+    transform: none;
+    margin-top: var(--rinch-popover-offset, 8px);
 }
 
 .rinch-popover--bottom-end .rinch-popover__dropdown {
     top: 100%;
     right: 0;
-    transform: translateY(var(--rinch-popover-offset, 8px));
+    transform: none;
+    margin-top: var(--rinch-popover-offset, 8px);
 }
 
 .rinch-popover--top .rinch-popover__dropdown {
     bottom: 100%;
     left: 50%;
-    transform: translateX(-50%) translateY(calc(-1 * var(--rinch-popover-offset, 8px)));
+    margin-bottom: var(--rinch-popover-offset, 8px);
 }
 
 .rinch-popover--top-start .rinch-popover__dropdown {
     bottom: 100%;
     left: 0;
-    transform: translateY(calc(-1 * var(--rinch-popover-offset, 8px)));
+    transform: none;
+    margin-bottom: var(--rinch-popover-offset, 8px);
 }
 
 .rinch-popover--top-end .rinch-popover__dropdown {
     bottom: 100%;
     right: 0;
-    transform: translateY(calc(-1 * var(--rinch-popover-offset, 8px)));
+    transform: none;
+    margin-bottom: var(--rinch-popover-offset, 8px);
 }
 
 .rinch-popover--left .rinch-popover__dropdown {
     right: 100%;
     top: 50%;
-    transform: translateY(-50%) translateX(calc(-1 * var(--rinch-popover-offset, 8px)));
+    margin-right: var(--rinch-popover-offset, 8px);
 }
 
 .rinch-popover--left-start .rinch-popover__dropdown {
     right: 100%;
     top: 0;
-    transform: translateX(calc(-1 * var(--rinch-popover-offset, 8px)));
+    transform: none;
+    margin-right: var(--rinch-popover-offset, 8px);
 }
 
 .rinch-popover--left-end .rinch-popover__dropdown {
     right: 100%;
     bottom: 0;
-    transform: translateX(calc(-1 * var(--rinch-popover-offset, 8px)));
+    transform: none;
+    margin-right: var(--rinch-popover-offset, 8px);
 }
 
 .rinch-popover--right .rinch-popover__dropdown {
     left: 100%;
     top: 50%;
-    transform: translateY(-50%) translateX(var(--rinch-popover-offset, 8px));
+    margin-left: var(--rinch-popover-offset, 8px);
 }
 
 .rinch-popover--right-start .rinch-popover__dropdown {
     left: 100%;
     top: 0;
-    transform: translateX(var(--rinch-popover-offset, 8px));
+    transform: none;
+    margin-left: var(--rinch-popover-offset, 8px);
 }
 
 .rinch-popover--right-end .rinch-popover__dropdown {
     left: 100%;
     bottom: 0;
-    transform: translateX(var(--rinch-popover-offset, 8px));
+    transform: none;
+    margin-left: var(--rinch-popover-offset, 8px);
 }
 
 /* Arrow */
@@ -139,6 +214,8 @@ pub fn styles() -> String {
     height: var(--rinch-popover-arrow-size, 8px);
     background-color: var(--rinch-color-body);
     border: 1px solid var(--rinch-color-border);
+    /* The arrow is its size, border included, themed or not (#1278). */
+    box-sizing: border-box;
     transform: rotate(45deg);
 }
 

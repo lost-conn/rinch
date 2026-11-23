@@ -3,6 +3,159 @@
 use super::*;
 
 impl RinchApp {
+    /// Offer a key to the focused element's `onkeydown` / `onkeyup` handler
+    /// and then its ancestors', nearest first, stopping at the first that
+    /// consumes it (issue #1678). Answers whether one did.
+    ///
+    /// The walk starts at the node the arbiter's claim names — a text control
+    /// (`FocusTarget::Input`) or a focusable node (`FocusTarget::Node`: a
+    /// `tabindex` element, a button, a link, a closed `<select>`). The
+    /// rich-text editor (its keys are `EditorHandle::on_key`'s), a render
+    /// surface (`set_key_handler`) and an open `<select>` list are not offered,
+    /// nor is a key while the focused field shows an IME composition: a key
+    /// the input method is composing with is the input method's, which a
+    /// browser marks `isComposing`. The ids are read before any handler runs,
+    /// so a handler that moves or removes nodes does not change who is asked.
+    pub(super) fn offer_element_key(&mut self, data: &events::KeyEventData) -> bool {
+        let start = match self.focus_target {
+            FocusTarget::Input(id) => id,
+            FocusTarget::Node(id) if self.node_target_is_live(id) => id,
+            _ => return false,
+        };
+        let data = &data
+            .clone()
+            .with_target(Some(rinch_core::dom::NodeId(start)));
+        let attr = if data.is_up() {
+            "data-onkeyup"
+        } else {
+            "data-onkeydown"
+        };
+        let ids: Vec<events::EventHandlerId> = {
+            let Some(doc) = self.doc.as_ref() else {
+                return false;
+            };
+            let d = doc.borrow();
+            if d.tree
+                .get(start)
+                .and_then(|n| n.attributes.get("data-preedit"))
+                .is_some_and(|p| !p.is_empty())
+            {
+                return false;
+            }
+            let mut ids = Vec::new();
+            let mut cur = Some(start);
+            while let Some(id) = cur {
+                let Some(node) = d.tree.get(id) else { break };
+                if let Some(h) = node
+                    .attributes
+                    .get(attr)
+                    .and_then(|v| v.parse::<usize>().ok())
+                {
+                    ids.push(events::EventHandlerId(h));
+                }
+                cur = node.parent;
+            }
+            ids
+        };
+        !ids.is_empty() && events::dispatch_key_handler_chain(ids, data)
+    }
+
+    /// Offer a wheel to the `onwheel` handler of the element under the
+    /// pointer (`hit`) and then its ancestors', nearest first, stopping at the
+    /// first that consumes it. Answers whether one did — the caller then
+    /// scrolls no container. The ids are read before any handler runs, so a
+    /// handler that changes the tree does not change who is asked.
+    ///
+    /// The event's [`target`](events::WheelEvent::target) is set here: the
+    /// nearest element at or above `hit` (a text node's parent, as the DOM's
+    /// `event.target` is).
+    pub(super) fn offer_element_wheel(&mut self, hit: u64, event: &events::WheelEvent) -> bool {
+        let mut event = *event;
+        let ids: Vec<events::EventHandlerId> = {
+            let Some(doc) = self.doc.as_ref() else {
+                return false;
+            };
+            let d = doc.borrow();
+            let mut ids = Vec::new();
+            let mut cur = Some(hit);
+            while let Some(id) = cur {
+                let Some(node) = d.tree.get(id) else { break };
+                if event.target.is_none() && node.is_element() {
+                    event.target = Some(rinch_core::dom::NodeId(id));
+                }
+                if let Some(h) = node
+                    .attributes
+                    .get("data-onwheel")
+                    .and_then(|v| v.parse::<usize>().ok())
+                {
+                    ids.push(events::EventHandlerId(h));
+                }
+                cur = node.parent;
+            }
+            ids
+        };
+        !ids.is_empty() && events::dispatch_wheel_handler_chain(ids, &event)
+    }
+
+    /// A trackpad pinch no render surface took (macOS, Wayland): offered to
+    /// the `onwheel` chain under the pointer as a wheel with Ctrl held, the
+    /// way a browser reports a pinch. `delta` is winit's scale change (0.1 is
+    /// 10% larger); the wheel's `delta_y` is chosen so
+    /// [`events::WheelEvent::zoom_factor`] gives back `1 + delta`.
+    ///
+    /// Only the desktop shell and the tests call it, so embed and Android
+    /// builds compile no caller.
+    #[allow(dead_code)]
+    pub(crate) fn pinch_as_wheel(&mut self, delta: f32) -> bool {
+        let Some((x, y)) = self.cursor_pos else {
+            return false;
+        };
+        let scale = 1.0 + delta;
+        if !(scale.is_finite() && scale > 0.0) {
+            return false;
+        }
+        let Some(hit) = self.move_target(x, y) else {
+            return false;
+        };
+        let mut modifiers = self.modifier_state();
+        modifiers.ctrl = true;
+        let event =
+            events::WheelEvent::new(0.0, -100.0 * scale.ln(), x, y).with_modifiers(modifiers);
+        self.offer_element_wheel(hit, &event)
+    }
+
+    /// Offer a key to the app-wide listeners (`rinch_core::on_app_key`, issue
+    /// #1784) — after the interceptor, the key entries, the dismiss stack and a
+    /// focused render surface's claim, before the focused element's default.
+    /// The callers leave out the rich-text editor's keys and an open native
+    /// `<select>` list's; this leaves out a key while the built-in text context
+    /// menu is open or the focused field shows an IME composition, as
+    /// [`Self::offer_element_key`] does. A focus move a listener made is
+    /// applied before the key's default, as an element handler's is.
+    pub(super) fn offer_app_key(&mut self, data: &events::KeyEventData) -> bool {
+        if data.is_down() {
+            if self.open_text_menu.is_some() {
+                return false;
+            }
+            if let FocusTarget::Input(id) = self.focus_target
+                && self.doc.as_ref().is_some_and(|doc| {
+                    doc.borrow()
+                        .tree
+                        .get(id)
+                        .and_then(|n| n.attributes.get("data-preedit"))
+                        .is_some_and(|p| !p.is_empty())
+                })
+            {
+                return false;
+            }
+        }
+        let consumed = events::dispatch_app_key(data);
+        self.drain_focus_requests(false);
+        consumed
+    }
+}
+
+impl RinchApp {
     /// Whether a visible scrollbar thumb should take a press that
     /// [`detect_resize_edge`] claimed.
     ///
@@ -87,17 +240,120 @@ impl RinchApp {
     /// Process a platform event and return a list of actions for the shell.
     ///
     /// `window_size` is in **physical** pixels; the logical layout viewport is
-    /// derived from it by [`Self::layout_viewport`]. The pointer coordinates
+    /// derived from it by `Self::layout_viewport`. The pointer coordinates
     /// carried by the mouse and file-drag events are **logical**, on every host
     /// — see [`rinch_platform::PlatformEvent`]'s *Coordinate space* note — so
     /// they compare directly against the layout tree `hit_test` probes.
-    #[allow(clippy::too_many_lines)]
     pub fn handle_event(
         &mut self,
         event: PlatformEvent,
         window_size: (u32, u32),
         scale_factor: f64,
     ) -> Vec<AppAction> {
+        let inside = match event {
+            PlatformEvent::MouseMove { x, y } => {
+                let (w, h) = Self::layout_viewport(window_size, scale_factor);
+                x >= 0.0 && y >= 0.0 && x < w && y < h
+            }
+            _ => false,
+        };
+        // Where hover may be hit-tested again under a still pointer (#2766):
+        // the mouse's own last position inside the window, never a finger's
+        // or a pen's.
+        match event {
+            PlatformEvent::MouseMove { .. } => {
+                self.mouse_in_window = inside
+                    && crate::render_surface::current_pointer(false).kind
+                        == crate::render_surface::SurfacePointerKind::Mouse;
+            }
+            PlatformEvent::MouseLeft => self.mouse_in_window = false,
+            _ => {}
+        }
+        // A press a menu popup's grab can name (#2552).
+        #[cfg(feature = "windowing")]
+        if matches!(
+            event,
+            PlatformEvent::MouseDown { .. } | PlatformEvent::KeyDown { .. }
+        ) && self.doc.is_some()
+        {
+            crate::window_handle::note_press(self.doc_key());
+        }
+        let mut actions = self.handle_event_inner(event, window_size, scale_factor);
+        // A window leave owed since a press held the pointer (#2672 review):
+        // forgotten when the pointer comes back, applied once nothing holds
+        // it (its release, or the heal of a missed one).
+        if self.left_while_captured {
+            if inside {
+                self.left_while_captured = false;
+            } else if !self.pointer_captured() {
+                self.left_while_captured = false;
+                let _dispatching = rinch_core::push_dispatching_doc(self.doc_key());
+                if self.pointer_left_window() {
+                    actions.push(AppAction::RequestRedraw);
+                }
+            }
+        }
+        // The element focus events (#2731) for whatever this event did to the
+        // focus or the window's: one diff after the event, so no route that
+        // moves the focus can skip them.
+        let _dispatching = rinch_core::push_dispatching_doc(self.doc_key());
+        if self.fire_focus_events() {
+            actions.push(AppAction::RequestRedraw);
+        }
+        actions
+    }
+
+    /// Whether a press holds the pointer: a pointer-capture `Drag`, a
+    /// pending or active element drag, a scrollbar-thumb drag, a text or
+    /// editor drag-select, or a render surface's press. The browser's
+    /// pointer capture: while it holds, the pointer leaving the viewport
+    /// fires no `mouseleave` (Chrome and Firefox).
+    pub(crate) fn pointer_captured(&self) -> bool {
+        #[cfg(feature = "windowing")]
+        let editor_drag = crate::editor::drag_anchor(self.input_doc()).is_some();
+        #[cfg(not(feature = "windowing"))]
+        let editor_drag = false;
+        rinch_core::Drag::is_active()
+            || self.pending_drag.is_some()
+            || self.active_dnd.is_some()
+            || self.scrollbar_drag.is_some()
+            || self.text_selecting
+            || !self.surface_captures.is_empty()
+            || editor_drag
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn handle_event_inner(
+        &mut self,
+        event: PlatformEvent,
+        window_size: (u32, u32),
+        scale_factor: f64,
+    ) -> Vec<AppAction> {
+        // A line wheel (#2287) is the `MouseWheel` of its pixel distance in
+        // every respect — `onwheel`, surfaces, the menus and tooltips a wheel
+        // closes, which container scrolls — except that its default scroll
+        // glides; the `MouseWheel` arm reads `line_wheel` for that.
+        if let PlatformEvent::MouseWheelLines {
+            x,
+            y,
+            lines_x,
+            lines_y,
+        } = event
+        {
+            let outer = std::mem::replace(&mut self.smooth_wheel.line_wheel, true);
+            let actions = self.handle_event(
+                PlatformEvent::MouseWheel {
+                    x,
+                    y,
+                    delta_x: lines_x * rinch_platform::WHEEL_LINE_PX,
+                    delta_y: lines_y * rinch_platform::WHEEL_LINE_PX,
+                },
+                window_size,
+                scale_factor,
+            );
+            self.smooth_wheel.line_wheel = outer;
+            return actions;
+        }
         // Mark this document as the one dispatching, for the whole of the call
         // (issue #139). Several `RinchApp`s share one thread — an app and its
         // DevTools panel, or two embedded `RinchContext`s — and process-lifetime
@@ -106,11 +362,67 @@ impl RinchApp {
         // effect flushes and layout all run under this and any of them may
         // unwind.
         let _dispatching = rinch_core::push_dispatching_doc(self.doc_key());
+        // A key press or a pointer press or release: what its handlers ask
+        // for is the user's asking (an activation token, #2501).
+        let _action = super::user_input::enter(&event);
+        // Hit tests are shared within one event only (`shared_hit`).
+        self.hit_memo.set(None);
 
         let mut actions = Vec::new();
         // Logical (CSS-pixel) viewport — for ClickContext *and* for every
         // `resolve_and_repaint` below.
         let (vp_w, vp_h) = Self::layout_viewport(window_size, scale_factor);
+
+        // Pointer lock (#2092). A lock whose element left the document ends
+        // here, on whatever event comes next (`AboutToWait` ends every turn of
+        // the desktop loop); a window that lost focus gives the pointer back,
+        // as a browser does; and Escape ends a held lock and goes no further —
+        // not to the dismiss stack, a key handler or a drag — as the browser
+        // consumes the Escape that exits its lock. Raw motion goes to the lock
+        // and the motion handlers, and is nothing else's.
+        // Only a lock this app asked for: several apps can share the thread
+        // (embedded contexts), and another's blur or Escape is not this one's.
+        // The Escape's auto-repeats are the lock's too, until it is released:
+        // a press that may be a repeat (`Unknown`, Android) counts as one
+        // until the `KeyUp` (or a focus loss) says the key went up.
+        crate::pointer_lock::prune();
+        match &event {
+            PlatformEvent::WindowFocus(false) => {
+                crate::pointer_lock::window_blurred(self.doc_key());
+            }
+            PlatformEvent::KeyDown {
+                key: KeyCode::Escape,
+                repeat,
+                ..
+            } if crate::pointer_lock::escape(self.doc_key(), *repeat == KeyRepeat::Fresh) => {
+                actions.push(AppAction::RequestRedraw);
+                return actions;
+            }
+            PlatformEvent::KeyUp {
+                key: KeyCode::Escape,
+                ..
+            } => crate::pointer_lock::escape_released(self.doc_key()),
+            PlatformEvent::PointerMotion { dx, dy } => {
+                crate::pointer_lock::dispatch_pointer_motion(*dx, *dy);
+                if self.has_pending_layout() {
+                    self.resolve_and_repaint(vp_w, vp_h);
+                    actions.push(AppAction::RequestRedraw);
+                }
+                return actions;
+            }
+            _ => {}
+        }
+
+        // A drag move deferred its layout to the frame. Anything but another
+        // move is settled against it first: a press, release, wheel or drop
+        // hit-tests, and must see the dragged box where the last move put it,
+        // as it did when the drag arm laid out per move — through the desktop
+        // shell (which flushes the move right before the release), an MCP
+        // `mouse_move` + `mouse_up` in one wake, embed's `update(&[move, up])`
+        // and Android alike, since all of them come through here.
+        if self.drag_layout_owed && !matches!(event, PlatformEvent::MouseMove { .. }) {
+            self.resolve_and_repaint(vp_w, vp_h);
+        }
 
         // The built-in text context menu (issue #813) lives exactly as long as
         // its target holds the keyboard and is in the document. Checked on
@@ -120,6 +432,134 @@ impl RinchApp {
         if !self.text_menu_target_is_live() {
             self.close_text_context_menu();
             actions.push(AppAction::RequestRedraw);
+        }
+        // An OS file drag in progress takes the pointer: while it lasts the
+        // window hears no press, release, wheel or key of its own, and a
+        // window that lost the keyboard is not where it is dropping. So any of
+        // them proves the drag ended, whether or not its `FileHoverCancelled`
+        // arrived (the #189 shape: a drop caret and an edge-band scroll armed
+        // by the hover must not wait for a cancel that may never come, #1649).
+        // A pointer move is weaker proof: on X11 the source's ungrab at the
+        // release sends the window a crossing Enter (a move to the shell)
+        // *before* the XdndDrop (measured with a GTK source, review of
+        // #1655), so a move only hides the caret and stops the scroll; the
+        // shown position and the hover target wait for the drop.
+        if self.file_drag_live() || self.file_hover_target.is_some() {
+            let over = matches!(
+                event,
+                PlatformEvent::MouseDown { .. }
+                    | PlatformEvent::MouseUp { .. }
+                    | PlatformEvent::MouseWheel { .. }
+                    | PlatformEvent::KeyDown { .. }
+                    | PlatformEvent::PointerCancel
+                    | PlatformEvent::WindowFocus(false)
+            );
+            if over && self.end_file_drag() {
+                actions.push(AppAction::RequestRedraw);
+            }
+            if matches!(event, PlatformEvent::MouseMove { .. }) && self.suspend_file_drag() {
+                actions.push(AppAction::RequestRedraw);
+            }
+        }
+        // Focus work parked by the handler of an earlier event (an `on_key`,
+        // an `oninput`, an interceptor or a menu shortcut that called
+        // `focus()` or `blur()`) is applied before the next key, press or
+        // composition is routed. The frame clock's drain comes only after
+        // every event the platform already has queued, so without this a key
+        // queued behind an Escape whose handler blurred the editor was still
+        // typed into it (review of #1481, F2). No layout has run, so a
+        // request that needs one stays parked, with the releases around it.
+        //
+        // A key, a composition and the window's keyboard enter go further
+        // (#2731): a request that needs a layout, or the mount's `autofocus`,
+        // gets one first, so the key lands in the field it focuses and the app
+        // hears the window has the keyboard with its field already focused.
+        let drained = match event {
+            PlatformEvent::KeyDown { .. }
+            | PlatformEvent::Ime(_)
+            | PlatformEvent::WindowFocus(true) => self.drain_focus_before_input(vp_w, vp_h),
+            PlatformEvent::MouseDown { .. } => self.drain_focus_requests(false),
+            _ => false,
+        };
+        if drained {
+            self.drain_pending_text_selection();
+            actions.push(AppAction::RequestRedraw);
+        }
+        // Where the pointer is, before anything can take the move: the desktop
+        // shell reads a press's position back out of `cursor_pos` (the move it
+        // flushed just before is what set it). The text menu below takes every
+        // move while it is open, so recording it only in the `MouseMove` arm
+        // left a real press judged where the menu was opened, inside its
+        // panel: an item never ran and a press elsewhere never closed it.
+        if let PlatformEvent::MouseMove { x, y } = event {
+            self.cursor_pos = Some((x, y));
+        }
+
+        // A primary press while a pointer-capture drag, an editor
+        // drag-select, an element drag, a scrollbar-thumb drag or a text
+        // selection drag is still live proves its release was missed (issues
+        // #381, #1028): a button cannot be pressed twice without being
+        // released in between. Desktop cannot see the button state on a move
+        // (see the `MouseMove` arm), so this is the first event that can tell. Ended
+        // **before** the press is dispatched — its handlers must not see the
+        // stranded drag, and a drag this very press arms is not the one being
+        // ended — and through `on_cancel`: left alone, the next release ran
+        // `finish_drag` and committed the stranded drag at this click's
+        // position, and a stranded element drag was dropped (`data-ondrop`)
+        // by that release. Scoped to this document, like every other ending
+        // (#139).
+        // Here rather than in the `MouseDown` arm because the text menu below
+        // swallows a press: the press that closes it would otherwise skip the
+        // heal, and its release, reaching the `MouseUp` arm with the menu gone,
+        // committed the stranded drag after all.
+        // Every press, handler or not and before anything can swallow it,
+        // names the button a pointer-capture drag armed from now on belongs to
+        // (issue #1087): the `MouseUp` arm ends a drag only on that button's
+        // release.
+        if let PlatformEvent::MouseDown { button, .. } = event {
+            rinch_core::note_pointer_press(Self::core_button(button));
+        }
+        // A surface that went away (unmounted, unregistered) holds no press.
+        self.prune_surface_captures();
+        if matches!(
+            event,
+            PlatformEvent::MouseDown {
+                button: MouseButton::Left,
+                ..
+            }
+        ) && self.heal_missed_release(
+            vp_w,
+            vp_h,
+            Some(crate::render_surface::current_pointer(true).id),
+        ) {
+            actions.push(AppAction::RequestRedraw);
+        }
+
+        // The `title` tooltip (#1646) goes on anything the user does: a press,
+        // a wheel or a key keeps it away from what the pointer is over until
+        // the pointer reaches another `title`; a cancel, blur or resize just
+        // takes it down. Before the menu below, which swallows presses.
+        let tooltip_up = self.title_tooltip.shown.is_some();
+        match &event {
+            PlatformEvent::MouseDown { .. }
+            | PlatformEvent::MouseWheel { .. }
+            | PlatformEvent::KeyDown { .. } => self.dismiss_title_tooltip(),
+            PlatformEvent::PointerCancel
+            | PlatformEvent::MouseLeft
+            | PlatformEvent::Resized { .. }
+            | PlatformEvent::WindowFocus(false)
+            | PlatformEvent::FileHoverEnter { .. } => self.hide_title_tooltip(),
+            _ => {}
+        }
+        // A hide is a frame to draw: nothing else this event does need ask
+        // for one (a bare Shift press, an embed host's lone press).
+        if tooltip_up && self.title_tooltip.shown.is_none() {
+            actions.push(AppAction::RequestRedraw);
+        }
+
+        // An open runtime popup's resize, file drag and composition (#822).
+        if self.runtime_popup_intercept(&event, vp_w, vp_h, &mut actions) {
+            return actions;
         }
         // While it is open the pointer belongs to the menu: an item press runs
         // it, any other press closes it unacted and is swallowed.
@@ -143,7 +583,7 @@ impl RinchApp {
                 }
             }
             PlatformEvent::Resized { width, height } => {
-                self.resize_layout(width, height);
+                self.window_resized(width, height);
                 actions.push(AppAction::RequestRedraw);
             }
             PlatformEvent::RedrawRequested => {
@@ -156,22 +596,39 @@ impl RinchApp {
                 // `drag_anchor` lookup lives inside `extend_editor_drag`, which
                 // answers `false` when this document has no drag-select — no
                 // need to run it twice on every single pointer move.
-                #[cfg(feature = "desktop")]
+                #[cfg(feature = "windowing")]
                 if self.extend_editor_drag(x, y, scale_factor, window_size) {
                     actions.push(AppAction::RequestRedraw);
                     return actions;
                 }
 
+                // One hit test per move, shared by the `data-onmousemove`
+                // dispatch, the drop-target search and hover (update-path
+                // audit F2.1). A handler that mutates the document bumps the
+                // hit cache's generation, and `move_hit` re-tests after that,
+                // so sharing never answers from a tree a handler changed.
+
                 // Additive: fire data-onmousemove before any drag/scroll/hover
-                // logic below (which can early-return).
-                self.dispatch_mouse_attr(
-                    "data-onmousemove",
-                    x,
-                    y,
-                    events::MouseButton::Left,
-                    vp_w,
-                    vp_h,
-                );
+                // logic below (which can early-return). Skipped outright —
+                // walk and hit test alike — when no node carries the
+                // attribute, which is what every pointer move of an app
+                // without a mousemove handler used to pay for.
+                if self
+                    .doc
+                    .as_ref()
+                    .is_some_and(|doc| doc.borrow().tree.mousemove_handlers > 0)
+                {
+                    let hit = self.move_target(x, y);
+                    self.dispatch_mouse_attr_at(
+                        "data-onmousemove",
+                        hit,
+                        x,
+                        y,
+                        events::MouseButton::Left,
+                        vp_w,
+                        vp_h,
+                    );
+                }
 
                 // ── Drag-and-drop: pending → active transition ────────────
                 if let Some(ref pending) = self.pending_drag {
@@ -186,12 +643,34 @@ impl RinchApp {
                         // Capture snapshot and compute anchor
                         self.activate_drag(node_id, mousedown_pos, (x, y), scale_factor);
 
-                        // Fire ondragstart handler
+                        // Fire ondragstart handler, its click context the
+                        // press point and the source's painted box (#2154):
+                        // a source that draws its own ghost keeps the point
+                        // it was grabbed at under the pointer.
                         if let Some(doc) = &self.doc {
+                            let (ex, ey, ew, eh) = {
+                                let d = doc.borrow();
+                                crate::app::hit_testing::painted_element_box(&d.tree, node_id)
+                            };
+                            events::set_click_context(events::ClickContext {
+                                mouse_x: mousedown_pos.0,
+                                mouse_y: mousedown_pos.1,
+                                element_x: ex,
+                                element_y: ey,
+                                element_width: ew,
+                                element_height: eh,
+                                text_hit: Default::default(),
+                                viewport_width: vp_w,
+                                viewport_height: vp_h,
+                                button: events::MouseButton::Left,
+                                modifiers: self.modifier_state(),
+                            });
                             Self::dispatch_drag_attr(doc, node_id, "data-ondragstart");
                         }
 
                         actions.push(AppAction::SetCursor(rinch_platform::CursorStyle::Grabbing));
+                        // Not hover's: the next re-check sends hover's again.
+                        self.hover_cursor = None;
                         actions.push(AppAction::RequestRedraw);
                         return actions;
                     }
@@ -203,141 +682,14 @@ impl RinchApp {
                 if let Some(ref mut drag) = self.active_dnd {
                     drag.cursor = (x, y);
 
-                    // Hit test for drop targets — check both DOM elements and surfaces
-                    let hit_id = if let Some(doc) = &self.doc {
-                        let d = doc.borrow();
-                        hit_test(&d.tree, x, y)
-                    } else {
-                        None
-                    };
-
-                    // Check if mouse is over a render surface
-                    let surface_target = if let Some(doc) = &self.doc {
-                        hit_id.and_then(|hid| {
-                            let d = doc.borrow();
-                            Self::find_render_surface_at_full(&d.tree, hid, x, y)
-                        })
-                    } else {
-                        None
-                    };
-
-                    let new_surface = surface_target.as_ref().map(|(sid, nid, _, _)| (*sid, *nid));
-
-                    // Handle surface drag enter/leave transitions
-                    if new_surface != self.drag_over_surface {
-                        // Leave old surface
-                        if let Some((old_sid, _)) = self.drag_over_surface {
-                            crate::render_surface::dispatch_surface_event(
-                                old_sid,
-                                crate::render_surface::SurfaceEvent::DragLeave,
-                            );
-                        }
-                        // Enter new surface
-                        if let Some((sid, _, lx, ly)) = &surface_target {
-                            crate::render_surface::dispatch_surface_event(
-                                *sid,
-                                crate::render_surface::SurfaceEvent::DragEnter { x: *lx, y: *ly },
-                            );
-                        }
-                        self.drag_over_surface = new_surface;
-                    }
-
-                    // Dispatch DragOver to current surface, or DOM drag events
-                    if let Some((sid, _, lx, ly)) = surface_target {
-                        // Mouse is over a surface — dispatch DragOver
-                        crate::render_surface::dispatch_surface_event(
-                            sid,
-                            crate::render_surface::SurfaceEvent::DragOver { x: lx, y: ly },
-                        );
-
-                        // Clear DOM drop target since we're over a surface
-                        let old_target = drag.over_target.take();
-                        if let Some(doc) = &self.doc {
-                            if let Some(old_id) = old_target {
-                                Self::dispatch_drag_attr(doc, old_id, "data-ondragleave");
-                            }
-                        }
-                    } else {
-                        // Not over a surface — use DOM drop target system
-                        let new_target = hit_id.and_then(|hid| {
-                            self.doc.as_ref().and_then(|doc| {
-                                let d = doc.borrow();
-                                Self::find_drop_target(&d.tree, hid)
-                            })
-                        });
-
-                        let old_target = drag.over_target;
-                        if new_target != old_target {
-                            drag.over_target = new_target;
-                            if let Some(doc) = &self.doc {
-                                if let Some(old_id) = old_target {
-                                    Self::dispatch_drag_attr(doc, old_id, "data-ondragleave");
-                                }
-                                if let Some(new_id) = new_target {
-                                    Self::dispatch_drag_attr(doc, new_id, "data-ondragenter");
-                                }
-                            }
-                        }
-
-                        if let Some(target_id) = drag.over_target {
-                            if let Some(doc) = &self.doc {
-                                let (cx, cy) = drag.cursor;
-                                Self::dispatch_drag_attr_with_context(
-                                    doc,
-                                    target_id,
-                                    "data-ondragover",
-                                    cx,
-                                    cy,
-                                );
-                            }
-                        }
-                    }
-
-                    // Fire ondragmove on source so editor can track cursor position.
-                    if let Some(doc) = &self.doc {
-                        let (cx, cy) = drag.cursor;
-                        events::set_click_context(events::ClickContext {
-                            mouse_x: cx,
-                            mouse_y: cy,
-                            element_x: 0.0,
-                            element_y: 0.0,
-                            element_width: 0.0,
-                            element_height: 0.0,
-                            text_hit: Default::default(),
-                            viewport_width: vp_w,
-                            viewport_height: vp_h,
-                            button: events::MouseButton::Left,
-                            modifiers: events::ModifierState::default(),
-                        });
-                        Self::dispatch_drag_attr(doc, drag.node_id, "data-ondragmove");
-                    }
+                    self.track_drag_pointer(vp_w, vp_h);
 
                     self.scene_dirty = true;
                     actions.push(AppAction::SetCursor(rinch_platform::CursorStyle::Grabbing));
+                    // Not hover's: the next re-check sends hover's again.
+                    self.hover_cursor = None;
                     actions.push(AppAction::RequestRedraw);
                     return actions;
-                }
-
-                // Check resize edge for borderless windows
-                if let Some(ref props) = self.window_props {
-                    if props.borderless && props.resizable {
-                        if let Some(inset) = props.resize_inset {
-                            // Compared in one unit — logical (#299). `x`/`y`
-                            // and the viewport are already logical, and
-                            // `resize_inset` is documented as matching a CSS
-                            // margin, so it is a CSS-pixel quantity to begin
-                            // with; the old `inset * scale` against a physical
-                            // `window_size` was compensating for a physical
-                            // pointer.
-                            if let Some(dir) = detect_resize_edge(x, y, vp_w, vp_h, inset)
-                                && !self.scrollbar_thumb_beats_resize(dir, x, y)
-                            {
-                                actions
-                                    .push(AppAction::SetCursor(resize_direction_to_cursor(&dir)));
-                                return actions;
-                            }
-                        }
-                    }
                 }
 
                 // Handle component drag (sliders, floating panels, etc.)
@@ -347,14 +699,24 @@ impl RinchApp {
                 // produces it — winit 0.31's `WindowEvent::PointerMoved` gives a
                 // position and a `PointerSource`, nothing about which buttons
                 // are held. So desktop cannot detect the swallowed release that
-                // issue #189's heal keys off, and a flag `RinchApp` maintained
-                // itself would be no help: the missed `MouseUp` that strands the
-                // drag is the same event that would have cleared the flag. See
-                // #294 for what desktop would actually need.
+                // issue #189's heal keys off on a move, and a flag `RinchApp`
+                // maintained itself would be no help: the missed `MouseUp` that
+                // strands the drag is the same event that would have cleared
+                // the flag. What desktop heals on instead is the next primary
+                // press and a window blur (`heal_missed_release`, issue #381);
+                // an OS query for the button state is the remaining option there.
                 let (drag_active, drag_forward_surface) =
                     rinch_core::update_drag_with_button(x, y, rinch_core::PrimaryButton::Unknown);
                 if drag_active && !drag_forward_surface {
-                    self.resolve_and_repaint(vp_w, vp_h);
+                    // No layout here. `on_move` wrote its signals and their
+                    // effects have already patched the DOM; the layout that
+                    // makes it visible runs once, at `AboutToWait` or in the
+                    // paint preamble, however many moves arrived before it.
+                    // Resolving per move laid the document out once per
+                    // pointer event — several times a frame on a high-rate
+                    // mouse (update-path audit F2.2). Owed, so that any other
+                    // event settles it first (see the top of this function).
+                    self.drag_layout_owed = true;
                     actions.push(AppAction::RequestRedraw);
                     return actions;
                 }
@@ -415,11 +777,10 @@ impl RinchApp {
                                 ScrollAxis::Vertical => node.scroll_offset.1 = new_scroll,
                                 ScrollAxis::Horizontal => node.scroll_offset.0 = new_scroll,
                             }
-                            node.dirty.insert(rinch_dom::DirtyFlags::PAINT);
                             // Whole-container repaint: covers the thumb's old
                             // rect as well as its new one (see the mousedown
                             // arm).
-                            d.tree.push_dirty(node_id);
+                            d.tree.mark_scrolled(node_id);
                         }
                         d.tree.dirty_nodes.insert(node_id);
                         if let Some(hid) = handler_id {
@@ -440,122 +801,204 @@ impl RinchApp {
                 }
 
                 // Handle read-only text selection drag
-                if self.text_selecting {
-                    if let Some(sel) = &self.text_selection {
-                        let ifc_node_id = sel.ifc_node_id;
-                        let anchor = sel.anchor_offset;
-                        let new_offset = if let Some(doc) = &self.doc {
-                            let d = doc.borrow();
-                            Self::compute_ifc_offset_from_click(&d.tree, ifc_node_id, x, y)
-                        } else {
-                            anchor
-                        };
-                        if let Some(sel) = &mut self.text_selection {
-                            sel.focus_offset = new_offset;
+                if self.text_selecting
+                    && let Some(sel) = &mut self.text_selection
+                    && !sel.dragged
+                {
+                    // Not a drag until the pointer leaves the press's spot.
+                    let (px, py) = sel.press;
+                    sel.dragged = (x - px).hypot(y - py) > 3.0;
+                }
+                if self.text_selecting && self.text_selection.as_ref().is_some_and(|s| s.dragged) {
+                    self.extend_text_selection_to(x, y);
+                    actions.push(AppAction::SetCursor(rinch_platform::CursorStyle::Text));
+                    self.hover_cursor = None;
+                    actions.push(AppAction::RequestRedraw);
+                    return actions;
+                }
+
+                // Check resize edge for borderless windows. Deliberately AFTER
+                // every live press gesture above, not before (#483): a
+                // scrollbar thumb drag, a pointer-capture `Drag` (even one
+                // forwarding to a captured render surface) and a read-only
+                // text-selection drag each either returned above already or
+                // (the surface-forwarding `Drag` case) left `drag_active`
+                // true, so a stray resize-edge hit mid-gesture must not steal
+                // the move and flip the cursor to a resize arrow instead of
+                // tracking it. That used to drop the frame whenever the
+                // pointer overshot the thumb's own extent (past the track
+                // end) or wandered into the corner square, which never yields
+                // to the thumb by design (#399/#439). Element DnD
+                // (`pending_drag`/`active_dnd`) and the editor's own
+                // drag-select already return above this point and need no
+                // guard here.
+                if self.scrollbar_drag.is_none() && !drag_active && !self.text_selecting {
+                    if let Some(ref props) = self.window_props {
+                        if props.borderless && props.resizable {
+                            if let Some(inset) = props.resize_inset {
+                                // Compared in one unit — logical (#299). `x`/`y`
+                                // and the viewport are already logical, and
+                                // `resize_inset` is documented as matching a CSS
+                                // margin, so it is a CSS-pixel quantity to begin
+                                // with; the old `inset * scale` against a physical
+                                // `window_size` was compensating for a physical
+                                // pointer.
+                                if let Some(dir) = detect_resize_edge(x, y, vp_w, vp_h, inset)
+                                    && !self.scrollbar_thumb_beats_resize(dir, x, y)
+                                {
+                                    // On a resize handle, over no content.
+                                    self.note_title_tooltip_move(
+                                        None,
+                                        x,
+                                        y,
+                                        rinch_core::timer::now(),
+                                    );
+                                    // The arrow is not hover's cursor.
+                                    self.hover_cursor = None;
+                                    actions.push(AppAction::SetCursor(resize_direction_to_cursor(
+                                        &dir,
+                                    )));
+                                    return actions;
+                                }
+                            }
                         }
-                        self.set_text_selection_attributes(ifc_node_id, anchor, new_offset);
-                        self.scene_dirty = true;
-                        actions.push(AppAction::SetCursor(rinch_platform::CursorStyle::Text));
-                        actions.push(AppAction::RequestRedraw);
-                        return actions;
                     }
                 }
 
                 // Update hover state and cursor
-                if let Some(doc) = &self.doc {
-                    let (hovered, cursor_style, old_hovered) = {
-                        let d = doc.borrow();
-                        let h = hit_test(&d.tree, x, y);
-                        let mut cs = h
-                            .and_then(|id| d.tree.get(id))
-                            .map(|n| cursor_value_to_style(&n.computed_style.cursor))
-                            .unwrap_or(rinch_platform::CursorStyle::Default);
-                        // Override cursor to I-beam when hovering over selectable text
-                        if let Some(hit_id) = h {
-                            if Self::find_selectable_ifc(&d.tree, hit_id).is_some() {
-                                cs = rinch_platform::CursorStyle::Text;
-                            }
-                        }
-                        (h, cs, d.tree.hovered_node)
-                    };
-                    let mut hovered_changed = false;
-                    doc.borrow_mut().update_hover(hovered, &mut hovered_changed);
-                    if hovered_changed {
-                        if let Some(old_id) = old_hovered {
-                            Self::dispatch_onleave(doc, old_id);
-                        }
-                        if let Some(hit_id) = hovered {
-                            Self::dispatch_onenter(doc, hit_id);
-                        }
-                    }
+                let mut tooltip_hit = None;
+                if let Some(doc) = self.doc.clone() {
+                    let doc = &doc;
+                    // `hovered` is the hit (the block, for an IFC's text),
+                    // which the surface and editor lookups below ask about;
+                    // `target` the element under the pointer (an inline one
+                    // in the text), which `:hover`, the cursor, the enter and
+                    // leave handlers and the tooltip take, as in Chrome
+                    // (#2648).
+                    let HoverAt {
+                        hovered,
+                        target,
+                        cursor: cursor_style,
+                        ..
+                    } = self.hover_at(doc, x, y);
                     // Don't request redraw — AboutToWait batches dirty state.
                     actions.push(AppAction::SetCursor(cursor_style));
+                    tooltip_hit = Some(target);
 
-                    // Dispatch MouseMove + MouseEnter/MouseLeave to render surfaces.
-                    // During an active drag with forward_surface_events, dispatch MouseMove
-                    // to the captured surface even when the mouse is outside its bounds
-                    // (pointer capture semantics).
-                    let new_surface = if let Some(hit_id) = hovered {
-                        let d = doc.borrow();
-                        Self::find_render_surface_at_full(&d.tree, hit_id, x, y)
-                    } else {
-                        None
-                    };
-
-                    let new_surface_entry = new_surface.as_ref().map(|(id, nid, _, _)| (*id, *nid));
-
-                    if new_surface_entry != self.hovered_surface {
-                        if !drag_active {
-                            // Normal (non-drag) path: dispatch enter/leave
-                            if let Some((old_id, _)) = self.hovered_surface {
-                                crate::render_surface::dispatch_surface_event(
-                                    old_id,
-                                    crate::render_surface::SurfaceEvent::MouseLeave,
-                                );
-                            }
-                            if let Some((sid, _, lx, ly)) = &new_surface {
-                                crate::render_surface::dispatch_surface_event(
-                                    *sid,
-                                    crate::render_surface::SurfaceEvent::MouseEnter {
-                                        x: *lx,
-                                        y: *ly,
-                                    },
-                                );
-                            }
-                            self.hovered_surface = new_surface_entry;
-                        }
-                        // During drag: don't update hovered_surface or send
-                        // enter/leave — the captured surface keeps getting events.
-                    }
-
-                    if let Some((surface_id, _, local_x, local_y)) = new_surface {
-                        // Mouse is over a surface — dispatch with hit-tested coords
-                        crate::render_surface::dispatch_surface_event(
-                            surface_id,
-                            crate::render_surface::SurfaceEvent::MouseMove {
-                                x: local_x,
-                                y: local_y,
-                            },
-                        );
-                    } else if drag_active && drag_forward_surface {
-                        // Mouse is OFF any surface during a drag with forwarding.
-                        // Pointer capture: dispatch to the captured surface with
-                        // coordinates relative to its bounds (may be negative or
-                        // beyond width/height).
-                        if let Some((captured_sid, captured_nid)) = self.hovered_surface {
+                    // A press on a surface holds its pointer until the release
+                    // (`SurfaceEvent`'s capture note): the move is that surface's,
+                    // in its coordinates, wherever it is, and no surface hears
+                    // an enter or a leave meanwhile.
+                    let pointer = crate::render_surface::current_pointer(false);
+                    let captured = self
+                        .surface_captures
+                        .iter()
+                        .find(|c| c.pointer == pointer.id)
+                        .map(|c| (c.surface, c.node));
+                    if let Some((sid, nid)) = captured {
+                        let (local_x, local_y) = {
                             let d = doc.borrow();
-                            let (local_x, local_y) =
-                                Self::surface_local_coords(&d.tree, captured_nid, x, y);
-                            drop(d);
-                            crate::render_surface::dispatch_surface_event(
-                                captured_sid,
-                                crate::render_surface::SurfaceEvent::MouseMove {
-                                    x: local_x,
-                                    y: local_y,
-                                },
+                            Self::surface_local_coords(&d.tree, nid, x, y)
+                        };
+                        crate::render_surface::dispatch_surface_pointer(
+                            sid,
+                            crate::render_surface::PointerPhase::Move,
+                            local_x,
+                            local_y,
+                            crate::render_surface::current_pointer(true),
+                        );
+                    } else {
+                        // Dispatch MouseMove + MouseEnter/MouseLeave to render surfaces.
+                        // During an active drag with forward_surface_events, dispatch MouseMove
+                        // to the captured surface even when the mouse is outside its bounds
+                        // (pointer capture semantics).
+                        let new_surface = if let Some(hit_id) = hovered {
+                            let d = doc.borrow();
+                            Self::find_render_surface_at_full(&d.tree, hit_id, x, y)
+                        } else {
+                            None
+                        };
+
+                        let new_surface_entry =
+                            new_surface.as_ref().map(|(id, nid, _, _)| (*id, *nid));
+
+                        if new_surface_entry != self.hovered_surface {
+                            if !drag_active {
+                                // Normal (non-drag) path: dispatch enter/leave
+                                if let Some((old_id, _)) = self.hovered_surface {
+                                    crate::render_surface::dispatch_surface_event(
+                                        old_id,
+                                        crate::render_surface::SurfaceEvent::MouseLeave,
+                                    );
+                                }
+                                if let Some((sid, _, lx, ly)) = &new_surface {
+                                    crate::render_surface::dispatch_surface_event(
+                                        *sid,
+                                        crate::render_surface::SurfaceEvent::MouseEnter {
+                                            x: *lx,
+                                            y: *ly,
+                                        },
+                                    );
+                                }
+                                self.hovered_surface = new_surface_entry;
+                            }
+                            // During drag: don't update hovered_surface or send
+                            // enter/leave — the captured surface keeps getting events.
+                        }
+
+                        if let Some((surface_id, _, local_x, local_y)) = new_surface {
+                            // Mouse is over a surface — dispatch with hit-tested coords
+                            crate::render_surface::dispatch_surface_pointer(
+                                surface_id,
+                                crate::render_surface::PointerPhase::Move,
+                                local_x,
+                                local_y,
+                                crate::render_surface::current_pointer(false),
                             );
+                        } else if drag_active && drag_forward_surface {
+                            // Mouse is OFF any surface during a drag with forwarding.
+                            // Pointer capture: dispatch to the captured surface with
+                            // coordinates relative to its bounds (may be negative or
+                            // beyond width/height).
+                            if let Some((captured_sid, captured_nid)) = self.hovered_surface {
+                                let d = doc.borrow();
+                                let (local_x, local_y) =
+                                    Self::surface_local_coords(&d.tree, captured_nid, x, y);
+                                drop(d);
+                                crate::render_surface::dispatch_surface_pointer(
+                                    captured_sid,
+                                    crate::render_surface::PointerPhase::Move,
+                                    local_x,
+                                    local_y,
+                                    crate::render_surface::current_pointer(false),
+                                );
+                            }
                         }
                     }
+
+                    // Link and image hover for editors that asked for them: the
+                    // move's one hit test, and nothing at all while no editor
+                    // has a hover callback. Last, because the callbacks are app
+                    // code that may change the document the hit above was taken
+                    // in — so the image under the pointer is read before any
+                    // link hover callback runs, not after.
+                    #[cfg(feature = "windowing")]
+                    {
+                        let image_hover = crate::editor::image_hover_wanted()
+                            .then(|| hovered.and_then(|hit| self.editor_image_at_hit(hit)));
+                        if crate::editor::link_hover_wanted() {
+                            self.update_editor_link_hover(hovered, x, y);
+                        }
+                        if let Some(image_hover) = image_hover {
+                            crate::editor::set_image_hover(self.input_doc(), image_hover);
+                        }
+                    }
+                }
+                // The `title` tooltip (#1646): (re)start the rest timer, or
+                // take down one that no longer describes what the pointer is
+                // over. Shown or hidden at `AboutToWait`.
+                if let Some(hovered) = tooltip_hit {
+                    self.note_title_tooltip_move(hovered, x, y, rinch_core::timer::now());
                 }
             }
             PlatformEvent::MouseDown {
@@ -563,6 +1006,9 @@ impl RinchApp {
                 y,
                 button: MouseButton::Left,
             } => {
+                // A missed release was already healed at the top of
+                // `handle_event`, ahead of the text menu (issue #381).
+
                 // Additive: fire data-onmousedown before the resize/drag/scroll/
                 // click logic below (which can early-return).
                 self.dispatch_mouse_attr(
@@ -589,8 +1035,10 @@ impl RinchApp {
                     }
                 }
 
-                // Multi-click detection
-                let now = Instant::now();
+                // Multi-click detection, on rinch's clock (#2842): the
+                // virtual one under the test harness, so a second click
+                // `advance_time` puts 501 ms on is a single click.
+                let now = rinch_core::timer::now();
                 let elapsed = now.duration_since(self.last_click_time);
                 let (last_x, last_y) = self.last_click_pos;
                 let distance = ((x - last_x).powi(2) + (y - last_y).powi(2)).sqrt();
@@ -612,112 +1060,52 @@ impl RinchApp {
                 // (and arms a drag-select). This MUST run in the Left-specific arm —
                 // the general MouseDown arm below never sees left buttons (the cause
                 // of the original "click does nothing" bug).
-                #[cfg(feature = "desktop")]
-                if self.try_new_editor_click(
-                    x,
-                    y,
-                    scale_factor,
-                    window_size,
-                    self.click_count,
-                    self.modifiers.shift,
-                ) {
+                //
+                // Not when the press is on a scrollbar: a scroller holding an
+                // editor paints its bar over the editor's edge, and a press on
+                // the thumb or the track is the scroller's (as in Chrome), not a
+                // click in the text. The scrollbar check below takes it. The
+                // same holds for a draggable under the bar (below).
+                //
+                // Searched once per press: the scrollbar branch below takes
+                // this answer. Nothing between here and there lays out, so
+                // the bar and its track are where they were.
+                let scrollbar_hit = self
+                    .doc
+                    .as_ref()
+                    .and_then(|doc| find_scrollbar_hit(&doc.borrow().tree, x, y));
+                let on_scrollbar = scrollbar_hit.is_some();
+                #[cfg(feature = "windowing")]
+                if !on_scrollbar
+                    && self.try_new_editor_click(
+                        x,
+                        y,
+                        scale_factor,
+                        window_size,
+                        self.click_count,
+                        self.modifier_state(),
+                    )
+                {
                     actions.push(AppAction::RequestRedraw);
                     return actions;
                 }
 
-                // Update :active and :focus pseudo-class state.
-                // Don't request redraw here — AboutToWait will pick up the
-                // dirty styles and batch them into a single repaint.
-                if let Some(doc) = self.doc.clone() {
-                    // The hit and the focus target it resolves to, in one
-                    // borrow: the walk starts where the hit test lands, so
-                    // re-borrowing between them buys nothing. The policy is
-                    // `resolve_click_focus`, which `handle_click`'s release
-                    // check also asks — one press, one answer (issue #316).
-                    let (hit, press_focus, focus_dom_target) = {
-                        let d = doc.borrow();
-                        let hit = hit_test(&d.tree, x, y);
-                        let press_focus = Self::resolve_click_focus(&d.tree, hit);
-                        // Where the DOM `:focus` state goes. The outer
-                        // `Option` is *whether to touch it at all*: a
-                        // `data-nofocus` press moves no focus, so it must not
-                        // clear the ring either (issue #312). The inner one is
-                        // where it lands — and a **disabled** control is never
-                        // it (issue #315): it takes no keyboard claim, so a
-                        // focus ring on it would be the style lying about who
-                        // owns the keyboard. `PressFocus::Node` is already
-                        // disabled-filtered by `resolve_click_focus`.
-                        let dom_target = match press_focus {
-                            PressFocus::Preserve => None,
-                            PressFocus::Node(nid) => Some(Some(nid)),
-                            PressFocus::Release => Some(
-                                hit.filter(|&nid| !Self::node_is_disabled_in_tree(&d.tree, nid)),
-                            ),
-                        };
-                        (hit, press_focus, dom_target)
-                    };
-                    // The arbiter-held generic node (issue #228). A press that
-                    // resolves anywhere other than it moves or releases the
-                    // claim right here, so paths that return before
-                    // `handle_click` (pending drag, scrollbar, no hit) can't
-                    // strand an invisible, still-Enter-activatable claim.
-                    let node_claim = match self.focus_target {
-                        FocusTarget::Node(fid) => Some(fid),
-                        _ => None,
-                    };
-                    // Any mousedown drops the keyboard focus ring wherever it
-                    // is (it only ever lives on the focused node): pointer
-                    // interaction never shows :focus-visible, and `update_focus`
-                    // below is a no-op when the hit node already holds
-                    // (Tab-driven) focus.
-                    {
-                        let mut d = doc.borrow_mut();
-                        if let Some(prev) = d.tree.focused_node {
-                            d.set_focus_visible(prev, false);
-                        }
-                        // :active applies while mouse is pressed
-                        d.update_active(hit);
-                        // :focus applies to the clicked element (persists after
-                        // release); anchored on the focusable ancestor for a
-                        // press inside one, nowhere at all for a disabled
-                        // one, and left exactly where it was for a
-                        // `data-nofocus` press.
-                        if let Some(target) = focus_dom_target {
-                            d.update_focus(target);
-                        }
-                    }
-                    // No outstanding doc borrow from here on: the arbiter's
-                    // teardown re-borrows, and the callbacks it defers are user
-                    // code that may mutate the DOM.
-                    match press_focus {
-                        // The press declined to move focus (issue #312): the
-                        // current owner keeps the keyboard — editor, input,
-                        // surface or node alike — and the click still fires from
-                        // `handle_click` below. This is the
-                        // `preventDefault()`-on-mousedown escape hatch, which
-                        // desktop had no equivalent of.
-                        PressFocus::Preserve => {}
-                        // Re-press inside the already-focused node: nothing to
-                        // do, the claim and its state stay put.
-                        PressFocus::Node(nid) if node_claim == Some(nid) => {}
-                        PressFocus::Node(nid) => {
-                            let (_, work) = self.set_focus_target_deferred(FocusTarget::Node(nid));
-                            Self::fire_focus_work(work);
-                            self.notify_node_focus_gained(nid);
-                        }
-                        PressFocus::Release if node_claim.is_some() => {
-                            self.set_focus_target(FocusTarget::None);
-                        }
-                        PressFocus::Release => {}
-                    }
-                }
+                // Update :active and :focus pseudo-class state, and move the
+                // keyboard claim. Don't request redraw here — AboutToWait will
+                // pick up the dirty styles and batch them into a single repaint.
+                self.claim_press_focus(x, y, true);
 
                 // Check for draggable element — enter pending drag instead of
-                // immediate click handling
+                // immediate click handling. An IFC's text is hit as its root,
+                // so the walk starts where the click walk starts, at the text
+                // node under the glyphs (`event_target_at`): an inline
+                // `<span draggable>` or `<a draggable>` in a paragraph is on
+                // the way, as Chrome starts its drag (#2233).
                 let draggable_node = if let Some(doc) = &self.doc {
                     let d = doc.borrow();
-                    if let Some(hit_id) = hit_test(&d.tree, x, y) {
-                        Self::find_draggable(&d.tree, hit_id)
+                    if let Some(hit_id) = self.shared_hit(&d, x, y) {
+                        let from = self.shared_event_target(&d, x, y).unwrap_or(hit_id);
+                        Self::find_draggable(&d.tree, from)
                     } else {
                         None
                     }
@@ -725,7 +1113,10 @@ impl RinchApp {
                     None
                 };
 
-                if let Some(drag_node_id) = draggable_node {
+                // Not when the press is on a scrollbar: a board of draggable
+                // columns paints its bar over them, and a press on the thumb
+                // or the track is the scroller's, as in Chrome.
+                if let Some(drag_node_id) = draggable_node.filter(|_| !on_scrollbar) {
                     self.pending_drag = Some(PendingDrag {
                         node_id: drag_node_id,
                         mousedown_pos: (x, y),
@@ -734,14 +1125,7 @@ impl RinchApp {
                     return actions;
                 }
 
-                // Check scrollbar hit first
-                let scrollbar_hit = if let Some(doc) = &self.doc {
-                    let d = doc.borrow();
-                    find_scrollbar_hit(&d.tree, x, y)
-                } else {
-                    None
-                };
-
+                // The scrollbar hit, searched above.
                 if let Some(hit) = scrollbar_hit {
                     let ScrollbarHit {
                         node_id,
@@ -761,32 +1145,63 @@ impl RinchApp {
                         // (#203). The track itself comes from the paint pass
                         // (#400), so the press and the thumb agree about where
                         // the track's ends are.
+                        //
+                        // A press on the thumb itself grabs it in place (#443):
+                        // only the motion after it scrolls, as in every browser
+                        // and toolkit. Jumping there made the thumb leap so its
+                        // leading edge landed under the pointer before the drag
+                        // began. The thumb is the one paint draws at the
+                        // current offset — the same `thumb_contains` the resize
+                        // zone asks (#399, #420).
                         let local = pointer_in_node(&d.tree, node_id, x, y);
-                        let new_scroll =
-                            track.scroll_for_click(axis.along(local.0, local.1) as f64);
-
-                        let handler_id = d
+                        let along = axis.along(local.0, local.1) as f64;
+                        let current = d
                             .tree
                             .nodes
                             .get(node_id)
-                            .and_then(|n| n.attributes.get("data-onscroll"))
-                            .and_then(|s| s.parse::<usize>().ok());
-                        if let Some(node) = d.tree.nodes.get_mut(node_id) {
-                            match axis {
-                                ScrollAxis::Vertical => node.scroll_offset.1 = new_scroll,
-                                ScrollAxis::Horizontal => node.scroll_offset.0 = new_scroll,
+                            .map(|n| match axis {
+                                ScrollAxis::Vertical => n.scroll_offset.1,
+                                ScrollAxis::Horizontal => n.scroll_offset.0,
+                            })
+                            .unwrap_or(0.0);
+                        let on_thumb = track.thumb_contains(current, along);
+                        let new_scroll = if on_thumb {
+                            current
+                        } else {
+                            // On the grid `mark_scrolled` keeps (#1543), so a
+                            // jump that snaps to where it is moves nothing.
+                            d.tree.snap_scroll_offset(track.scroll_for_click(along))
+                        };
+
+                        // A press that moved nothing dirties nothing and
+                        // fires no `onscroll`: the first scroll is the first
+                        // move's. That is every grab, and a track press whose
+                        // jump clamps to the offset it already has — past the
+                        // thumb at the far end, before it at the start (#444,
+                        // the #1135 review's L3).
+                        if new_scroll != current {
+                            let handler_id = d
+                                .tree
+                                .nodes
+                                .get(node_id)
+                                .and_then(|n| n.attributes.get("data-onscroll"))
+                                .and_then(|s| s.parse::<usize>().ok());
+                            if let Some(node) = d.tree.nodes.get_mut(node_id) {
+                                match axis {
+                                    ScrollAxis::Vertical => node.scroll_offset.1 = new_scroll,
+                                    ScrollAxis::Horizontal => node.scroll_offset.0 = new_scroll,
+                                }
+                                // The thumb lives inside the container's own layout
+                                // rect, which `compute_dirty_region` unions whole —
+                                // so marking the container paint-dirty covers where
+                                // the thumb was as well as where it now is, and the
+                                // software renderer leaves no #173-style trail.
+                                d.tree.mark_scrolled(node_id);
                             }
-                            node.dirty.insert(rinch_dom::DirtyFlags::PAINT);
-                            // The thumb lives inside the container's own layout
-                            // rect, which `compute_dirty_region` unions whole —
-                            // so marking the container paint-dirty covers where
-                            // the thumb was as well as where it now is, and the
-                            // software renderer leaves no #173-style trail.
-                            d.tree.push_dirty(node_id);
-                        }
-                        d.tree.dirty_nodes.insert(node_id);
-                        if let Some(hid) = handler_id {
-                            scroll_handler_to_fire = Some(hid);
+                            d.tree.dirty_nodes.insert(node_id);
+                            if let Some(hid) = handler_id {
+                                scroll_handler_to_fire = Some(hid);
+                            }
                         }
 
                         self.scrollbar_drag = Some(ScrollbarDrag {
@@ -825,27 +1240,79 @@ impl RinchApp {
                 );
 
                 let mut handled = false;
+                // An editor press is resolved on the tree as it was pressed, and
+                // the app's `data-oncontextmenu` claim is looked up on it too —
+                // both BEFORE the caret moves. Moving the caret re-runs the
+                // editor's decorations, which can re-render the very run the
+                // press landed on (a spellchecker that withdraws its squiggle
+                // once the caret is inside the word), and nothing lays the
+                // document out again before the next read: a claim walk would
+                // start from a detached node, and a second caret resolution
+                // would map `(x, y)` against a text node with no layout and
+                // land at the block start (review of #836). The web backend
+                // orders it the same way (`rinch-web`'s `editor_input`).
+                #[cfg(feature = "windowing")]
+                let editor_press = if button == MouseButton::Right {
+                    self.resolve_editor_context_press(x, y)
+                } else {
+                    None
+                };
+                // Focus, for every button (issue #452): a browser's mousedown
+                // focuses the nearest focusable ancestor of what it lands on
+                // whatever the button, and before `contextmenu` fires — so the
+                // claim runs ahead of both the app's `data-oncontextmenu` and
+                // the built-in text menu. Two presses are someone else's to
+                // place, and the claim stays out of both:
+                // - a press on an editor, whatever the button, as the left arm
+                //   hands it to `try_new_editor_click` before its own claim
+                //   runs. Asked of the hit rather than of `editor_press`, which
+                //   is resolved for a right press only: a middle press in a
+                //   focused editor inside a `tabindex` wrapper handed the
+                //   keyboard to the wrapper (review of #1140). Chrome keeps it
+                //   on the contenteditable;
+                // - a press while a `<select>` popup is open, which is modal
+                //   (`handle_click_with_button`'s phase -1): the claim would
+                //   move `:focus` into the popup while the arbiter stays on
+                //   the select.
+                #[cfg(feature = "windowing")]
+                let editor_owns_press = editor_press.is_some()
+                    || matches!(
+                        self.text_target_at(x, y),
+                        Some(super::text_context_menu::TextTarget::Editor(_))
+                    );
+                #[cfg(not(feature = "windowing"))]
+                let editor_owns_press = false;
+                if !editor_owns_press && !self.is_select_open() {
+                    self.claim_press_focus(x, y, false);
+                }
                 if button == MouseButton::Right {
-                    // The editor's caret rule runs *before* the app handler, so a
-                    // `data-oncontextmenu` that draws its own menu reads the word
-                    // under the pointer rather than wherever the caret happened to
-                    // be. The web backend already orders it this way; see
-                    // `App::apply_editor_context_caret`.
-                    #[cfg(feature = "desktop")]
-                    self.apply_editor_context_caret(x, y);
-                    // Right-click: try oncontextmenu dispatch first
                     let mods = self.modifier_state();
-                    if let Some(doc) = &self.doc {
+                    let claim = self.doc.as_ref().and_then(|doc| {
                         let hit_id = {
                             let d = doc.borrow();
-                            hit_test(&d.tree, x, y)
-                        };
-                        if let Some(hit_id) = hit_id {
-                            if Self::dispatch_oncontextmenu(doc, hit_id, x, y, vp_w, vp_h, mods) {
-                                actions.push(AppAction::RequestRedraw);
-                                handled = true;
-                            }
+                            self.shared_target(&d, x, y)
+                        }?;
+                        Self::oncontextmenu_handler_at(doc, hit_id)
+                    });
+                    if let Some(claim) = claim {
+                        // The app claimed the press over an editor: place the
+                        // caret (and take the keyboard, as the web's mousedown
+                        // does) before its handler runs, so a handler drawing its
+                        // own menu — a spellchecker's suggestions — reads the
+                        // word under the pointer off `EditorHandle::selection`.
+                        #[cfg(feature = "windowing")]
+                        if let Some(press) = &editor_press
+                            && crate::editor::editor_for_doc(self.doc_key(), press.container)
+                                .is_some()
+                        {
+                            self.set_focus_target(FocusTarget::Editor(press.container));
+                            self.editor_goal_x = None;
+                            self.apply_editor_context_press(press);
+                            self.refresh_editor_overlays();
                         }
+                        Self::fire_oncontextmenu(claim, x, y, vp_w, vp_h, mods);
+                        actions.push(AppAction::RequestRedraw);
+                        handled = true;
                     }
                 }
                 // Nothing handled a right press: on a text target it is the
@@ -854,7 +1321,15 @@ impl RinchApp {
                 // so. A `data-oncontextmenu` above the field keeps winning.
                 if !handled
                     && button == MouseButton::Right
-                    && self.text_context_menu_gesture(x, y, vp_w, vp_h, &mut actions)
+                    && self.text_context_menu_gesture(
+                        x,
+                        y,
+                        vp_w,
+                        vp_h,
+                        &mut actions,
+                        #[cfg(feature = "windowing")]
+                        editor_press,
+                    )
                 {
                     handled = true;
                 }
@@ -876,12 +1351,29 @@ impl RinchApp {
                     vp_h,
                 );
 
+                // A gesture ends on the release of the button that started it
+                // (issue #1087). Every gesture ended below except the
+                // pointer-capture `Drag` — the element drag, the scrollbar
+                // thumb, the text-selection and editor drag-selects, `:active`
+                // — is armed only by a left press, so a right or middle release
+                // while the left button is still held is a chord, not their
+                // end: it used to drop a live element drag wherever the pointer
+                // was. `Drag` records the button that armed it and checks it
+                // itself (`finish_drag_for_button`). The release still reaches
+                // `data-onmouseup` above and a focused render surface below,
+                // which are told which button it was.
+                let primary = button == MouseButton::Left;
+
                 // New editor (M5): end any drag-select.
-                #[cfg(feature = "desktop")]
-                crate::editor::end_drag(self.input_doc());
+                #[cfg(feature = "windowing")]
+                if primary {
+                    crate::editor::end_drag(self.input_doc());
+                }
 
                 // ── Drag-and-drop: complete or cancel ─────────────────────
-                if let Some(pending) = self.pending_drag.take() {
+                if !primary {
+                    // A chord: the element drag, pending or active, stays live.
+                } else if let Some(pending) = self.pending_drag.take() {
                     // Threshold was never crossed — fire normal click instead
                     let (px, py) = pending.mousedown_pos;
                     let click_actions = self.handle_click(px, py, scale_factor, vp_w, vp_h);
@@ -911,36 +1403,79 @@ impl RinchApp {
                             Self::dispatch_drag_attr(doc, target_id, "data-ondragleave");
                         }
                     }
-                    // Fire ondragend on source
-                    if let Some(doc) = &self.doc {
-                        let (cx, cy) = drag.cursor;
-                        events::set_click_context(events::ClickContext {
-                            mouse_x: cx,
-                            mouse_y: cy,
-                            element_x: 0.0,
-                            element_y: 0.0,
-                            element_width: 0.0,
-                            element_height: 0.0,
-                            text_hit: Default::default(),
-                            viewport_width: vp_w,
-                            viewport_height: vp_h,
-                            button: events::MouseButton::Left,
-                            modifiers: self.modifier_state(),
-                        });
-                        Self::dispatch_drag_attr(doc, drag.node_id, "data-ondragend");
-                    }
-                    // Reset ghost visibility for next drag
-                    events::reset_drag_ghost_visibility();
-                    self.scene_dirty = true;
+                    self.end_active_dnd(&drag, vp_w, vp_h);
                     actions.push(AppAction::RequestRedraw);
                 }
 
-                // Dispatch MouseUp to focused render surface
-                if let Some(surface_id) = crate::render_surface::focused_surface_id() {
+                // The release of a press that started on a surface is that
+                // surface's, wherever it happens. The release of the button
+                // that started it frees the pointer, which then leaves the
+                // surface if it is no longer over it; a release of another
+                // button meanwhile is a chord (#1087): the surface hears it,
+                // and keeps the pointer.
+                let pointer = crate::render_surface::current_pointer(false);
+                let captured = self
+                    .surface_captures
+                    .iter()
+                    .position(|c| c.pointer == pointer.id)
+                    .map(|i| {
+                        let capture = self.surface_captures[i];
+                        if capture.button == button {
+                            self.surface_captures.remove(i);
+                        }
+                        capture
+                    });
+                if let Some(capture) = captured {
+                    let (surface_id, surface_node) = (capture.surface, capture.node);
+                    let ended = capture.button == button;
+                    if let Some(doc) = self.doc.clone() {
+                        let (local_x, local_y, now_over) = {
+                            let d = doc.borrow();
+                            let (lx, ly) = Self::surface_local_coords(&d.tree, surface_node, x, y);
+                            let over = self.shared_hit(&d, x, y).and_then(|hit| {
+                                Self::find_render_surface_at_full(&d.tree, hit, x, y)
+                            });
+                            (lx, ly, over)
+                        };
+                        crate::render_surface::dispatch_surface_pointer(
+                            surface_id,
+                            crate::render_surface::PointerPhase::Up(
+                                crate::render_surface::SurfaceMouseButton::from_platform(button),
+                            ),
+                            local_x,
+                            local_y,
+                            pointer,
+                        );
+                        let now_over = now_over.map(|(sid, nid, lx, ly)| ((sid, nid), lx, ly));
+                        if ended
+                            && self.surface_captures.is_empty()
+                            && self.hovered_surface != now_over.map(|(entry, _, _)| entry)
+                        {
+                            if let Some((old_id, _)) = self.hovered_surface {
+                                crate::render_surface::dispatch_surface_event(
+                                    old_id,
+                                    crate::render_surface::SurfaceEvent::MouseLeave,
+                                );
+                            }
+                            if let Some(((sid, _), lx, ly)) = now_over {
+                                crate::render_surface::dispatch_surface_event(
+                                    sid,
+                                    crate::render_surface::SurfaceEvent::MouseEnter {
+                                        x: lx,
+                                        y: ly,
+                                    },
+                                );
+                            }
+                            self.hovered_surface = now_over.map(|(entry, _, _)| entry);
+                        }
+                    }
+                } else if let Some(surface_id) = crate::render_surface::focused_surface_id() {
+                    // A release with no press on a surface behind it goes to
+                    // the focused surface, as it always has.
                     if let Some(doc) = &self.doc {
                         let surface_hit = {
                             let d = doc.borrow();
-                            if let Some(hit_id) = hit_test(&d.tree, x, y) {
+                            if let Some(hit_id) = self.shared_hit(&d, x, y) {
                                 Self::find_render_surface_at(&d.tree, hit_id, x, y)
                             } else {
                                 None
@@ -963,14 +1498,17 @@ impl RinchApp {
                     }
                 }
 
-                rinch_core::finish_drag(x, y);
-                self.scrollbar_drag = None;
-                self.text_selecting = false;
+                rinch_core::finish_drag_for_button(x, y, Self::core_button(button));
+                if primary {
+                    self.scrollbar_drag = None;
+                    self.text_selecting = false;
+                    self.release_held_link_click();
 
-                // Clear :active pseudo-class state on mouse release.
-                // Don't request redraw — AboutToWait batches dirty state.
-                if let Some(doc) = &self.doc {
-                    doc.borrow_mut().update_active(None);
+                    // Clear :active pseudo-class state on mouse release.
+                    // Don't request redraw — AboutToWait batches dirty state.
+                    if let Some(doc) = &self.doc {
+                        doc.borrow_mut().update_active(None);
+                    }
                 }
             }
             PlatformEvent::MouseWheel {
@@ -980,27 +1518,56 @@ impl RinchApp {
                 delta_y,
             } => {
                 self.cursor_pos = Some((x, y));
+                // A line wheel's default scroll glides (#2287) unless the app
+                // turned that off. Taken, so nothing this wheel dispatches
+                // reads it as its own.
+                let glide =
+                    std::mem::take(&mut self.smooth_wheel.line_wheel) && self.smooth_wheel.enabled;
+
+                // One hit test serves both questions below — is the wheel
+                // over a render surface, and which container does it scroll —
+                // since nothing between them touches the document (#911).
+                let hit = self
+                    .doc
+                    .as_ref()
+                    .and_then(|doc| self.shared_hit(&doc.borrow(), x, y));
 
                 // Check if scrolling over a render surface — dispatch and skip normal scroll
                 let surface_consumed = if let Some(doc) = &self.doc {
                     let surface_hit = {
                         let d = doc.borrow();
-                        if let Some(hit_id) = hit_test(&d.tree, x, y) {
+                        if let Some(hit_id) = hit {
                             Self::find_render_surface_at(&d.tree, hit_id, x, y)
                         } else {
                             None
                         }
                     };
                     if let Some((surface_id, local_x, local_y)) = surface_hit {
-                        crate::render_surface::dispatch_surface_event(
-                            surface_id,
-                            crate::render_surface::SurfaceEvent::MouseWheel {
-                                x: local_x,
-                                y: local_y,
-                                delta_x: delta_x as f32,
-                                delta_y: delta_y as f32,
-                            },
-                        );
+                        // Ctrl+wheel zooms a surface with pointer events (a
+                        // `Pinch`, as the browser backend reports it); every
+                        // other wheel is a wheel.
+                        let zoomed = self.modifiers.ctrl
+                            && crate::render_surface::dispatch_surface_zoom(
+                                surface_id,
+                                local_x,
+                                local_y,
+                                // Desktop's `delta_y` is winit's sign, the
+                                // opposite of the DOM's `deltaY` (a positive
+                                // one scrolls content up: the wheel turned
+                                // away from the user, which zooms in).
+                                crate::render_surface::wheel_zoom_scale(-(delta_y as f32)),
+                            );
+                        if !zoomed {
+                            crate::render_surface::dispatch_surface_event(
+                                surface_id,
+                                crate::render_surface::SurfaceEvent::MouseWheel {
+                                    x: local_x,
+                                    y: local_y,
+                                    delta_x: delta_x as f32,
+                                    delta_y: delta_y as f32,
+                                },
+                            );
+                        }
                         true
                     } else {
                         false
@@ -1009,108 +1576,129 @@ impl RinchApp {
                     false
                 };
 
-                if !surface_consumed && let Some(doc) = &self.doc {
-                    let hit_node = hit_test(&doc.borrow().tree, x, y);
-                    if let Some(hit_node) = hit_node {
+                // The element's own `onwheel`, then its ancestors', nearest
+                // first; one that consumes the wheel scrolls nothing. The
+                // handlers get the DOM's sign, the opposite of winit's.
+                // From the element under the pointer, an inline one in a
+                // paragraph's text included (#2648).
+                let wheel_consumed = !surface_consumed
+                    && self.move_target(x, y).is_some_and(|hit| {
+                        let event = events::WheelEvent::new(-delta_x as f32, -delta_y as f32, x, y)
+                            .with_modifiers(self.modifier_state());
+                        self.offer_element_wheel(hit, &event)
+                    });
+                if wheel_consumed {
+                    actions.push(AppAction::RequestRedraw);
+                }
+
+                // Shift turns a plain vertical wheel sideways where the
+                // platform does (`WheelEvent::scroll_deltas`: Linux and
+                // Windows, as Chrome and Firefox scroll there; not macOS,
+                // which sends a Shift mouse wheel sideways itself and keeps a
+                // trackpad with Shift held vertical). Only the default scroll:
+                // the `onwheel` payload above keeps the deltas as they came.
+                let (delta_x, delta_y) = if self.modifiers.shift
+                    && delta_x == 0.0
+                    && events::shift_wheel_turns_sideways()
+                {
+                    (delta_y, 0.0)
+                } else {
+                    (delta_x, delta_y)
+                };
+
+                if !surface_consumed
+                    && !wheel_consumed
+                    && let Some(doc) = &self.doc
+                {
+                    if let Some(hit_node) = hit {
                         let mut doc_mut = doc.borrow_mut();
-                        // (container, handler) per container that actually moved.
-                        // A list because the two axes can resolve to different
-                        // containers — a horizontally scrolling strip inside a
-                        // vertically scrolling page — and each is owed its own
-                        // event. Keyed by container so a diagonal that moves one
-                        // container on both axes still fires once: `onscroll` is
-                        // "this element scrolled", not "this element scrolled
-                        // vertically". The payload is read back off the node once
-                        // both axes have been applied, so a diagonal's single
-                        // event carries both new offsets.
-                        let mut scrolled: Vec<(usize, usize)> = Vec::new();
+                        // One container takes the whole wheel
+                        // (`wheel_scroll_target`): the nearest from the hit up
+                        // that can still move toward it, so a list at its end
+                        // chains to the scroller around it, and a diagonal
+                        // wheel is not split across two containers (Chrome and
+                        // Firefox send it to one). The walk falls back to the
+                        // container under the point when the hit is in another
+                        // branch (a fixed overlay). `lock_scroll` (#474) is in
+                        // the rule: a container outside an open `Modal`/
+                        // `Drawer` cannot move, on either route — it gates
+                        // here, at the *arm*, rather than restyling the body
+                        // (see `RinchDocument::set_scroll_locked`).
+                        //
+                        // `scrolled` keeps (container, handler) for the
+                        // container if it moved; the payload is read back off
+                        // the node once both axes have been applied, so a
+                        // diagonal's single `onscroll` carries both offsets.
+                        let mut scrolled: Vec<(u64, usize)> = Vec::new();
+                        let target =
+                            wheel_scroll_target(&doc_mut.tree, hit_node, x, y, -delta_x, -delta_y);
+                        let moves_on = |doc: &RinchDocument, axis| {
+                            target.filter(|&id| {
+                                rinch_dom::paint::scrollbar::overflows(&doc.tree, id, axis)
+                            })
+                        };
 
                         // Vertical scrolling
-                        // First try the hit node's ancestor chain. If the hit node is in
-                        // a different DOM branch (e.g., an absolutely-positioned overlay),
-                        // fall back to finding the scroll container geometrically at (x, y).
-                        // `scroll_locked_out` is `lock_scroll` (#474): an open
-                        // `Modal`/`Drawer` refuses a gesture whose container is
-                        // outside it. It gates here, at the *arm*, rather than
-                        // restyling the body — see
-                        // `RinchDocument::set_scroll_locked`. Both resolution
-                        // routes are covered, including the geometric fallback,
-                        // because a fixed overlay is exactly the shape that
-                        // fallback exists for.
                         if delta_y.abs() > 0.0
-                            && let Some(scroll_node_id) =
-                                find_scroll_container(&doc_mut.tree, hit_node)
-                                    .or_else(|| find_scroll_container_at_point(&doc_mut.tree, x, y))
-                            && !doc_mut.tree.scroll_locked_out(scroll_node_id)
+                            && let Some(scroll_node_id) = moves_on(
+                                &doc_mut,
+                                rinch_dom::paint::scrollbar::ScrollbarAxis::Vertical,
+                            )
                         {
-                            let nid = rinch_core::dom::NodeId(scroll_node_id);
-                            let content_height = doc_mut.scroll_height(nid);
-                            let visible_height = doc_mut.client_height(nid);
-                            let max_scroll = (content_height - visible_height).max(0.0);
-
-                            // Read handler ID before mutable borrow
-                            let handler_id = doc_mut
-                                .tree
-                                .nodes
-                                .get(scroll_node_id)
-                                .and_then(|n| n.attributes.get("data-onscroll"))
-                                .and_then(|s| s.parse::<usize>().ok());
-                            let old_y = doc_mut.scroll_top(nid);
-                            let new_y = (old_y - delta_y).clamp(0.0, max_scroll);
-                            if new_y != old_y {
-                                if let Some(node) = doc_mut.tree.nodes.get_mut(scroll_node_id) {
-                                    node.scroll_offset.1 = new_y;
-                                    node.dirty.insert(rinch_dom::DirtyFlags::PAINT);
-                                    doc_mut.tree.push_dirty(scroll_node_id);
+                            if glide {
+                                // A glide moves nothing yet: its frames do,
+                                // from the `AboutToWait` clock
+                                // (`tick_wheel_scroll`), each a scroll write
+                                // and an `onscroll` of its own.
+                                self.smooth_wheel.animate(
+                                    &doc_mut,
+                                    scroll_node_id,
+                                    smooth_wheel::WheelAxis::Vertical,
+                                    -delta_y,
+                                );
+                            } else {
+                                let (moved, handler_id) = Self::scroll_vertically_by(
+                                    &mut doc_mut,
+                                    scroll_node_id,
+                                    -delta_y,
+                                );
+                                if moved {
                                     self.scene_dirty = true;
-                                }
-                                doc_mut.tree.dirty_nodes.insert(scroll_node_id);
-                                if let Some(hid) = handler_id {
-                                    scrolled.push((scroll_node_id, hid));
+                                    if let Some(hid) = handler_id {
+                                        scrolled.push((scroll_node_id, hid));
+                                    }
                                 }
                             }
                         }
 
                         // Horizontal scrolling
                         if delta_x.abs() > 0.0
-                            && let Some(scroll_node_id) = find_horizontal_scroll_container(
-                                &doc_mut.tree,
-                                hit_node,
+                            && let Some(scroll_node_id) = moves_on(
+                                &doc_mut,
+                                rinch_dom::paint::scrollbar::ScrollbarAxis::Horizontal,
                             )
-                            .or_else(|| {
-                                find_horizontal_scroll_container_at_point(&doc_mut.tree, x, y)
-                            })
-                            && !doc_mut.tree.scroll_locked_out(scroll_node_id)
                         {
-                            let nid = rinch_core::dom::NodeId(scroll_node_id);
-                            let content_width = doc_mut.scroll_width(nid);
-                            let visible_width = doc_mut.client_width(nid);
-                            let max_scroll = (content_width - visible_width).max(0.0);
-
-                            // Read before the mutable node borrow, as the
-                            // vertical half does.
-                            let handler_id = doc_mut
-                                .tree
-                                .nodes
-                                .get(scroll_node_id)
-                                .and_then(|n| n.attributes.get("data-onscroll"))
-                                .and_then(|s| s.parse::<usize>().ok());
-                            let mut moved = false;
-                            if let Some(node) = doc_mut.tree.nodes.get_mut(scroll_node_id) {
-                                let new_x = (node.scroll_offset.0 - delta_x).clamp(0.0, max_scroll);
-                                if new_x != node.scroll_offset.0 {
-                                    node.scroll_offset.0 = new_x;
-                                    node.dirty.insert(rinch_dom::DirtyFlags::PAINT);
-                                    doc_mut.tree.push_dirty(scroll_node_id);
+                            if glide {
+                                self.smooth_wheel.animate(
+                                    &doc_mut,
+                                    scroll_node_id,
+                                    smooth_wheel::WheelAxis::Horizontal,
+                                    -delta_x,
+                                );
+                            } else {
+                                let (moved, handler_id) = Self::scroll_horizontally_by(
+                                    &mut doc_mut,
+                                    scroll_node_id,
+                                    -delta_x,
+                                );
+                                if moved {
                                     self.scene_dirty = true;
-                                    moved = true;
+                                    if let Some(hid) = handler_id
+                                        && !scrolled.iter().any(|(n, _)| *n == scroll_node_id)
+                                    {
+                                        scrolled.push((scroll_node_id, hid));
+                                    }
                                 }
-                            }
-                            if moved
-                                && let Some(hid) = handler_id
-                                && !scrolled.iter().any(|(n, _)| *n == scroll_node_id)
-                            {
-                                scrolled.push((scroll_node_id, hid));
                             }
                         }
 
@@ -1137,16 +1725,55 @@ impl RinchApp {
                     actions.push(AppAction::RequestRedraw);
                 }
             }
+            PlatformEvent::MouseLeft => {
+                // A press holding the pointer keeps its hover until it ends
+                // (`handle_event`); the leave is applied then.
+                if self.pointer_captured() {
+                    self.left_while_captured = true;
+                } else if self.pointer_left_window() {
+                    actions.push(AppAction::RequestRedraw);
+                }
+            }
             PlatformEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods;
+                // A real modifier change supersedes what a modified debug
+                // `mouse_down` remembered, so a `mouse_up` that never came
+                // (the MCP client went away) cannot replay it later. Debug
+                // commands' own synthesized changes keep it
+                // (`debug_modifiers_changed`).
+                #[cfg(feature = "debug")]
+                {
+                    self.debug_modifiers_to_restore = None;
+                }
             }
             PlatformEvent::WindowFocus(focused) => {
+                // Modifiers a debug `mouse_down` is holding are released with
+                // the keyboard, as a physical key would be: a window that lost
+                // focus holds no key down, and the matching debug `mouse_up`
+                // may never come.
+                #[cfg(feature = "debug")]
+                if !focused {
+                    if let Some(m) = self.debug_modifiers_to_restore.take() {
+                        self.modifiers = m;
+                    }
+                }
                 // Notify-and-retain (issue #147, decision 1): the in-document
                 // claim survives an alt-tab — releasing it would fire
                 // `data-onchange` on every window switch, a straight #226
                 // regression — but a registered target is told, and told again
                 // when the window comes back, so it can hide its caret and idle
                 // its blink timer. `ime_state()` reports disabled meanwhile.
+                // A window that lost focus may not be sent the release of a
+                // drag in progress (issues #381, #1028: every gesture
+                // `heal_missed_release` ends) — on Windows it goes to the
+                // window that took focus. On X11/Wayland the implicit pointer
+                // grab still delivers it, and a blur can be a transient
+                // keyboard grab (a global hotkey, Alt+Tab) mid-drag: that
+                // healthy drag is cancelled too. Accepted — a cancel, never a
+                // wrong commit.
+                if !focused && self.heal_missed_release(vp_w, vp_h, None) {
+                    actions.push(AppAction::RequestRedraw);
+                }
                 if self.window_focused != focused {
                     self.window_focused = focused;
                     if !focused {
@@ -1154,6 +1781,16 @@ impl RinchApp {
                         // keyboard; so does the built-in text menu (#813). The
                         // field's claim itself is kept, as below.
                         self.close_text_context_menu();
+                        // So does a native `<select>`'s popup, in a browser as
+                        // on every desktop toolkit; the control keeps the
+                        // keyboard, as a closed one would (#1171). And a popup
+                        // built on a key entry (the `Select` component's list):
+                        // the claim is kept, so `notify_focus_moved` would see
+                        // focus still inside it and close nothing.
+                        if self.is_select_open() {
+                            self.close_select_popup_returning_focus();
+                        }
+                        rinch_core::notify_window_blurred(self.doc_key());
                         // The matching `KeyUp` of anything held across the blur
                         // goes to the window that took the keyboard, so the
                         // Enter/Space activation latch (issue #228) would stay
@@ -1178,6 +1815,17 @@ impl RinchApp {
                     self.scene_dirty = true;
                     actions.push(AppAction::RequestRedraw);
                 }
+                // The element's own `blur` / `focus` (#2731), before the
+                // window's state is published, so a reader of
+                // `window_focused()` sees them done.
+                self.fire_focus_events();
+                // Last, so a reader of `window_focused` (#1770) runs after the
+                // app's own blur handling above: keys released, menus closed,
+                // the drag healed, key entries told.
+                self.publish_window_state(crate::window::WindowFacts {
+                    focused: Some(focused),
+                    ..Default::default()
+                });
             }
             PlatformEvent::KeyDown {
                 key,
@@ -1188,14 +1836,11 @@ impl RinchApp {
             } => {
                 // ── Drag-and-drop: Escape cancels active drag ─────────────
                 if key == KeyCode::Escape {
-                    if let Some(drag) = self.active_dnd.take() {
-                        if let Some(doc) = &self.doc {
-                            if let Some(target_id) = drag.over_target {
-                                Self::dispatch_drag_attr(doc, target_id, "data-ondragleave");
-                            }
-                            Self::dispatch_drag_attr(doc, drag.node_id, "data-ondragend");
-                        }
-                        self.scene_dirty = true;
+                    // The same teardown a `PointerCancel` runs (issue #333):
+                    // it used to spell its own, and spelled less — the ghost
+                    // a drag had suppressed stayed suppressed into the next
+                    // drag, and a surface under the drag never heard it leave.
+                    if self.cancel_active_dnd(vp_w, vp_h) {
                         actions.push(AppAction::RequestRedraw);
                         return actions;
                     }
@@ -1213,6 +1858,119 @@ impl RinchApp {
                     hook_key_str(key, text.as_deref(), logical_key.as_deref());
 
                 tracing::trace!(?key, ?text, ?key_str, shift, ctrl, alt, "KeyDown event");
+
+                // The focused editor's `EditorHandle::on_key` sees the key
+                // first — before the document-level interceptor and the
+                // dismiss stack in step 1 — which is the order the browser
+                // gives it (rinch-web's editor listener is a `document`
+                // capture listener; the interceptor and the dismiss stack run
+                // from the bubble-phase delegate). That is what lets an
+                // autocomplete popup in an editor inside a `Modal` take
+                // Escape: the popup closes and the modal stays. A key the
+                // callback leaves goes on through step 1 as always, and is not
+                // offered a second time in the arbiter's editor arm. The built-in
+                // text context menu (step 1.5) owns the keyboard while it is
+                // open, so nothing is offered then. Menu chords won before
+                // this, in the shell, on both backends.
+                #[cfg(feature = "windowing")]
+                let mut editor_key_offered = false;
+                #[cfg(feature = "windowing")]
+                if let FocusTarget::Editor(container) = self.focus_target
+                    && self.open_text_menu.is_none()
+                    && let Some(ks) = key_str.as_deref()
+                    && let Some(handle) = crate::editor::editor_for_doc(self.doc_key(), container)
+                {
+                    editor_key_offered = true;
+                    let offered = crate::editor::EditorKey {
+                        // The browser's spelling, which `on_key` speaks on
+                        // both platforms (the spacebar is `" "`, #1161).
+                        key: ks,
+                        primary: ctrl,
+                        ctrl: modifiers.ctrl,
+                        meta: modifiers.meta,
+                        shift,
+                        alt,
+                        repeat: repeat == KeyRepeat::Repeat,
+                    };
+                    if handle.offer_key(&offered) {
+                        // The callback may have edited or moved the selection.
+                        self.refresh_editor_overlays();
+                        self.resolve_and_repaint(vp_w, vp_h);
+                        actions.push(AppAction::RequestRedraw);
+                        return actions;
+                    }
+                }
+
+                // A key while the keyboard is inside a node view's component (an
+                // input in an app's sheet drawn in an editor) is the view's
+                // `NodeViewSpec::on_key`'s first, ahead of the element that holds
+                // the keyboard; an Escape it leaves gives the keyboard back to the
+                // editor, caret after the node (node views, decision (c)).
+                #[cfg(feature = "windowing")]
+                if let FocusTarget::Input(nid) | FocusTarget::Node(nid) | FocusTarget::Select(nid) =
+                    self.focus_target
+                    && let Some(ks) = key_str.as_deref()
+                    && let Some((container, host)) = self
+                        .doc
+                        .as_ref()
+                        .and_then(|d| Self::node_view_around(&d.borrow().tree, nid))
+                    && let Some(handle) = crate::editor::editor_for_doc(self.doc_key(), container)
+                {
+                    let offered = crate::editor::EditorKey {
+                        key: ks,
+                        primary: ctrl,
+                        ctrl: modifiers.ctrl,
+                        meta: modifiers.meta,
+                        shift,
+                        alt,
+                        repeat: repeat == KeyRepeat::Repeat,
+                    };
+                    if handle.offer_node_view_key(host, &offered) {
+                        // An Escape posted a focus request for the editor: apply
+                        // it now, so the next key reaches the editor.
+                        self.drain_focus_requests(false);
+                        self.refresh_editor_overlays();
+                        self.resolve_and_repaint(vp_w, vp_h);
+                        actions.push(AppAction::RequestRedraw);
+                        return actions;
+                    }
+                }
+
+                // 0.5. The element's own `onkeydown` (issue #1678): the focused
+                //      `<input>`/`<textarea>` or focusable node, then its
+                //      ancestors, nearest first, before the document-level
+                //      interceptor and the dismiss stack — the place an
+                //      editor's `on_key` has, so a `[[` picker in a field
+                //      inside a `Modal` takes Escape and the modal stays. A
+                //      consumed key goes no further: not to the interceptor,
+                //      the dismiss stack, the field's own editing, `onsubmit`,
+                //      activation or Tab. Not while the text context menu owns
+                //      the keyboard, as the editor's `on_key` is not.
+                if self.open_text_menu.is_none()
+                    && let Some(ref ks) = key_str
+                {
+                    let key_data = events::KeyEventData::new(ks.clone(), format!("{:?}", key))
+                        .with_modifiers(ctrl, shift, alt, modifiers.meta);
+                    let claim = self.focus_target;
+                    let consumed = self.offer_element_key(&key_data);
+                    // A handler that moved the focus (`other.focus()`) moved
+                    // it for this key too: the rest of the arm runs against
+                    // the new claim, as Chrome inserts an unconsumed key into
+                    // the element focused during its keydown.
+                    self.drain_focus_requests(false);
+                    // Space activates on its release, on the element that
+                    // got the press: a Space whose handler moved the focus
+                    // to another button clicks nothing (Chrome). Enter, which
+                    // activates on the press, goes to the new focus.
+                    let space_left_its_element = key_data.is_space()
+                        && self.focus_target != claim
+                        && matches!(self.focus_target, FocusTarget::Node(_));
+                    if consumed || space_left_its_element {
+                        self.resolve_and_repaint(vp_w, vp_h);
+                        actions.push(AppAction::RequestRedraw);
+                        return actions;
+                    }
+                }
 
                 // 1. User keyboard hooks (document-level interceptor). A user
                 //    handler that consumes the key wins and stops here, like a
@@ -1254,20 +2012,59 @@ impl RinchApp {
                 // 2. Route by the focus arbiter (design A10): exactly one target
                 //    owns keyboard input, so there is no order-dependent fallthrough.
                 match self.focus_target {
-                    #[cfg(feature = "desktop")]
+                    #[cfg(feature = "windowing")]
                     FocusTarget::Editor(container) => {
                         if let Some(handle) =
                             crate::editor::editor_for_doc(self.doc_key(), container)
                         {
-                            self.dispatch_new_editor_key(
-                                &handle,
-                                key,
-                                logical_key.as_deref(),
-                                text.as_deref(),
-                                shift,
-                                ctrl,
-                                alt,
-                            );
+                            // The app's `EditorHandle::on_key` sees the key before
+                            // the editor moves the caret or runs a binding, and
+                            // may take it (an open autocomplete popup's arrows).
+                            // Normally it was offered above, ahead of step 1; it
+                            // is offered here only if it was not (the text
+                            // context menu was open and let the key through).
+                            let offered = (!editor_key_offered)
+                                .then_some(key_str.as_deref())
+                                .flatten()
+                                .map(|k| crate::editor::EditorKey {
+                                    key: k,
+                                    primary: ctrl,
+                                    ctrl: modifiers.ctrl,
+                                    meta: modifiers.meta,
+                                    shift,
+                                    alt,
+                                    repeat: repeat == KeyRepeat::Repeat,
+                                });
+                            if offered.is_some_and(|k| handle.offer_key(&k)) {
+                                // The app's `on_key` took it.
+                            } else if key == KeyCode::Tab
+                                && !ctrl
+                                && !alt
+                                && !modifiers.meta
+                                && handle.refuses_edits()
+                            {
+                                // #833: a read-only editor is a `readonly` field
+                                // to Tab. Its keymap's `Tab` / `Shift-Tab`
+                                // (sink / lift a list item) are refused, and a
+                                // matched binding is consumed even so, which
+                                // left a keyboard user who came in with no way
+                                // out. Tab and Shift+Tab go to the next and the
+                                // previous Tab stop instead, from the editor's
+                                // place in the document (`handle_tab`).
+                                self.handle_tab(shift);
+                            } else {
+                                self.dispatch_new_editor_key(
+                                    &handle,
+                                    key,
+                                    logical_key.as_deref(),
+                                    text.as_deref(),
+                                    shift,
+                                    ctrl,
+                                    alt,
+                                    modifiers,
+                                    (vp_w, vp_h),
+                                );
+                            }
                             // Position the caret against the current layout (dirtying
                             // its block if it reparented), re-layout, then the
                             // post-layout caret pass finalizes it with fresh geometry.
@@ -1280,22 +2077,25 @@ impl RinchApp {
                             // fall through to the global handlers instead of being
                             // silently swallowed.
                             self.focus_target = FocusTarget::None;
+                            self.sync_keyboard_editor();
                         }
                     }
                     FocusTarget::Surface(surface_id) => {
+                        let surface_key_data = crate::render_surface::SurfaceKeyData {
+                            key: key_str.clone().unwrap_or_default(),
+                            code: format!("{:?}", key),
+                            ctrl,
+                            shift,
+                            alt,
+                            meta: modifiers.meta,
+                        };
                         // Forward KeyDown + text input to the focused surface.
+                        // Always delivered, whatever the key turns out to be
+                        // claimed by below — `set_event_handler` is the input
+                        // path and issue #482's fix below does not touch it.
                         crate::render_surface::dispatch_surface_event(
                             surface_id,
-                            crate::render_surface::SurfaceEvent::KeyDown(
-                                crate::render_surface::SurfaceKeyData {
-                                    key: key_str.clone().unwrap_or_default(),
-                                    code: format!("{:?}", key),
-                                    ctrl,
-                                    shift,
-                                    alt,
-                                    meta: modifiers.meta,
-                                },
-                            ),
+                            crate::render_surface::SurfaceEvent::KeyDown(surface_key_data.clone()),
                         );
                         if let Some(ref t) = text {
                             if !t.is_empty() && t.chars().all(|c| !c.is_control()) {
@@ -1305,7 +2105,47 @@ impl RinchApp {
                                 );
                             }
                         }
-                        actions.push(AppAction::RequestRedraw);
+                        // Issue #482: a focused surface used to swallow every
+                        // key unconditionally, deafening a host's own
+                        // window-level keybindings (undo, delete, …) and
+                        // rinch's own DevTools/inspect/Tab handling the moment
+                        // a user clicked the canvas — whether or not the
+                        // surface did anything with the key. Now it stops
+                        // here only for a key the surface's own
+                        // `set_key_handler` claims (default: none); anything
+                        // else falls through to exactly the global fallback an
+                        // unfocused canvas already gets.
+                        if crate::render_surface::dispatch_surface_key_event(
+                            surface_id,
+                            &surface_key_data,
+                        ) {
+                            // A claimed key is the surface's, release and all
+                            // (issue #1784).
+                            events::withhold_app_key_release(&surface_key_data.code);
+                            actions.push(AppAction::RequestRedraw);
+                        } else if let Some(ref ks) = key_str
+                            && self.offer_app_key(
+                                &events::KeyEventData::new(ks.clone(), format!("{:?}", key))
+                                    .with_modifiers(ctrl, shift, alt, modifiers.meta),
+                            )
+                        {
+                            self.resolve_and_repaint(vp_w, vp_h);
+                            actions.push(AppAction::RequestRedraw);
+                            return actions;
+                        } else if self.handle_unclaimed_key_fallback(
+                            key,
+                            text.as_ref(),
+                            shift,
+                            ctrl,
+                            alt,
+                            modifiers,
+                            repeat,
+                            vp_w,
+                            vp_h,
+                            &mut actions,
+                        ) {
+                            return actions;
+                        }
                     }
                     // A native <select> popup owns the keyboard while open:
                     // navigate / commit / dismiss / type-ahead.
@@ -1323,113 +2163,44 @@ impl RinchApp {
                     // inspect / Tab navigation / read-only text-selection caret
                     // motion.
                     FocusTarget::Input(_) | FocusTarget::None | FocusTarget::Node(_) => {
-                        // Self-heal a stale Node claim before routing, exactly
-                        // like the Editor arm's unmount handling above: node ids
-                        // are recycled slab indices (see
-                        // `live_focused_input_handler`), so a claim whose node
-                        // was unmounted must not swallow Enter/Space, anchor
-                        // Tab, or — worst — activate whatever unrelated node
-                        // reused the slot.
-                        if let FocusTarget::Node(id) = self.focus_target
-                            && !self.node_target_is_live(id)
-                        {
-                            self.set_focus_target(FocusTarget::None);
+                        if self.offer_registered_node_key(
+                            key,
+                            key_str.as_ref(),
+                            ctrl,
+                            shift,
+                            alt,
+                            modifiers.meta,
+                            &mut actions,
+                        ) {
+                            return actions;
                         }
-
-                        // A registered custom widget (issue #147) gets first
-                        // refusal on its own keys, ahead of every global
-                        // handler below — that is what "owns the keyboard"
-                        // means. `true` consumes; `false` falls through to
-                        // DevTools / inspect / Tab / Enter-Space activation
-                        // exactly as before, so registering costs an
-                        // unregistered node nothing.
-                        //
-                        // The `key` string matches the document-level
-                        // interceptor's spelling (`hook_key_str`), which names
-                        // every key rinch has a `KeyCode` for regardless of the
-                        // modifiers held (issue #336). The physical-code
-                        // fallback is left in for the one remaining hole — a
-                        // `KeyCode::Other` carrying no printable text — so a
-                        // widget always sees a non-empty key.
-                        if let FocusTarget::Node(id) = self.focus_target {
-                            let key_data = events::KeyEventData::new(
-                                key_str.clone().unwrap_or_else(|| format!("{:?}", key)),
-                                format!("{:?}", key),
+                        // The app-wide key listeners (issue #1784), ahead of
+                        // the field's editing, Tab, activation and `onsubmit`
+                        // — as a browser's `window` listener runs before its
+                        // default action — and with nothing focused too.
+                        if let Some(ref ks) = key_str
+                            && self.offer_app_key(
+                                &events::KeyEventData::new(ks.clone(), format!("{:?}", key))
+                                    .with_modifiers(ctrl, shift, alt, modifiers.meta),
                             )
-                            .with_modifiers(
-                                ctrl,
-                                shift,
-                                alt,
-                                modifiers.meta,
-                            );
-                            if crate::focus_registry::offer_key(self.doc_key(), id, &key_data) {
-                                actions.push(AppAction::RequestRedraw);
-                                return actions;
-                            }
-                        }
-
-                        #[cfg(feature = "desktop")]
-                        if key == KeyCode::F12 {
-                            actions.push(AppAction::ToggleDevTools);
+                        {
+                            self.resolve_and_repaint(vp_w, vp_h);
+                            actions.push(AppAction::RequestRedraw);
                             return actions;
                         }
-
-                        // Alt+I: toggle inspect mode
-                        if key == KeyCode::KeyI && alt && !ctrl && !shift {
-                            actions.push(AppAction::ToggleInspectMode);
+                        if self.handle_unclaimed_key_fallback(
+                            key,
+                            text.as_ref(),
+                            shift,
+                            ctrl,
+                            alt,
+                            modifiers,
+                            repeat,
+                            vp_w,
+                            vp_h,
+                            &mut actions,
+                        ) {
                             return actions;
-                        }
-
-                        match key {
-                            KeyCode::Tab => self.handle_tab(shift),
-                            KeyCode::Backspace => self.handle_backspace(),
-                            KeyCode::Delete => self.handle_delete(),
-                            KeyCode::ArrowLeft => self.handle_arrow_left(shift, ctrl),
-                            KeyCode::ArrowRight => self.handle_arrow_right(shift, ctrl),
-                            KeyCode::Home => self.handle_home(shift),
-                            KeyCode::End => self.handle_end(shift),
-                            KeyCode::KeyA if ctrl => self.handle_select_all(),
-                            KeyCode::KeyC if ctrl => self.handle_copy(),
-                            KeyCode::KeyV if ctrl => self.handle_paste(),
-                            KeyCode::KeyX if ctrl => self.handle_cut(),
-                            KeyCode::Enter | KeyCode::Space
-                                if !ctrl && matches!(self.focus_target, FocusTarget::Node(_)) =>
-                            {
-                                if let FocusTarget::Node(id) = self.focus_target
-                                    && self.press_is_fresh(key, repeat)
-                                {
-                                    self.node_activation_held = Some(key);
-                                    self.activate_focused_node(id, vp_w, vp_h);
-                                    actions.push(AppAction::RequestRedraw);
-                                }
-                            }
-                            KeyCode::Enter if !ctrl => self.handle_enter(shift),
-                            // Space with no Node target falls through to the `_`
-                            // arm below — the one text-input path (pre-#228), so
-                            // a future change to that gate can't miss Space.
-                            // Alt+Down on a focused `<select>` opens its popup,
-                            // the browser's third way in beside Enter and Space
-                            // (issue #314). Anything else falls through.
-                            KeyCode::ArrowDown
-                                if alt
-                                    && matches!(self.focus_target, FocusTarget::Node(_))
-                                    && self.focused_node_is_select() =>
-                            {
-                                if let FocusTarget::Node(id) = self.focus_target {
-                                    self.open_select_popup(id, vp_w, vp_h);
-                                    actions.push(AppAction::RequestRedraw);
-                                }
-                            }
-                            KeyCode::ArrowUp => self.handle_arrow_up(shift),
-                            KeyCode::ArrowDown => self.handle_arrow_down(shift),
-                            _ => {
-                                if !ctrl
-                                    && let Some(t) = &text
-                                    && !t.is_empty()
-                                {
-                                    self.handle_text_input(t);
-                                }
-                            }
                         }
                     }
                 }
@@ -1473,11 +2244,27 @@ impl RinchApp {
                 //    whatever a handler thinks, or a consumed release strands
                 //    the latch and the next press is swallowed — and the
                 //    surface forward below, which is the surface's own claim.
+                //    A redraw is requested unconditionally (issue #486): a
+                //    handler that writes a `Signal` already gets one through
+                //    the signal-change callback, but one that mutates the DOM
+                //    directly through a `NodeHandle` setter has no such
+                //    fallback, and named damage marks a node dirty with no
+                //    way to ask the shell to paint a frame at all.
                 if let Some(ref ks) = key_str {
                     let key_data = events::KeyEventData::new(ks.clone(), format!("{:?}", key))
                         .with_modifiers(ctrl, shift, alt, modifiers.meta)
                         .with_kind(events::KeyEventKind::Up);
+                    // The element's own `onkeyup` first, as `onkeydown` is
+                    // offered first (issue #1678). A consuming handler stops
+                    // the walk to its ancestors; the interceptor hears the
+                    // release regardless, since a release has no default to
+                    // prevent and a held-key tracker must see every one.
+                    self.offer_element_key(&key_data);
                     events::dispatch_keyboard_event(&key_data);
+                    // Every release reaches the app-wide listeners too, but
+                    // one whose press a focused surface claimed (#1784).
+                    self.offer_app_key(&key_data);
+                    actions.push(AppAction::RequestRedraw);
                 }
 
                 // 2. Then the focus arbiter's holder, again mirroring KeyDown.
@@ -1517,7 +2304,13 @@ impl RinchApp {
                             )
                             .with_modifiers(ctrl, shift, alt, modifiers.meta)
                             .with_kind(events::KeyEventKind::Up);
+                            // Return value ignored for the same reason as the
+                            // interceptor above: a release has nothing
+                            // downstream to suppress, so the redraw is
+                            // requested whether or not the handler claims to
+                            // have consumed it (issue #486).
                             crate::focus_registry::offer_key(self.doc_key(), id, &key_data);
+                            actions.push(AppAction::RequestRedraw);
                         }
                     }
                     _ => {}
@@ -1528,7 +2321,7 @@ impl RinchApp {
                 // exactly like KeyDown: whichever text target holds focus consumes
                 // it. IME is a shared runtime service, not a per-widget path.
                 match self.focus_target {
-                    #[cfg(feature = "desktop")]
+                    #[cfg(feature = "windowing")]
                     FocusTarget::Editor(container) => {
                         if let Some(handle) =
                             crate::editor::editor_for_doc(self.doc_key(), container)
@@ -1540,6 +2333,7 @@ impl RinchApp {
                         } else {
                             // Focused editor unmounted out from under us.
                             self.focus_target = FocusTarget::None;
+                            self.sync_keyboard_editor();
                         }
                     }
                     FocusTarget::Input(node_id) => {
@@ -1554,10 +2348,17 @@ impl RinchApp {
                         // would, so a field that goes disabled mid-composition
                         // ends up in exactly one state whichever event lands
                         // first.
-                        if self.live_focused_input_handler().is_some() {
-                            self.dispatch_input_ime(node_id, ime);
+                        // An input method enabled changes nothing on screen:
+                        // its redraw presented the same frame again (#2698).
+                        // Nor does the empty composition winit's Wayland text
+                        // input clears at each keyboard enter and leave, when
+                        // none was showing (#2763).
+                        let changes = !matches!(ime, ImeEvent::Enabled)
+                            && (self.live_focused_input_handler().is_none()
+                                || self.dispatch_input_ime(node_id, ime));
+                        if changes {
+                            actions.push(AppAction::RequestRedraw);
                         }
-                        actions.push(AppAction::RequestRedraw);
                     }
                     // A registered custom text component (issue #176) consumes
                     // the same portable `ImeEvent` as the two built-in engines
@@ -1598,8 +2399,12 @@ impl RinchApp {
                 }
                 // Process any pending input focus request (e.g., from an Effect
                 // triggered by run_on_main_thread that called request_focus).
-                if let Some(request) = rinch_core::take_pending_focus_request(self.doc_key()) {
-                    self.apply_focus_request(request);
+                if self.drain_focus_requests(true) {
+                    actions.push(AppAction::RequestRedraw);
+                }
+                // And any pending set_selection_range()/select() (issue #552),
+                // drained after the focus request above for the same reason.
+                if self.drain_pending_text_selection() {
                     actions.push(AppAction::RequestRedraw);
                 }
             }
@@ -1625,17 +2430,28 @@ impl RinchApp {
                 #[cfg(feature = "debug")]
                 self.handle_debug_commands(&mut actions, scale_factor, window_size);
             }
-            PlatformEvent::FileHoverEnter { position, .. }
-            | PlatformEvent::FileDragMoved { position } => {
+            PlatformEvent::FileHoverEnter { .. } | PlatformEvent::FileDragMoved { .. } => {
                 // OS file drag entered or is moving over the window.
                 // Hit-test the drag position and fire data-onfiledragenter
                 // on the first ancestor with that attribute (like ondragenter for
                 // internal DnD).
+                let (position, path) = match &event {
+                    PlatformEvent::FileHoverEnter { path, position } => (*position, Some(path)),
+                    PlatformEvent::FileDragMoved { position } => (*position, None),
+                    _ => unreachable!(),
+                };
+                #[cfg(not(feature = "windowing"))]
+                let _ = path;
                 let (x, y) = (position.0 as f32, position.1 as f32);
+                // Where a picture dropped here would land in an editor (#1649).
+                #[cfg(feature = "windowing")]
+                if self.note_file_drag((x, y), path.map(|p| p.as_path())) {
+                    actions.push(AppAction::RequestRedraw);
+                }
                 if let Some(doc) = &self.doc {
                     let hit_id = {
                         let d = doc.borrow();
-                        hit_test(&d.tree, x, y)
+                        self.shared_hit(&d, x, y)
                     };
                     if let Some(hit_id) = hit_id {
                         let target = Self::find_file_drop_target(&doc.borrow().tree, hit_id);
@@ -1656,24 +2472,37 @@ impl RinchApp {
             }
             PlatformEvent::FileHoverCancelled => {
                 // OS file drag left the window without dropping.
-                if let Some(target_id) = self.file_hover_target.take() {
-                    if let Some(doc) = &self.doc {
-                        Self::dispatch_drag_attr(doc, target_id, "data-onfiledragleave");
-                        actions.push(AppAction::RequestRedraw);
-                    }
+                if self.end_file_drag() {
+                    actions.push(AppAction::RequestRedraw);
                 }
             }
             PlatformEvent::FileDropped { paths, position } => {
                 // Files were dropped from the OS. Hit-test and dispatch to the
                 // nearest ancestor with data-onfiledrop.
                 let (x, y) = (position.0 as f32, position.1 as f32);
-                if let Some(doc) = &self.doc {
+                if let Some(doc) = self.doc.clone() {
+                    let doc = &doc;
                     let hit_id = {
                         let d = doc.borrow();
-                        hit_test(&d.tree, x, y)
+                        self.shared_hit(&d, x, y)
                     };
-                    if let Some(hit_id) = hit_id {
-                        Self::dispatch_file_drop(doc, hit_id, paths);
+                    // An editor that takes pictures itself gets a drop of image
+                    // files first; anything else is the app's file-drop handler's.
+                    // What it does not take (the PDF dropped with a
+                    // photo, a file only named like a picture) is the app's
+                    // handler's still.
+                    // The drop lands where its drop caret showed it would.
+                    #[cfg(feature = "windowing")]
+                    let indicated = self.file_drag.take().and_then(|drag| drag.caret);
+                    #[cfg(feature = "windowing")]
+                    if let Some(caret) = &indicated {
+                        caret.handle.show_drop_caret(None);
+                    }
+                    #[cfg(feature = "windowing")]
+                    let paths = self.editor_file_drop(x, y, paths, indicated);
+                    if let Some(hit_id) = hit_id.filter(|_| !paths.is_empty()) {
+                        let context = (x, y, vp_w, vp_h, self.modifier_state());
+                        Self::dispatch_file_drop(doc, hit_id, paths, context);
                     }
                     // Clean up hover state
                     if let Some(target_id) = self.file_hover_target.take() {
@@ -1683,6 +2512,15 @@ impl RinchApp {
                 }
             }
             PlatformEvent::AboutToWait => {
+                // A focused registered target `set_inner_html` freed (#1509):
+                // release the claim now, so its `on_focus_lost` runs and the
+                // claim is not left on a dead (or re-minted) id until the next
+                // key, Tab or click. One scan of an empty list otherwise.
+                if let FocusTarget::Node(id) = self.focus_target
+                    && crate::focus_registry::was_freed(self.doc_key(), id)
+                {
+                    self.set_focus_target(FocusTarget::None);
+                }
                 // Was there anything to tick? Not: is anything still running
                 // afterwards. A transition that *finishes* on this tick applies
                 // its end value and then reports nothing active, and that last
@@ -1724,6 +2562,17 @@ impl RinchApp {
                     self.scene_dirty = true;
                 }
 
+                // A drag resting in an edge band scrolls a frame's worth, and
+                // keeps the clock turning for the next one.
+                if self.tick_drag_auto_scroll(rinch_core::timer::now(), vp_w, vp_h, had_running) {
+                    actions.push(AppAction::RequestRedraw);
+                }
+                // A wheel notch gliding (#2287) moves a frame's worth; the
+                // clock stops once the last one has arrived.
+                if self.tick_wheel_scroll() {
+                    actions.push(AppAction::RequestRedraw);
+                }
+
                 if self.has_dirty_nodes() {
                     if self.resolve_and_repaint(vp_w, vp_h) {
                         actions.push(AppAction::RequestRedraw);
@@ -1731,8 +2580,14 @@ impl RinchApp {
                 }
 
                 // Process any pending input focus request from effects
-                if let Some(request) = rinch_core::take_pending_focus_request(self.doc_key()) {
-                    self.apply_focus_request(request);
+                if self.drain_focus_requests(true) {
+                    actions.push(AppAction::RequestRedraw);
+                }
+                // And any pending set_selection_range()/select() (issue #552),
+                // drained after the focus request above for the same reason.
+                // A selection applied here is drawn: the wake that sent it
+                // decided before this turn (#2608 review).
+                if self.drain_pending_text_selection() {
                     actions.push(AppAction::RequestRedraw);
                 }
 
@@ -1763,6 +2618,18 @@ impl RinchApp {
                 if any_transitions || any_animations || any_video {
                     actions.push(AppAction::RequestRedraw);
                 }
+
+                // Content a layout or scroll moved under a still mouse is
+                // hovered (#2766), after every resolve above.
+                if self.rehover_still_pointer(vp_w, vp_h, &mut actions) {
+                    actions.push(AppAction::RequestRedraw);
+                }
+
+                // A pointer that has rested long enough shows its `title`
+                // (#1646); a shown tooltip follows its `title`.
+                if self.tick_title_tooltip(rinch_core::timer::now(), vp_w, vp_h) {
+                    actions.push(AppAction::RequestRedraw);
+                }
             }
             // `PlatformEvent` is `#[non_exhaustive]`: a future variant is a no-op
             // here until this match is taught about it.
@@ -1770,6 +2637,652 @@ impl RinchApp {
         }
 
         actions
+    }
+
+    /// Self-heal a stale `FocusTarget::Node` claim, then give a focused
+    /// registered widget (`register_focus_target`'s `on_key`) first refusal on
+    /// the key. Runs ahead of the app-wide key listeners (#1784) and of
+    /// [`Self::handle_unclaimed_key_fallback`]. Answers whether it consumed.
+    #[allow(clippy::too_many_arguments)]
+    fn offer_registered_node_key(
+        &mut self,
+        key: KeyCode,
+        key_str: Option<&String>,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+        meta: bool,
+        actions: &mut Vec<AppAction>,
+    ) -> bool {
+        // Self-heal a stale Node claim before routing, exactly like the
+        // Editor arm's unmount handling in `handle_event`: node ids are
+        // recycled slab indices (see `live_focused_input_handler`), so a
+        // claim whose node was unmounted must not swallow Enter/Space, anchor
+        // Tab, or — worst — activate whatever unrelated node reused the slot.
+        if let FocusTarget::Node(id) = self.focus_target
+            && !self.node_target_is_live(id)
+        {
+            self.set_focus_target(FocusTarget::None);
+        }
+
+        // A registered custom widget (issue #147) gets first refusal on its
+        // own keys, ahead of every global handler below — that is what "owns
+        // the keyboard" means. `true` consumes; `false` falls through to
+        // DevTools / inspect / Tab / Enter-Space activation exactly as
+        // before, so registering costs an unregistered node nothing.
+        //
+        // The `key` string matches the document-level interceptor's spelling
+        // (`hook_key_str`), which names every key rinch has a `KeyCode` for
+        // regardless of the modifiers held (issue #336). The physical-code
+        // fallback is left in for the one remaining hole — a `KeyCode::Other`
+        // carrying no printable text — so a widget always sees a non-empty
+        // key.
+        if let FocusTarget::Node(id) = self.focus_target {
+            let key_data = events::KeyEventData::new(
+                key_str.cloned().unwrap_or_else(|| format!("{:?}", key)),
+                format!("{:?}", key),
+            )
+            .with_modifiers(ctrl, shift, alt, meta);
+            if crate::focus_registry::offer_key(self.doc_key(), id, &key_data) {
+                actions.push(AppAction::RequestRedraw);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The global `KeyDown` fallback — DevTools (F12) / inspect mode (Alt+I) /
+    /// Tab navigation / clipboard chords / Enter-Space activation / the
+    /// catch-all text-input path.
+    ///
+    /// Shared by two callers of the focus arbiter's match in
+    /// [`Self::handle_event`]: `FocusTarget::Input/None/Node`, where it always
+    /// ran, and — since issue #482 — `FocusTarget::Surface` once the surface
+    /// itself has declined the key (`set_key_handler`, default: declines
+    /// everything). A focused `RenderSurface` used to swallow every key
+    /// unconditionally; routing an unclaimed one through here instead means a
+    /// game canvas with focus still lets DevTools, inspect mode, Tab and the
+    /// rest work, exactly as an unfocused canvas always did.
+    ///
+    /// `focus_target` reads inside this function (the `FocusTarget::Node`
+    /// guards) correctly do nothing when called from the `Surface` arm, since
+    /// `self.focus_target` is `Surface(_)` there — no caller-specific branching
+    /// needed.
+    ///
+    /// Returns `true` if the caller should return `actions` immediately
+    /// (an action already fully answers this key); `false` if the key fell
+    /// through everything (including plain text input, already attempted),
+    /// in which case the caller's match arm ends normally.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_unclaimed_key_fallback(
+        &mut self,
+        key: KeyCode,
+        text: Option<&String>,
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+        modifiers: Modifiers,
+        repeat: KeyRepeat,
+        vp_w: f32,
+        vp_h: f32,
+        actions: &mut Vec<AppAction>,
+    ) -> bool {
+        // The registered widget's `on_key` (issue #147) was offered by the
+        // caller, ahead of the app-wide key listeners (#1784):
+        // `offer_registered_node_key`.
+
+        // The DevTools keys, unless the app turned them off (#2689): off,
+        // they are not consumed and go on below like any other key.
+        let devtools = self.devtools_enabled();
+
+        #[cfg(feature = "windowing")]
+        if devtools && key == KeyCode::F12 {
+            actions.push(AppAction::ToggleDevTools);
+            return true;
+        }
+
+        // Alt+I: toggle inspect mode
+        if devtools && key == KeyCode::KeyI && alt && !ctrl && !shift {
+            actions.push(AppAction::ToggleInspectMode);
+            return true;
+        }
+
+        match key {
+            KeyCode::Tab => self.handle_tab(shift),
+            // The caret and delete keys follow the platform's text keymap
+            // (issue #951): on macOS Cmd+Left is the line's start and Option
+            // the word modifier, not Ctrl. ArrowUp/ArrowDown go the same way
+            // below, after Alt+Down has had its chance to open a `<select>`.
+            KeyCode::Backspace
+            | KeyCode::Delete
+            | KeyCode::ArrowLeft
+            | KeyCode::ArrowRight
+            | KeyCode::Home
+            | KeyCode::End => self.handle_text_key(key, modifiers),
+            // The clipboard and select-all chords (Cmd on macOS — `ctrl` is
+            // `Modifiers::primary`), and undo / redo on a focused
+            // `<input>`/`<textarea>` (issue #288), the browser's chords:
+            // Ctrl+Z, Ctrl+Shift+Z and Ctrl+Y. None of them with Alt: Windows
+            // reports AltGr as Ctrl+Alt, and AltGr+C, +X, +A, +Z type
+            // characters on some layouts (Polish `ć`, `ź`, `ą`, `ż`; #934) —
+            // the `_` arm below inserts them.
+            KeyCode::KeyA if ctrl && !alt => self.handle_select_all(),
+            KeyCode::KeyC if ctrl && !alt => self.handle_copy(),
+            KeyCode::KeyV if ctrl && !alt => {
+                self.handle_paste();
+            }
+            KeyCode::KeyX if ctrl && !alt => self.handle_cut(),
+            KeyCode::KeyZ if ctrl && !alt && shift => self.handle_redo(),
+            KeyCode::KeyZ if ctrl && !alt => self.handle_undo(),
+            KeyCode::KeyY if ctrl && !alt => self.handle_redo(),
+            KeyCode::Enter | KeyCode::Space
+                if !ctrl && matches!(self.focus_target, FocusTarget::Node(_)) =>
+            {
+                if let FocusTarget::Node(id) = self.focus_target
+                    && self.press_is_fresh(key, repeat)
+                {
+                    self.node_activation_held = Some(key);
+                    self.activate_focused_node(id, vp_w, vp_h);
+                    actions.push(AppAction::RequestRedraw);
+                }
+            }
+            KeyCode::Enter if !ctrl => self.handle_enter(shift),
+            // Space with no Node target falls through to the `_` arm below —
+            // the one text-input path (pre-#228), so a future change to that
+            // gate can't miss Space. Alt+Down on a focused `<select>` opens
+            // its popup, the browser's third way in beside Enter and Space
+            // (issue #314). Anything else falls through.
+            KeyCode::ArrowDown
+                if alt
+                    && matches!(self.focus_target, FocusTarget::Node(_))
+                    && self.focused_node_is_select() =>
+            {
+                if let FocusTarget::Node(id) = self.focus_target {
+                    self.open_select_popup(id, vp_w, vp_h);
+                    actions.push(AppAction::RequestRedraw);
+                }
+            }
+            KeyCode::ArrowUp | KeyCode::ArrowDown => self.handle_text_key(key, modifiers),
+            _ => {
+                // Never with the primary modifier — except AltGr text, which
+                // Windows reports as Ctrl+Alt and a backend passes on only
+                // when AltGr typed it (#934).
+                if (!ctrl
+                    || rinch_platform::is_alt_graph_text(
+                        rinch_platform::alt_graph_is_ctrl_alt(),
+                        modifiers,
+                        text.map(String::as_str),
+                        None,
+                    ))
+                    && let Some(t) = text
+                    && !t.is_empty()
+                {
+                    self.handle_text_input(t);
+                }
+            }
+        }
+        false
+    }
+
+    /// Move `id`'s vertical scroll offset by `dy` content pixels (positive
+    /// scrolls down), clamped to its range: the vertical scroll write of a
+    /// gesture, the wheel's and a drag's auto-scroll alike. The offset is kept
+    /// on the device pixel grid (#1543); what a delta leaves below it is kept
+    /// too, so sub-pixel deltas still add up.
+    ///
+    /// Answers whether the offset moved and, with it, the container's
+    /// `data-onscroll` handler, which the caller fires once no borrow of the
+    /// document is held.
+    pub(crate) fn scroll_vertically_by(
+        doc_mut: &mut RinchDocument,
+        id: u64,
+        dy: f64,
+    ) -> (bool, Option<usize>) {
+        let nid = rinch_core::dom::NodeId(id);
+        let content_height = doc_mut.scroll_height(nid);
+        let visible_height = doc_mut.client_height(nid);
+        let max_scroll = (content_height - visible_height).max(0.0);
+
+        // Read handler ID before mutable borrow
+        let handler_id = doc_mut
+            .tree
+            .nodes
+            .get(id)
+            .and_then(|n| n.attributes.get("data-onscroll"))
+            .and_then(|s| s.parse::<usize>().ok());
+        let old_y = doc_mut.scroll_top(nid);
+        let remainder = doc_mut
+            .tree
+            .nodes
+            .get(id)
+            .map_or((0.0, 0.0), |n| n.scroll_remainder);
+        let precise = (old_y + remainder.1 + dy).clamp(0.0, max_scroll);
+        let new_y = doc_mut.tree.snap_scroll_offset(precise);
+        let mut moved = false;
+        if new_y != old_y {
+            if let Some(node) = doc_mut.tree.nodes.get_mut(id) {
+                node.scroll_offset.1 = new_y;
+                doc_mut.tree.mark_scrolled(id);
+                moved = true;
+            }
+            doc_mut.tree.dirty_nodes.insert(id);
+        }
+        // After `mark_scrolled`, which zeroes the remainder every other writer
+        // leaves stale.
+        if let Some(node) = doc_mut.tree.nodes.get_mut(id) {
+            node.scroll_remainder = (remainder.0, precise - new_y);
+        }
+        (moved, handler_id.filter(|_| moved))
+    }
+
+    /// Move `id`'s horizontal scroll offset by `dx` content pixels (positive
+    /// scrolls right), clamped to its range — `-range..=0` for a container
+    /// that scrolls from its right edge (`scrollbar::scroll_bounds`, #2546):
+    /// the horizontal twin of
+    /// [`Self::scroll_vertically_by`], the wheel's and a drag's auto-scroll
+    /// alike. On the device pixel grid, keeping what falls below it (#1543);
+    /// the vertical remainder is kept.
+    pub(crate) fn scroll_horizontally_by(
+        doc_mut: &mut RinchDocument,
+        id: u64,
+        dx: f64,
+    ) -> (bool, Option<usize>) {
+        let (min_scroll, max_scroll) = rinch_dom::paint::scrollbar::scroll_bounds(
+            &doc_mut.tree,
+            id,
+            rinch_dom::paint::scrollbar::ScrollbarAxis::Horizontal,
+        );
+        let handler_id = doc_mut
+            .tree
+            .nodes
+            .get(id)
+            .and_then(|n| n.attributes.get("data-onscroll"))
+            .and_then(|s| s.parse::<usize>().ok());
+        let device_scale = doc_mut.tree.device_scale;
+        let mut moved = false;
+        if let Some(node) = doc_mut.tree.nodes.get_mut(id) {
+            let precise =
+                (node.scroll_offset.0 + node.scroll_remainder.0 + dx).clamp(min_scroll, max_scroll);
+            let new_x = rinch_dom::node::snap_to_device(precise, device_scale);
+            let remainder = (precise - new_x, node.scroll_remainder.1);
+            if new_x != node.scroll_offset.0 {
+                node.scroll_offset.0 = new_x;
+                doc_mut.tree.mark_scrolled(id);
+                moved = true;
+            }
+            // After `mark_scrolled`, which zeroes both: this axis keeps its new
+            // remainder, the vertical one is kept.
+            if let Some(node) = doc_mut.tree.nodes.get_mut(id) {
+                node.scroll_remainder = remainder;
+            }
+        }
+        (moved, handler_id.filter(|_| moved))
+    }
+
+    /// One frame of drag auto-scroll, run by the `AboutToWait` frame clock.
+    ///
+    /// While an element drag is live and its pointer is in the band along an
+    /// edge of a scroll container under it
+    /// ([`events::drag_auto_scroll_velocity`]), that container scrolls by the
+    /// band's speed times the time since the last tick (capped; a first tick
+    /// counts one frame), fires its `data-onscroll`, and — since the content
+    /// under the still pointer moved — the drag is resolved again
+    /// ([`Self::track_drag_pointer`]), so the drop target there hears
+    /// `data-ondragover`. Each axis on its own (#2091): the nearest container
+    /// that can still move vertically toward a top or bottom band scrolls
+    /// vertically, and the nearest that can still move horizontally toward a
+    /// left or right band scrolls horizontally — a column's list and the board
+    /// row around it, in one frame, with the pointer in a corner of both. A
+    /// list at its end lets the container around it take over.
+    ///
+    /// Answers whether the pointer is in such a band, which is whether the
+    /// clock must keep turning.
+    ///
+    /// The hit test it needs is the one the drag's last resolve made
+    /// ([`Self::track_drag_pointer`] keeps it in `drag_hit_memo`) whenever the
+    /// hit cache's generation and the pointer are unchanged since and nothing
+    /// was animating (`motion`: a transition or animation tick moves a
+    /// `transform` without moving the generation), so a drag frame whose
+    /// pointer is in no band costs no hit test.
+    pub(crate) fn tick_drag_auto_scroll(
+        &mut self,
+        now: Instant,
+        vp_w: f32,
+        vp_h: f32,
+        motion: bool,
+    ) -> bool {
+        use rinch_dom::paint::scrollbar::ScrollbarAxis;
+        // An element drag, or an OS file drag showing a drop caret (#1649):
+        // a file dragged over a long note scrolls it as an element drag does.
+        let element = self.active_dnd.as_ref().map(|drag| drag.cursor);
+        #[cfg(feature = "windowing")]
+        let file = self
+            .file_drag
+            .as_ref()
+            .filter(|drag| drag.caret.is_some() && !drag.suspended)
+            .map(|drag| drag.cursor);
+        #[cfg(not(feature = "windowing"))]
+        let file: Option<(f32, f32)> = None;
+        let Some((x, y)) = element.or(file) else {
+            self.drag_auto_scroll_at = None;
+            return false;
+        };
+        let Some(doc) = self.doc.clone() else {
+            return false;
+        };
+        if element.is_some() && !motion && self.hit_memo.get().is_none() {
+            // `shared_hit` checks the generation and the point itself.
+            self.hit_memo.set(self.drag_hit_memo);
+        }
+        let (vertical, horizontal) = {
+            let d = doc.borrow();
+            match self.shared_hit(&d, x, y) {
+                Some(hit) => (
+                    Self::drag_auto_scroll_container(&d, hit, ScrollbarAxis::Vertical, y, vp_h),
+                    Self::drag_auto_scroll_container(&d, hit, ScrollbarAxis::Horizontal, x, vp_w),
+                ),
+                None => (None, None),
+            }
+        };
+        // A hit test made afresh here (after motion) is the newest answer.
+        if element.is_some() {
+            self.drag_hit_memo = self.hit_memo.get();
+        }
+        if vertical.is_none() && horizontal.is_none() {
+            self.drag_auto_scroll_at = None;
+            return false;
+        }
+        let elapsed = self
+            .drag_auto_scroll_at
+            .map(|then| now.duration_since(then).as_secs_f32());
+        self.drag_auto_scroll_at = Some(now);
+        let step = events::drag_auto_scroll_step(elapsed);
+        let mut scrolled: Vec<(u64, usize)> = Vec::new();
+        let mut any_moved = false;
+        {
+            let mut doc_mut = doc.borrow_mut();
+            if let Some((container, velocity)) = vertical {
+                let dy = f64::from(velocity * step);
+                let (moved, handler) = Self::scroll_vertically_by(&mut doc_mut, container, dy);
+                any_moved |= moved;
+                if let Some(handler) = handler {
+                    scrolled.push((container, handler));
+                }
+            }
+            if let Some((container, velocity)) = horizontal {
+                let dx = f64::from(velocity * step);
+                let (moved, handler) = Self::scroll_horizontally_by(&mut doc_mut, container, dx);
+                any_moved |= moved;
+                if let Some(handler) = handler
+                    && !scrolled.iter().any(|(c, _)| *c == container)
+                {
+                    scrolled.push((container, handler));
+                }
+            }
+        }
+        if any_moved {
+            self.scene_dirty = true;
+            // Payloads read once both axes moved, so a container scrolled on
+            // both fires once with both offsets.
+            for (container, handler_id) in scrolled {
+                let event = Self::scroll_event_for(&doc.borrow().tree, container);
+                rinch_core::events::dispatch_scroll_event(
+                    rinch_core::events::EventHandlerId(handler_id),
+                    event,
+                );
+            }
+            if element.is_some() {
+                self.track_drag_pointer(vp_w, vp_h);
+            } else {
+                // The text under the still pointer moved: so does the drop
+                // caret. The hit memo still names the point before the scroll.
+                self.hit_memo.set(None);
+                #[cfg(feature = "windowing")]
+                self.place_file_drop_caret();
+            }
+        }
+        true
+    }
+
+    /// The container a drag's pointer at `at` (its `y` for the vertical axis,
+    /// its `x` for the horizontal) over `hit` auto-scrolls on `axis`, and how
+    /// fast: the nearest ancestor of `hit` (or `hit`, or the body) that
+    /// overflows on that axis, is not locked out (`lock_scroll`), has the
+    /// pointer in one of its bands on that axis and can still move toward that
+    /// band's edge. A container's bands are measured on the part of its painted
+    /// box inside the viewport (`viewport` long on that axis); the body's on
+    /// the viewport.
+    fn drag_auto_scroll_container(
+        d: &RinchDocument,
+        hit: u64,
+        axis: rinch_dom::paint::scrollbar::ScrollbarAxis,
+        at: f32,
+        viewport: f32,
+    ) -> Option<(u64, f32)> {
+        use rinch_dom::paint::scrollbar::{ScrollbarAxis, overflows};
+        let vertical = axis == ScrollbarAxis::Vertical;
+        let tree = &d.tree;
+        let chain = std::iter::successors(Some(hit), |&id| tree.get(id).and_then(|n| n.parent))
+            .chain(std::iter::once(tree.body_id));
+        for id in chain {
+            if tree.get(id).is_none() || !overflows(tree, id, axis) || tree.scroll_locked_out(id) {
+                continue;
+            }
+            let (start, end) = if id == tree.body_id {
+                (0.0, viewport)
+            } else {
+                let (bx, by, bw, bh) = painted_element_box(tree, id);
+                let (start, len) = if vertical { (by, bh) } else { (bx, bw) };
+                (start.max(0.0), (start + len).min(viewport))
+            };
+            let velocity = events::drag_auto_scroll_velocity(at, start, end);
+            if velocity == 0.0 {
+                continue;
+            }
+            let nid = rinch_core::dom::NodeId(id);
+            let offset = if vertical {
+                d.scroll_top(nid)
+            } else {
+                d.scroll_left(nid)
+            };
+            // The ends the offset can reach, which are the range's ends on the
+            // device pixel grid (#1543): at a fractional scale the last
+            // fraction of a device pixel of a range off the grid is never
+            // reached, and `offset < max` held for ever there. An rtl
+            // container's horizontal range is `-range..=0` (#2546).
+            let (min, max) = rinch_dom::paint::scrollbar::scroll_bounds(&d.tree, id, axis);
+            let (min, max) = (
+                d.tree.snap_scroll_offset(min),
+                d.tree.snap_scroll_offset(max),
+            );
+            if (velocity < 0.0 && offset > min) || (velocity > 0.0 && offset < max) {
+                return Some((id, velocity));
+            }
+        }
+        None
+    }
+
+    /// Resolve what an element drag in flight is over, at its cursor
+    /// (`ActiveDrag::cursor`): a render surface hears `DragEnter`/`DragOver`/
+    /// `DragLeave`, a DOM drop target `data-ondragenter`/`data-ondragleave` on a
+    /// change and `data-ondragover` every time, and the source
+    /// `data-ondragmove`.
+    ///
+    /// A pointer move runs it, and so does a frame that auto-scrolled the
+    /// content under a still pointer ([`Self::tick_drag_auto_scroll`]): what is
+    /// under the pointer changed though the pointer did not.
+    fn track_drag_pointer(&mut self, vp_w: f32, vp_h: f32) {
+        let Some((x, y)) = self.active_dnd.as_ref().map(|drag| drag.cursor) else {
+            return;
+        };
+        // Hit test for drop targets — check both DOM elements and surfaces
+        let hit_id = self.move_hit(x, y);
+        // Kept for the frame's auto-scroll tick, which asks the same point.
+        self.drag_hit_memo = self.hit_memo.get();
+        let Some(drag) = self.active_dnd.as_mut() else {
+            return;
+        };
+
+        // Check if mouse is over a render surface
+        let surface_target = if let Some(doc) = &self.doc {
+            hit_id.and_then(|hid| {
+                let d = doc.borrow();
+                Self::find_render_surface_at_full(&d.tree, hid, x, y)
+            })
+        } else {
+            None
+        };
+
+        let new_surface = surface_target.as_ref().map(|(sid, nid, _, _)| (*sid, *nid));
+
+        // Handle surface drag enter/leave transitions
+        if new_surface != self.drag_over_surface {
+            // Leave old surface
+            if let Some((old_sid, _)) = self.drag_over_surface {
+                crate::render_surface::dispatch_surface_event(
+                    old_sid,
+                    crate::render_surface::SurfaceEvent::DragLeave,
+                );
+            }
+            // Enter new surface
+            if let Some((sid, _, lx, ly)) = &surface_target {
+                crate::render_surface::dispatch_surface_event(
+                    *sid,
+                    crate::render_surface::SurfaceEvent::DragEnter { x: *lx, y: *ly },
+                );
+            }
+            self.drag_over_surface = new_surface;
+        }
+
+        // Dispatch DragOver to current surface, or DOM drag events
+        if let Some((sid, _, lx, ly)) = surface_target {
+            // Mouse is over a surface — dispatch DragOver
+            crate::render_surface::dispatch_surface_event(
+                sid,
+                crate::render_surface::SurfaceEvent::DragOver { x: lx, y: ly },
+            );
+
+            // Clear DOM drop target since we're over a surface
+            let old_target = drag.over_target.take();
+            if let Some(doc) = &self.doc {
+                if let Some(old_id) = old_target {
+                    Self::dispatch_drag_attr(doc, old_id, "data-ondragleave");
+                }
+            }
+        } else {
+            // Not over a surface — use DOM drop target system
+            let new_target = hit_id.and_then(|hid| {
+                self.doc.as_ref().and_then(|doc| {
+                    let d = doc.borrow();
+                    Self::find_drop_target(&d.tree, hid)
+                })
+            });
+
+            let old_target = drag.over_target;
+            if new_target != old_target {
+                drag.over_target = new_target;
+                if let Some(doc) = &self.doc {
+                    if let Some(old_id) = old_target {
+                        Self::dispatch_drag_attr(doc, old_id, "data-ondragleave");
+                    }
+                    if let Some(new_id) = new_target {
+                        Self::dispatch_drag_attr(doc, new_id, "data-ondragenter");
+                    }
+                }
+            }
+
+            if let Some(target_id) = drag.over_target {
+                if let Some(doc) = &self.doc {
+                    let (cx, cy) = drag.cursor;
+                    Self::dispatch_drag_attr_with_context(
+                        doc,
+                        target_id,
+                        "data-ondragover",
+                        cx,
+                        cy,
+                    );
+                }
+            }
+        }
+
+        // Fire ondragmove on source so editor can track cursor position.
+        if let Some(doc) = &self.doc {
+            let (cx, cy) = drag.cursor;
+            events::set_click_context(events::ClickContext {
+                mouse_x: cx,
+                mouse_y: cy,
+                element_x: 0.0,
+                element_y: 0.0,
+                element_width: 0.0,
+                element_height: 0.0,
+                text_hit: Default::default(),
+                viewport_width: vp_w,
+                viewport_height: vp_h,
+                button: events::MouseButton::Left,
+                modifiers: events::ModifierState::default(),
+            });
+            Self::dispatch_drag_attr(doc, drag.node_id, "data-ondragmove");
+        }
+    }
+
+    /// Cancel an element-to-element drag in flight: a render surface under it
+    /// hears `DragLeave`, a drop target `data-ondragleave`, and nothing hears
+    /// that something dropped. Then [`Self::end_active_dnd`].
+    ///
+    /// The one cancel path — Escape and `PointerCancel` both come here, so they
+    /// cannot drift apart again (issue #333). Returns whether a drag was live.
+    fn cancel_active_dnd(&mut self, vp_w: f32, vp_h: f32) -> bool {
+        let Some(drag) = self.active_dnd.take() else {
+            return false;
+        };
+        if let Some((surface_sid, _)) = self.drag_over_surface.take() {
+            crate::render_surface::dispatch_surface_event(
+                surface_sid,
+                crate::render_surface::SurfaceEvent::DragLeave,
+            );
+        }
+        if let Some(doc) = &self.doc {
+            if let Some(target_id) = drag.over_target {
+                Self::dispatch_drag_attr(doc, target_id, "data-ondragleave");
+            }
+        }
+        self.end_active_dnd(&drag, vp_w, vp_h);
+        true
+    }
+
+    /// What every ending of an element-to-element drag owes once the target
+    /// side is settled, whether it dropped or was cancelled: `data-ondragend`
+    /// on the source, with the drag's last cursor as its `ClickContext` (the
+    /// source has a ghost and a dragging class to undo, and this is the only
+    /// callback that will ever tell it to); the built-in ghost visible again,
+    /// since a `suppress_drag_ghost` lasts exactly as long as its drag; and a
+    /// repaint, for the ghost's pixels.
+    ///
+    /// `drag` has already been taken out of `active_dnd`.
+    fn end_active_dnd(&mut self, drag: &ActiveDrag, vp_w: f32, vp_h: f32) {
+        if let Some(doc) = &self.doc {
+            let (cx, cy) = drag.cursor;
+            events::set_click_context(events::ClickContext {
+                mouse_x: cx,
+                mouse_y: cy,
+                element_x: 0.0,
+                element_y: 0.0,
+                element_width: 0.0,
+                element_height: 0.0,
+                text_hit: Default::default(),
+                viewport_width: vp_w,
+                viewport_height: vp_h,
+                button: events::MouseButton::Left,
+                modifiers: self.modifier_state(),
+            });
+            Self::dispatch_drag_attr(doc, drag.node_id, "data-ondragend");
+        }
+        // The runtime's end, whatever happened to the source node (#2091).
+        events::notify_element_drag_ended();
+        events::reset_drag_ghost_visibility();
+        self.drag_auto_scroll_at = None;
+        self.drag_hit_memo = None;
+        self.scene_dirty = true;
     }
 
     /// Release everything an in-flight press is holding, without completing any
@@ -1805,57 +3318,14 @@ impl RinchApp {
         // `end_drag` call site: a cancel in one document must not tear down a
         // drag-select another `RinchApp` on this thread is still holding
         // (issue #139).
-        #[cfg(feature = "desktop")]
+        #[cfg(feature = "windowing")]
         crate::editor::end_drag(self.input_doc());
 
-        // A pending drag is discarded outright. `MouseUp` would have read it as
-        // "the threshold was never crossed, so this was a click" — the reading a
-        // cancel exists to prevent.
-        released |= self.pending_drag.take().is_some();
-
-        if let Some(drag) = self.active_dnd.take() {
-            released = true;
-            // A surface the drag was over hears that it left, never that
-            // something dropped on it.
-            if let Some((surface_sid, _)) = self.drag_over_surface.take() {
-                crate::render_surface::dispatch_surface_event(
-                    surface_sid,
-                    crate::render_surface::SurfaceEvent::DragLeave,
-                );
-            }
-            if let Some(doc) = &self.doc {
-                if let Some(target_id) = drag.over_target {
-                    Self::dispatch_drag_attr(doc, target_id, "data-ondragleave");
-                }
-                // `ondragend` still fires: the source has a ghost and a
-                // dragging class to undo, and it is the only callback that
-                // will ever tell it to.
-                let (cx, cy) = drag.cursor;
-                events::set_click_context(events::ClickContext {
-                    mouse_x: cx,
-                    mouse_y: cy,
-                    element_x: 0.0,
-                    element_y: 0.0,
-                    element_width: 0.0,
-                    element_height: 0.0,
-                    text_hit: Default::default(),
-                    viewport_width: vp_w,
-                    viewport_height: vp_h,
-                    button: events::MouseButton::Left,
-                    modifiers: self.modifier_state(),
-                });
-                Self::dispatch_drag_attr(doc, drag.node_id, "data-ondragend");
-            }
-            events::reset_drag_ghost_visibility();
-            self.scene_dirty = true;
-        }
+        released |= self.release_press_gestures(vp_w, vp_h, None);
 
         // The pointer-capture drag's counterpart to the `finish_drag` on
         // `MouseUp`. A no-op when none is active.
         rinch_core::Drag::cancel();
-
-        released |= self.scrollbar_drag.take().is_some();
-        released |= std::mem::take(&mut self.text_selecting);
 
         // Clear `:active`, and — as on `MouseUp` — don't count it as a reason to
         // redraw: the dirty state it leaves is batched by `AboutToWait`.
@@ -1866,142 +3336,442 @@ impl RinchApp {
         released
     }
 
-    /// Dispatch `data-onenter` handler for the hovered node or its ancestors.
+    /// End every press-armed gesture `RinchApp` itself holds, committing none
+    /// of it: the part of [`Self::cancel_pointer_interaction`] that
+    /// [`Self::heal_missed_release`] shares (issue #1028).
     ///
-    /// Walks up from `hit_id` looking for a `data-onenter` attribute. If found,
-    /// dispatches the registered event handler. Used for menu hover-to-switch.
-    pub(super) fn dispatch_onenter(doc: &Rc<RefCell<RinchDocument>>, hit_id: usize) {
-        let handler_id = {
-            let d = doc.borrow();
-            let mut current = Some(hit_id);
-            let mut found = None;
-            while let Some(nid) = current {
-                if let Some(node) = d.tree.get(nid) {
-                    // A stale attribute must not stop the walk: disposing a
-                    // scope frees its handlers (issue #141) while nothing strips
-                    // the attribute from a node that outlives them, and this
-                    // walk commits to the first node carrying one.
-                    if let Some(id) = node
-                        .attributes
-                        .get("data-onenter")
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .filter(|&id| events::has_click_handler(events::EventHandlerId(id)))
-                    {
-                        found = Some(id);
-                        break;
-                    }
-                    current = node.parent;
-                } else {
-                    break;
-                }
-            }
-            found
-        };
-        if let Some(id) = handler_id {
-            events::dispatch_event(events::EventHandlerId(id));
-        }
+    /// - A pending element drag is discarded outright. `MouseUp` would have
+    ///   read it as "the threshold was never crossed, so this was a click" —
+    ///   the reading a cancel exists to prevent.
+    /// - An active element drag is cancelled ([`Self::cancel_active_dnd`]):
+    ///   `data-ondragleave` on the target, `data-ondragend` on the source, no
+    ///   `data-ondrop`.
+    /// - A scrollbar-thumb drag and a read-only text-selection drag are just
+    ///   released; the selection itself is kept, as a release would keep it.
+    /// - A render surface holding a press hears it cancelled
+    ///   ([`Self::release_surface_captures`]; `pressing` limits that to one
+    ///   pointer's).
+    ///
+    /// Returns whether anything was in flight.
+    fn release_press_gestures(&mut self, vp_w: f32, vp_h: f32, pressing: Option<u64>) -> bool {
+        let mut released = self.pending_drag.take().is_some();
+        released |= self.cancel_active_dnd(vp_w, vp_h);
+        released |= self.scrollbar_drag.take().is_some();
+        released |= std::mem::take(&mut self.text_selecting);
+        released |= self.release_surface_captures(pressing);
+        released
     }
 
-    /// Dispatch `data-onleave` handler for the previously hovered node or its ancestors.
+    /// Fire `data-onleave` and `data-onenter` (`onmouseleave` /
+    /// `onmouseenter`) as the pointer moves onto `target`, as the DOM fires
+    /// `mouseleave` and `mouseenter` (#2648): each element of the previous
+    /// hover chain (`chain`, the old target and its ancestors) that is not
+    /// over `target`'s chain leaves, innermost first, then each element of
+    /// the new chain that was not in the old enters, outermost first, as
+    /// Chrome 157 orders them. Moving between two inline elements in one
+    /// paragraph leaves the first and enters the second; the paragraph,
+    /// which holds both, hears neither.
     ///
-    /// Walks up from `old_id` looking for a `data-onleave` attribute. If found,
-    /// dispatches the registered event handler. Used for tooltip hover-out.
-    pub(super) fn dispatch_onleave(doc: &Rc<RefCell<RinchDocument>>, old_id: usize) {
-        let handler_id = {
-            let d = doc.borrow();
-            let mut current = Some(old_id);
-            let mut found = None;
-            while let Some(nid) = current {
-                if let Some(node) = d.tree.get(nid) {
-                    // A stale attribute must not stop the walk: disposing a
-                    // scope frees its handlers (issue #141) while nothing strips
-                    // the attribute from a node that outlives them, and this
-                    // walk commits to the first node carrying one.
-                    if let Some(id) = node
-                        .attributes
-                        .get("data-onleave")
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .filter(|&id| events::has_click_handler(events::EventHandlerId(id)))
-                    {
-                        found = Some(id);
-                        break;
-                    }
-                    current = node.parent;
-                } else {
-                    break;
-                }
-            }
-            found
-        };
-        if let Some(id) = handler_id {
-            events::dispatch_event(events::EventHandlerId(id));
-        }
-    }
-
-    /// Dispatch `data-oncontextmenu` handler for the right-clicked node or its ancestors.
-    ///
-    /// Walks up from `hit_id` looking for a `data-oncontextmenu` attribute.
-    /// If found, sets the [`ClickContext`] with mouse position and element bounds,
-    /// then dispatches the registered event handler. Returns `true` if a handler
-    /// was found and dispatched.
-    pub(super) fn dispatch_oncontextmenu(
+    /// `chain` is kept here rather than walked from the tree's previous
+    /// hovered node, which a removal clears: an element whose hovered child
+    /// was re-rendered under a still pointer is not entered again. A left
+    /// element that has gone from the tree has nothing to run. The handler
+    /// ids are read before any runs, so a handler that changes the tree does
+    /// not change who is told.
+    pub(super) fn dispatch_enter_leave(
         doc: &Rc<RefCell<RinchDocument>>,
-        hit_id: usize,
+        chain: &mut Vec<u64>,
+        target: Option<u64>,
+    ) {
+        let handlers = {
+            let d = doc.borrow();
+            let mut new_chain = Vec::new();
+            let mut cur = target;
+            while let Some(id) = cur {
+                let Some(node) = d.tree.get(id) else { break };
+                new_chain.push(id);
+                cur = node.parent;
+            }
+            // A stale attribute claims nothing: disposing a scope frees its
+            // handlers (issue #141) while the attribute stays on the node.
+            let handler = |id: u64, attr: &str| {
+                d.tree
+                    .get(id)
+                    .and_then(|n| n.attributes.get(attr))
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|&h| events::has_click_handler(events::EventHandlerId(h)))
+            };
+            let mut handlers = Vec::new();
+            // An element that left the document is not told (#2766), as in
+            // Chrome: a detached one keeps its attributes and, until its
+            // scope is disposed, its handlers.
+            for &id in chain
+                .iter()
+                .filter(|&&id| !new_chain.contains(&id) && d.is_in_document(id))
+            {
+                handlers.extend(handler(id, "data-onleave"));
+            }
+            for &id in new_chain.iter().rev().filter(|id| !chain.contains(id)) {
+                handlers.extend(handler(id, "data-onenter"));
+            }
+            *chain = new_chain;
+            handlers
+        };
+        for id in handlers {
+            events::dispatch_event(events::EventHandlerId(id));
+        }
+    }
+
+    /// The hover half of a pointer at `(x, y)`, shared by a real move (the
+    /// `MouseMove` arm) and a still pointer whose content moved under it
+    /// ([`Self::rehover_still_pointer`], #2766): hit-test (through the
+    /// event's shared hit), move `:hover` (`update_hover`, after
+    /// `settle_detached_hover` re-anchors a hover whose node left the
+    /// document), fire `onmouseleave`/`onmouseenter` on the difference
+    /// ([`Self::dispatch_enter_leave`]), and work out the cursor. Records the
+    /// geometry it hit-tested ([`Self::hover_epoch`]) and the cursor.
+    pub(super) fn hover_at(&mut self, doc: &Rc<RefCell<RinchDocument>>, x: f32, y: f32) -> HoverAt {
+        let (hovered, target, cursor, epoch) = {
+            let d = doc.borrow();
+            let h = self.shared_hit(&d, x, y);
+            let target = self.shared_target(&d, x, y);
+            let cursor = target
+                .and_then(|id| d.tree.get(id))
+                .map(|n| n.computed_style.cursor);
+            let mut cs = cursor
+                .as_ref()
+                .map(cursor_value_to_style)
+                .unwrap_or(rinch_platform::CursorStyle::Default);
+            // `cursor: auto` is the I-beam over selectable text; a cursor the
+            // element names wins (an `<a>`'s `pointer`), as in Chrome.
+            if cursor == Some(rinch_dom::computed_style::CursorValue::Auto)
+                && let Some(hit_id) = h
+                && Self::selectable_at(&d.tree, hit_id, x, y).is_some()
+            {
+                cs = rinch_platform::CursorStyle::Text;
+            }
+            // Read before any handler runs: a handler's scroll moves it, and
+            // must be looked at again.
+            (h, target, cs, d.tree.geometry_epoch())
+        };
+        let changed = {
+            let mut d = doc.borrow_mut();
+            d.settle_detached_hover(&self.hover_chain);
+            let mut hovered_changed = false;
+            d.update_hover(target, &mut hovered_changed);
+            hovered_changed || self.hover_chain.first().copied() != target
+        };
+        if changed {
+            Self::dispatch_enter_leave(doc, &mut self.hover_chain, target);
+        }
+        self.hover_epoch = epoch;
+        self.hover_cursor = Some(cursor);
+        HoverAt {
+            hovered,
+            target,
+            cursor,
+            changed,
+        }
+    }
+
+    /// Hit-test hover again at the pointer's last position when the frame
+    /// moved what may be under it (#2766): a layout, a scroll, or the removal
+    /// of the hovered element, under a mouse that did not move. Chrome does
+    /// the same after a layout or scroll, so an element a layout slides under
+    /// a resting pointer is entered, and one slid away from it is left.
+    ///
+    /// Run at `AboutToWait`, after the frame's layout. It asks nothing on a
+    /// frame whose geometry did not move (`NodeTree::geometry_epoch` is
+    /// what [`Self::hover_at`] last hit-tested, and the hovered element is
+    /// still in the document), nor when the mouse is not in the window (a
+    /// leave cleared hover, #2672), its last move was a finger's or a pen's,
+    /// or a press holds the pointer ([`Self::pointer_captured`]: Chrome sends
+    /// no boundary events to others while the pointer is captured). After the
+    /// release, the next `AboutToWait` looks again only if the geometry moved
+    /// meanwhile, or a gesture showed a cursor of its own (a drag's grabbing
+    /// hand, the text I-beam and a resize arrow clear `hover_cursor`, so
+    /// hover's cursor is sent again). When the element under
+    /// the pointer is the one hover already has, nothing else happens: no
+    /// event, no restyle, no cursor, no frame. Otherwise `:hover` restyles,
+    /// the leave and enter handlers run as for a real move, the cursor
+    /// follows and the `title` tooltip restarts its rest on the new element.
+    /// Answers whether the restyle or the handlers left a frame to draw.
+    pub(super) fn rehover_still_pointer(
+        &mut self,
+        vp_w: f32,
+        vp_h: f32,
+        actions: &mut Vec<AppAction>,
+    ) -> bool {
+        if !self.mouse_in_window || self.left_while_captured || self.pointer_captured() {
+            return false;
+        }
+        let (Some((x, y)), Some(doc)) = (self.cursor_pos, self.doc.clone()) else {
+            return false;
+        };
+        let moved = {
+            let d = doc.borrow();
+            d.tree.geometry_epoch() != self.hover_epoch
+                || self
+                    .hover_chain
+                    .first()
+                    .is_some_and(|&id| !d.is_in_document(id))
+                // A drag, a text-selection drag or a resize handle showed a
+                // cursor of its own: hover's is owed again.
+                || self.hover_cursor.is_none()
+        };
+        if !moved {
+            return false;
+        }
+        // On a borderless window's resize handle the pointer is over no
+        // content, and the cursor is the resize arrow (the `MouseMove` arm).
+        if let Some(props) = &self.window_props
+            && props.borderless
+            && props.resizable
+            && let Some(inset) = props.resize_inset
+            && let Some(dir) = detect_resize_edge(x, y, vp_w, vp_h, inset)
+            && !self.scrollbar_thumb_beats_resize(dir, x, y)
+        {
+            return false;
+        }
+        // Defensive: `handle_event` already dropped the memo, and nothing in
+        // `AboutToWait` hit-tests before this outside a drag (when this does
+        // not run); but a memo kept across a tick could answer from a
+        // transform the tick moved without moving the generation.
+        self.hit_memo.set(None);
+        let old_cursor = self.hover_cursor;
+        let h = self.hover_at(&doc, x, y);
+        if old_cursor != Some(h.cursor) {
+            actions.push(AppAction::SetCursor(h.cursor));
+        }
+        if !h.changed {
+            return false;
+        }
+        let tooltip_up = self.title_tooltip.shown.is_some();
+        self.note_title_tooltip_move(h.target, x, y, rinch_core::timer::now());
+        let tooltip_hidden = tooltip_up && self.title_tooltip.shown.is_none();
+        (self.has_dirty_nodes() && self.resolve_and_repaint(vp_w, vp_h)) || tooltip_hidden
+    }
+
+    /// The mouse left the window ([`PlatformEvent::MouseLeft`], #2672):
+    /// nothing is under the pointer, as in Chrome, whose `:hover` clears and
+    /// whose elements hear `mouseleave` when the mouse leaves the page. The
+    /// hover chain empties (and the elements whose style reads `:hover`
+    /// restyle), each element it held hears its `onmouseleave`, innermost
+    /// first, and a render surface under the pointer hears `MouseLeave`.
+    /// Before, only the `title` tooltip went, and an `a:hover` stayed lit
+    /// until the pointer came back. `cursor_pos` keeps the last position,
+    /// where a release or a cancelled surface press with no move between is
+    /// placed. While a press holds the pointer the leave waits for it to end
+    /// ([`Self::pointer_captured`]). Answers whether anything changed.
+    pub(super) fn pointer_left_window(&mut self) -> bool {
+        let Some(doc) = self.doc.clone() else {
+            return false;
+        };
+        let mut changed = false;
+        let mut hovered_changed = false;
+        let restyle = {
+            let mut d = doc.borrow_mut();
+            // A hovered node removed this turn (or by a touch tap) must not
+            // leave its ancestors `:hover` (#2766 review).
+            d.settle_detached_hover(&self.hover_chain);
+            d.update_hover(None, &mut hovered_changed)
+        };
+        if hovered_changed || !self.hover_chain.is_empty() {
+            Self::dispatch_enter_leave(&doc, &mut self.hover_chain, None);
+            changed = true;
+        }
+        changed |= restyle;
+        // A surface holding a press keeps its pointer until the release
+        // (`SurfaceEvent`'s capture note); otherwise the one under the
+        // pointer is left.
+        if self.surface_captures.is_empty()
+            && let Some((sid, _)) = self.hovered_surface.take()
+        {
+            crate::render_surface::dispatch_surface_event(
+                sid,
+                crate::render_surface::SurfaceEvent::MouseLeave,
+            );
+            changed = true;
+        }
+        // An editor's link or image is no longer under the pointer.
+        #[cfg(feature = "windowing")]
+        {
+            if crate::editor::link_hover_wanted() {
+                crate::editor::set_link_hover(self.input_doc(), None);
+            }
+            if crate::editor::image_hover_wanted() {
+                crate::editor::set_image_hover(self.input_doc(), None);
+            }
+        }
+        changed
+    }
+
+    /// The focus half of a pointer press, for **every** button: drop the
+    /// keyboard focus ring, move `:focus`, and move or release the arbiter's
+    /// generic-node claim — the answer [`Self::resolve_click_focus`] gives.
+    /// `primary` also sets `:active`, which is the primary button's alone.
+    ///
+    /// A browser's mousedown focuses the nearest focusable ancestor of the hit
+    /// node whatever the button (Chrome 153, measured: a right or middle press
+    /// on a `tabindex="-1"` item inside a focused `tabindex="0"` listbox
+    /// focuses the item). The right/middle path used to run none of this, so
+    /// its release check in `handle_click_with_button` let go of the listbox
+    /// and nothing took the keyboard (issue #452). Running the one claim on
+    /// both paths is what makes that check agree with the press by
+    /// construction.
+    pub(super) fn claim_press_focus(&mut self, x: f32, y: f32, primary: bool) {
+        let Some(doc) = self.doc.clone() else {
+            return;
+        };
+        // The hit and the focus target it resolves to, in one
+        // borrow: the walk starts where the hit test lands, so
+        // re-borrowing between them buys nothing. The policy is
+        // `resolve_click_focus`, which `handle_click`'s release
+        // check also asks — one press, one answer (issue #316).
+        let (hit, press_focus, focus_dom_target) = {
+            let d = doc.borrow();
+            // The element pressed, an inline one in a paragraph's text
+            // included (#2648): `:active` and the focus walk start there.
+            let hit = self.shared_target(&d, x, y);
+            let press_focus = Self::resolve_click_focus(&d.tree, hit);
+            // Where the DOM `:focus` state goes. The outer
+            // `Option` is *whether to touch it at all*: a
+            // `data-nofocus` press moves no focus, so it must not
+            // clear the ring either (issue #312). The inner one is
+            // where it lands — and a **disabled** control is never
+            // it (issue #315): it takes no keyboard claim, so a
+            // focus ring on it would be the style lying about who
+            // owns the keyboard. `PressFocus::Node` is already
+            // disabled-filtered by `resolve_click_focus`.
+            let dom_target = match press_focus {
+                PressFocus::Preserve => None,
+                PressFocus::Node(nid) => Some(Some(nid)),
+                PressFocus::Release => {
+                    Some(hit.filter(|&nid| !Self::node_is_disabled_in_tree(&d.tree, nid)))
+                }
+            };
+            (hit, press_focus, dom_target)
+        };
+        // The arbiter-held generic node (issue #228). A press that
+        // resolves anywhere other than it moves or releases the
+        // claim right here, so paths that return before
+        // `handle_click` (pending drag, scrollbar, no hit) can't
+        // strand an invisible, still-Enter-activatable claim.
+        let node_claim = match self.focus_target {
+            FocusTarget::Node(fid) => Some(fid),
+            _ => None,
+        };
+        // Any mousedown drops the keyboard focus ring wherever it
+        // is (it only ever lives on the focused node): pointer
+        // interaction never shows :focus-visible, and `update_focus`
+        // below is a no-op when the hit node already holds
+        // (Tab-driven) focus.
+        {
+            let mut d = doc.borrow_mut();
+            if let Some(prev) = d.tree.focused_node {
+                d.set_focus_visible(prev, false);
+            }
+            // :active applies while the primary button is pressed —
+            // and only that button, as in a browser.
+            if primary {
+                d.update_active(hit);
+            }
+            // :focus applies to the clicked element (persists after
+            // release); anchored on the focusable ancestor for a
+            // press inside one, nowhere at all for a disabled
+            // one, and left exactly where it was for a
+            // `data-nofocus` press.
+            if let Some(target) = focus_dom_target {
+                d.update_focus(target);
+            }
+        }
+        // No outstanding doc borrow from here on: the arbiter's
+        // teardown re-borrows, and the callbacks it defers are user
+        // code that may mutate the DOM.
+        match press_focus {
+            // The press declined to move focus (issue #312): the
+            // current owner keeps the keyboard — editor, input,
+            // surface or node alike — and the click still fires from
+            // `handle_click` below. This is the
+            // `preventDefault()`-on-mousedown escape hatch, which
+            // desktop had no equivalent of.
+            PressFocus::Preserve => {}
+            // Re-press inside the already-focused node: nothing to
+            // do, the claim and its state stay put.
+            PressFocus::Node(nid) if node_claim == Some(nid) => {}
+            PressFocus::Node(nid) => {
+                let (_, work) = self.set_focus_target_deferred(FocusTarget::Node(nid));
+                Self::fire_focus_work(work);
+                self.notify_node_focus_gained(nid);
+            }
+            PressFocus::Release if node_claim.is_some() => {
+                self.set_focus_target(FocusTarget::None);
+            }
+            PressFocus::Release => {}
+        }
+    }
+
+    /// The live `data-oncontextmenu` nearest `hit_id` on its ancestor chain:
+    /// its handler id and the box it is painted in. The walk stops at the first
+    /// element carrying the attribute; a stale one claims nothing.
+    pub(super) fn oncontextmenu_handler_at(
+        doc: &Rc<RefCell<RinchDocument>>,
+        hit_id: u64,
+    ) -> Option<(usize, f32, f32, f32, f32)> {
+        let d = doc.borrow();
+        let mut current = Some(hit_id);
+        let mut found = None;
+        while let Some(nid) = current {
+            if let Some(node) = d.tree.get(nid) {
+                // A stale attribute must not stop the walk — see the note
+                // on the `data-onenter` walk (issue #141).
+                if let Some(val) = node.attributes.get("data-oncontextmenu") {
+                    if let Some(id) = val
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|&id| events::has_click_handler(events::EventHandlerId(id)))
+                    {
+                        // The box the element is *painted* in, exactly as
+                        // the click path reports it — a hand-rolled
+                        // parent-chain sum composed no transform and made
+                        // no `position: fixed` exception (#203).
+                        let (ax, ay, aw, ah) = painted_element_box(&d.tree, nid);
+                        found = Some((id, ax, ay, aw, ah));
+                    }
+                    break;
+                }
+                current = node.parent;
+            } else {
+                break;
+            }
+        }
+        found
+    }
+
+    /// Run a `data-oncontextmenu` handler found by
+    /// [`Self::oncontextmenu_handler_at`], with the click context it reads.
+    pub(super) fn fire_oncontextmenu(
+        (id, elem_x, elem_y, elem_w, elem_h): (usize, f32, f32, f32, f32),
         x: f32,
         y: f32,
         viewport_width: f32,
         viewport_height: f32,
         modifiers: events::ModifierState,
-    ) -> bool {
-        let handler_info = {
-            let d = doc.borrow();
-            let mut current = Some(hit_id);
-            let mut found = None;
-            while let Some(nid) = current {
-                if let Some(node) = d.tree.get(nid) {
-                    // A stale attribute must not stop the walk — see the note
-                    // on the `data-onenter` walk (issue #141).
-                    if let Some(val) = node.attributes.get("data-oncontextmenu") {
-                        if let Some(id) = val
-                            .parse::<usize>()
-                            .ok()
-                            .filter(|&id| events::has_click_handler(events::EventHandlerId(id)))
-                        {
-                            // The box the element is *painted* in, exactly as
-                            // the click path reports it — a hand-rolled
-                            // parent-chain sum composed no transform and made
-                            // no `position: fixed` exception (#203).
-                            let (ax, ay, aw, ah) = painted_element_box(&d.tree, nid);
-                            found = Some((id, ax, ay, aw, ah));
-                        }
-                        break;
-                    }
-                    current = node.parent;
-                } else {
-                    break;
-                }
-            }
-            found
-        };
-        if let Some((id, elem_x, elem_y, elem_w, elem_h)) = handler_info {
-            events::set_click_context(events::ClickContext {
-                mouse_x: x,
-                mouse_y: y,
-                element_x: elem_x,
-                element_y: elem_y,
-                element_width: elem_w,
-                element_height: elem_h,
-                text_hit: events::TextHitInfo::default(),
-                viewport_width,
-                viewport_height,
-                button: events::MouseButton::Right,
-                modifiers,
-            });
-            events::dispatch_event(events::EventHandlerId(id));
-            true
-        } else {
-            false
-        }
+    ) {
+        events::set_click_context(events::ClickContext {
+            mouse_x: x,
+            mouse_y: y,
+            element_x: elem_x,
+            element_y: elem_y,
+            element_width: elem_w,
+            element_height: elem_h,
+            text_hit: events::TextHitInfo::default(),
+            viewport_width,
+            viewport_height,
+            button: events::MouseButton::Right,
+            modifiers,
+        });
+        events::dispatch_event(events::EventHandlerId(id));
     }
 
     /// Build an absolute-positioned ancestor chain for `hit_id`, from immediate
@@ -2020,10 +3790,10 @@ impl RinchApp {
     /// enough to be worth the agreement.
     pub(crate) fn collect_click_ancestors(
         tree: &rinch_dom::NodeTree,
-        hit_id: usize,
+        hit_id: u64,
     ) -> Vec<events::AncestorBounds> {
         // Chain from hit upward: [hit, parent, grandparent, ..., root]
-        let mut chain: Vec<usize> = Vec::new();
+        let mut chain: Vec<u64> = Vec::new();
         let mut cur = Some(hit_id);
         while let Some(nid) = cur {
             chain.push(nid);
@@ -2058,7 +3828,7 @@ impl RinchApp {
 
     /// Walk up from `hit_id` looking for a `draggable="true"` attribute.
     /// Returns the node ID of the first draggable ancestor (or self).
-    pub(crate) fn find_draggable(tree: &rinch_dom::NodeTree, hit_id: usize) -> Option<usize> {
+    pub(crate) fn find_draggable(tree: &rinch_dom::NodeTree, hit_id: u64) -> Option<u64> {
         let mut current = Some(hit_id);
         while let Some(nid) = current {
             if let Some(node) = tree.get(nid) {
@@ -2075,7 +3845,7 @@ impl RinchApp {
 
     /// Walk up from `hit_id` looking for a `data-ondrop` attribute.
     /// Returns the node ID of the first drop target ancestor (or self).
-    pub(crate) fn find_drop_target(tree: &rinch_dom::NodeTree, hit_id: usize) -> Option<usize> {
+    pub(crate) fn find_drop_target(tree: &rinch_dom::NodeTree, hit_id: u64) -> Option<u64> {
         let mut current = Some(hit_id);
         while let Some(nid) = current {
             if let Some(node) = tree.get(nid) {
@@ -2095,7 +3865,7 @@ impl RinchApp {
     /// to know the cursor position relative to the target.
     pub(crate) fn dispatch_drag_attr_with_context(
         doc: &Rc<RefCell<RinchDocument>>,
-        node_id: usize,
+        node_id: u64,
         attr: &str,
         cursor_x: f32,
         cursor_y: f32,
@@ -2150,7 +3920,7 @@ impl RinchApp {
 
     /// Dispatch a drag event attribute (data-ondragstart, data-ondrop, etc.)
     /// by walking up from `node_id` looking for the specified attribute.
-    pub(crate) fn dispatch_drag_attr(doc: &Rc<RefCell<RinchDocument>>, node_id: usize, attr: &str) {
+    pub(crate) fn dispatch_drag_attr(doc: &Rc<RefCell<RinchDocument>>, node_id: u64, attr: &str) {
         let handler_id = {
             let d = doc.borrow();
             let mut current = Some(node_id);
@@ -2217,10 +3987,123 @@ impl RinchApp {
         vp_w: f32,
         vp_h: f32,
     ) {
+        // The element under the pointer, an inline one in a paragraph's
+        // text included (#2648).
+        let hit = self.move_target(x, y);
+        self.dispatch_mouse_attr_at(attr, hit, x, y, button, vp_w, vp_h);
+    }
+
+    /// The hit test for `(x, y)` in `d`, shared by every consumer of the event
+    /// being handled (update-path audit F2.1 for a pointer move, #908 for a press).
+    ///
+    /// A left press asks "what is under the pointer" of the `data-onmousedown`
+    /// dispatch, the editor, the focus claim, the draggable search, and each phase
+    /// of the click — a toolbar press over a focused editor ran nine hit tests of
+    /// one tree at one point, where the answer can only change when the tree does.
+    /// The memo holds the last answer with the document and the hit cache's
+    /// generation it was computed at; a generation that has moved since — a handler
+    /// that mutated the document, a layout, a scroll — re-tests, so the answer is
+    /// always the one a fresh [`hit_test`] would give.
+    ///
+    /// The generation is what the hit cache itself trusts, and one input is known
+    /// to move without it: a transition or animation tick writes a `transform` into
+    /// `computed_style` without bumping it (the hit cache keys its *contents* by
+    /// `HitStyleKey`, which holds whether a transform is `none`, not its
+    /// value). So the memo never outlives the event it was filled in:
+    /// `handle_event` drops it on entry. The ticks run inside
+    /// `handle_event(AboutToWait)` and nothing in that arm hit-tests, so no answer
+    /// from before a tick is ever reused. A hit test added after the ticks there
+    /// would have to drop the memo first.
+    pub(crate) fn shared_hit(&self, d: &RinchDocument, x: f32, y: f32) -> Option<u64> {
+        let doc_key = d.doc_key();
+        let generation = d.tree.hit_cache.generation();
+        let (xb, yb) = (x.to_bits(), y.to_bits());
+        if let Some(m) = self.hit_memo.get()
+            && m.doc_key == doc_key
+            && m.generation == generation
+            && m.x == xb
+            && m.y == yb
+        {
+            return m.hit;
+        }
+        let hit = hit_test(&d.tree, x, y);
+        // The hit test itself invalidates nothing, so the generation read
+        // before it still describes the tree it answered for.
+        self.hit_memo.set(Some(HitMemo {
+            doc_key,
+            generation,
+            x: xb,
+            y: yb,
+            hit,
+            target: None,
+        }));
+        hit
+    }
+
+    /// The element a pointer event at `(x, y)` targets: [`Self::shared_hit`]
+    /// refined to the inline element under the point
+    /// (`hit_testing::element_of_target`, #2648),
+    /// shared within the event as the hit is. `:hover`, `:active`, the
+    /// cursor, `mouseenter`/`mouseleave`, the `data-onmouse*` handlers,
+    /// `oncontextmenu`, `onwheel`, the `title` tooltip and press focus take
+    /// it; what asks about the block's text (selection, the editor, render
+    /// surfaces, scrolling) keeps the hit.
+    pub(crate) fn shared_target(&self, d: &RinchDocument, x: f32, y: f32) -> Option<u64> {
+        let hit = self.shared_hit(d, x, y)?;
+        let target = self.shared_event_target(d, x, y)?;
+        Some(super::hit_testing::element_of_target(&d.tree, hit, target))
+    }
+
+    /// Where the click and drag walks start for a pointer event at `(x, y)`:
+    /// [`Self::shared_hit`] refined by `hit_testing::event_target_at` (the text node
+    /// under the glyphs, or the inline element whose padding is under the
+    /// point), else the hit. Shared within the event as the hit is, so a
+    /// press asks `event_target_at` once however many of its paths want
+    /// the answer (#2647: three did, each measuring the paragraph's
+    /// elements again).
+    pub(crate) fn shared_event_target(&self, d: &RinchDocument, x: f32, y: f32) -> Option<u64> {
+        let hit = self.shared_hit(d, x, y)?;
+        // `shared_hit` left the memo describing this point, tree and hit.
+        let memo = self.hit_memo.get();
+        if let Some(target) = memo.and_then(|m| m.target) {
+            return target;
+        }
+        let target = Some(super::hit_testing::event_target_at(&d.tree, hit, x, y).unwrap_or(hit));
+        if let Some(mut m) = memo {
+            m.target = Some(target);
+            self.hit_memo.set(Some(m));
+        }
+        target
+    }
+
+    /// [`Self::shared_target`] against this app's own document.
+    pub(super) fn move_target(&self, x: f32, y: f32) -> Option<u64> {
+        let doc = self.doc.as_ref()?;
+        self.shared_target(&doc.borrow(), x, y)
+    }
+
+    /// [`Self::shared_hit`] against this app's own document.
+    pub(super) fn move_hit(&self, x: f32, y: f32) -> Option<u64> {
+        let doc = self.doc.as_ref()?;
+        self.shared_hit(&doc.borrow(), x, y)
+    }
+
+    /// [`Self::dispatch_mouse_attr`] for a hit test the caller already ran.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dispatch_mouse_attr_at(
+        &self,
+        attr: &str,
+        hit: Option<u64>,
+        x: f32,
+        y: f32,
+        button: events::MouseButton,
+        vp_w: f32,
+        vp_h: f32,
+    ) {
         let Some(doc) = &self.doc else { return };
         let handler_info = {
             let d = doc.borrow();
-            let Some(hit_id) = hit_test(&d.tree, x, y) else {
+            let Some(hit_id) = hit else {
                 return;
             };
             let mut current = Some(hit_id);
@@ -2269,16 +4152,16 @@ impl RinchApp {
         }
     }
 
-    /// Walk up from `hit_id` looking for a `data-onfiledrop` attribute.
-    /// Returns the node ID of the first file-drop target ancestor (or self).
-    pub(crate) fn find_file_drop_target(
-        tree: &rinch_dom::NodeTree,
-        hit_id: usize,
-    ) -> Option<usize> {
+    /// Walk up from `hit_id` looking for a `data-onfiledrop` or
+    /// `data-ondropfiles` attribute. Returns the node ID of the first
+    /// file-drop target ancestor (or self).
+    pub(crate) fn find_file_drop_target(tree: &rinch_dom::NodeTree, hit_id: u64) -> Option<u64> {
         let mut current = Some(hit_id);
         while let Some(nid) = current {
             if let Some(node) = tree.get(nid) {
-                if node.attributes.contains_key("data-onfiledrop") {
+                if node.attributes.contains_key("data-onfiledrop")
+                    || node.attributes.contains_key("data-ondropfiles")
+                {
                     return Some(nid);
                 }
                 current = node.parent;
@@ -2289,41 +4172,96 @@ impl RinchApp {
         None
     }
 
-    /// Dispatch an OS file-drop event by walking up from `hit_id` looking for
-    /// `data-onfiledrop` and invoking the registered `FileDropCallback`.
+    /// Dispatch an OS file-drop event by walking up from `hit_id` to the first
+    /// node carrying a live `data-onfiledrop` (paths) or `data-ondropfiles`
+    /// ([`LocalFile`](rinch_core::file::LocalFile)s, issue #1771) handler, and
+    /// invoking each of the two that node carries, paths first.
+    ///
+    /// `(x, y, viewport_width, viewport_height, modifiers)` is the click
+    /// context the handler reads through `get_click_context()` (#1650): the
+    /// drop point in logical window px and the handler element's painted box,
+    /// the frame every other handler's context is in.
     pub(crate) fn dispatch_file_drop(
         doc: &Rc<RefCell<RinchDocument>>,
-        hit_id: usize,
+        hit_id: u64,
         paths: Vec<std::path::PathBuf>,
+        (x, y, viewport_width, viewport_height, modifiers): (
+            f32,
+            f32,
+            f32,
+            f32,
+            events::ModifierState,
+        ),
     ) {
-        let handler_id = {
+        // A stale attribute must not stop the walk: disposing a scope frees
+        // its handlers (issue #141) while nothing strips the attribute from a
+        // node that outlives them, and this walk commits to the first node
+        // carrying a live one.
+        let live =
+            |node: &rinch_dom::node::Node, attr: &str, has: fn(events::EventHandlerId) -> bool| {
+                node.attributes
+                    .get(attr)
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|&id| has(events::EventHandlerId(id)))
+            };
+        let found = {
             let d = doc.borrow();
             let mut current = Some(hit_id);
             let mut found = None;
             while let Some(nid) = current {
-                if let Some(node) = d.tree.get(nid) {
-                    // A stale attribute must not stop the walk: disposing a
-                    // scope frees its handlers (issue #141) while nothing strips
-                    // the attribute from a node that outlives them, and this
-                    // walk commits to the first node carrying one.
-                    if let Some(id) = node
-                        .attributes
-                        .get("data-onfiledrop")
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .filter(|&id| events::has_file_drop_handler(events::EventHandlerId(id)))
-                    {
-                        found = Some(id);
-                        break;
-                    }
-                    current = node.parent;
-                } else {
+                let Some(node) = d.tree.get(nid) else { break };
+                let path_handler = live(node, "data-onfiledrop", events::has_file_drop_handler);
+                let file_handler = live(node, "data-ondropfiles", events::has_files_drop_handler);
+                if path_handler.is_some() || file_handler.is_some() {
+                    found = Some((
+                        path_handler,
+                        file_handler,
+                        painted_element_box(&d.tree, nid),
+                    ));
                     break;
                 }
+                current = node.parent;
             }
             found
         };
-        if let Some(id) = handler_id {
+        let Some((path_handler, file_handler, (elem_x, elem_y, elem_w, elem_h))) = found else {
+            return;
+        };
+        let context = events::ClickContext {
+            mouse_x: x,
+            mouse_y: y,
+            element_x: elem_x,
+            element_y: elem_y,
+            element_width: elem_w,
+            element_height: elem_h,
+            text_hit: events::TextHitInfo::default(),
+            viewport_width,
+            viewport_height,
+            button: events::MouseButton::Left,
+            modifiers,
+        };
+        // A path that cannot be `stat`ed now (gone since the drop) is left
+        // out of the `LocalFile`s; the paths handler still gets every path.
+        // On wasm32 (an embed build in a browser) there is no file system to
+        // read a path from, so the handler gets no files.
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let files: Vec<rinch_core::file::LocalFile> = if file_handler.is_some() {
+            paths
+                .iter()
+                .filter_map(|p| rinch_core::file::LocalFile::from_path(p).ok())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let files: Vec<rinch_core::file::LocalFile> = Vec::new();
+        if let Some(id) = path_handler {
+            events::set_click_context(context);
             events::dispatch_file_drop_event(events::EventHandlerId(id), paths);
+        }
+        if let Some(id) = file_handler {
+            events::set_click_context(context);
+            events::dispatch_files_drop_event(events::EventHandlerId(id), files);
         }
     }
 
@@ -2331,7 +4269,7 @@ impl RinchApp {
     /// up the active drag state.
     pub(crate) fn activate_drag(
         &mut self,
-        node_id: usize,
+        node_id: u64,
         mousedown_pos: (f32, f32),
         cursor: (f32, f32),
         scale_factor: f64,
@@ -2364,11 +4302,22 @@ impl RinchApp {
             .unwrap_or((0.0, 0.0))
         };
 
-        #[cfg(any(feature = "gpu", feature = "android-gpu", feature = "embed"))]
+        #[cfg(any(feature = "gpu-renderer", feature = "android-gpu", feature = "embed"))]
         let snapshot = {
             let mut painter = VelloPainter::new();
+            // Grey text: the ghost is appended at the pointer's fractional
+            // translate, off the subpixel grid (#2286 stage 3).
+            painter.set_subpixel_text(false);
             let mut d = doc.borrow_mut();
             let d = &mut *d;
+            // Its clips reach the frame's count through `append_scene`: an
+            // unbounded layer must not count the whole plane.
+            painter.set_tile_target(peniko::kurbo::Rect::new(
+                0.0,
+                0.0,
+                d.tree.viewport.width as f64 * scale_factor,
+                d.tree.viewport.height as f64 * scale_factor,
+            ));
 
             rinch_dom::paint::paint_subtree(
                 &d.tree,
@@ -2398,6 +4347,9 @@ impl RinchApp {
 
             let mut painter = TinySkiaPainter::new(sw, sh);
             painter.fill_transparent();
+            // Grey text, as the GPU ghost (#2286 stage 3): drawn at the
+            // pointer, off the subpixel grid.
+            painter.set_subpixel_text(false);
 
             rinch_dom::paint::paint_subtree(
                 &d.tree,
@@ -2412,7 +4364,7 @@ impl RinchApp {
 
         self.active_dnd = Some(ActiveDrag {
             node_id,
-            #[cfg(any(feature = "gpu", feature = "android-gpu", feature = "embed"))]
+            #[cfg(any(feature = "gpu-renderer", feature = "android-gpu", feature = "embed"))]
             snapshot,
             #[cfg(software_shell)]
             snapshot_pixels,
@@ -2424,11 +4376,37 @@ impl RinchApp {
             cursor,
             over_target: None,
         });
+        self.drag_auto_scroll_at = None;
+        self.drag_hit_memo = None;
+        // A drag starts with the built-in ghost visible, whatever the last one
+        // left behind: a `suppress_drag_ghost` lasts exactly as long as its
+        // own drag. Every ending resets it too (`end_active_dnd`); this is the
+        // half that holds for an ending nobody has written yet (issue #333).
+        // Before `data-ondragstart` fires, so a source that hides the ghost
+        // there still does.
+        events::reset_drag_ghost_visibility();
+        // `data-drag-ghost="false"` on the source or an ancestor hides it
+        // (#2091): an attribute a component sets at render, which a host
+        // applying a sandboxed guest's DOM reads like any other, where the
+        // guest's own `suppress_drag_ghost()` reaches nothing that paints.
+        let no_ghost = self.doc.as_ref().is_some_and(|doc| {
+            let d = doc.borrow();
+            std::iter::successors(Some(node_id), |&id| d.tree.get(id).and_then(|n| n.parent))
+                .filter_map(|id| d.tree.get(id))
+                .find_map(|n| n.attributes.get("data-drag-ghost"))
+                .is_some_and(|v| v.eq_ignore_ascii_case("false"))
+        });
+        if no_ghost {
+            events::suppress_drag_ghost();
+        }
+        // The ghost appears now, not on the next move: `build_pixels` names
+        // its rect as the frame's damage.
+        self.scene_dirty = true;
     }
 }
 
 /// A cursor motion produced by an arrow/Home/End key (design §7 keyboard).
-#[cfg(feature = "desktop")]
+#[cfg(feature = "windowing")]
 #[derive(Clone, Copy)]
 pub(crate) enum Motion {
     CharLeft,
@@ -2445,14 +4423,15 @@ pub(crate) enum Motion {
 
 /// Derive the key string handed to the user keyboard hook (and the focus
 /// registry's `on_key`) from a key event's keycode + text + layout-mapped
-/// key value, spelled the way a browser spells `KeyboardEvent.key` — bar the
-/// spacebar, which rinch has always named `"Space"` where a browser reports
-/// `" "` (`rinch-web` forwards `event.key()`, so it reports `" "`; that
-/// divergence predates issue #336 and `spacebar_reports_the_named_key_not_its_text`
-/// pins it deliberately). Four steps, in order:
+/// key value, spelled the way a browser spells `KeyboardEvent.key` — the
+/// spacebar included, which is `" "` (its `code` is `"Space"`), as `rinch-web`
+/// reports it by forwarding `event.key()`. Desktop named it `"Space"` until
+/// issue #1161. Four steps, in order:
 ///
-/// 1. **A named key wins over the text it would insert** — a spacebar press
-///    reports `"Space"`, not `" "`, and Tab reports `"Tab"`, not `"\t"`.
+/// 1. **A named key wins over the text it would insert** — Tab reports
+///    `"Tab"`, not `"\t"`. The spacebar's "name" is its character, `" "`, so a
+///    release (which carries no text) and a chord (whose text a modifier
+///    suppressed) spell it the same as a plain press.
 /// 2. **A printable `text` wins for character keys**, so a non-QWERTY layout
 ///    reports the letter the user actually typed rather than the physical
 ///    QWERTY position — the same rule [`editor_key_binding`] follows. This is
@@ -2510,8 +4489,9 @@ pub(crate) fn hook_key_str(
     character_key_str(key).map(str::to_string)
 }
 
-/// Keys whose *name* is their `KeyboardEvent.key` spelling, so it wins over
-/// whatever text they would insert.
+/// Keys whose `KeyboardEvent.key` spelling is fixed by the key itself, so it
+/// wins over whatever text they would insert. For every key but the spacebar
+/// that is a name; the spacebar's is the space character (#1161).
 fn named_key_str(key: KeyCode) -> Option<&'static str> {
     Some(match key {
         KeyCode::ArrowLeft => "ArrowLeft",
@@ -2527,7 +4507,7 @@ fn named_key_str(key: KeyCode) -> Option<&'static str> {
         KeyCode::Escape => "Escape",
         KeyCode::PageUp => "PageUp",
         KeyCode::PageDown => "PageDown",
-        KeyCode::Space => "Space",
+        KeyCode::Space => " ",
         // Modifier keys (as physical key presses)
         KeyCode::ShiftLeft | KeyCode::ShiftRight => "Shift",
         KeyCode::ControlLeft | KeyCode::ControlRight => "Control",
@@ -2610,7 +4590,7 @@ fn character_key_str(key: KeyCode) -> Option<&'static str> {
 /// for keys with no bindable identity, which then fall through to text input.
 /// The one `char` of a one-`char` string, or `None` — the shape a
 /// single-letter test on a DOM key string takes (`"A"` yes, `"F5"` no).
-#[cfg(feature = "desktop")]
+#[cfg(feature = "windowing")]
 fn single_char(s: &str) -> Option<char> {
     let mut it = s.chars();
     match (it.next(), it.next()) {
@@ -2619,7 +4599,7 @@ fn single_char(s: &str) -> Option<char> {
     }
 }
 
-#[cfg(feature = "desktop")]
+#[cfg(feature = "windowing")]
 fn editor_key_binding(
     key: KeyCode,
     logical_key: Option<&str>,
@@ -2712,7 +4692,7 @@ fn editor_key_binding(
 }
 
 /// Rich-text editor keyboard handling (desktop).
-#[cfg(feature = "desktop")]
+#[cfg(feature = "windowing")]
 impl RinchApp {
     /// Translate a key press into an action on the focused editor's
     /// [`EditorHandle`](crate::editor::EditorHandle). Returns whether the document
@@ -2730,69 +4710,82 @@ impl RinchApp {
         shift: bool,
         ctrl: bool,
         alt: bool,
+        modifiers: Modifiers,
+        viewport: (f32, f32),
     ) -> bool {
-        // The vertical "goal column" survives only a run of Up/Down — any other key
-        // (typing, horizontal arrows, Home/End, edits) abandons it.
-        if !matches!(key, KeyCode::ArrowUp | KeyCode::ArrowDown) {
+        // 1. Cursor movement / selection extension — geometry-dependent (visual lines,
+        //    goal column), so it stays view-owned and never touches the keymap. Which
+        //    chord is which motion is the platform's text keymap (issue #951): Ctrl =
+        //    word / document on Windows and Linux; Option = word, Cmd = line /
+        //    document on macOS, where Home/End leave the caret alone. Backspace and
+        //    Delete are the editor keymap's below.
+        let motion = match text_key_action(self.text_keymap, key, modifiers) {
+            Some(TextKeyAction::Move { motion, extend }) => Some((motion, extend)),
+            Some(TextKeyAction::Inert) => {
+                self.editor_goal_x = None;
+                return false;
+            }
+            // macOS Page Up / Down: a page of scroll, the caret left (#2020).
+            Some(TextKeyAction::ScrollPage { down }) => {
+                self.page_editor(handle, down, false, true, viewport);
+                return false;
+            }
+            _ => None,
+        };
+        // The vertical "goal column" survives only a run of Up/Down and Page
+        // Up/Down — any other key (typing, horizontal arrows, Home/End, edits)
+        // abandons it.
+        if !matches!(
+            motion,
+            Some((
+                TextMotion::LineUp
+                    | TextMotion::LineDown
+                    | TextMotion::PageUp
+                    | TextMotion::PageDown,
+                _
+            ))
+        ) {
             self.editor_goal_x = None;
         }
-        // 1. Cursor movement / selection extension — geometry-dependent (visual lines,
-        //    goal column), so it stays view-owned and never touches the keymap. (Shift
-        //    extends, Ctrl = word/doc.)
-        match key {
-            KeyCode::ArrowLeft => {
-                return self.move_editor(
-                    handle,
-                    if ctrl {
-                        Motion::WordLeft
-                    } else {
-                        Motion::CharLeft
-                    },
-                    shift,
-                );
+        if let Some((motion, extend)) = motion {
+            if let TextMotion::PageUp | TextMotion::PageDown = motion {
+                let down = motion == TextMotion::PageDown;
+                return self.page_editor(handle, down, extend, false, viewport);
             }
-            KeyCode::ArrowRight => {
-                return self.move_editor(
-                    handle,
-                    if ctrl {
-                        Motion::WordRight
-                    } else {
-                        Motion::CharRight
-                    },
-                    shift,
-                );
-            }
-            KeyCode::ArrowUp => return self.move_editor(handle, Motion::LineUp, shift),
-            KeyCode::ArrowDown => return self.move_editor(handle, Motion::LineDown, shift),
-            KeyCode::Home => {
-                return self.move_editor(
-                    handle,
-                    if ctrl {
-                        Motion::DocStart
-                    } else {
-                        Motion::LineStart
-                    },
-                    shift,
-                );
-            }
-            KeyCode::End => {
-                return self.move_editor(
-                    handle,
-                    if ctrl {
-                        Motion::DocEnd
-                    } else {
-                        Motion::LineEnd
-                    },
-                    shift,
-                );
-            }
-            _ => {}
+            let motion = match motion {
+                TextMotion::CharLeft => Motion::CharLeft,
+                TextMotion::CharRight => Motion::CharRight,
+                TextMotion::WordLeft => Motion::WordLeft,
+                TextMotion::WordRight => Motion::WordRight,
+                TextMotion::LineStart => Motion::LineStart,
+                TextMotion::LineEnd => Motion::LineEnd,
+                TextMotion::LineUp => Motion::LineUp,
+                TextMotion::LineDown => Motion::LineDown,
+                TextMotion::DocStart => Motion::DocStart,
+                TextMotion::DocEnd => Motion::DocEnd,
+                TextMotion::PageUp | TextMotion::PageDown => unreachable!("paged above"),
+            };
+            return self.move_editor(handle, motion, extend);
         }
         // 2. Tab: navigate table cells when in a table (shared handle method); otherwise
         //    fall through to the keymap, which binds `Tab`→sinkListItem /
-        //    `Shift-Tab`→liftListItem. Consumed either way — no editor focus traversal.
+        //    `Shift-Tab`→liftListItem. Consumed either way — no editor focus traversal
+        //    (a read-only editor's Tab never gets here: its caller moves the focus, #833).
         if matches!(key, KeyCode::Tab) && handle.tab_cell(shift) {
             return true;
+        }
+        // 2.5. AltGr text (#934): Windows reports AltGr as Ctrl+Alt, so Polish
+        //    AltGr+C (`ć`) arrives as a Ctrl+Alt+C carrying text. A backend keeps
+        //    the text on a Ctrl+Alt press only when AltGr typed it, so here it is
+        //    typing — ahead of the clipboard chords and the keymap's Mod-Alt
+        //    bindings, which would otherwise take it.
+        if rinch_platform::is_alt_graph_text(
+            rinch_platform::alt_graph_is_ctrl_alt(),
+            modifiers,
+            text,
+            None,
+        ) {
+            return text.is_some_and(|t| handle.insert_text(t));
         }
         // 3. Clipboard (Ctrl+C/X/V, Ctrl+Shift+V) — needs the platform clipboard, so it
         //    can't be an editor-core command. Runs before the keymap, which never binds
@@ -2859,17 +4852,53 @@ impl RinchApp {
             return handle.move_cursor(cm, extend);
         }
         let state = handle.state();
+        let vertical = match motion {
+            Motion::LineUp => Some(-1),
+            Motion::LineDown => Some(1),
+            _ => None,
+        };
+        // Shift+Up/Down over a cell selection steps its head cell (#1847).
+        if extend
+            && let Some(dir) = vertical
+            && matches!(state.selection, Selection::Cell(_))
+        {
+            return handle.shift_arrow_cells(rinch_editor_core::Axis::Vert, dir, None);
+        }
         let doc = state.doc.clone();
         let head = state.selection.head();
-        let new_head: Option<Pos> = match motion {
+        use rinch_core::dom::CaretAffinity;
+        let new_head: Option<(Pos, CaretAffinity)> = match motion {
             // Visual-line edge for wrapped paragraphs (geometry), falling back to
             // the block edge when the caret has no Parley layout (an empty block).
+            // Home's edge is drawn at the start of its line (downstream, the
+            // default); End's at the end of its line, upstream when it is a soft
+            // wrap point — the same model position as the next line's start
+            // (#301).
             Motion::LineStart => self
                 .visual_line_bound(handle, head, false)
-                .or_else(|| core_motion::line_boundary(&doc, head, false)),
+                .or_else(|| core_motion::line_boundary(&doc, head, false))
+                .map(|p| (p, CaretAffinity::Downstream)),
             Motion::LineEnd => self
                 .visual_line_bound(handle, head, true)
-                .or_else(|| core_motion::line_boundary(&doc, head, true)),
+                .map(|p| {
+                    let wrap = matches!(
+                        (
+                            self.editor_caret_point(handle, head),
+                            self.editor_caret_point_with(handle, p, CaretAffinity::Downstream),
+                        ),
+                        (Some((_, hy, hh)), Some((_, py, _))) if py > hy + hh * 0.5
+                    );
+                    let affinity = if wrap {
+                        CaretAffinity::Upstream
+                    } else {
+                        CaretAffinity::Downstream
+                    };
+                    (p, affinity)
+                })
+                .or_else(|| {
+                    core_motion::line_boundary(&doc, head, true)
+                        .map(|p| (p, CaretAffinity::Downstream))
+                }),
             Motion::LineUp | Motion::LineDown => {
                 // Establish the goal column from the current caret on the first
                 // vertical step, then reuse it so the cursor keeps its horizontal
@@ -2879,23 +4908,241 @@ impl RinchApp {
                     .or_else(|| self.editor_caret_point(handle, head).map(|(x, _, _)| x));
                 self.editor_goal_x = goal_x;
                 self.vertical_step(handle, head, matches!(motion, Motion::LineDown), goal_x)
-                    .map(|sel| sel.head())
+                    .map(|(sel, affinity)| (sel.head(), affinity))
             }
             // The model motions returned early via `handle.move_cursor` above.
             _ => None,
         };
+        // Shift+Up/Down at a cell's top or bottom line selects cells, as
+        // prosemirror-tables' `shiftArrow` does (#1847).
+        if extend
+            && let Some(dir) = vertical
+            && handle.shift_arrow_cells(
+                rinch_editor_core::Axis::Vert,
+                dir,
+                new_head.map(|(p, _)| p),
+            )
+        {
+            return true;
+        }
+        // Up or Down leaving the caret's textblock (or a selected node) must not
+        // step over a node an app draws with a node view: it is node-selected and
+        // offered the caret (`NodeViewSpec::on_caret_enter`), as Left and Right
+        // do. Horizontal rules are still stepped over.
+        if !extend && matches!(motion, Motion::LineUp | Motion::LineDown) {
+            let down = matches!(motion, Motion::LineDown);
+            let leaves = match new_head {
+                Some((nh, _)) => {
+                    handle.caret_address(nh).map(|(t, _)| t)
+                        != handle.caret_address(head).map(|(t, _)| t)
+                }
+                None => true,
+            };
+            if leaves && let Some(sel) = handle.vertical_node_view(down) {
+                let from = if down {
+                    crate::editor::CaretFrom::Above
+                } else {
+                    crate::editor::CaretFrom::Below
+                };
+                handle.select_from_arrow(sel, from);
+                return true;
+            }
+        }
         match new_head {
-            Some(nh) => {
+            Some((nh, affinity)) => {
                 let sel = if extend {
                     Selection::text(state.selection.anchor(), nh)
                 } else {
                     Selection::cursor(nh)
                 };
-                handle.set_selection(sel);
+                handle.set_selection_with_affinity(sel, affinity);
                 true
             }
             None => false,
         }
+    }
+
+    /// Page Up (`down = false`) or Page Down in the focused editor (#2020).
+    ///
+    /// The page is Chrome's: 0.875 of the scrollport's height
+    /// (`ScrollableArea::MinFractionToStepWhenPaging`), the scrollport being
+    /// the editor's nearest scroll container's padding box — the editor's own
+    /// when it scrolls — at most the viewport, or the viewport when nothing
+    /// scrolls. Chrome measures the focused editable element instead; for an
+    /// editor inside a taller scroller that pages past what is on screen, and
+    /// Firefox (like this) measures the scroller.
+    ///
+    /// The scroller is [`page_scroller`]'s: one a `lock_scroll` overlay
+    /// leaves alone is skipped, and the walk stops at a `position: fixed` box
+    /// (a modal), whose place no scroller outside it changes.
+    ///
+    /// The scroller moves a page first and is laid out — so a virtualized
+    /// editor materializes the blocks the page lands in — and the caret goes
+    /// to the point a page below (above) where it is now, measured after the
+    /// scroll, at the goal column Up/Down keep: with the caret in view it
+    /// keeps its place on screen, as in Firefox and native text views. The
+    /// target is a page from the caret, not from the view: when the user has
+    /// scrolled away from the caret (the wheel), the point a page from it is
+    /// outside the scrollport, and the scroller is moved again to bring that
+    /// point in before it is hit-tested — Chrome 155 and Firefox 155 both
+    /// move the caret a page from where it is, wherever the view is, and the
+    /// caret's reveal then shows it. Only a page that reaches the document's
+    /// last (first) line, or runs past the editor, puts the caret at the
+    /// document's end (start), as Chrome does. `extend` (Shift) keeps the
+    /// anchor.
+    ///
+    /// `scroll_only` (macOS's plain Page Up / Down), a read-only editor (as
+    /// Chrome's read-only `<textarea>`) and a caret with no geometry scroll a
+    /// page and leave the selection. Returns whether the selection changed.
+    fn page_editor(
+        &mut self,
+        handle: &crate::editor::EditorHandle,
+        down: bool,
+        extend: bool,
+        scroll_only: bool,
+        (vp_w, vp_h): (f32, f32),
+    ) -> bool {
+        use rinch_core::dom::NodeId;
+        use rinch_editor_core::{CursorMotion, Selection};
+        let FocusTarget::Editor(container) = self.focus_target else {
+            return false;
+        };
+        let Some(doc) = self.doc.clone() else {
+            return false;
+        };
+        // The scroller, its scrollport's height (the page is 0.875 of it) and
+        // the scrollport's band in window space, inside the viewport: where a
+        // point must be for the hit test to find what is there.
+        let (scroller, page, band) = {
+            let d = doc.borrow();
+            let scroller = page_scroller(&d.tree, container);
+            let view = (0.0, vp_h);
+            let (port, band) = scroller.map_or((f64::from(vp_h), view), |s| {
+                let cs = &d.tree.nodes[s].computed_style;
+                let port = d.client_height(NodeId(s))
+                    + f64::from(cs.padding_top.to_px())
+                    + f64::from(cs.padding_bottom.to_px());
+                if s == d.tree.body_id {
+                    return (port, view);
+                }
+                let (_, top, _, _) = painted_element_box(&d.tree, s);
+                let top = top + cs.border_top_width.to_px();
+                (port, (top.max(0.0), (top + port as f32).min(vp_h)))
+            });
+            (scroller, (port.min(f64::from(vp_h)) * 0.875).max(1.0), band)
+        };
+        let step = if down { page } else { -page };
+        let head = handle.selection().head();
+        let from = if scroll_only || handle.refuses_edits() {
+            None
+        } else {
+            self.editor_caret_point(handle, head)
+        };
+        // A page of scroll, with the scroller's `onscroll`, as the wheel.
+        let scrolled = scroller.map_or(0.0, |s| self.page_scroll_by(&doc, s, step));
+        let Some((cx, cy, ch)) = from else {
+            return false;
+        };
+        // Lay the scrolled content out: the hit test below reads it, and a
+        // virtualized editor materializes the blocks now on screen.
+        self.resolve_and_repaint(vp_w, vp_h);
+        let goal_x = self.editor_goal_x.unwrap_or(cx);
+        self.editor_goal_x = Some(goal_x);
+        // A page from the caret's middle, where the caret is drawn now —
+        // measured, so a scroller that did not carry the editor moves nothing.
+        let now_y = self
+            .editor_caret_point(handle, head)
+            .map_or(f64::from(cy) - scrolled, |(_, y, _)| f64::from(y));
+        let mut ty = (now_y + f64::from(ch * 0.5) + step) as f32;
+        // The caret scrolled out of view (#2028 review F1): the point a page
+        // from it is outside the scrollport too, where the hit test finds
+        // nothing. Bring the point inside first — half a caret in from the
+        // edge it is past — and lay out again.
+        let (lo, hi) = (band.0 + ch * 0.5, band.1 - ch * 0.5);
+        let over = if ty < lo {
+            ty - lo
+        } else if ty > hi {
+            ty - hi
+        } else {
+            0.0
+        };
+        if over != 0.0
+            && lo <= hi
+            && let Some(s) = scroller
+        {
+            let moved = self.page_scroll_by(&doc, s, f64::from(over));
+            if moved != 0.0 {
+                self.resolve_and_repaint(vp_w, vp_h);
+                ty -= moved as f32;
+            }
+        }
+        let edge = || {
+            let doc = handle.doc();
+            if down {
+                Selection::at_end(&doc).head()
+            } else {
+                Selection::at_start(&doc).head()
+            }
+        };
+        // What is there: the hit test first. A point the hit test does not
+        // find in this editor — off screen where no scroller could bring it
+        // in (past the window's edge, on a locked page), under a box that
+        // covers it, or past the editor's end (start), where a neighbouring
+        // editor or a modal's backdrop is — is resolved from the layout;
+        // past the end (start) that is the last (first) line, which the rule
+        // below turns into the end (start).
+        let target = self
+            .editor_point(goal_x, ty)
+            .filter(|hit| hit.container == container)
+            .or_else(|| self.editor_point_by_geometry(container, goal_x, ty))
+            .and_then(|hit| hit.pos(handle))
+            .map(|p| {
+                let (affinity, rect) = self.editor_hit_affinity(handle, p, ty);
+                (p, affinity, rect)
+            })
+            // On the document's last (first) line: Chrome goes to its end.
+            .filter(|&(_, _, rect)| {
+                let end = self.editor_caret_point(handle, edge());
+                !matches!((rect, end), (Some((_, py, ph)), Some((_, ey, _)))
+                    if (py - ey).abs() < ph * 0.5)
+            });
+        let Some((p, affinity, _)) = target else {
+            let motion = if down {
+                CursorMotion::DocEnd
+            } else {
+                CursorMotion::DocStart
+            };
+            return handle.move_cursor(motion, extend);
+        };
+        let sel = if extend {
+            Selection::text(handle.selection().anchor(), p)
+        } else {
+            Selection::cursor(p)
+        };
+        handle.set_selection_with_affinity(sel, affinity);
+        true
+    }
+
+    /// Scroll `s` by `dy` for a page key and fire its `onscroll`, as the wheel
+    /// does. Returns how far it actually moved.
+    fn page_scroll_by(&mut self, doc: &Rc<RefCell<RinchDocument>>, s: u64, dy: f64) -> f64 {
+        use rinch_core::dom::NodeId;
+        let (scrolled, fired) = {
+            let mut d = doc.borrow_mut();
+            let before = d.scroll_top(NodeId(s));
+            let (moved, handler) = Self::scroll_vertically_by(&mut d, s, dy);
+            if moved {
+                self.scene_dirty = true;
+            }
+            (
+                d.scroll_top(NodeId(s)) - before,
+                handler.map(|h| (h, Self::scroll_event_for(&d.tree, s))),
+            )
+        };
+        if let Some((h, event)) = fired {
+            rinch_core::events::dispatch_scroll_event(rinch_core::events::EventHandlerId(h), event);
+        }
+        scrolled
     }
 
     // ── IME (input method editor) ──────────────────────────────────────
@@ -2906,7 +5153,7 @@ impl RinchApp {
     /// Apply an [`ImeEvent`] to the focused new editor: preedit becomes a
     /// transient overlay (never in the document), commit clears it and inserts
     /// the text in one transaction, delete-surrounding deletes around the caret.
-    #[cfg(feature = "desktop")]
+    #[cfg(feature = "windowing")]
     fn dispatch_editor_ime(&mut self, handle: &crate::editor::EditorHandle, ime: ImeEvent) {
         match ime {
             ImeEvent::Enabled => {}
@@ -2931,7 +5178,7 @@ impl RinchApp {
 /// IME (input method editor) handling for single-line `<input>` text fields.
 ///
 /// Ungated: `<input>` IME works on every build with an app loop. (The editor IME
-/// half above is `desktop`-gated because it needs the [`EditorHandle`](crate::editor::EditorHandle).)
+/// half above is `windowing`-gated because it needs the [`EditorHandle`](crate::editor::EditorHandle).)
 impl RinchApp {
     /// Apply an [`ImeEvent`] to the focused `<input>`: preedit is rendered inline
     /// at the caret via the `data-preedit` attribute, commit clears it and inserts
@@ -2940,13 +5187,28 @@ impl RinchApp {
     /// `pub(super)` so the focus arbiter can flush a pending composition as an
     /// implicit commit when the input blurs (issue #226) — the browser's
     /// compositionend-before-blur.
-    pub(super) fn dispatch_input_ime(&mut self, node_id: usize, ime: ImeEvent) {
+    ///
+    /// Answers whether the field may have changed on screen. `false` only for
+    /// an event that changed nothing: `Enabled`, and an empty `Preedit` or a
+    /// `Disabled` with no composition showing and no deferred write to apply.
+    /// Those are what winit's Wayland text input sends when the window gains
+    /// and loses the keyboard (#2763), and they used to repaint the whole field.
+    pub(super) fn dispatch_input_ime(&mut self, node_id: u64, ime: ImeEvent) -> bool {
+        // Every write of the field's caret attributes moves this, an adopted
+        // deferred value's included.
+        let synced = self.input_caret_generation.get();
+        let mut changed = true;
         match ime {
-            ImeEvent::Enabled => {}
+            ImeEvent::Enabled => changed = false,
             ImeEvent::Preedit { text, cursor } => {
                 let ended = text.is_empty();
                 self.focused_input_preedit = if ended { None } else { Some((text, cursor)) };
-                self.sync_input_preedit_to_dom(node_id);
+                changed = self.sync_input_preedit_to_dom(node_id);
+                if !ended {
+                    // A composition changes a browser's `.value` (the preedit
+                    // is in it), so it sets the dirty value flag (#1186).
+                    self.mark_focused_input_edited();
+                }
                 if ended {
                     // An empty preedit *is* the end of the composition on the
                     // winit backends (an IME cancel delivers only this — no
@@ -2955,6 +5217,7 @@ impl RinchApp {
                     // otherwise it stays parked and later wins over whatever
                     // was written in the meantime (issue #238).
                     self.adopt_focused_input_value_from_dom();
+                    changed |= self.input_caret_generation.get() != synced;
                 }
             }
             ImeEvent::Commit(text) => {
@@ -2977,41 +5240,91 @@ impl RinchApp {
             }
             ImeEvent::Disabled => {
                 self.focused_input_preedit = None;
-                self.sync_input_preedit_to_dom(node_id);
+                changed = self.sync_input_preedit_to_dom(node_id);
                 // The composition is over either way: apply a deferred write.
                 self.adopt_focused_input_value_from_dom();
+                changed |= self.input_caret_generation.get() != synced;
             }
         }
+        changed
     }
 
     /// Write (or clear) the focused `<input>`'s `data-preedit` attribute so the
-    /// paint path renders the composition string inline at the caret.
-    fn sync_input_preedit_to_dom(&self, node_id: usize) {
-        let Some(doc) = &self.doc else { return };
+    /// paint path renders the composition string inline at the caret, and
+    /// answer whether it changed.
+    ///
+    /// An unchanged attribute names no damage (#2763): winit's Wayland text
+    /// input clears the composition at each keyboard enter (an empty
+    /// `Preedit`) and leave (`Disabled`) whether or not one was showing, and
+    /// naming the field for those repainted its whole box and text on every
+    /// window focus change, for a frame that drew the same pixels.
+    fn sync_input_preedit_to_dom(&self, node_id: u64) -> bool {
+        let Some(doc) = &self.doc else { return false };
         let mut d = doc.borrow_mut();
-        if let Some(node) = d.tree.nodes.get_mut(node_id) {
-            match &self.focused_input_preedit {
-                Some((text, _)) => {
-                    node.attributes.insert("data-preedit".into(), text.clone());
-                }
-                None => {
-                    node.attributes.remove("data-preedit");
-                }
-            }
-            node.dirty.insert(rinch_dom::DirtyFlags::PAINT);
+        let Some(node) = d.tree.nodes.get_mut(node_id) else {
+            return false;
+        };
+        let want = self.focused_input_preedit.as_ref().map(|(text, _)| text);
+        if node.attributes.get("data-preedit") == want {
+            return false;
         }
-        d.tree.dirty_nodes.insert(node_id);
+        match want {
+            Some(text) => {
+                node.attributes.insert("data-preedit".into(), text.clone());
+            }
+            None => {
+                node.attributes.remove("data-preedit");
+            }
+        }
+        // The composition is painted inline from `data-preedit`: name the
+        // field, or a partial frame keeps the old composition on screen.
+        d.tree.mark_paint_dirty(node_id);
+        // A field scrolls the composition's end into view (#1721, #827).
+        let d = &mut *d;
+        rinch_dom::form_control::reveal_caret(
+            &mut d.tree,
+            &mut d.font_cx,
+            &mut d.layout_cx,
+            node_id,
+        );
+        true
     }
 
-    /// The focused `<input>`'s caret rect in logical window space, for the IME
-    /// candidate box. Approximated at the field's text origin (left padding, full
-    /// height); the exact caret-x is a follow-up.
-    pub(crate) fn input_caret_area(&self, node_id: usize) -> Option<(f32, f32, f32, f32)> {
+    /// The focused field's caret rect in logical window space, for the IME
+    /// candidate box: the caret paint draws — the displayed text's, so the
+    /// end of an IME composition, through the field's scroll (#1721, #827) —
+    /// from the metrics it keeps cached
+    /// (`rinch_dom::form_control::input_displayed_caret_rect`), so the poll
+    /// every event-loop pass makes shapes nothing at an unchanged state. A
+    /// document already borrowed answers the text origin, full height
+    /// ([`Self::input_text_origin_area`]).
+    #[cfg(any(feature = "windowing", feature = "embed", test))]
+    pub(crate) fn input_caret_area(&self, node_id: u64) -> Option<(f32, f32, f32, f32)> {
+        let doc = self.doc.as_ref()?;
+        if let Ok(mut d) = doc.try_borrow_mut() {
+            let d = &mut *d;
+            if let Some((x, y, h)) = rinch_dom::form_control::input_displayed_caret_rect(
+                &d.tree,
+                &mut d.font_cx,
+                &mut d.layout_cx,
+                node_id,
+            ) {
+                return Some((x, y, 1.0, h));
+            }
+        }
+        self.input_text_origin_area(node_id)
+    }
+
+    /// A field's text origin (the start of its text column,
+    /// `rinch_dom::form_control::text_column`), full height, in logical window
+    /// space: the text context menu's anchor for an empty field, and the IME
+    /// area's fallback.
+    pub(crate) fn input_text_origin_area(&self, node_id: u64) -> Option<(f32, f32, f32, f32)> {
         let doc = self.doc.as_ref()?;
         let d = doc.borrow();
         let node = d.tree.get(node_id)?;
-        let pad_l = node.computed_style.padding_left.to_px();
-        let (_, _, _, h) = d.query_node_layout(node_id as u64)?;
+        let (pad_l, _) = rinch_dom::form_control::text_column(node);
+        let (_, _, _, h) = d.query_node_layout(node_id)?;
         // The candidate box goes where the field is *painted*, so the text
         // origin is pushed forward through the composed transform rather than
         // added to an untransformed parent-chain sum (#203).
@@ -3023,7 +5336,185 @@ impl RinchApp {
     }
 }
 
-#[cfg(feature = "desktop")]
+// Not under `#[cfg(feature = "windowing")]`: `handle_event` runs in every
+// build (embed, Android, `components,theme`).
+impl RinchApp {
+    /// End every gesture of this document that is waiting on a release which
+    /// was probably missed — a primary press (proof), or the window losing
+    /// focus (a trade-off; see the `WindowFocus` arm) (issues #381, #1028).
+    ///
+    /// The pointer-capture drag ends through `on_cancel`, never `on_end`
+    /// ([`rinch_core::heal_missed_release`], scoped to this document, #139 —
+    /// not the unscoped `Drag::cancel` a `PointerCancel` uses); the editor's
+    /// drag-select is released; and the gestures `RinchApp` holds itself —
+    /// a pending or active element drag, a scrollbar-thumb drag, a text
+    /// selection drag — go through [`Self::release_press_gestures`], so a
+    /// stranded element drag is cancelled (`data-ondragend`, no `data-ondrop`)
+    /// rather than dropped by the next unrelated release. `:active` is not
+    /// cleared: a press sets its own, but after a blur it stays where the
+    /// stranded press put it until the next release (pre-existing). A render
+    /// surface holding a press is told it was cancelled
+    /// ([`Self::release_surface_captures`]) — for a press, only the pressing
+    /// pointer's capture (`pressing`), since another finger's press proves
+    /// nothing about this one; for a blur (`None`), every capture. Returns
+    /// whether anything was ended.
+    fn heal_missed_release(&mut self, vp_w: f32, vp_h: f32, pressing: Option<u64>) -> bool {
+        #[cfg(feature = "windowing")]
+        crate::editor::end_drag(self.input_doc());
+        let released = self.release_press_gestures(vp_w, vp_h, pressing);
+        // Every build: `handle_event` calls this with or without `windowing`
+        // (embed, Android), and the pointer-capture drag lives in rinch-core.
+        rinch_core::heal_missed_release() | released
+    }
+
+    /// The platform took `pointer` away mid-press (a touch the system
+    /// cancelled): the surface holding its press hears a `PointerCancel` (a
+    /// `MouseUp` where the cursor is, without pointer events) and lets it go.
+    /// Nothing happens for a pointer that holds no surface's press. Desktop
+    /// only: no other shell names the pointer a touch belongs to.
+    #[cfg(feature = "windowing")]
+    pub(crate) fn cancel_surface_pointer(
+        &mut self,
+        pointer: crate::render_surface::SurfacePointer,
+    ) {
+        let Some(i) = self
+            .surface_captures
+            .iter()
+            .position(|c| c.pointer == pointer.id)
+        else {
+            return;
+        };
+        let capture = self.surface_captures.remove(i);
+        self.dispatch_surface_capture_cancel(capture, pointer);
+    }
+
+    /// Tell the surface holding `capture` that its press is over without a
+    /// release: `PointerCancel` with pointer events, a `MouseUp` where the
+    /// cursor is without.
+    fn dispatch_surface_capture_cancel(
+        &self,
+        capture: super::SurfaceCapture,
+        pointer: crate::render_surface::SurfacePointer,
+    ) {
+        let (x, y) = self.cursor_pos.unwrap_or((0.0, 0.0));
+        let (local_x, local_y) = match &self.doc {
+            Some(doc) => Self::surface_local_coords(&doc.borrow().tree, capture.node, x, y),
+            None => (x, y),
+        };
+        crate::render_surface::dispatch_surface_pointer_cancel(
+            capture.surface,
+            local_x,
+            local_y,
+            pointer,
+        );
+    }
+
+    /// End the surface captures whose release went missing, as
+    /// [`Self::release_press_gestures`] ends every other press gesture: each
+    /// surface hears its press cancelled (`PointerCancel`, or a `MouseUp`
+    /// without pointer events). `only`: just that pointer's (a press proves
+    /// only its own pointer's release was missed — another finger's press
+    /// proves nothing, and two fingers each holding a surface is a pinch);
+    /// `None`: every one (a window blur, a platform `PointerCancel`).
+    /// Answers whether any was ended.
+    pub(crate) fn release_surface_captures(&mut self, only: Option<u64>) -> bool {
+        let mut ended = Vec::new();
+        self.surface_captures.retain(|c| {
+            let end = only.is_none_or(|id| c.pointer == id);
+            if end {
+                ended.push(*c);
+            }
+            !end
+        });
+        for capture in &ended {
+            let pointer = crate::render_surface::SurfacePointer {
+                pressure: 0.0,
+                ..capture.device
+            };
+            self.dispatch_surface_capture_cancel(*capture, pointer);
+        }
+        !ended.is_empty()
+    }
+
+    /// Drop the captures of surfaces that went away (unregistered — an
+    /// unmounted `RenderSurface` unregisters itself — or whose node left the
+    /// document): nothing is left to tell, and a stale capture would keep
+    /// every other surface from hearing an enter, a move or a leave.
+    pub(crate) fn prune_surface_captures(&mut self) {
+        if self.surface_captures.is_empty() {
+            return;
+        }
+        let doc = self.doc.clone();
+        self.surface_captures.retain(|c| {
+            crate::render_surface::surface_is_registered(c.surface)
+                && doc
+                    .as_ref()
+                    .is_some_and(|d| d.borrow().is_connected(rinch_core::dom::NodeId(c.node)))
+        });
+    }
+}
+
+impl RinchApp {
+    /// A pointer move during an OS file drag (#1649): hide the drop caret and
+    /// stop the edge-band scroll, keeping the shown position and the hover
+    /// target for a drop that may still come (X11 delivers the release's
+    /// crossing Enter before the drop). Answers whether an overlay changed.
+    fn suspend_file_drag(&mut self) -> bool {
+        #[cfg(feature = "windowing")]
+        if let Some(drag) = self.file_drag.as_mut()
+            && !drag.suspended
+        {
+            drag.suspended = true;
+            if self.active_dnd.is_none() {
+                self.drag_auto_scroll_at = None;
+            }
+            if let Some(caret) = &drag.caret
+                && caret.handle.show_drop_caret(None)
+            {
+                self.scene_dirty = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether an OS file drag is in flight over the window (#1649).
+    fn file_drag_live(&self) -> bool {
+        #[cfg(feature = "windowing")]
+        return self.file_drag.is_some();
+        #[cfg(not(feature = "windowing"))]
+        false
+    }
+
+    /// End the OS file drag in flight, whatever ended it (a cancel, or the
+    /// first event that proves it is over, #1649): hide its drop caret, stop
+    /// its edge-band scroll and tell the `data-onfiledragenter` target it left.
+    /// Answers whether anything changed.
+    pub(crate) fn end_file_drag(&mut self) -> bool {
+        let mut changed = false;
+        #[cfg(feature = "windowing")]
+        if let Some(drag) = self.file_drag.take() {
+            if self.active_dnd.is_none() {
+                self.drag_auto_scroll_at = None;
+            }
+            if let Some(caret) = drag.caret
+                && caret.handle.show_drop_caret(None)
+            {
+                self.scene_dirty = true;
+                changed = true;
+            }
+        }
+        if let Some(target_id) = self.file_hover_target.take()
+            && let Some(doc) = &self.doc
+        {
+            Self::dispatch_drag_attr(doc, target_id, "data-onfiledragleave");
+            changed = true;
+        }
+        changed
+    }
+}
+
+#[cfg(feature = "windowing")]
 impl RinchApp {
     /// This app's document identity for scoping shared input state, or `None`
     /// before mount (issue #139).
@@ -3060,7 +5551,7 @@ impl RinchApp {
     /// copies has changed the clipboard while appearing to do nothing.
     #[cfg(feature = "clipboard")]
     pub(super) fn editor_cut(&self, handle: &crate::editor::EditorHandle) -> bool {
-        if handle.is_read_only() {
+        if handle.refuses_edits() {
             return false;
         }
         match handle.selection_clipboard() {
@@ -3073,7 +5564,9 @@ impl RinchApp {
     }
 
     /// Paste the clipboard over the selection, preferring rich `text/html`, then a
-    /// raw bitmap image (as a PNG `data:` URL), then `text/plain`.
+    /// raw bitmap image, then `text/plain`. A bitmap is offered to the app when
+    /// it asked for pictures (`EditorHandle::on_image_input`) and is otherwise
+    /// inserted as a PNG `data:` URL.
     ///
     /// **Asynchronous** (issue #149). Reading the clipboard is a request to another
     /// process; against a hung X11 selection owner arboard waits up to four seconds,
@@ -3115,8 +5608,9 @@ impl RinchApp {
     /// is wherever the user has since wandered — the paste would land somewhere they
     /// never asked for. Mapping is what a transactional editor can offer, and it is
     /// exactly what the anchor does. If the document was *replaced* meanwhile
-    /// (`load_doc`, a collaborative re-projection) the anchor reports `None` and the
-    /// paste is dropped rather than aimed at unrelated content.
+    /// (`load_doc`), or a collaborating peer removed or restructured the block
+    /// the paste was aimed at, the anchor reports `None` and the paste is
+    /// dropped rather than aimed at unrelated content.
     ///
     /// # Threads
     ///
@@ -3141,7 +5635,7 @@ impl RinchApp {
     fn dispatch_editor_paste(handle: &crate::editor::EditorHandle, plain_only: bool) -> bool {
         use rinch_clipboard::{ClipboardResult, RichPaste};
 
-        if handle.is_read_only() {
+        if handle.refuses_edits() {
             return false;
         }
         let handle = handle.clone();
@@ -3150,11 +5644,11 @@ impl RinchApp {
         // leaves this thread. It is dropped unrun if the editor's component
         // unmounts first (rinch-core's parked-callback lifetime rule), which also
         // releases the anchor.
-        let id = rinch_core::park_main_callback::<ClipboardResult<RichPaste>>(move |result| {
-            if let Ok(content) = result {
-                apply_paste_at_anchor(&handle, &anchor, content);
-            }
-        });
+        let id = rinch_core::park_main_callback::<ClipboardResult<(RichPaste, Option<String>)>>(
+            move |result| {
+                paste_read_arrived(handle, anchor, result, Self::paste_bitmap_or_html);
+            },
+        );
         let deliver = move |result| {
             rinch_core::run_on_main_thread(move || rinch_core::resume_main_callback(id, result));
         };
@@ -3162,33 +5656,283 @@ impl RinchApp {
             // Ctrl+Shift+V wants `text/plain` specifically — not "the text this
             // html reduces to" — so it reads that flavour and nothing else. One
             // read, so there is nothing for the combined probe to save here.
-            crate::clipboard::paste_text_async(move |result| deliver(result.map(RichPaste::Text)));
+            crate::clipboard::paste_text_async(move |result| {
+                deliver(result.map(|text| (RichPaste::Text(text), None)))
+            });
         } else {
-            crate::clipboard::paste_rich_async(deliver);
+            // The text beside an html answer rides the same worker job: the
+            // editor's paste hook (`Plugin::handle_paste`) sees both flavours,
+            // as it does on the web, where the `paste` event carries both.
+            crate::clipboard::paste_rich_with_text_async(deliver);
         }
         true
     }
 
-    /// Resolve a window/logical point to `(container id, textblock id, flat IFC
-    /// byte offset)` inside whatever editor it lands on — the shared primitive for
-    /// click, drag-select, and vertical/Home-End movement. Snaps to the nearest
-    /// block when the point misses every textblock (see [`Self::editor_point_address_in`]).
-    pub(crate) fn editor_point_address(&self, x: f32, y: f32) -> Option<(usize, usize, usize)> {
+    /// The second read of a paste whose html is pictures only, for an editor with
+    /// an [`on_image_input`](crate::editor::EditorHandle::on_image_input)
+    /// callback: the clipboard's bitmap, offered to the callback at `anchor`.
+    /// When the clipboard holds no bitmap after all, `html` is pasted as it
+    /// would have been. Asynchronous and anchored, like the first read.
+    #[cfg(feature = "clipboard")]
+    fn paste_bitmap_or_html(
+        handle: crate::editor::EditorHandle,
+        anchor: crate::editor::SelectionAnchor,
+        html: String,
+        text: Option<String>,
+    ) {
+        use rinch_clipboard::{ClipboardResult, ImageData};
+
+        let id =
+            rinch_core::park_main_callback::<ClipboardResult<ImageData<'static>>>(move |result| {
+                apply_paste_at_anchor(&handle, &anchor, bitmap_or_html(result, html), text);
+            });
+        crate::clipboard::paste_image_async(move |result| {
+            rinch_core::run_on_main_thread(move || rinch_core::resume_main_callback(id, result));
+        });
+    }
+
+    /// A drop of files on an editor that takes pictures itself
+    /// ([`on_image_input`](crate::editor::EditorHandle::on_image_input)): the
+    /// caret goes to the drop point, the editor takes the keyboard, and every
+    /// picture among `paths` is read off the UI thread and offered to the
+    /// callback, in order, each as soon as it is read.
+    ///
+    /// Returns the paths the editor did **not** take, which are the app's own
+    /// file-drop handler's: all of them when the editor takes nothing (the
+    /// point is in no editor, the editor has no callback or refuses edits, no
+    /// file is a picture), and otherwise the files that are not pictures.
+    ///
+    /// A file is a picture when its extension says so (`png`, `jpg`, `jpeg`,
+    /// `gif`, `webp`), its first bytes agree
+    /// ([`sniff_image_mime`](crate::editor::sniff_image_mime)) and it is at
+    /// most [`MAX_DROPPED_IMAGE_BYTES`]: see [`dropped_file_is_a_picture`]. So
+    /// a text file renamed `.png` is not claimed and reaches the app's handler
+    /// like any other file.
+    #[cfg(feature = "windowing")]
+    pub(crate) fn editor_file_drop(
+        &mut self,
+        x: f32,
+        y: f32,
+        paths: Vec<std::path::PathBuf>,
+        indicated: Option<super::DropCaret>,
+    ) -> Vec<std::path::PathBuf> {
+        let Some(claim) = self.claim_editor_file_drop_at(x, y, &paths, indicated.as_ref()) else {
+            return paths;
+        };
+        let EditorDropClaim {
+            handle,
+            anchor,
+            images,
+            rest,
+        } = claim;
+        // The reads are off the UI thread (a photo is megabytes, and the file
+        // may be on a slow mount). One offer is parked here per file, as a
+        // paste's insertion is, and dropped unrun if the editor unmounts
+        // first; each is resumed as soon as its file is read, so the files of
+        // a drop are not all held in memory at once.
+        let anchor = Rc::new(anchor);
+        let ids: Vec<rinch_core::MainCallbackId> = images
+            .iter()
+            .map(|_| {
+                let (handle, anchor) = (handle.clone(), anchor.clone());
+                rinch_core::park_main_callback::<Option<DroppedImage>>(move |file| {
+                    offer_dropped_images(&handle, &anchor, file.into_iter().collect());
+                })
+            })
+            .collect();
+        std::thread::spawn(move || {
+            for (path, id) in images.iter().zip(ids) {
+                let file = read_dropped_image(path);
+                rinch_core::run_on_main_thread(move || rinch_core::resume_main_callback(id, file));
+            }
+        });
+        rest
+    }
+
+    /// [`Self::claim_editor_file_drop_at`] for a drop no drop caret showed.
+    #[cfg(all(test, feature = "windowing"))]
+    pub(crate) fn claim_editor_file_drop(
+        &mut self,
+        x: f32,
+        y: f32,
+        paths: &[std::path::PathBuf],
+    ) -> Option<EditorDropClaim> {
+        self.claim_editor_file_drop_at(x, y, paths, None)
+    }
+
+    /// The synchronous half of [`Self::editor_file_drop`]: decide whether the
+    /// editor under `(x, y)` takes this drop and, if so, put its caret at the
+    /// drop point and give it the keyboard (as a press there would, and as the
+    /// browser runtime does). `None` when it takes nothing.
+    ///
+    /// When the drag showed a drop caret (`indicated`, #1649), the drop point
+    /// is in that caret's editor and its document has not changed since, the
+    /// caret goes where the drop caret was, not to whatever the drop point
+    /// resolves to now.
+    #[cfg(feature = "windowing")]
+    pub(crate) fn claim_editor_file_drop_at(
+        &mut self,
+        x: f32,
+        y: f32,
+        paths: &[std::path::PathBuf],
+        indicated: Option<&super::DropCaret>,
+    ) -> Option<EditorDropClaim> {
+        // Cheapest first: no disk is touched for a drop that cannot be the
+        // editor's.
+        if !paths.iter().any(|p| path_looks_like_an_image(p)) {
+            return None;
+        }
+        let hit = self.editor_point(x, y)?;
+        let handle = crate::editor::editor_for_doc(self.doc_key(), hit.container)?;
+        if !handle.has_image_input_callback() || handle.refuses_edits() {
+            return None;
+        }
+        let (images, rest): (Vec<_>, Vec<_>) = paths
+            .iter()
+            .cloned()
+            .partition(|p| dropped_file_is_a_picture(p));
+        if images.is_empty() {
+            return None;
+        }
+        let pos = match indicated
+            .filter(|caret| caret.container == hit.container && caret.doc.same_ref(&handle.doc()))
+        {
+            Some(caret) => caret.pos,
+            None => hit.pos(&handle)?,
+        };
+        handle.set_selection(rinch_editor_core::Selection::cursor(pos));
+        handle.focus();
+        self.refresh_editor_overlays();
+        let anchor = handle.anchor_selection();
+        Some(EditorDropClaim {
+            handle,
+            anchor,
+            images,
+            rest,
+        })
+    }
+
+    /// An OS file drag is over the window at `cursor`, hovering `path` when
+    /// the platform names one (#1649): note it and place its drop caret.
+    /// Answers whether an overlay changed.
+    #[cfg(feature = "windowing")]
+    pub(crate) fn note_file_drag(
+        &mut self,
+        cursor: (f32, f32),
+        path: Option<&std::path::Path>,
+    ) -> bool {
+        let drag = self.file_drag.get_or_insert(super::FileDrag {
+            cursor,
+            picture: false,
+            paths_known: false,
+            suspended: false,
+            caret: None,
+        });
+        if drag.suspended {
+            // A hover after a pointer move: a new drag, not the one the move
+            // interrupted (whose caret is hidden already).
+            *drag = super::FileDrag {
+                cursor,
+                picture: false,
+                paths_known: false,
+                suspended: false,
+                caret: None,
+            };
+        }
+        drag.cursor = cursor;
+        if let Some(path) = path {
+            drag.paths_known = true;
+            drag.picture |= path_looks_like_an_image(path);
+        }
+        self.place_file_drop_caret()
+    }
+
+    /// Put the drop caret of the OS file drag in flight where a drop at its
+    /// pointer would land, in the editor under it that would take the drop:
+    /// one with an [`on_image_input`](crate::editor::EditorHandle::on_image_input)
+    /// callback that does not refuse edits, for a drag holding a path named
+    /// like a picture — or naming no path yet (the paths arrive a moment
+    /// after the drag enters; a drop that holds no picture inserts nothing).
+    /// Anywhere else, no caret. Neither the selection nor the scroll moves:
+    /// the drop does both. Answers whether an overlay changed.
+    #[cfg(feature = "windowing")]
+    pub(crate) fn place_file_drop_caret(&mut self) -> bool {
+        let Some(drag) = self.file_drag.as_ref() else {
+            return false;
+        };
+        let (x, y) = drag.cursor;
+        let target = if drag.picture || !drag.paths_known {
+            self.file_drop_target(x, y)
+        } else {
+            None
+        };
+        let old = self.file_drag.as_mut().and_then(|drag| drag.caret.take());
+        let mut changed = false;
+        if let Some(old) = &old
+            && target.as_ref().is_none_or(|t| t.0 != old.container)
+        {
+            changed |= old.handle.show_drop_caret(None);
+        }
+        if let Some((container, handle, pos, affinity)) = target {
+            changed |= handle.show_drop_caret(Some((pos, affinity)));
+            let doc = handle.doc();
+            if let Some(drag) = self.file_drag.as_mut() {
+                drag.caret = Some(super::DropCaret {
+                    container,
+                    handle,
+                    pos,
+                    doc,
+                });
+            }
+        }
+        if changed {
+            self.scene_dirty = true;
+        }
+        changed
+    }
+
+    /// The editor a picture dropped at `(x, y)` would land in, and where: its
+    /// container, handle, position and the side of a soft wrap the point is
+    /// on. The cheap half of [`Self::claim_editor_file_drop_at`]'s test — no file
+    /// is read while a drag hovers.
+    #[cfg(feature = "windowing")]
+    fn file_drop_target(
+        &self,
+        x: f32,
+        y: f32,
+    ) -> Option<(
+        u64,
+        crate::editor::EditorHandle,
+        rinch_editor_core::Pos,
+        rinch_core::dom::CaretAffinity,
+    )> {
+        let hit = self.editor_point(x, y)?;
+        let handle = crate::editor::editor_for_doc(self.doc_key(), hit.container)?;
+        if !handle.has_image_input_callback() || handle.refuses_edits() {
+            return None;
+        }
+        let pos = hit.pos(&handle)?;
+        let (affinity, _) = self.editor_hit_affinity(&handle, pos, y);
+        Some((hit.container, handle, pos, affinity))
+    }
+
+    /// Resolve a window/logical point inside whatever editor it lands on — the
+    /// container, the textblock, the flat IFC byte offset and, when the point is
+    /// on an inline box (an image), that box and which half of it (#1104): the
+    /// shared primitive for click, drag-select and vertical movement. Snaps to
+    /// the nearest block when the point misses every textblock (see
+    /// [`Self::editor_point_address_in`]).
+    pub(crate) fn editor_point(&self, x: f32, y: f32) -> Option<EditorPoint> {
         self.editor_point_address_in(x, y, true)
     }
 
     /// The shared resolver. When `allow_nearest` is false it requires the point to
     /// land directly on (or inside) a textblock; when true it falls back to the
     /// geometrically nearest block in the editor (snap-to-line).
-    fn editor_point_address_in(
-        &self,
-        x: f32,
-        y: f32,
-        allow_nearest: bool,
-    ) -> Option<(usize, usize, usize)> {
+    fn editor_point_address_in(&self, x: f32, y: f32, allow_nearest: bool) -> Option<EditorPoint> {
         let doc = self.doc.clone()?;
         let d = doc.borrow();
-        let hit = hit_test(&d.tree, x, y)?;
+        let hit = self.shared_hit(&d, x, y)?;
         // Walk up for the nearest editor textblock (including empty ones, which
         // have no Parley layout) and the `data-pm-editor` container.
         let mut textblock = None;
@@ -3214,11 +5958,41 @@ impl RinchApp {
             None if allow_nearest => Self::nearest_textblock_in(&d.tree, cont, x, y)?,
             None => return None,
         };
+        Self::point_in_textblock(&d, cont, tb, x, y)
+    }
+
+    /// Resolve window point `(x, y)` in `container`'s editor by geometry
+    /// alone — the textblock whose painted band holds `y`, else the nearest
+    /// ([`Self::nearest_textblock_in`]), with no hit test — so a point that
+    /// is laid out but not on screen (scrolled past the window's edge, or
+    /// under a box that covers it) still resolves. A point below (above) the
+    /// editor resolves on its last (first) line.
+    fn editor_point_by_geometry(&self, container: u64, x: f32, y: f32) -> Option<EditorPoint> {
+        let doc = self.doc.clone()?;
+        let d = doc.borrow();
+        let tb = Self::nearest_textblock_in(&d.tree, container, x, y)?;
+        Self::point_in_textblock(&d, container, tb, x, y)
+    }
+
+    /// Window point `(x, y)` resolved inside textblock `tb` of editor `cont`.
+    fn point_in_textblock(
+        d: &RinchDocument,
+        cont: u64,
+        tb: u64,
+        x: f32,
+        y: f32,
+    ) -> Option<EditorPoint> {
         let node = d.tree.get(tb)?;
         // An empty textblock has no inline content and so no Parley layout — the
         // only cursor position in it is offset 0.
+        let point = |byte, inline_box| EditorPoint {
+            container: cont,
+            textblock: tb,
+            byte,
+            inline_box,
+        };
         let Some(layout) = node.text_layout.as_ref() else {
-            return Some((cont, tb, 0));
+            return Some(point(0, None));
         };
         // The click, mapped into the textblock's own space: Parley's layout is
         // in that space, so a transformed editor still resolves to the
@@ -3228,9 +6002,16 @@ impl RinchApp {
         let pad_t = node.computed_style.padding_top.to_px();
         let rel_x = local_x - pad_l + node.scroll_offset.0 as f32;
         let rel_y = local_y - pad_t + node.scroll_offset.1 as f32;
-        let ifc_byte =
-            rinch_dom::text_query::byte_offset_from_position(&layout.layout, rel_x, rel_y);
-        Some((cont, tb, ifc_byte))
+        // Never inside a grapheme cluster (#1684): Parley gives a caret stop
+        // to every character of a glyph that draws several (an emoji ZWJ
+        // sequence, a flag, `❤️`).
+        // At the text drawn under the point, and the box drawn there (#2404).
+        let ifc_byte = rinch_dom::text_query::grapheme_offset_in_inline(layout, rel_x, rel_y);
+        // Parley steps over an inline box to the byte after it, which is the
+        // byte of both of the box's sides: name the box and the half instead.
+        let inline_box =
+            rinch_dom::text_query::inline_box_in_inline(layout, rel_x, rel_y, |id| d.tree.get(id));
+        Some(point(ifc_byte, inline_box))
     }
 
     /// Whether a click at logical `(x, y)` landed in a **task item's checkbox
@@ -3242,7 +6023,7 @@ impl RinchApp {
             return false;
         };
         let d = doc.borrow();
-        let Some(hit) = hit_test(&d.tree, x, y) else {
+        let Some(hit) = self.shared_hit(&d, x, y) else {
             return false;
         };
         // Walk up to the nearest task_item element (stopping at the editor container).
@@ -3293,7 +6074,7 @@ impl RinchApp {
     /// blockquote / the editor root, which carry schema-node element children) or a
     /// void leaf (image / hr / hard break). Recognizes **empty** textblocks too,
     /// which have no Parley `text_layout`, by structure rather than layout.
-    fn is_editor_textblock(tree: &rinch_dom::NodeTree, id: usize) -> bool {
+    fn is_editor_textblock(tree: &rinch_dom::NodeTree, id: u64) -> bool {
         let Some(node) = tree.get(id) else {
             return false;
         };
@@ -3308,10 +6089,15 @@ impl RinchApp {
             return false;
         }
         // Containers hold schema-node element children; a textblock's children are
-        // inline (text / mark wrappers) or it is empty.
+        // inline (text / mark wrappers / inline leaves) or it is empty. An inline
+        // leaf carries `data-pm-type` too (`<br data-pm-type="hard_break">`), and
+        // must not make its paragraph read as a container (#1099).
         !node.children.iter().any(|&c| {
-            tree.get(c)
-                .is_some_and(|n| n.attributes.contains_key("data-pm-type"))
+            tree.get(c).is_some_and(|n| {
+                n.attributes
+                    .get("data-pm-type")
+                    .is_some_and(|t| !matches!(t.as_str(), "hard_break" | "image"))
+            })
         })
     }
 
@@ -3322,11 +6108,11 @@ impl RinchApp {
     /// unrelated one above/below. Considers empty textblocks (no `text_layout`) too.
     fn nearest_textblock_in(
         tree: &rinch_dom::NodeTree,
-        container: usize,
+        container: u64,
         x: f32,
         y: f32,
-    ) -> Option<usize> {
-        let mut best: Option<(usize, f32)> = None;
+    ) -> Option<u64> {
+        let mut best: Option<(u64, f32)> = None;
         let mut stack = vec![container];
         while let Some(id) = stack.pop() {
             let Some(node) = tree.get(id) else { continue };
@@ -3354,32 +6140,69 @@ impl RinchApp {
         handle: &crate::editor::EditorHandle,
         pos: rinch_editor_core::Pos,
     ) -> Option<(f32, f32, f32)> {
+        self.editor_caret_point_with(handle, pos, handle.caret_affinity_at(pos))
+    }
+
+    /// [`Self::editor_caret_point`] on `affinity`'s side of a soft wrap
+    /// (#301). `editor_caret_point` itself draws `pos` the way the editor
+    /// does: with the selection's caret-affinity hint at its head, downstream
+    /// anywhere else.
+    pub(crate) fn editor_caret_point_with(
+        &self,
+        handle: &crate::editor::EditorHandle,
+        pos: rinch_editor_core::Pos,
+        affinity: rinch_core::dom::CaretAffinity,
+    ) -> Option<(f32, f32, f32)> {
         let (tb, flat) = handle.caret_address(pos)?;
         let doc = self.doc.clone()?;
         let d = doc.borrow();
-        let (local_x, local_y) = d.query_caret_position(tb as u64, flat)?;
-        let height = d
-            .query_glyph_bounds(tb as u64, flat)
-            .map(|g| g.height)
-            .unwrap_or(18.0);
-        let node = d.tree.get(tb)?;
-        let pad_l = node.computed_style.padding_left.to_px();
-        let pad_t = node.computed_style.padding_top.to_px();
-        // Parley's `local_x`/`local_y` and the glyph height are in the
-        // textblock's own space; push all three forward through the composed
-        // transform so the answer is in window coordinates (#203). The height
-        // is measured as the image of a vertical step, which is what a
-        // `scale()` ancestor stretches.
-        let fwd = |lx: f32, ly: f32| {
-            rinch_dom::paint::point_from_painted_box(&d.tree, tb, 1.0, lx as f64, ly as f64)
-        };
-        let (cx, cy) = fwd(pad_l + local_x, pad_t + local_y);
-        let (_, cy2) = fwd(pad_l + local_x, pad_t + local_y + height);
-        Some((cx as f32, cy as f32, (cy2 - cy).abs() as f32))
+        // Beside an image the flat byte names neither side; the image's box
+        // does (#1104).
+        if let Some((tb, leaf, after)) = handle.caret_inline_box(pos, affinity)
+            && let Some(rect) = d.inline_box_caret_window_rect(tb, leaf, after)
+        {
+            return Some(rect);
+        }
+        // Text only: vertical motion falls back to the model on a blank line,
+        // where `DomDocument::query_caret_rect` would answer the block's box.
+        d.text_caret_window_rect_with_affinity(tb, flat, affinity)
     }
 
-    /// One vertical cursor step (Up / Down), as a text cursor. First tries the
-    /// visual line above or below via Parley geometry; when that is **stuck** — the
+    /// Which side of a soft wrap a caret placed at `pos` by a hit at window
+    /// `y` belongs to (#301), and its point on that side: `Upstream` when the
+    /// upstream caret is nearer `y` than the downstream one — a hit past a
+    /// wrapped line's end, which lands on the wrap point — else `Downstream`. Anywhere but a
+    /// wrap point both sides are one caret, and the answer is `Downstream`.
+    pub(crate) fn editor_hit_affinity(
+        &self,
+        handle: &crate::editor::EditorHandle,
+        pos: rinch_editor_core::Pos,
+        y: f32,
+    ) -> (rinch_core::dom::CaretAffinity, Option<(f32, f32, f32)>) {
+        use rinch_core::dom::CaretAffinity;
+        // Nearness, not containment: a caret rect covers the glyphs, not the
+        // line box, so a hit in the leading above or below them lies in neither.
+        // Distance from `y` to the rect's vertical span, 0 inside it.
+        let distance = |r: Option<(f32, f32, f32)>| {
+            r.map_or(f32::INFINITY, |(_, ry, rh)| {
+                (ry - y).max(y - (ry + rh)).max(0.0)
+            })
+        };
+        let down = self.editor_caret_point_with(handle, pos, CaretAffinity::Downstream);
+        if distance(down) > 0.0 {
+            let up = self.editor_caret_point_with(handle, pos, CaretAffinity::Upstream);
+            if distance(up) < distance(down) {
+                return (CaretAffinity::Upstream, up);
+            }
+        }
+        (CaretAffinity::Downstream, down)
+    }
+
+    /// One vertical cursor step (Up / Down), as a text cursor. Inside one
+    /// textblock it reads the line above or below from the layout
+    /// ([`Self::line_step_in_textblock`], no hit test, #1121); off the
+    /// textblock's first or last line it hit-tests the point above or below
+    /// the caret; when that is **stuck** — the
     /// caret would stay on the same visual line because a block atom (a horizontal
     /// rule) or a large gap blocks the way — it steps **over** the atom to the
     /// next/previous textblock (`Selection::near_text`, which skips atoms). `None`
@@ -3391,36 +6214,48 @@ impl RinchApp {
         head: rinch_editor_core::Pos,
         down: bool,
         goal_x: Option<f32>,
-    ) -> Option<rinch_editor_core::Selection> {
+    ) -> Option<(rinch_editor_core::Selection, rinch_core::dom::CaretAffinity)> {
+        use rinch_core::dom::CaretAffinity;
         use rinch_editor_core::{Pos, Selection};
         let doc = handle.doc();
+        // A line above or below the caret's in the same textblock is read from
+        // its layout, with no hit test: a clipping scroller hides a line
+        // scrolled out of view, where a hit test found nothing and the step
+        // jumped to the next block (#1121). Only a step out of the caret's
+        // first or last line hit-tests its way into another block.
+        if let Some((p, affinity)) = self.line_step_in_textblock(handle, head, down, goal_x) {
+            return Some((Selection::cursor(p), affinity));
+        }
         if let Some((cx, cy, ch)) = self.editor_caret_point(handle, head)
-            && let Some((_c, tb, ifc)) = {
+            && let ty = if down { cy + ch * 1.5 } else { cy - ch * 0.5 }
+            && let Some(hit) = {
                 // Hit-test at the goal column (preserved across consecutive
                 // Up/Down), falling back to the live caret x for the first step.
                 let tx = goal_x.unwrap_or(cx);
-                let ty = if down { cy + ch * 1.5 } else { cy - ch * 0.5 };
-                self.editor_point_address(tx, ty)
+                self.editor_point(tx, ty)
             }
-            && let Some(p) = handle.pos_at(tb, ifc)
+            && let Some(p) = hit.pos(handle)
         {
+            // A goal column past the target line's end lands on its wrap
+            // point, which is drawn on that line only upstream (#301).
+            let (affinity, rect) = self.editor_hit_affinity(handle, p, ty);
             // A move into a *different* textblock is always a real line change.
             let head_tb = handle.caret_address(head).map(|(t, _)| t);
             let p_tb = handle.caret_address(p).map(|(t, _)| t);
             if p_tb != head_tb {
-                return Some(Selection::cursor(p));
+                return Some((Selection::cursor(p), affinity));
             }
             // Same textblock: accept only if the caret actually advanced to a
             // different visual line (a wrapped paragraph) — otherwise the target
             // point snapped back to the current line (a block atom is in the way).
-            if let Some((_, py, _)) = self.editor_caret_point(handle, p) {
+            if let Some((_, py, _)) = rect {
                 let advanced = if down {
                     py > cy + ch * 0.5
                 } else {
                     py < cy - ch * 0.5
                 };
                 if advanced {
-                    return Some(Selection::cursor(p));
+                    return Some((Selection::cursor(p), affinity));
                 }
             }
         }
@@ -3439,18 +6274,105 @@ impl RinchApp {
         } else {
             head.0
         };
-        Selection::near_text(
+        let target = Selection::near_text(
             &doc,
             Pos(probe.min(doc.content_size())),
             if down { 1 } else { -1 },
-        )
+        )?;
+        // Into a table from outside it: the cell under the goal column, not
+        // the table's last (first) cell in document order (#1847).
+        let goal = goal_x.or_else(|| self.editor_caret_point(handle, head).map(|(x, _, _)| x));
+        let entry = goal.and_then(|gx| {
+            handle.vertical_table_entry(target.head(), down, gx, |p| {
+                self.editor_caret_point(handle, p).map(|(x, _, _)| x)
+            })
+        });
+        Some((
+            entry.map_or(target, Selection::cursor),
+            CaretAffinity::Downstream,
+        ))
+    }
+
+    /// Where Up (`down = false`) or Down puts a caret at `head` when the line
+    /// above or below the caret's is in the same textblock: the position at
+    /// the goal column (`goal_x`, window px, else the caret's own x) on that
+    /// line, and the side of a soft wrap it is drawn on there (#301). All
+    /// read from the textblock's Parley layout by LINE INDEX, with no hit
+    /// test and no y coordinate: the caret's line is the one it is drawn on
+    /// (an image's box's beside an image, #1116), the target is the next or
+    /// previous index, and the column is resolved on that line as a press
+    /// would be ([`rinch_dom::text_query::caret_on_line`]: grapheme clusters,
+    /// an image and its half). So it answers for a line scrolled out of view
+    /// (#1121), and where line boxes overlap — a y there can name another
+    /// line. `None` on the textblock's first (up) or last (down) line, with
+    /// no layout, or when the answer is not drawn on the target line on
+    /// either side; the caller then hit-tests.
+    fn line_step_in_textblock(
+        &self,
+        handle: &crate::editor::EditorHandle,
+        head: rinch_editor_core::Pos,
+        down: bool,
+        goal_x: Option<f32>,
+    ) -> Option<(rinch_editor_core::Pos, rinch_core::dom::CaretAffinity)> {
+        use rinch_core::dom::CaretAffinity;
+        use rinch_dom::text_query::{LineOf, caret_on_line, line_index_of};
+        let (tb, _) = handle.caret_address(head)?;
+        let affinity = handle.caret_affinity_at(head);
+        let (cx, cy, ch) = self.editor_caret_point(handle, head)?;
+        let doc = self.doc.clone()?;
+        // The line a caret at `pos` with `aff` is drawn on, in `tb`'s layout:
+        // beside an image the image's line (#1116), when the layout holds it.
+        let line_of = |pos: rinch_editor_core::Pos, aff: CaretAffinity| -> Option<usize> {
+            let (t, flat) = handle.caret_address(pos)?;
+            if t != tb {
+                return None;
+            }
+            let leaf = handle
+                .caret_inline_box(pos, aff)
+                .filter(|&(leaf_tb, _, _)| leaf_tb == tb)
+                .map(|(_, leaf, _)| leaf);
+            let d = doc.borrow();
+            let layout = &d.tree.get(tb)?.text_layout.as_ref()?.layout;
+            leaf.and_then(|leaf| line_index_of(layout, LineOf::InlineBox(leaf)))
+                .or_else(|| line_index_of(layout, LineOf::Caret(flat, aff)))
+        };
+        let own = line_of(head, affinity)?;
+        let target = if down { own + 1 } else { own.checked_sub(1)? };
+        let (byte, inline_box) = {
+            let d = doc.borrow();
+            let node = d.tree.get(tb)?;
+            let layout = node.text_layout.as_ref()?;
+            if target >= layout.layout.len() {
+                return None;
+            }
+            // The goal column in the layout's own space, as
+            // `editor_point_address_in` maps a press, taken at the caret's
+            // height (a transform can couple x and y).
+            let (local_x, _) = pointer_in_node(&d.tree, tb, goal_x.unwrap_or(cx), cy + ch * 0.5);
+            let rel_x =
+                local_x - node.computed_style.padding_left.to_px() + node.scroll_offset.0 as f32;
+            caret_on_line(&layout.layout, &layout.text_content, target, rel_x)?
+        };
+        let p = inline_box
+            .and_then(|(leaf, after)| handle.pos_beside_inline_leaf(leaf, after))
+            .or_else(|| handle.pos_at(tb, byte))?;
+        // The side of a soft wrap that is on the target line; neither means
+        // the column resolved somewhere else, and the hit test decides.
+        [CaretAffinity::Downstream, CaretAffinity::Upstream]
+            .into_iter()
+            .find(|&aff| line_of(p, aff) == Some(target))
+            .map(|aff| (p, aff))
     }
 
     /// The model position at the start (`end = false`) or end (`end = true`) of the
     /// caret's current **visual** line — so Home/End land at the wrapped line's edge,
-    /// not the whole block's. Hit-tests the far-left / far-right of the caret's line
-    /// box via the same geometry as [`Self::vertical_step`]. `None` when the caret
-    /// has no Parley geometry (an empty block); the caller falls back to the
+    /// not the whole block's. Read from the caret's Parley layout
+    /// ([`rinch_dom::text_query::visual_line_edges_for_node`]): the line the
+    /// caret is drawn on, with the caret's affinity hint choosing the upper line
+    /// at a soft wrap (#301) and an image's box the image's line (#1116), so it answers
+    /// the same for a line scrolled out of view — where it used to hit-test a point
+    /// on the line, which a clipping scroller hides (#1107). `None` when the caret
+    /// has no Parley layout (an empty block); the caller falls back to the
     /// block-level `rinch_editor_core::motion::line_boundary`.
     fn visual_line_bound(
         &self,
@@ -3458,42 +6380,58 @@ impl RinchApp {
         head: rinch_editor_core::Pos,
         end: bool,
     ) -> Option<rinch_editor_core::Pos> {
-        let (_cx, cy, ch) = self.editor_caret_point(handle, head)?;
-        let (tb, _flat) = handle.caret_address(head)?;
-        // Content-box left/right of the textblock, in window coords.
-        let (content_left, content_right) = {
+        let (tb, flat) = handle.caret_address(head)?;
+        let affinity = handle.caret_affinity_at(head);
+        let edges = {
+            use rinch_dom::text_query::{LineOf, visual_line_edges_for_node};
             let doc = self.doc.clone()?;
             let d = doc.borrow();
-            let node = d.tree.get(tb)?;
-            let pad_l = node.computed_style.padding_left.to_px();
-            let pad_r = node.computed_style.padding_right.to_px();
-            let w = node.layout.width;
-            // Both edges pushed forward through the composed transform, so the
-            // probe lands on the painted line rather than beside it (#203).
-            let fwd = |lx: f32| {
-                rinch_dom::paint::point_from_painted_box(&d.tree, tb, 1.0, lx as f64, 0.0).0 as f32
-            };
-            (fwd(pad_l), fwd(w - pad_r))
+            let id = tb;
+            // The line the caret is DRAWN on: beside an image that is the
+            // image's line, which the byte query cannot tell (between two
+            // images a soft wrap separates, the byte's caret is on the upper
+            // line and a downstream caret before the second image on the
+            // lower one, #1116).
+            handle
+                .caret_inline_box(head, affinity)
+                .filter(|&(leaf_tb, _, _)| leaf_tb == tb)
+                .and_then(|(_, leaf, _)| {
+                    visual_line_edges_for_node(&d, id, LineOf::InlineBox(leaf))
+                })
+                .or_else(|| visual_line_edges_for_node(&d, id, LineOf::Caret(flat, affinity)))?
         };
-        // Probe the middle of the caret's line box, just inside the far edge.
-        let ty = cy + ch * 0.5;
-        let tx = if end {
-            content_right - 1.0
+        let range = edges.range.clone();
+        // An image has no bytes, so the edge byte is the byte of both sides of
+        // an image at the line's edge, and of one at that byte on the
+        // neighbouring line, and `pos_at` picks a side by where the text runs
+        // are (#1116). An image that is the line's first item is the line's
+        // start, one that is its last item its end; any other image at the
+        // edge byte is on the neighbouring line. `pos_at` answers the position
+        // before the images at a text run's end, which is right for the end of
+        // a line that ends in text; at a line's start it can answer before an
+        // image that ends the line above (`bravo` / image / `charlie`), so
+        // Home steps past every position at the start byte. Items are in
+        // visual order, so a line holding right-to-left text keeps `pos_at`'s
+        // answer.
+        let edge_box = if !edges.ltr {
+            None
+        } else if end {
+            edges.last_box
         } else {
-            content_left + 1.0
+            edges.first_box
         };
-        let (_c, tb2, ifc) = self.editor_point_address(tx, ty)?;
-        let p = handle.pos_at(tb2, ifc)?;
-        // At a soft-wrap boundary the end-of-line byte is the same model position as
-        // the start of the next visual line, and rinch-dom renders its caret with
-        // *downstream* affinity (at the next line's start). For End, step back one
-        // position when the target spilled onto the next line so the caret stays at
-        // the visual end of the current line.
-        if end
-            && let Some((_, py, _)) = self.editor_caret_point(handle, p)
-            && py > cy + ch * 0.5
-        {
-            return Some(rinch_editor_core::Pos(p.0.saturating_sub(1)));
+        if let Some(p) = edge_box.and_then(|id| handle.pos_beside_inline_leaf(id, end)) {
+            return Some(p);
+        }
+        // At a soft wrap the end-of-line position is the same model position as
+        // the start of the next visual line. End draws it at the end of this line
+        // by setting the caret-affinity hint (#301).
+        let byte = if end { range.end } else { range.start };
+        let mut p = handle.pos_at(tb, byte)?;
+        if !end && edges.ltr {
+            while handle.caret_address(rinch_editor_core::Pos(p.0 + 1)) == Some((tb, byte)) {
+                p.0 += 1;
+            }
         }
         Some(p)
     }
@@ -3502,10 +6440,14 @@ impl RinchApp {
     /// `(x, y)`, if the click landed inside any editor — independent of whether it
     /// hit a textblock. Used so a click on the editor's padding / empty area still
     /// takes (or keeps) focus rather than blurring it.
-    pub(crate) fn editor_container_at(&self, x: f32, y: f32) -> Option<usize> {
+    pub(crate) fn editor_container_at(&self, x: f32, y: f32) -> Option<u64> {
         let doc = self.doc.clone()?;
         let d = doc.borrow();
-        let hit = hit_test(&d.tree, x, y)?;
+        let hit = self.shared_hit(&d, x, y)?;
+        // A press inside a node view's component is the component's (#node-views).
+        if Self::in_node_view(&d.tree, hit) {
+            return None;
+        }
         let mut cur = Some(hit);
         while let Some(id) = cur {
             let node = d.tree.get(id)?;
@@ -3517,24 +6459,26 @@ impl RinchApp {
         None
     }
 
-    /// The host id of an editor **leaf** node element — an `<img>`/`<hr>` whose
-    /// `data-pm-type` is `image` or `horizontal_rule` — under logical point
-    /// `(x, y)`, if the click landed on one inside an editor container. Walks up
-    /// from the hit node, recording the first leaf seen, and returns it only once
-    /// the walk reaches the `data-pm-editor` container (so a leaf outside any editor,
-    /// or a click on a non-leaf block, yields `None`). The click→node-select path.
-    pub(super) fn editor_leaf_at(&self, x: f32, y: f32) -> Option<usize> {
+    /// The host id of the innermost editor node element (one carrying
+    /// `data-pm-type`) under logical point `(x, y)`, if the press landed inside an
+    /// editor container and not inside a node view's component. Whether it names a
+    /// node a press **node-selects** is the schema's answer, not this walk's:
+    /// [`EditorHandle::node_selection_at_host`](crate::editor::EditorHandle::node_selection_at_host)
+    /// accepts a selectable leaf atom (an image, a horizontal rule, an `embed`, or
+    /// an app schema's own) and nothing else, so a paragraph's host answers `None`
+    /// and the press places a caret. The click→node-select path.
+    pub(super) fn editor_leaf_at(&self, x: f32, y: f32) -> Option<u64> {
         let doc = self.doc.clone()?;
         let d = doc.borrow();
-        let hit = hit_test(&d.tree, x, y)?;
-        let mut leaf: Option<usize> = None;
+        let hit = self.shared_hit(&d, x, y)?;
+        if Self::in_node_view(&d.tree, hit) {
+            return None;
+        }
+        let mut leaf: Option<u64> = None;
         let mut cur = Some(hit);
         while let Some(id) = cur {
             let node = d.tree.get(id)?;
-            if leaf.is_none()
-                && let Some(t) = node.attributes.get("data-pm-type")
-                && matches!(t.as_str(), "image" | "horizontal_rule")
-            {
+            if leaf.is_none() && node.attributes.contains_key("data-pm-type") {
                 leaf = Some(id);
             }
             if node.attributes.get("data-pm-editor").map(String::as_str) == Some("true") {
@@ -3543,6 +6487,222 @@ impl RinchApp {
             cur = node.parent;
         }
         None
+    }
+
+    /// Whether `hit` is **inside** a node view's component: below (not on) an
+    /// element carrying [`NODE_VIEW_ATTR`](crate::editor::NODE_VIEW_ATTR) that sits
+    /// in an editor. A press or a key there is the component's; a press on the
+    /// view's host itself (its frame) is the editor's, and node-selects it.
+    pub(crate) fn in_node_view(tree: &rinch_dom::NodeTree, hit: u64) -> bool {
+        Self::node_view_around(tree, hit).is_some()
+    }
+
+    /// `(editor container, view host)` when `node` is inside a node view's
+    /// component (see [`Self::in_node_view`]).
+    pub(crate) fn node_view_around(tree: &rinch_dom::NodeTree, node: u64) -> Option<(u64, u64)> {
+        let mut host: Option<u64> = None;
+        let mut cur = tree.get(node)?.parent;
+        while let Some(id) = cur {
+            let n = tree.get(id)?;
+            if n.attributes.get("data-pm-editor").map(String::as_str) == Some("true") {
+                return host.map(|h| (id, h));
+            }
+            if host.is_none() && n.attributes.contains_key(crate::editor::NODE_VIEW_ATTR) {
+                host = Some(id);
+            }
+            cur = n.parent;
+        }
+        None
+    }
+
+    /// The link on the character under logical point `(x, y)`, given the hit
+    /// test's answer `hit` for that point: `(editor container, its handle, the
+    /// link)`. `None` unless the point is over a glyph (not beside a line's end,
+    /// not in padding: no snapping to the nearest block, unlike
+    /// [`Self::editor_point`]) and that character carries a link.
+    ///
+    /// Takes the hit rather than testing itself so a pointer move can share its
+    /// one hit test with hover and cursor (update-path audit F2.1).
+    pub(crate) fn editor_link_at_hit(
+        &self,
+        hit: u64,
+        x: f32,
+        y: f32,
+    ) -> Option<(
+        u64,
+        crate::editor::EditorHandle,
+        rinch_editor_core::LinkSpan,
+    )> {
+        let doc = self.doc.clone()?;
+        let (container, tb, byte) = {
+            let d = doc.borrow();
+            let mut textblock = None;
+            let mut container = None;
+            let mut cur = Some(hit);
+            while let Some(id) = cur {
+                let node = d.tree.get(id)?;
+                if textblock.is_none() && Self::is_editor_textblock(&d.tree, id) {
+                    textblock = Some(id);
+                }
+                if node.attributes.get("data-pm-editor").map(String::as_str) == Some("true") {
+                    container = Some(id);
+                    break;
+                }
+                cur = node.parent;
+            }
+            let (container, tb) = (container?, textblock?);
+            let node = d.tree.get(tb)?;
+            let layout = node.text_layout.as_ref()?;
+            // The same mapping into the textblock's layout space as
+            // `editor_point_address_in`.
+            let (local_x, local_y) = pointer_in_node(&d.tree, tb, x, y);
+            let rel_x =
+                local_x - node.computed_style.padding_left.to_px() + node.scroll_offset.0 as f32;
+            let rel_y =
+                local_y - node.computed_style.padding_top.to_px() + node.scroll_offset.1 as f32;
+            // The link drawn under the point (#2404).
+            let range = rinch_dom::text_query::cluster_range_in_inline(layout, rel_x, rel_y)?;
+            (container, tb, range.start)
+        };
+        let handle = crate::editor::editor_for_doc(self.doc_key(), container)?;
+        let pos = handle.pos_at(tb, byte)?;
+        let link = handle.link_at(pos)?;
+        Some((container, handle, link))
+    }
+
+    /// Where `link` is painted, in logical window coordinates: the union of its
+    /// per-line boxes, pushed through the composed transform like
+    /// [`Self::editor_caret_point`]. A zero rect when it has no geometry yet.
+    fn editor_link_rect(
+        &self,
+        handle: &crate::editor::EditorHandle,
+        link: &rinch_editor_core::LinkSpan,
+    ) -> rinch_core::ElementBounds {
+        let rect = || {
+            let (tb, a) = handle.caret_address(link.from)?;
+            let (tb_end, b) = handle.caret_address(link.to)?;
+            if tb != tb_end {
+                return None; // a link is inline content: one textblock
+            }
+            let doc = self.doc.clone()?;
+            let d = doc.borrow();
+            let node = d.tree.get(tb)?;
+            let layout = node.text_layout.as_ref()?;
+            let pad_l = node.computed_style.padding_left.to_px() - node.scroll_offset.0 as f32;
+            let pad_t = node.computed_style.padding_top.to_px() - node.scroll_offset.1 as f32;
+            let fwd = |lx: f32, ly: f32| {
+                let (wx, wy) = rinch_dom::paint::point_from_painted_box(
+                    &d.tree,
+                    tb,
+                    1.0,
+                    (pad_l + lx) as f64,
+                    (pad_t + ly) as f64,
+                );
+                (wx as f32, wy as f32)
+            };
+            let mut bounds: Option<(f32, f32, f32, f32)> = None;
+            for (lx, ly, w, h) in rinch_dom::text_query::selection_rects_for_inline(layout, a, b) {
+                for (px, py) in [
+                    fwd(lx, ly),
+                    fwd(lx + w, ly + h),
+                    fwd(lx + w, ly),
+                    fwd(lx, ly + h),
+                ] {
+                    bounds = Some(match bounds {
+                        None => (px, py, px, py),
+                        Some((x0, y0, x1, y1)) => (x0.min(px), y0.min(py), x1.max(px), y1.max(py)),
+                    });
+                }
+            }
+            let (x0, y0, x1, y1) = bounds?;
+            Some(rinch_core::ElementBounds {
+                x: x0,
+                y: y0,
+                width: x1 - x0,
+                height: y1 - y0,
+            })
+        };
+        rect().unwrap_or_default()
+    }
+
+    /// A trackpad pinch (winit's `PinchGesture`) of `delta` (positive is
+    /// magnification): a `Pinch` with scale `1 + delta` to the surface under
+    /// the cursor, if it has pointer events. Answers whether one heard it.
+    pub(crate) fn surface_pinch_gesture(&mut self, delta: f32) -> bool {
+        let Some((x, y)) = self.cursor_pos else {
+            return false;
+        };
+        let Some(doc) = self.doc.clone() else {
+            return false;
+        };
+        let surface_hit = {
+            let d = doc.borrow();
+            self.shared_hit(&d, x, y)
+                .and_then(|hit| Self::find_render_surface_at(&d.tree, hit, x, y))
+        };
+        surface_hit.is_some_and(|(surface_id, local_x, local_y)| {
+            crate::render_surface::dispatch_surface_zoom(surface_id, local_x, local_y, 1.0 + delta)
+        })
+    }
+
+    /// Report the link under the pointer to [`crate::editor::set_link_hover`],
+    /// which fires the editors' `on_link_hover` callbacks on a change. `hit` is
+    /// the pointer move's shared hit test. The caller has checked
+    /// [`crate::editor::link_hover_wanted`], so an app without a hover
+    /// callback never gets here.
+    pub(crate) fn update_editor_link_hover(&self, hit: Option<u64>, x: f32, y: f32) {
+        let hovered =
+            hit.and_then(|hit| self.editor_link_at_hit(hit, x, y))
+                .map(|(_, handle, link)| {
+                    let rect = self.editor_link_rect(&handle, &link);
+                    (handle, crate::editor::LinkHover { link, rect })
+                });
+        crate::editor::set_link_hover(self.input_doc(), hovered);
+    }
+
+    /// The editor image whose `<img>` is `hit` or holds it, with its editor:
+    /// the walk [`Self::editor_leaf_at`] makes, for images only, and the box
+    /// the `<img>` was painted in (logical window pixels, through the composed
+    /// transform, as `bounds_signal` reports it).
+    fn editor_image_at_hit(
+        &self,
+        hit: u64,
+    ) -> Option<(crate::editor::EditorHandle, crate::editor::ImageHover)> {
+        let doc = self.doc.clone()?;
+        let (container, image, rect) = {
+            let d = doc.borrow();
+            let mut image = None;
+            let mut cur = Some(hit);
+            let container = loop {
+                let id = cur?;
+                let node = d.tree.get(id)?;
+                if image.is_none()
+                    && node.attributes.get("data-pm-type").map(String::as_str) == Some("image")
+                {
+                    image = Some(id);
+                }
+                if node.attributes.get("data-pm-editor").map(String::as_str) == Some("true") {
+                    break id;
+                }
+                cur = node.parent;
+            };
+            let image = image?;
+            let (x, y, width, height) =
+                crate::app::hit_testing::painted_element_box(&d.tree, image);
+            (
+                container,
+                image,
+                rinch_core::ElementBounds {
+                    x,
+                    y,
+                    width,
+                    height,
+                },
+            )
+        };
+        let handle = crate::editor::editor_for_doc(self.doc_key(), container)?;
+        let (pos, attrs) = handle.image_at_host(image)?;
+        Some((handle, crate::editor::ImageHover { pos, attrs, rect }))
     }
 
     /// Focus the new editor under a pointer click at logical `(x, y)` and set the
@@ -3564,6 +6724,10 @@ impl RinchApp {
     /// Shift+click drags from the existing anchor). The only click that keeps the
     /// prior selection is one that resolves to no textblock at all (an empty editor
     /// with no addressable block).
+    ///
+    /// A single press on a linked character is first offered to the editor's
+    /// [`on_link_click`](crate::editor::EditorHandle::on_link_click) callback;
+    /// one it claims changes nothing but focus.
     pub(crate) fn try_new_editor_click(
         &mut self,
         x: f32,
@@ -3571,8 +6735,9 @@ impl RinchApp {
         scale: f64,
         window_size: (u32, u32),
         click_count: u8,
-        shift: bool,
+        modifiers: events::ModifierState,
     ) -> bool {
+        let shift = modifiers.shift;
         let Some(container) = self.editor_container_at(x, y) else {
             return false;
         };
@@ -3582,17 +6747,50 @@ impl RinchApp {
         // Take keyboard focus through the arbiter (tears down a prior surface /
         // input / CE / different editor).
         self.set_focus_target(FocusTarget::Editor(container));
+        // A press is the user's interaction: the spellchecker starts (#2862).
+        handle.spell_user_focus();
         // A click places the cursor at a new column, so abandon any vertical goal
         // column from a prior Up/Down run.
         self.editor_goal_x = None;
+        // A press on a link is the app's first (`EditorHandle::on_link_click`),
+        // before anything below moves the caret. Asked about the character
+        // under the pointer, so a press just past a link's end is not on it.
+        if click_count == 1
+            && let Some(hit) = self
+                .doc
+                .as_ref()
+                .and_then(|d| self.shared_hit(&d.borrow(), x, y))
+            && let Some((c, link_handle, link)) = self.editor_link_at_hit(hit, x, y)
+            && c == container
+        {
+            let click = crate::editor::LinkClick {
+                link,
+                primary: if cfg!(target_os = "macos") {
+                    modifiers.meta
+                } else {
+                    modifiers.ctrl
+                },
+                ctrl: modifiers.ctrl,
+                meta: modifiers.meta,
+                shift: modifiers.shift,
+                alt: modifiers.alt,
+            };
+            if link_handle.dispatch_link_click(&click) {
+                crate::editor::end_drag(self.input_doc());
+                self.refresh_editor_overlays();
+                let (w, h) = Self::layout_viewport(window_size, scale);
+                self.resolve_and_repaint(w, h);
+                return true;
+            }
+        }
         // A click in a task item's checkbox gutter toggles its `checked` state instead
         // of placing a caret (the checkbox is a CSS `::before`, so the hit is geometric,
         // not a real element). Resolve the nearest textblock for a document position,
         // then toggle the enclosing task item.
         if self.editor_task_checkbox_at(x, y)
-            && let Some((c, tb, ifc)) = self.editor_point_address(x, y)
-            && c == container
-            && let Some(pos) = handle.pos_at(tb, ifc)
+            && let Some(hit) = self.editor_point(x, y)
+            && hit.container == container
+            && let Some(pos) = hit.pos(&handle)
             && handle.toggle_task_checked_at(pos.0)
         {
             crate::editor::end_drag(self.input_doc());
@@ -3609,9 +6807,9 @@ impl RinchApp {
         {
             handle.set_selection(selection);
             crate::editor::end_drag(self.input_doc());
-        } else if let Some((c, textblock, ifc_byte)) = self.editor_point_address(x, y)
-            && c == container
-            && let Some(clicked) = handle.pos_at(textblock, ifc_byte)
+        } else if let Some(hit) = self.editor_point(x, y)
+            && hit.container == container
+            && let Some(clicked) = hit.pos(&handle)
         {
             use rinch_editor_core::Selection;
             let doc = handle.doc();
@@ -3628,7 +6826,14 @@ impl RinchApp {
                 _ if shift => (Selection::text(prior_anchor, clicked), Some(prior_anchor)),
                 _ => (Selection::cursor(clicked), Some(clicked)),
             };
-            handle.set_selection(selection);
+            // A press past a wrapped line's end lands on its wrap point, and
+            // belongs to the line pressed on (#301).
+            let affinity = if selection.is_empty() {
+                self.editor_hit_affinity(&handle, clicked, y).0
+            } else {
+                rinch_core::dom::CaretAffinity::Downstream
+            };
+            handle.set_selection_with_affinity(selection, affinity);
             if let Some(anchor) = drag_anchor {
                 crate::editor::begin_drag(self.input_doc(), container, anchor.0);
             }
@@ -3654,16 +6859,16 @@ impl RinchApp {
         let Some((container, anchor)) = crate::editor::drag_anchor(self.input_doc()) else {
             return false;
         };
-        let Some((c, tb, ifc)) = self.editor_point_address(x, y) else {
+        let Some(hit) = self.editor_point(x, y) else {
             return true; // dragged off the text; keep the drag, don't change selection
         };
-        if c != container {
+        if hit.container != container {
             return true;
         }
         let Some(handle) = crate::editor::editor_for_doc(self.doc_key(), container) else {
             return false;
         };
-        if let Some(head) = handle.pos_at(tb, ifc) {
+        if let Some(head) = hit.pos(&handle) {
             use rinch_editor_core::{Pos, Selection, tables};
             let doc = handle.doc();
             // A drag that spans two different cells of one table is a cell (rectangle)
@@ -3687,30 +6892,153 @@ impl RinchApp {
     }
 }
 
+/// What [`RinchApp::hover_at`] found under the pointer.
+pub(super) struct HoverAt {
+    /// The hit (the block, for an IFC's text): what render surfaces and the
+    /// editor's link and image hover ask about.
+    pub(super) hovered: Option<u64>,
+    /// The element under the pointer, an inline one in a paragraph's text
+    /// included (#2648): what `:hover`, the enter and leave handlers, the
+    /// cursor and the `title` tooltip take.
+    pub(super) target: Option<u64>,
+    /// The cursor shape `target` asks for.
+    pub(super) cursor: rinch_platform::CursorStyle,
+    /// Whether the hover chain changed (leave and enter handlers ran).
+    pub(super) changed: bool,
+}
+
+/// A window point resolved inside an editor ([`RinchApp::editor_point`]): the
+/// container, the textblock, the flat byte Parley's hit test answers, and —
+/// when the point is on an inline box (an image) — that box's element id and
+/// whether the point is on its right half.
+#[cfg(feature = "windowing")]
+pub(crate) struct EditorPoint {
+    pub(crate) container: u64,
+    pub(crate) textblock: u64,
+    pub(crate) byte: usize,
+    pub(crate) inline_box: Option<(u64, bool)>,
+}
+
+#[cfg(feature = "windowing")]
+impl EditorPoint {
+    /// The model position the point resolves to: the side of the inline box
+    /// it is on, else the flat byte's position. The byte alone cannot name a
+    /// side of an image, which occupies no bytes (#1104).
+    pub(crate) fn pos(
+        &self,
+        handle: &crate::editor::EditorHandle,
+    ) -> Option<rinch_editor_core::Pos> {
+        self.inline_box
+            .and_then(|(leaf, after)| handle.pos_beside_inline_leaf(leaf, after))
+            .or_else(|| handle.pos_at(self.textblock, self.byte))
+    }
+}
+
 /// Insert clipboard `content` into `handle` at `anchor` — the completion half of
-/// the asynchronous paste, always on the main thread.
+/// the asynchronous paste, always on the main thread. `text` is the `text/plain`
+/// flavour offered beside an html `content` (`paste_rich_with_text`).
 ///
 /// The anchor, not the live selection, is the insertion point: see
 /// [`RinchApp::dispatch_editor_paste`]. An anchor that no longer resolves means the
 /// document the user aimed at was replaced while the read was in flight, and the
 /// paste is dropped rather than aimed at whatever now occupies those offsets.
-#[cfg(all(feature = "desktop", feature = "clipboard"))]
+///
+/// Text and html go through `EditorHandle::paste`, the one paste entry point both
+/// platforms share, so the editor's plugins see the paste (`Plugin::handle_paste`)
+/// at the anchor before the default inserts it. A bitmap has no plugin hook: it is
+/// offered to the app's `EditorHandle::on_image_input` callback as a PNG when
+/// there is one, and otherwise goes in as an image node with a `data:` URL.
+#[cfg(all(feature = "windowing", feature = "clipboard"))]
 fn apply_paste_at_anchor(
     handle: &crate::editor::EditorHandle,
     anchor: &crate::editor::SelectionAnchor,
     content: rinch_clipboard::RichPaste,
+    text: Option<String>,
 ) -> bool {
     use rinch_clipboard::RichPaste;
+    use rinch_editor_core::PasteContent;
 
     let Some(selection) = anchor.selection() else {
         return false;
     };
-    handle.set_selection(selection);
     match content {
-        RichPaste::Html(html) => handle.replace_selection_with_html(&html),
-        RichPaste::Image(img) => image_rgba_to_png_data_url(img.width, img.height, &img.bytes)
-            .is_some_and(|url| handle.insert_image(&url, "")),
-        RichPaste::Text(text) => !text.is_empty() && handle.replace_selection_with_text(&text),
+        // An app that takes pictures itself is handed the PNG and answers with
+        // the `src` (or inserts later, or refuses): no `data:` URL is made. It
+        // is offered AT the anchor, so the caret of a person who moved on while
+        // the clipboard was read stays where they are.
+        RichPaste::Image(img) if handle.has_image_input_callback() => {
+            image_rgba_to_png(img.width, img.height, &img.bytes).is_some_and(|png| {
+                handle.offer_image_input_at(
+                    anchor,
+                    crate::editor::ImageInputSource::Paste,
+                    png,
+                    "image/png",
+                    None,
+                )
+            })
+        }
+        RichPaste::Html(html) => {
+            handle.set_selection(selection);
+            handle.paste(&PasteContent::new(text, Some(html)))
+        }
+        RichPaste::Image(img) => {
+            handle.set_selection(selection);
+            image_rgba_to_png_data_url(img.width, img.height, &img.bytes)
+                .is_some_and(|url| handle.insert_image(&url, ""))
+        }
+        RichPaste::Text(text) => {
+            handle.set_selection(selection);
+            handle.paste(&PasteContent::text(text))
+        }
+    }
+}
+
+/// The first clipboard read of an editor paste has answered: apply it at
+/// `anchor`, or ask for a second read.
+///
+/// A browser's "Copy image" offers the picture twice: as html
+/// (`<img src="https://…">`) and as the bitmap. The probe prefers html, so an
+/// app that takes pictures itself (`EditorHandle::on_image_input`) would be
+/// handed an `<img>` pointing wherever it was copied from and never the bytes.
+/// For html that is pictures and nothing else, `second_read` is called to read
+/// the bitmap ([`RinchApp::paste_bitmap_or_html`]; [`bitmap_or_html`] is what
+/// it then pastes). Everything else is applied here.
+#[cfg(all(feature = "windowing", feature = "clipboard"))]
+fn paste_read_arrived(
+    handle: crate::editor::EditorHandle,
+    anchor: crate::editor::SelectionAnchor,
+    result: rinch_clipboard::ClipboardResult<(rinch_clipboard::RichPaste, Option<String>)>,
+    second_read: impl FnOnce(
+        crate::editor::EditorHandle,
+        crate::editor::SelectionAnchor,
+        String,
+        Option<String>,
+    ),
+) {
+    use rinch_clipboard::RichPaste;
+    match result {
+        Ok((RichPaste::Html(html), text))
+            if handle.has_image_input_callback() && handle.html_is_only_images(&html) =>
+        {
+            second_read(handle, anchor, html, text);
+        }
+        Ok((content, text)) => {
+            apply_paste_at_anchor(&handle, &anchor, content, text);
+        }
+        Err(_) => {}
+    }
+}
+
+/// What the second read of a pictures-only html paste pastes: the bitmap when
+/// the clipboard held one, and otherwise the html, as it would have been.
+#[cfg(all(feature = "windowing", feature = "clipboard"))]
+fn bitmap_or_html(
+    bitmap: rinch_clipboard::ClipboardResult<rinch_clipboard::ImageData<'static>>,
+    html: String,
+) -> rinch_clipboard::RichPaste {
+    match bitmap {
+        Ok(image) => rinch_clipboard::RichPaste::Image(image),
+        Err(_) => rinch_clipboard::RichPaste::Html(html),
     }
 }
 
@@ -3719,10 +7047,21 @@ fn apply_paste_at_anchor(
 /// buffer isn't exactly `width * height * 4` bytes or PNG encoding fails.
 ///
 /// `png` and `base64` are guaranteed present here: this is reached only via the
-/// editor paste path, gated on `desktop`, which enables `dep:png`/`dep:base64`.
-#[cfg(all(feature = "desktop", feature = "clipboard"))]
+/// editor paste path, gated on `windowing`, which enables `dep:png`/`dep:base64`.
+#[cfg(all(feature = "windowing", feature = "clipboard"))]
 fn image_rgba_to_png_data_url(width: usize, height: usize, rgba: &[u8]) -> Option<String> {
     use base64::Engine;
+    let png = image_rgba_to_png(width, height, rgba)?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+    Some(format!("data:image/png;base64,{b64}"))
+}
+
+/// Encode `width`×`height` RGBA8 pixels (the clipboard bitmap format) as a PNG
+/// file's bytes: what an [`on_image_input`](crate::editor::EditorHandle::on_image_input)
+/// callback is handed for a pasted bitmap. `None` if the buffer isn't exactly
+/// `width * height * 4` bytes or PNG encoding fails.
+#[cfg(all(feature = "windowing", feature = "clipboard"))]
+fn image_rgba_to_png(width: usize, height: usize, rgba: &[u8]) -> Option<Vec<u8>> {
     if width == 0 || height == 0 || rgba.len() != width.checked_mul(height)?.checked_mul(4)? {
         return None;
     }
@@ -3734,11 +7073,155 @@ fn image_rgba_to_png_data_url(width: usize, height: usize, rgba: &[u8]) -> Optio
         let mut writer = encoder.write_header().ok()?;
         writer.write_image_data(rgba).ok()?;
     }
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
-    Some(format!("data:image/png;base64,{b64}"))
+    Some(png)
 }
 
-#[cfg(all(test, feature = "desktop", feature = "clipboard"))]
+/// A file drop an editor took: see [`RinchApp::claim_editor_file_drop_at`].
+#[cfg(feature = "windowing")]
+pub(crate) struct EditorDropClaim {
+    pub(crate) handle: crate::editor::EditorHandle,
+    /// The caret at the drop point, anchored.
+    pub(crate) anchor: crate::editor::SelectionAnchor,
+    /// The pictures, to be read and offered.
+    pub(crate) images: Vec<std::path::PathBuf>,
+    /// The other files of the drop: the app's file-drop handler's.
+    pub(crate) rest: Vec<std::path::PathBuf>,
+}
+
+/// An image file dropped on an editor, read: its bytes, what they are, and the
+/// file's name.
+#[cfg(feature = "windowing")]
+pub(crate) struct DroppedImage {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) mime: &'static str,
+    pub(crate) name: Option<String>,
+}
+
+/// The largest dropped file an editor takes as a picture: 64 MiB. A bigger one
+/// is not claimed (it goes to the app's own file-drop handler with the other
+/// files, and a warning is logged): the file is read whole into memory and
+/// handed to the app as one `Vec`, and a drop is an easy way to hand over a
+/// video by mistake.
+#[cfg(feature = "windowing")]
+pub(crate) const MAX_DROPPED_IMAGE_BYTES: u64 = 64 << 20;
+
+/// Whether a dropped path is taken for an image, by extension alone (no disk
+/// access: the first, free test of who gets the drop).
+#[cfg(feature = "windowing")]
+pub(crate) fn path_looks_like_an_image(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        ["png", "jpg", "jpeg", "gif", "webp"]
+            .iter()
+            .any(|known| e.eq_ignore_ascii_case(known))
+    })
+}
+
+/// Whether a dropped file is a picture the editor takes: named like one
+/// ([`path_looks_like_an_image`]), a regular file of at most
+/// [`MAX_DROPPED_IMAGE_BYTES`], and an image by its first bytes
+/// ([`sniff_image_mime`](crate::editor::sniff_image_mime)). Reads twelve bytes,
+/// on the UI thread: this is what decides who gets the drop, and a file that
+/// is only *named* like a picture must reach the app's handler, not vanish.
+#[cfg(feature = "windowing")]
+pub(crate) fn dropped_file_is_a_picture(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    if !path_looks_like_an_image(path) {
+        return false;
+    }
+    // `metadata` follows a symlink; a device or a pipe is not a regular file,
+    // so nothing here can read without end or block on an open.
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    if meta.len() > MAX_DROPPED_IMAGE_BYTES {
+        tracing::warn!(
+            "dropped image {} is {} bytes, over the {} the editor takes; left to the app's file-drop handler",
+            path.display(),
+            meta.len(),
+            MAX_DROPPED_IMAGE_BYTES
+        );
+        return false;
+    }
+    let mut head = [0u8; 12];
+    let mut filled = 0;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    while filled < head.len() {
+        match file.read(&mut head[filled..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => filled += n,
+        }
+    }
+    crate::editor::sniff_image_mime(&head[..filled]).is_some()
+}
+
+/// Read a dropped file; `None` when it cannot be read, is over
+/// [`MAX_DROPPED_IMAGE_BYTES`], or its first bytes are not an image rinch
+/// decodes, whatever it is called. Runs off the UI thread. The claim has asked
+/// [`dropped_file_is_a_picture`] already; the file may have changed since, so
+/// the answer here is the one that counts, and no more than the limit is read.
+#[cfg(feature = "windowing")]
+pub(crate) fn read_dropped_image(path: &std::path::Path) -> Option<DroppedImage> {
+    use std::io::Read;
+    if !dropped_file_is_a_picture(path) {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(path).and_then(|file| {
+        file.take(MAX_DROPPED_IMAGE_BYTES + 1)
+            .read_to_end(&mut bytes)
+    });
+    if let Err(e) = read {
+        tracing::warn!("dropped image {} could not be read: {e}", path.display());
+        return None;
+    }
+    if bytes.len() as u64 > MAX_DROPPED_IMAGE_BYTES {
+        return None;
+    }
+    let mime = crate::editor::sniff_image_mime(&bytes)?;
+    Some(DroppedImage {
+        bytes,
+        mime,
+        name: path.file_name().map(|n| n.to_string_lossy().into_owned()),
+    })
+}
+
+/// Offer dropped image files to `handle`'s
+/// [`on_image_input`](crate::editor::EditorHandle::on_image_input) callback,
+/// the completion half of [`RinchApp::editor_file_drop`], on the main thread.
+///
+/// Every one is offered **at `anchor`**, where the drop was aimed (mapped
+/// through whatever was typed while the files were read; a replaced document
+/// drops the whole drop), and not at the live selection: the person's caret is
+/// theirs. An inserted picture moves the anchor past itself, so pictures
+/// answered at once land side by side in the order they were dropped, across
+/// calls with the same anchor too. Returns how many were inserted by this call.
+#[cfg(feature = "windowing")]
+pub(crate) fn offer_dropped_images(
+    handle: &crate::editor::EditorHandle,
+    anchor: &crate::editor::SelectionAnchor,
+    files: Vec<DroppedImage>,
+) -> usize {
+    let mut inserted = 0;
+    for file in files {
+        if handle.offer_image_input_at(
+            anchor,
+            crate::editor::ImageInputSource::Drop,
+            file.bytes,
+            file.mime,
+            file.name,
+        ) {
+            inserted += 1;
+        }
+    }
+    inserted
+}
+
+#[cfg(all(test, feature = "windowing", feature = "clipboard"))]
 mod async_paste_tests {
     use super::apply_paste_at_anchor;
     use crate::editor::create_editor;
@@ -3776,7 +7259,8 @@ mod async_paste_tests {
         assert!(apply_paste_at_anchor(
             &handle,
             &anchor,
-            RichPaste::Text("THERE".into())
+            RichPaste::Text("THERE".into()),
+            None
         ));
         assert_eq!(text_of(&handle), "helloTHERE world!");
     }
@@ -3795,9 +7279,69 @@ mod async_paste_tests {
         assert!(apply_paste_at_anchor(
             &handle,
             &anchor,
-            RichPaste::Text("X".into())
+            RichPaste::Text("X".into()),
+            None
         ));
         assert_eq!(text_of(&handle), "ABhelloX world");
+    }
+
+    /// A plugin that claims the paste (`Plugin::handle_paste`) is handed the
+    /// anchor's selection *mapped through* what was typed while the clipboard
+    /// read was in flight, not the live caret: its transaction lands where the
+    /// user pressed Ctrl+V. The typing is in front of the anchor, so the mapped
+    /// position (8) differs from the raw one (6) and from the live caret (3).
+    #[test]
+    fn a_claiming_plugin_pastes_at_the_mapped_anchor() {
+        use rinch_editor_core::{
+            EditorState, Fragment, PasteContent, Plugin, PluginKey, Transaction,
+        };
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        /// Wraps the pasted text in brackets at the selection it was handed,
+        /// and records where that was.
+        struct Bracketer(Rc<Cell<Option<usize>>>);
+        impl Plugin for Bracketer {
+            fn key(&self) -> PluginKey {
+                PluginKey("test.bracketer")
+            }
+            fn handle_paste(
+                &self,
+                state: &EditorState,
+                paste: &PasteContent,
+            ) -> Option<Transaction> {
+                let at = state.selection.from().0;
+                self.0.set(Some(at));
+                let text = format!("[{}]", paste.text.as_deref()?);
+                let node = state.schema().text_with_marks(&text, vec![]).ok()?;
+                let mut tr = state.tr();
+                tr.replace_with(at, at, Fragment::from_node(node)).ok()?;
+                Some(tr)
+            }
+        }
+
+        let handle = editor_with("<p>hello world</p>");
+        let offered_at = Rc::new(Cell::new(None));
+        assert!(handle.add_plugin(Rc::new(Bracketer(offered_at.clone()))));
+        handle.set_selection(Selection::cursor(Pos(6))); // "hello| world"
+        let anchor = handle.anchor_selection();
+
+        // The user types in front of the anchor while the read is pending.
+        handle.set_selection(Selection::cursor(Pos(1)));
+        assert!(handle.insert_text("AB"));
+
+        assert!(apply_paste_at_anchor(
+            &handle,
+            &anchor,
+            RichPaste::Text("X".into()),
+            None
+        ));
+        assert_eq!(
+            offered_at.get(),
+            Some(8),
+            "the plugin saw the mapped anchor"
+        );
+        assert_eq!(text_of(&handle), "ABhello[X] world");
     }
 
     /// Ctrl+V on a writable editor, and the editor goes read-only (a role changed)
@@ -3820,7 +7364,7 @@ mod async_paste_tests {
                 let anchor = handle.anchor_selection();
                 handle.set_read_only(locked_meanwhile);
                 assert_eq!(
-                    apply_paste_at_anchor(&handle, &anchor, paste),
+                    apply_paste_at_anchor(&handle, &anchor, paste, None),
                     !locked_meanwhile
                 );
                 let expected = if locked_meanwhile {
@@ -3868,7 +7412,8 @@ mod async_paste_tests {
         assert!(apply_paste_at_anchor(
             &handle,
             &anchor,
-            RichPaste::Html("<strong>BOLD</strong>".into())
+            RichPaste::Html("<strong>BOLD</strong>".into()),
+            None
         ));
         assert_eq!(text_of(&handle), "aBOLDb");
         handle.set_selection(Selection::text(Pos(3), Pos(7)));
@@ -3889,7 +7434,7 @@ mod async_paste_tests {
         handle.load_html("<p>completely different</p>");
 
         assert!(
-            !apply_paste_at_anchor(&handle, &anchor, RichPaste::Text("X".into())),
+            !apply_paste_at_anchor(&handle, &anchor, RichPaste::Text("X".into()), None),
             "an anchor into a replaced document must not resolve"
         );
         assert_eq!(text_of(&handle), "completely different");
@@ -3905,7 +7450,8 @@ mod async_paste_tests {
         assert!(!apply_paste_at_anchor(
             &handle,
             &anchor,
-            RichPaste::Text(String::new())
+            RichPaste::Text(String::new()),
+            None
         ));
         assert_eq!(text_of(&handle), "ab");
     }
@@ -3923,7 +7469,8 @@ mod async_paste_tests {
         assert!(apply_paste_at_anchor(
             &handle,
             &anchor,
-            RichPaste::Image(img)
+            RichPaste::Image(img),
+            None
         ));
 
         let doc = handle.doc();
@@ -3935,7 +7482,298 @@ mod async_paste_tests {
     }
 }
 
-#[cfg(all(test, feature = "desktop", feature = "clipboard"))]
+/// A pasted bitmap and dropped image files, for an editor whose app takes
+/// pictures itself (`EditorHandle::on_image_input`): the completion halves,
+/// which is everything after the clipboard or the disk has answered.
+#[cfg(all(test, feature = "windowing", feature = "clipboard"))]
+mod image_input_tests {
+    use super::{
+        DroppedImage, apply_paste_at_anchor, offer_dropped_images, path_looks_like_an_image,
+        read_dropped_image,
+    };
+    use crate::editor::{ImageInput, ImageInputSource, create_editor};
+    use rinch_clipboard::{ImageData, RichPaste};
+    use rinch_editor_core::serialize::node_to_html;
+    use rinch_editor_core::{Pos, Selection};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+    fn editor_with(html: &str, caret: usize) -> crate::editor::EditorHandle {
+        let handle = create_editor();
+        assert!(handle.load_html(html));
+        handle.set_selection(Selection::cursor(Pos(caret)));
+        handle
+    }
+
+    fn html(handle: &crate::editor::EditorHandle) -> String {
+        node_to_html(&handle.doc())
+    }
+
+    /// What the app was offered, minus the anchor.
+    type Offered = Rc<RefCell<Vec<(ImageInputSource, Vec<u8>, String, Option<String>)>>>;
+
+    /// Register a callback that records every offer and answers `src-N`.
+    fn taking_pictures(handle: &crate::editor::EditorHandle) -> Offered {
+        let offered: Offered = Rc::default();
+        let log = offered.clone();
+        handle.on_image_input(move |input: ImageInput| {
+            let mut log = log.borrow_mut();
+            log.push((input.source, input.bytes, input.mime, input.name));
+            Some((format!("app-blob:{}", log.len()), String::new()))
+        });
+        offered
+    }
+
+    /// With the callback, a pasted bitmap reaches the app as a PNG file's bytes
+    /// and the document gets the `src` the app answered with: no `data:` URL.
+    #[test]
+    fn a_pasted_bitmap_is_offered_as_png_and_the_apps_src_is_what_is_inserted() {
+        let handle = editor_with("<p>ab</p>", 2);
+        let offered = taking_pictures(&handle);
+        let anchor = handle.anchor_selection();
+        // The person typed on while the clipboard was read.
+        handle.set_selection(Selection::cursor(Pos(1)));
+        assert!(handle.insert_text("X"));
+
+        let bitmap = ImageData::new(2, 1, vec![255, 0, 0, 255, 0, 255, 0, 255]);
+        assert!(apply_paste_at_anchor(
+            &handle,
+            &anchor,
+            RichPaste::Image(bitmap),
+            None
+        ));
+
+        let offered = offered.borrow();
+        assert_eq!(offered.len(), 1);
+        let (source, bytes, mime, name) = &offered[0];
+        assert_eq!(*source, ImageInputSource::Paste);
+        assert_eq!(&bytes[..8], PNG_MAGIC, "encoded, not raw pixels");
+        let mut reader = png::Decoder::new(std::io::Cursor::new(bytes))
+            .read_info()
+            .expect("a real PNG");
+        let mut pixels = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut pixels).expect("its one frame");
+        assert_eq!((info.width, info.height), (2, 1));
+        assert_eq!(
+            &pixels[..info.buffer_size()],
+            &[255, 0, 0, 255, 0, 255, 0, 255]
+        );
+        assert_eq!(mime, "image/png");
+        assert_eq!(*name, None);
+        assert_eq!(html(&handle), r#"<p>Xa<img src="app-blob:1">b</p>"#);
+        assert_eq!(
+            handle.selection(),
+            Selection::cursor(Pos(2)),
+            "the caret stays where the person was typing, after the X"
+        );
+    }
+
+    /// The app refusing (or answering later) inserts nothing now, and the
+    /// default `data:` URL is not what fills the gap.
+    #[test]
+    fn a_pasted_bitmap_the_app_does_not_answer_for_inserts_nothing() {
+        let handle = editor_with("<p>ab</p>", 2);
+        handle.on_image_input(|_| None);
+        let anchor = handle.anchor_selection();
+        let bitmap = ImageData::new(1, 1, vec![255, 0, 0, 255]);
+        assert!(!apply_paste_at_anchor(
+            &handle,
+            &anchor,
+            RichPaste::Image(bitmap),
+            None
+        ));
+        assert_eq!(html(&handle), "<p>ab</p>");
+    }
+
+    #[test]
+    fn a_path_is_taken_for_an_image_by_its_extension() {
+        for yes in ["a.png", "/x/y/Photo.JPG", "b.jpeg", "c.gif", "d.WebP"] {
+            assert!(path_looks_like_an_image(std::path::Path::new(yes)), "{yes}");
+        }
+        for no in ["notes.txt", "png", "archive.png.zip", "drawing.svg", "x."] {
+            assert!(!path_looks_like_an_image(std::path::Path::new(no)), "{no}");
+        }
+    }
+
+    /// A dropped file is offered as its own bytes, typed by what they are, and
+    /// a file that only claims to be a picture is skipped.
+    #[test]
+    fn a_dropped_file_is_read_whole_and_typed_by_its_first_bytes() {
+        let dir = std::env::temp_dir().join(format!("rinch-image-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("holiday.png");
+        let mut bytes = PNG_MAGIC.to_vec();
+        bytes.extend_from_slice(b"the rest of the file");
+        std::fs::write(&real, &bytes).unwrap();
+        // A JPEG that was named `.png`: its bytes decide.
+        let misnamed = dir.join("scan.png");
+        std::fs::write(&misnamed, b"\xff\xd8\xff\xe0 jfif").unwrap();
+        let fake = dir.join("notes.png");
+        std::fs::write(&fake, b"just some words").unwrap();
+
+        let read = read_dropped_image(&real).expect("a PNG");
+        assert_eq!(read.bytes, bytes, "the file's bytes, untouched");
+        assert_eq!(read.mime, "image/png");
+        assert_eq!(read.name.as_deref(), Some("holiday.png"));
+        assert_eq!(
+            read_dropped_image(&misnamed).map(|f| f.mime),
+            Some("image/jpeg")
+        );
+        assert!(read_dropped_image(&fake).is_none());
+        assert!(read_dropped_image(&dir.join("gone.png")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn dropped(name: &str) -> DroppedImage {
+        DroppedImage {
+            bytes: name.as_bytes().to_vec(),
+            mime: "image/png",
+            name: Some(name.to_string()),
+        }
+    }
+
+    /// Several files dropped at once land at the drop point, side by side, in
+    /// the order they were dropped.
+    #[test]
+    fn dropped_files_are_offered_in_order_and_land_side_by_side_at_the_drop_point() {
+        let handle = editor_with("<p>ab</p>", 2);
+        let offered = taking_pictures(&handle);
+        let anchor = handle.anchor_selection();
+        // The live caret is elsewhere by the time the files are read.
+        handle.set_selection(Selection::cursor(Pos(3)));
+
+        let n = offer_dropped_images(&handle, &anchor, vec![dropped("1.png"), dropped("2.png")]);
+        assert_eq!(n, 2);
+        let offered = offered.borrow();
+        assert_eq!(
+            offered
+                .iter()
+                .map(|(source, bytes, _, name)| (*source, bytes.clone(), name.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    ImageInputSource::Drop,
+                    b"1.png".to_vec(),
+                    Some("1.png".to_string())
+                ),
+                (
+                    ImageInputSource::Drop,
+                    b"2.png".to_vec(),
+                    Some("2.png".to_string())
+                ),
+            ]
+        );
+        assert_eq!(
+            html(&handle),
+            r#"<p>a<img src="app-blob:1"><img src="app-blob:2">b</p>"#
+        );
+    }
+
+    /// The note the files were dropped on was replaced while they were read:
+    /// the app is not asked to store pictures for a place that is gone.
+    #[test]
+    fn a_drop_whose_document_was_replaced_offers_nothing() {
+        let handle = editor_with("<p>ab</p>", 2);
+        let offered = taking_pictures(&handle);
+        let anchor = handle.anchor_selection();
+        assert!(handle.load_html("<p>another note</p>"));
+        assert_eq!(
+            offer_dropped_images(&handle, &anchor, vec![dropped("1.png")]),
+            0
+        );
+        assert!(offered.borrow().is_empty());
+        assert_eq!(html(&handle), "<p>another note</p>");
+    }
+
+    /// The html and text a second read was asked to fall back to.
+    type SecondRead = Option<(String, Option<String>)>;
+
+    /// What the first clipboard read of a paste did: asked for the bitmap
+    /// (`Some`), or was applied at once (`None`; the document says what).
+    fn route(handle: &crate::editor::EditorHandle, content: RichPaste) -> SecondRead {
+        let second: Rc<RefCell<SecondRead>> = Rc::default();
+        let second_in = second.clone();
+        super::paste_read_arrived(
+            handle.clone(),
+            handle.anchor_selection(),
+            Ok((content, Some("plain".to_string()))),
+            move |_, _, html, text| *second_in.borrow_mut() = Some((html, text)),
+        );
+        second.take()
+    }
+
+    /// A browser's "Copy image": the clipboard offers `<img src="https://…">`
+    /// as html beside the bitmap. With the callback, html that is pictures and
+    /// nothing else is NOT pasted; the bitmap is asked for instead. (Review
+    /// mutant M12, switching this branch off, survived the first suite.)
+    #[test]
+    fn a_copy_image_paste_asks_for_the_bitmap_and_does_not_paste_the_remote_img() {
+        const COPY_IMAGE: &str = r#"<meta charset="utf-8"><img src="https://example.com/cat.png">"#;
+        let handle = editor_with("<p>ab</p>", 2);
+        let offered = taking_pictures(&handle);
+        let second = route(&handle, RichPaste::Html(COPY_IMAGE.to_string()));
+        assert_eq!(
+            second,
+            Some((COPY_IMAGE.to_string(), Some("plain".to_string()))),
+            "the second read is asked for, with the html and text to fall back to"
+        );
+        assert_eq!(html(&handle), "<p>ab</p>", "and nothing is pasted yet");
+        assert!(offered.borrow().is_empty());
+
+        // Pictures and words: an ordinary html paste, no second read.
+        let words = r#"<p>see <img src="https://example.com/cat.png"></p>"#;
+        assert_eq!(route(&handle, RichPaste::Html(words.to_string())), None);
+        assert_eq!(
+            html(&handle),
+            r#"<p>asee <img src="https://example.com/cat.png">b</p>"#
+        );
+
+        // No callback: the html is the paste, as before the callback existed.
+        let plain = editor_with("<p>ab</p>", 2);
+        assert_eq!(route(&plain, RichPaste::Html(COPY_IMAGE.to_string())), None);
+        assert_eq!(
+            html(&plain),
+            r#"<p>a<img src="https://example.com/cat.png">b</p>"#
+        );
+    }
+
+    /// The second read's answer: the bitmap when there is one, else the html
+    /// the first read brought.
+    #[test]
+    fn the_second_read_pastes_the_bitmap_or_falls_back_to_the_html() {
+        use rinch_clipboard::ClipboardError;
+        let bitmap = ImageData::new(1, 1, vec![255, 0, 0, 255]);
+        assert!(matches!(
+            super::bitmap_or_html(Ok(bitmap), "<img>".to_string()),
+            RichPaste::Image(img) if img.width == 1 && img.bytes.len() == 4
+        ));
+        assert!(matches!(
+            super::bitmap_or_html(Err(ClipboardError::TimedOut), "<img>".to_string()),
+            RichPaste::Html(html) if html == "<img>"
+        ));
+    }
+
+    /// A bitmap pasted where no image fits (a code block): the app is not
+    /// asked to store it.
+    #[test]
+    fn a_bitmap_pasted_into_a_code_block_is_not_offered() {
+        let handle = editor_with("<pre><code>let x = 1;</code></pre>", 4);
+        let offered = taking_pictures(&handle);
+        let anchor = handle.anchor_selection();
+        let bitmap = ImageData::new(1, 1, vec![255, 0, 0, 255]);
+        assert!(!apply_paste_at_anchor(
+            &handle,
+            &anchor,
+            RichPaste::Image(bitmap),
+            None
+        ));
+        assert!(offered.borrow().is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "windowing", feature = "clipboard"))]
 mod paste_image_tests {
     use super::image_rgba_to_png_data_url;
 
@@ -3998,10 +7836,14 @@ mod hook_key_str_tests {
     }
 
     #[test]
-    fn spacebar_reports_the_named_key_not_its_text() {
-        // A real (or injected) spacebar press is `KeyCode::Space` with
-        // text=" " — the named-key arm must win so hooks see "Space".
-        assert_eq!(k(KeyCode::Space, Some(" ")), Some("Space".to_string()));
+    fn spacebar_reports_the_browser_key_whatever_the_event_carries() {
+        // `KeyboardEvent.key` for the spacebar is " " (its `code` is "Space"),
+        // and #1161 made desktop agree with rinch-web. The fixed arm must win
+        // on every shape: a press (text " "), a release or chord (no text), an
+        // event whose text is something else entirely.
+        assert_eq!(k(KeyCode::Space, Some(" ")), Some(" ".to_string()));
+        assert_eq!(k(KeyCode::Space, None), Some(" ".to_string()));
+        assert_eq!(k(KeyCode::Space, Some("x")), Some(" ".to_string()));
         // Same for Tab, whose text is a control character anyway.
         assert_eq!(k(KeyCode::Tab, Some("\t")), Some("Tab".to_string()));
     }
@@ -4105,9 +7947,10 @@ mod hook_key_str_tests {
         assert_eq!(kl(KeyCode::KeyA, Some("A"), "A"), Some("A".to_string()));
         // And a named key still outranks both.
         assert_eq!(
-            kl(KeyCode::Space, Some(" "), " "),
-            Some("Space".to_string())
+            kl(KeyCode::Enter, Some("x"), "y"),
+            Some("Enter".to_string())
         );
+        assert_eq!(kl(KeyCode::Space, Some("x"), "y"), Some(" ".to_string()));
     }
 
     #[test]
@@ -4137,7 +7980,7 @@ mod hook_key_str_tests {
     }
 }
 
-#[cfg(all(test, feature = "desktop"))]
+#[cfg(all(test, feature = "windowing"))]
 mod editor_key_binding_tests {
     use super::editor_key_binding;
     use rinch_editor_core::{Key, KeyBinding, Modifiers};
@@ -4194,5 +8037,63 @@ mod editor_key_binding_tests {
         // takes the logical arm — everything else keeps resolving physically.
         let b = editor_key_binding(KeyCode::Enter, Some("Enter"), false, false, false).unwrap();
         assert_eq!(b.key, Key::Enter);
+    }
+}
+
+/// The order an app hears `data-onfiledragenter` / `-leave` / `-drop` on X11,
+/// where the release's crossing Enter (a pointer move) comes before the drop
+/// (review of #1655): the drop before the leave, as before #1649.
+#[cfg(all(test, feature = "windowing"))]
+mod file_drop_order_1649_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+    use std::rc::Rc;
+
+    #[test]
+    fn a_pointer_move_before_the_drop_keeps_drop_before_leave() {
+        let log: Rc<RefCell<Vec<&'static str>>> = Rc::default();
+        let l = log.clone();
+        let mut app = RinchApp::new(move |scope: &mut RenderScope| {
+            let root = scope.create_element("div");
+            root.set_attribute("style", "width: 800px; height: 600px");
+            let (a, b, c) = (l.clone(), l.clone(), l.clone());
+            let enter = scope.register_handler(move || a.borrow_mut().push("enter"));
+            let leave = scope.register_handler(move || b.borrow_mut().push("leave"));
+            let drop = scope.register_file_drop_handler(move |_| c.borrow_mut().push("drop"));
+            root.set_attribute("data-onfiledragenter", &enter.0.to_string());
+            root.set_attribute("data-onfiledragleave", &leave.0.to_string());
+            root.set_attribute("data-onfiledrop", &drop.0.to_string());
+            root
+        });
+        app.mount_component(800.0, 600.0);
+        app.resolve_and_repaint(800.0, 600.0);
+        let vp = (800, 600);
+        let path = PathBuf::from("/x/a.txt");
+        app.handle_event(
+            PlatformEvent::FileHoverEnter {
+                path: path.clone(),
+                position: (100.0, 100.0),
+            },
+            vp,
+            1.0,
+        );
+        app.handle_event(
+            PlatformEvent::FileDragMoved {
+                position: (120.0, 100.0),
+            },
+            vp,
+            1.0,
+        );
+        app.handle_event(PlatformEvent::MouseMove { x: 120.0, y: 100.0 }, vp, 1.0);
+        app.handle_event(
+            PlatformEvent::FileDropped {
+                paths: vec![path],
+                position: (120.0, 100.0),
+            },
+            vp,
+            1.0,
+        );
+        assert_eq!(*log.borrow(), vec!["enter", "drop", "leave"]);
     }
 }

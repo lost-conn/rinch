@@ -104,8 +104,14 @@ thing rather than several*:
 - **A deliberately minimal `Step` set.** `ReplaceStep`, `ReplaceAroundStep`,
   `AddMarkStep`, `RemoveMarkStep`, `SetNodeAttrStep`, `SetDocAttrStep`. Steps are
   invertible (undo), mappable (redo, decoration tracking, collaboration rebase) and
-  composable. Tables and collaboration add **no** new step kinds — that is the test
-  of whether the set is actually primitive.
+  composable. Collaboration adds **no** new step kinds — that is the test of
+  whether the set is actually primitive. `BatchStep` (#1200) is the one addition,
+  and it adds no expressiveness: it is a list of disjoint replaces and attribute
+  changes that builds the document those `ReplaceStep`s and `SetNodeAttrStep`s
+  would one at a time, maps positions as they would, and inverts — as one step, so
+  a table command touching every row is linear rather than quadratic. Where it
+  differs (content checked on the result only; a rebase that brings two replaces
+  together) is in `docs/src/guide/editor.md`.
 - **Persistent tree, so identity is cheap.** `Node` is `Rc`-shared and every edit
   produces a new tree sharing unchanged subtrees. `Node::same_ref` (an `Rc::ptr_eq`)
   therefore answers "did this subtree change?" in constant time — which is what makes
@@ -157,13 +163,21 @@ code, and why its own tests project onto a mock document with no renderer presen
 all.
 
 **The `ViewDesc` tree** mirrors the document: one descriptor per model node, holding
-its host node, its mark-wrapper chain, and its children. Diffing walks descriptors
+its host node and its children; a textblock also owns the mark wrappers its inline
+children sit in, shared between adjacent runs a mark continues across (#1833). Diffing walks descriptors
 against the new document, with `Node::same_ref` as a fast skip — an unchanged subtree
-costs one pointer comparison. The diff is **positional, not keyed**: text edits are
-local, so position is a good proxy for identity, and a keyed/LIS pass would buy
-nothing until reorder churn matters. A node whose *kind* changed (tag or mark set)
-is rebuilt and swapped rather than patched in place, because a changed mark set
-alters the wrapper chain around it. The root's host element is created by the caller
+costs one pointer comparison. The diff is **not keyed**: it first matches the children
+the new node shares by reference at the start and at the end, then diffs the changed
+stretch between them positionally, inserting new children before the unchanged suffix.
+An edit typically changes one contiguous stretch of siblings, so that isolates it without a
+keyed/LIS pass. Matching the suffix is what keeps a split or join local: a purely
+positional diff re-pointed every later block at its neighbour's host and rewrote its
+text, so one Enter re-shaped every paragraph below the caret (issue #905). A node whose *kind* changed (tag, node type, or
+mark set) is rebuilt rather than patched in place. A textblock's inline children are
+placed in their mark wrappers by `ViewDesc::regroup_inline`, which shares a wrapper
+between adjacent runs whose mark continues (#1833) and runs only when the children's
+structure changed (a child built, replaced, removed or moved), so a keystroke inside a
+run costs a text write and nothing else. The root's host element is created by the caller
 (the `Editor` component) and is never replaced — only its children reconcile.
 
 **Decorations diff independently of the document.** A transaction that changes only
@@ -218,7 +232,7 @@ platform API:
 
 Input translation and the caret pass live in the runtime proper:
 `app/event_dispatch.rs` turns platform key/pointer/IME events into `KeyBinding`s and
-handle calls, `app/focus.rs` holds the focus arbiter, and `shell/rinch_runtime.rs`
+handle calls, `app/focus.rs` holds the focus arbiter, and `shell/rinch_runtime/actions.rs`
 drives the post-layout caret pass and the blink clock.
 
 **Browser (`crates/rinch-web/`)** does the same jobs against the browser DOM in
@@ -273,8 +287,9 @@ see the Collaboration section of CLAUDE.md, the
 `rinch-editable` is a **separate, unrelated** engine for single-line `<input>` and
 `<textarea>` widgets: `StringDocument`, `EditCommand`, `EditableState`,
 `InputHandler`, and its own `Position`/`Selection`/`UndoStack` types. It shares no
-code and no types with `rinch-editor-core` — the identical names live in different
-crates. The quickest tell: `rinch-editable`'s `Selection` is a **struct** of two
+types with `rinch-editor-core` — the identical names live in different crates. The
+one piece of code the two share is word segmentation: both take their words from the
+leaf crate `rinch-words` (#1619), so a field's Ctrl+Backspace and the editor's agree. The quickest tell: `rinch-editable`'s `Selection` is a **struct** of two
 `Position`s, while `rinch-editor-core`'s is an **enum** of `Text`/`Node`/`Cell`.
 
 The split is intentional: a text field does not need a schema, steps, or a CRDT, and

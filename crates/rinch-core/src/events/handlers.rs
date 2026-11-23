@@ -1,4 +1,4 @@
-//! Event handler registry for click, input, and file-drop events.
+//! Event handler registry for click, input, file-drop, key and wheel events.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -36,8 +36,11 @@ impl InputCallback {
     }
 
     /// Invoke the callback with the input value.
+    ///
+    /// Runs untracked (issue #285): called from inside an effect, the
+    /// handler's signal reads do not subscribe that effect.
     pub fn invoke(&self, value: String) {
-        (self.0)(value)
+        crate::reactive::untracked_handler(|| (self.0)(value))
     }
 }
 
@@ -78,8 +81,11 @@ impl FileDropCallback {
     }
 
     /// Invoke the callback with the dropped file paths.
+    ///
+    /// Runs untracked (issue #285): called from inside an effect, the
+    /// handler's signal reads do not subscribe that effect.
     pub fn invoke(&self, paths: Vec<PathBuf>) {
-        (self.0)(paths)
+        crate::reactive::untracked_handler(|| (self.0)(paths))
     }
 }
 
@@ -158,8 +164,11 @@ impl ScrollCallback {
     }
 
     /// Invoke the callback with the container's current scroll offsets.
+    ///
+    /// Runs untracked (issue #285): called from inside an effect, the
+    /// handler's signal reads do not subscribe that effect.
     pub fn invoke(&self, event: ScrollEvent) {
-        (self.0)(event)
+        crate::reactive::untracked_handler(|| (self.0)(event))
     }
 }
 
@@ -184,6 +193,186 @@ impl crate::element::IntoEventHandler<ScrollCallback> for ScrollCallback {
 impl<F: Fn(ScrollEvent) + 'static> crate::element::IntoEventHandler<ScrollCallback> for F {
     fn into_event_handler(self) -> ScrollCallback {
         ScrollCallback::from(self)
+    }
+}
+
+/// Cloneable callback for an element's `onkeydown` / `onkeyup` (issue #1678).
+///
+/// Receives the key as [`KeyEventData`](super::KeyEventData) and answers
+/// whether it **consumed** the key: `true` is the browser's `preventDefault()`
+/// plus `stopPropagation()` — the element's own handling of the key (inserting
+/// a line break, submitting, moving focus) does not happen, no ancestor's
+/// handler is offered it, and neither the document-level keyboard interceptor
+/// nor the dismiss stack sees the press. `false` lets the key go on as if the
+/// handler were not there.
+#[derive(Clone)]
+pub struct KeyCallback(pub Rc<dyn Fn(&super::KeyEventData) -> bool>);
+
+impl KeyCallback {
+    /// Create a new key callback from a function.
+    pub fn new<F: Fn(&super::KeyEventData) -> bool + 'static>(f: F) -> Self {
+        Self(Rc::new(f))
+    }
+
+    /// Invoke the callback with a key event; answers whether it consumed it.
+    ///
+    /// Runs untracked (issue #285), like every other app callback.
+    pub fn invoke(&self, key: &super::KeyEventData) -> bool {
+        crate::reactive::untracked_handler(|| (self.0)(key))
+    }
+}
+
+impl std::fmt::Debug for KeyCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("KeyCallback(...)")
+    }
+}
+
+/// A wheel turn (or trackpad scroll, or pinch) over an element — the payload
+/// handed to an element's `onwheel` handler.
+///
+/// The deltas have the DOM's sign and unit on every backend
+/// (`WheelEvent.deltaX/deltaY`): **logical pixels**, positive `delta_y` when
+/// the content would move up (the wheel turned towards the user, a two-finger
+/// swipe up), positive `delta_x` when it would move left. A notched wheel's
+/// lines are 40 px each, as the desktop scrolls them; a page is the window's
+/// height.
+///
+/// A trackpad **pinch** arrives as a wheel with `modifiers.ctrl` set, as a
+/// browser reports it: spreading the fingers is a negative `delta_y`, and
+/// [`zoom_factor`](Self::zoom_factor) turns either a pinch or a Ctrl+wheel
+/// into the same scale.
+///
+/// `#[non_exhaustive]`: build one with [`WheelEvent::new`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct WheelEvent {
+    /// Horizontal distance in logical pixels; positive scrolls right.
+    pub delta_x: f32,
+    /// Vertical distance in logical pixels; positive scrolls down.
+    pub delta_y: f32,
+    /// The pointer, in logical window pixels (the frame of
+    /// [`ClickContext::mouse_x`](super::ClickContext::mouse_x)).
+    pub x: f32,
+    /// The pointer, in logical window pixels.
+    pub y: f32,
+    /// Shift / Ctrl / Alt / Meta at the time of the wheel. Ctrl is set for a
+    /// trackpad pinch.
+    pub modifiers: super::ModifierState,
+    /// The element under the pointer, the DOM's `event.target`: the deepest
+    /// element the wheel is over (over text, the element holding it), which
+    /// is the handler's own element or one inside it. On the web, under an
+    /// element rinch did not create (raw HTML), the nearest one it did. `None`
+    /// for an event built by hand.
+    ///
+    /// Turn it into a handle with [`NodeHandle::handle_for`] on any handle
+    /// of the same document (the handler's own element, typically) to walk
+    /// up from it — for instance to ask which scroll container inside the
+    /// handler's element a plain wheel would move
+    /// ([`NodeHandle::can_scroll_toward`]) before taking the wheel for
+    /// itself.
+    ///
+    /// [`NodeHandle::handle_for`]: crate::dom::NodeHandle::handle_for
+    /// [`NodeHandle::can_scroll_toward`]: crate::dom::NodeHandle::can_scroll_toward
+    pub target: Option<crate::dom::NodeId>,
+}
+
+impl WheelEvent {
+    /// A wheel event with these deltas at `(x, y)`, no modifiers held.
+    pub fn new(delta_x: f32, delta_y: f32, x: f32, y: f32) -> Self {
+        Self {
+            delta_x,
+            delta_y,
+            x,
+            y,
+            modifiers: super::ModifierState::default(),
+            target: None,
+        }
+    }
+
+    /// The same event with these modifiers.
+    pub fn with_modifiers(mut self, modifiers: super::ModifierState) -> Self {
+        self.modifiers = modifiers;
+        self
+    }
+
+    /// The same event over this element ([`target`](Self::target)).
+    pub fn with_target(mut self, target: crate::dom::NodeId) -> Self {
+        self.target = Some(target);
+        self
+    }
+
+    /// The deltas the default scroll moves by: these deltas, except that with
+    /// Shift held a wheel with no sideways part scrolls sideways by its
+    /// vertical one where the platform does that ([`shift_wheel_turns_sideways`]:
+    /// Linux and Windows, as Chrome and Firefox scroll there; not macOS, whose
+    /// mouse wheel already arrives sideways under Shift and whose trackpad
+    /// with Shift held stays vertical). A handler that wants to know where
+    /// the default scroll would go — or to scroll the way it does — reads this.
+    pub fn scroll_deltas(&self) -> (f32, f32) {
+        if self.modifiers.shift && self.delta_x == 0.0 && shift_wheel_turns_sideways() {
+            (self.delta_y, 0.0)
+        } else {
+            (self.delta_x, self.delta_y)
+        }
+    }
+
+    /// The scale this wheel zooms by when it is read as a zoom (a pinch, or
+    /// Ctrl/Cmd+wheel): 100 px of `delta_y` is a factor of *e*, the curve
+    /// browsers and most canvas apps use. Above 1 zooms in.
+    pub fn zoom_factor(&self) -> f32 {
+        (-self.delta_y / 100.0).exp()
+    }
+}
+
+thread_local! {
+    static SHIFT_WHEEL_SIDEWAYS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(!cfg!(target_os = "macos")) };
+}
+
+/// Whether Shift turns a vertical-only wheel sideways for the default scroll
+/// on this platform ([`WheelEvent::scroll_deltas`]): yes on Linux and Windows
+/// (Chrome's and Firefox's behaviour there), no on macOS, where the system
+/// does it for a mouse wheel itself. Native builds answer by the target OS;
+/// rinch-web sets it from `navigator.platform` when it installs its wheel
+/// listener.
+pub fn shift_wheel_turns_sideways() -> bool {
+    SHIFT_WHEEL_SIDEWAYS.with(std::cell::Cell::get)
+}
+
+/// Set [`shift_wheel_turns_sideways`] for this thread: the web backend's
+/// platform answer, and tests of the macOS half. Not app API.
+#[doc(hidden)]
+pub fn set_shift_wheel_turns_sideways(on: bool) {
+    SHIFT_WHEEL_SIDEWAYS.with(|c| c.set(on));
+}
+
+/// Cloneable callback for an element's `onwheel`.
+///
+/// Receives the [`WheelEvent`] and answers whether it **consumed** it: `true`
+/// stops the wheel — no ancestor's `onwheel` is offered it and no scroll
+/// container scrolls (the browser's `preventDefault()`). `false` lets it go on
+/// as if the handler were not there.
+#[derive(Clone)]
+pub struct WheelCallback(pub Rc<dyn Fn(&WheelEvent) -> bool>);
+
+impl WheelCallback {
+    /// Create a new wheel callback from a function.
+    pub fn new<F: Fn(&WheelEvent) -> bool + 'static>(f: F) -> Self {
+        Self(Rc::new(f))
+    }
+
+    /// Invoke the callback; answers whether it consumed the wheel.
+    ///
+    /// Runs untracked (issue #285), like every other app callback.
+    pub fn invoke(&self, event: &WheelEvent) -> bool {
+        crate::reactive::untracked_handler(|| (self.0)(event))
+    }
+}
+
+impl std::fmt::Debug for WheelCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WheelCallback(...)")
     }
 }
 
@@ -228,8 +417,14 @@ pub fn unregister_handler(id: EventHandlerId) {
     drop(input);
     let file_drop = FILE_DROP_REGISTRY.with(|r| r.borrow_mut().handlers.remove(&id));
     drop(file_drop);
+    let files_drop = FILES_DROP_REGISTRY.with(|r| r.borrow_mut().remove(&id));
+    drop(files_drop);
     let scroll = SCROLL_REGISTRY.with(|r| r.borrow_mut().handlers.remove(&id));
     drop(scroll);
+    let key = KEY_REGISTRY.with(|r| r.borrow_mut().remove(&id));
+    drop(key);
+    let wheel = WHEEL_REGISTRY.with(|r| r.borrow_mut().remove(&id));
+    drop(wheel);
 }
 
 /// Whether a click handler is still registered under this id.
@@ -258,6 +453,16 @@ pub fn has_file_drop_handler(id: EventHandlerId) -> bool {
     FILE_DROP_REGISTRY.with(|registry| registry.borrow().handlers.contains_key(&id))
 }
 
+/// Whether an `ondropfiles` handler (issue #1771) is still registered under
+/// this id. See [`has_click_handler`].
+pub fn has_files_drop_handler(id: EventHandlerId) -> bool {
+    FILES_DROP_REGISTRY.with(|registry| registry.borrow().contains_key(&id))
+}
+
+/// A handler for files dropped from the OS, handed as
+/// [`LocalFile`](crate::file::LocalFile)s (`ondropfiles`, issue #1771).
+type FilesDropCallback = Rc<dyn Fn(Vec<crate::file::LocalFile>)>;
+
 // Thread-local event handler registry.
 thread_local! {
     // None of the four registries below are const-evaluable: each `::new()`
@@ -267,6 +472,14 @@ thread_local! {
     static INPUT_REGISTRY: RefCell<InputRegistry> = RefCell::new(InputRegistry::new());
     static FILE_DROP_REGISTRY: RefCell<FileDropRegistry> = RefCell::new(FileDropRegistry::new());
     static SCROLL_REGISTRY: RefCell<ScrollRegistry> = RefCell::new(ScrollRegistry::new());
+    /// `ondropfiles` handlers (issue #1771).
+    static FILES_DROP_REGISTRY: RefCell<HashMap<EventHandlerId, FilesDropCallback>> =
+        RefCell::new(HashMap::new());
+    /// `onkeydown` / `onkeyup` handlers (issue #1678).
+    static KEY_REGISTRY: RefCell<HashMap<EventHandlerId, KeyCallback>> = RefCell::new(HashMap::new());
+    /// `onwheel` handlers.
+    static WHEEL_REGISTRY: RefCell<HashMap<EventHandlerId, WheelCallback>> =
+        RefCell::new(HashMap::new());
     // Not const-evaluable: goes through the non-const `Default` trait method.
     static INPUT_CONTEXT: RefCell<InputContext> = RefCell::new(InputContext::default());
     /// Flag to signal that an input event was handled and a re-render may be needed.
@@ -279,7 +492,7 @@ pub struct InputContext {
     /// The current value of the input field.
     pub value: String,
     /// The node ID of the input element.
-    pub node_id: usize,
+    pub node_id: u64,
 }
 
 /// Registry that maps event handler IDs to callbacks.
@@ -385,6 +598,18 @@ pub fn set_click_context(ctx: ClickContext) {
     });
 }
 
+/// Set the link the current click went through, read by [`click_link`].
+///
+/// Called by the runtime around a pointer click's dispatch: set before the
+/// handler runs, cleared (`None`) after it.
+///
+/// [`click_link`]: super::click_link
+pub fn set_click_link(href: Option<String>) {
+    super::CLICK_LINK.with(|c| {
+        *c.borrow_mut() = href;
+    });
+}
+
 /// Set the ancestor chain for the current click, used by [`click_ancestors`].
 ///
 /// Called by the runtime before dispatching a click handler. Pass an empty
@@ -435,9 +660,12 @@ pub fn dispatch_event(id: EventHandlerId) -> bool {
     });
 
     if let Some(h) = handler {
-        tracing::info!("dispatch_event: Calling handler {:?}", id);
-        h();
-        tracing::info!("dispatch_event: Handler {:?} completed", id);
+        tracing::trace!("dispatch_event: calling handler {:?}", id);
+        // One transaction per handler: every signal it writes lands before any
+        // effect runs, and effects flush once, when it returns. See
+        // `crate::reactive::batch` and the guide's "Batching" section.
+        crate::reactive::batch(|| h());
+        tracing::trace!("dispatch_event: handler {:?} completed", id);
         true
     } else {
         // `debug!`, and no registry dump: since #141 a miss is an expected
@@ -501,7 +729,7 @@ pub fn dispatch_input_event(id: EventHandlerId, value: String) -> bool {
     });
 
     if let Some(h) = handler {
-        h.invoke(value);
+        crate::reactive::batch(|| h.invoke(value));
         // Signal that an input event was handled - caller should re-render
         INPUT_EVENT_HANDLED.with(|flag| *flag.borrow_mut() = true);
         true
@@ -540,7 +768,68 @@ pub fn dispatch_file_drop_event(id: EventHandlerId, paths: Vec<PathBuf>) -> bool
     let handler: Option<FileDropCallback> =
         FILE_DROP_REGISTRY.with(|registry| registry.borrow().handlers.get(&id).cloned());
     if let Some(h) = handler {
-        h.invoke(paths);
+        crate::reactive::batch(|| h.invoke(paths));
+        true
+    } else {
+        false
+    }
+}
+
+thread_local! {
+    static PRESS_WITHOUT_ACTIVATION: std::cell::Cell<Option<i32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set by a backend for the length of a click it dispatches from a press
+/// that grants the page no user activation: on the web a touch or pen
+/// `pointerdown`, whose click runs on contact unless the element can scroll
+/// (#1582). `Some(pointer id)`; `None` after. Code that needs activation (the
+/// file picker, #1771) asks [`press_without_activation`] and waits for that
+/// pointer's release, which does grant it.
+#[doc(hidden)]
+pub fn set_press_without_activation(pointer: Option<i32>) {
+    PRESS_WITHOUT_ACTIVATION.with(|p| p.set(pointer));
+}
+
+/// The pointer whose press is being dispatched without user activation, if
+/// any. See [`set_press_without_activation`].
+#[doc(hidden)]
+pub fn press_without_activation() -> Option<i32> {
+    PRESS_WITHOUT_ACTIVATION.with(std::cell::Cell::get)
+}
+
+/// Register an `ondropfiles` handler (issue #1771) and return its id: called
+/// with the files dropped from the OS onto an element carrying
+/// `data-ondropfiles`, as [`LocalFile`](crate::file::LocalFile)s, on the
+/// desktop and on the web. While it runs, [`get_click_context`] holds the drop
+/// point and that element's box on both (#1822).
+#[doc(hidden)]
+pub fn register_files_drop_handler(
+    callback: impl Fn(Vec<crate::file::LocalFile>) + 'static,
+) -> EventHandlerId {
+    let id = next_handler_id();
+    // Re-enter the registration-time context root and owner on dispatch
+    // (issues #136, #141), as every other handler does.
+    let root = crate::context::current_context_root();
+    crate::reactive::record_handler(id);
+    let owner = crate::reactive::Owner::current();
+    let callback: FilesDropCallback = Rc::new(move |files| {
+        let _root = crate::context::push_context_root(root);
+        let _owner = owner.push();
+        crate::reactive::untracked_handler(|| callback(files));
+    });
+    FILES_DROP_REGISTRY.with(|registry| {
+        registry.borrow_mut().insert(id, callback);
+    });
+    id
+}
+
+/// Dispatch dropped files to the `ondropfiles` handler with the given id, in
+/// one batch. Returns `true` if a handler was found and called.
+pub fn dispatch_files_drop_event(id: EventHandlerId, files: Vec<crate::file::LocalFile>) -> bool {
+    let handler = FILES_DROP_REGISTRY.with(|registry| registry.borrow().get(&id).cloned());
+    if let Some(h) = handler {
+        crate::reactive::batch(|| h(files));
         true
     } else {
         false
@@ -578,11 +867,117 @@ pub fn dispatch_scroll_event(id: EventHandlerId, event: ScrollEvent) -> bool {
     let handler: Option<ScrollCallback> =
         SCROLL_REGISTRY.with(|registry| registry.borrow().handlers.get(&id).cloned());
     if let Some(h) = handler {
-        h.invoke(event);
+        crate::reactive::batch(|| h.invoke(event));
         true
     } else {
         false
     }
+}
+
+/// Register an element key handler (`onkeydown` / `onkeyup`, issue #1678)
+/// and return its ID, to be written to the element's `data-onkeydown` or
+/// `data-onkeyup` attribute.
+///
+/// Like every other handler it is owned by the scope registering it and
+/// re-enters that scope and context root on dispatch (issues #136, #141).
+#[doc(hidden)]
+pub fn register_key_handler(callback: KeyCallback) -> EventHandlerId {
+    let id = next_handler_id();
+    let root = crate::context::current_context_root();
+    crate::reactive::record_handler(id);
+    let owner = crate::reactive::Owner::current();
+    let callback = KeyCallback::new(move |key| {
+        let _root = crate::context::push_context_root(root);
+        let _owner = owner.push();
+        callback.invoke(key)
+    });
+    KEY_REGISTRY.with(|registry| {
+        registry.borrow_mut().insert(id, callback);
+    });
+    id
+}
+
+/// Whether a key handler is still registered under this id. See
+/// [`has_click_handler`].
+pub fn has_key_handler(id: EventHandlerId) -> bool {
+    KEY_REGISTRY.with(|registry| registry.borrow().contains_key(&id))
+}
+
+/// Offer a key to the element key handler with the given ID, as one
+/// transaction (`batch`). Answers whether the handler **consumed** it; a
+/// missing handler (freed with its scope, #141) consumed nothing.
+pub fn dispatch_key_handler(id: EventHandlerId, key: &super::KeyEventData) -> bool {
+    let handler: Option<KeyCallback> =
+        KEY_REGISTRY.with(|registry| registry.borrow().get(&id).cloned());
+    match handler {
+        Some(h) => crate::reactive::batch(|| h.invoke(key)),
+        None => false,
+    }
+}
+
+/// Offer a key to a chain of element key handlers, nearest first — the
+/// `onkeydown` / `onkeyup` ids a backend read off the focused element and its
+/// ancestors, **before** calling any of them (a handler may change the tree,
+/// and the path is the one the key was pressed in, as a browser fixes an
+/// event's path at dispatch). Stops at the first handler that consumes the
+/// key and answers whether one did (issue #1678).
+pub fn dispatch_key_handler_chain(
+    ids: impl IntoIterator<Item = EventHandlerId>,
+    key: &super::KeyEventData,
+) -> bool {
+    ids.into_iter().any(|id| dispatch_key_handler(id, key))
+}
+
+/// Register an element wheel handler (`onwheel`) and return its ID, to be
+/// written to the element's `data-onwheel` attribute.
+///
+/// Owned by the scope registering it, and re-enters that scope and context
+/// root on dispatch (issues #136, #141), like every other handler.
+#[doc(hidden)]
+pub fn register_wheel_handler(callback: WheelCallback) -> EventHandlerId {
+    let id = next_handler_id();
+    let root = crate::context::current_context_root();
+    crate::reactive::record_handler(id);
+    let owner = crate::reactive::Owner::current();
+    let callback = WheelCallback::new(move |event| {
+        let _root = crate::context::push_context_root(root);
+        let _owner = owner.push();
+        callback.invoke(event)
+    });
+    WHEEL_REGISTRY.with(|registry| {
+        registry.borrow_mut().insert(id, callback);
+    });
+    id
+}
+
+/// Whether a wheel handler is still registered under this id. See
+/// [`has_click_handler`].
+pub fn has_wheel_handler(id: EventHandlerId) -> bool {
+    WHEEL_REGISTRY.with(|registry| registry.borrow().contains_key(&id))
+}
+
+/// Offer a wheel to the `onwheel` handler with the given ID, as one
+/// transaction (`batch`). Answers whether it **consumed** the wheel; a missing
+/// handler (freed with its scope, #141) consumed nothing.
+pub fn dispatch_wheel_handler(id: EventHandlerId, event: &WheelEvent) -> bool {
+    let handler: Option<WheelCallback> =
+        WHEEL_REGISTRY.with(|registry| registry.borrow().get(&id).cloned());
+    match handler {
+        Some(h) => crate::reactive::batch(|| h.invoke(event)),
+        None => false,
+    }
+}
+
+/// Offer a wheel to a chain of `onwheel` handlers, nearest first — the ids a
+/// backend read off the element under the pointer and its ancestors **before**
+/// calling any of them (a handler may change the tree; the path is the one the
+/// wheel turned over). Stops at the first handler that consumes it and answers
+/// whether one did; a consumed wheel scrolls nothing.
+pub fn dispatch_wheel_handler_chain(
+    ids: impl IntoIterator<Item = EventHandlerId>,
+    event: &WheelEvent,
+) -> bool {
+    ids.into_iter().any(|id| dispatch_wheel_handler(id, event))
 }
 
 /// Check if an input event was handled since last check, and clear the flag.
@@ -612,6 +1007,15 @@ pub fn clear_handlers() {
     });
     SCROLL_REGISTRY.with(|registry| {
         registry.borrow_mut().handlers.clear();
+    });
+    FILES_DROP_REGISTRY.with(|registry| {
+        registry.borrow_mut().clear();
+    });
+    KEY_REGISTRY.with(|registry| {
+        registry.borrow_mut().clear();
+    });
+    WHEEL_REGISTRY.with(|registry| {
+        registry.borrow_mut().clear();
     });
     reset_handler_ids();
 }
@@ -771,5 +1175,148 @@ mod owner_tests {
             "the nested handler's signal belongs to the inner scope"
         );
         assert!(current_owner().is_none(), "the stack drains completely");
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    //! Every handler dispatch is one reactive transaction: the signals a
+    //! handler writes all land before any effect runs, effects flush once when
+    //! it returns, and a memo it reads after a write is already current.
+    //!
+    //! One handler per registry per test, for the reason `owner_tests` gives.
+
+    use super::*;
+    use crate::events::{
+        KeyEventData, clear_keyboard_interceptor, dispatch_keyboard_event, set_keyboard_interceptor,
+    };
+    use crate::reactive::{Effect, Memo, Signal, reactive_counters, subscribe_signal_change};
+    use std::cell::{Cell, RefCell};
+
+    /// How many signals the multi-write handlers write. Several, so "one flush"
+    /// and "one flush per write" are different numbers.
+    const WRITES: usize = 5;
+
+    /// Counts the flushes that reach the host — the signal-change callback is
+    /// what the desktop shell turns into a `ReRender`.
+    fn count_flushes() -> (Rc<Cell<u32>>, crate::reactive::SignalChangeSubscription) {
+        let flushes = Rc::new(Cell::new(0));
+        let f = Rc::clone(&flushes);
+        let sub = subscribe_signal_change(move || f.set(f.get() + 1));
+        (flushes, sub)
+    }
+
+    /// K writes in one click handler: one flush, one run of the effect that
+    /// reads all of them, and that run sees every write (no intermediate
+    /// state, which is what an effect re-run per write would glitch through).
+    #[test]
+    fn a_click_handler_that_writes_k_signals_flushes_once() {
+        let signals: Vec<Signal<u32>> = (0..WRITES).map(|_| Signal::new(0)).collect();
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let s = Rc::clone(&seen);
+        let sigs = signals.clone();
+        let _effect = Effect::new(move || {
+            let sum: u32 = sigs.iter().map(|sig| sig.get()).sum();
+            s.borrow_mut().push(sum);
+        });
+        seen.borrow_mut().clear();
+
+        let sigs = signals.clone();
+        let id = register_handler(Rc::new(move || {
+            for (i, sig) in sigs.iter().enumerate() {
+                sig.set(i as u32 + 1);
+            }
+        }));
+        let (flushes, _sub) = count_flushes();
+        let runs_before = reactive_counters().effect_runs;
+
+        assert!(dispatch_event(id));
+
+        assert_eq!(flushes.get(), 1, "one flush for the whole handler");
+        assert_eq!(reactive_counters().effect_runs - runs_before, 1);
+        assert_eq!(*seen.borrow(), vec![15], "1+2+3+4+5, never a partial sum");
+    }
+
+    /// A click whose handler writes no signal requests no re-render (issue
+    /// #234): the batch the dispatch runs in wrote nothing, so the host's
+    /// signal-change callback — a desktop `ReRender`, an embedded context's
+    /// dirty flag — is not called. The handler did run (positive control).
+    #[test]
+    fn a_click_handler_that_writes_nothing_requests_no_rerender() {
+        let ran = Rc::new(Cell::new(0));
+        let r = Rc::clone(&ran);
+        let id = register_handler(Rc::new(move || r.set(r.get() + 1)));
+        let (flushes, _sub) = count_flushes();
+
+        assert!(dispatch_event(id));
+
+        assert_eq!(ran.get(), 1, "the handler ran");
+        assert_eq!(
+            flushes.get(),
+            0,
+            "and wrote nothing, so nothing is requested"
+        );
+    }
+
+    /// A handler that writes and then reads a memo of what it wrote gets the
+    /// new value, although the flush has not happened yet.
+    #[test]
+    fn a_handler_reads_a_fresh_memo_after_its_own_write() {
+        let n = Signal::new(3i32);
+        let squared = Memo::new(move || n.get() * n.get());
+        let effect_runs = Rc::new(Cell::new(0));
+        let e = Rc::clone(&effect_runs);
+        let _effect = Effect::new(move || {
+            let _ = squared.get();
+            e.set(e.get() + 1);
+        });
+
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let o = Rc::clone(&observed);
+        let runs_inside = Rc::clone(&effect_runs);
+        let id = register_input_handler(InputCallback::new(move |value: String| {
+            n.set(value.parse().unwrap());
+            o.borrow_mut().push((squared.get(), runs_inside.get()));
+            n.set(n.get() + 1);
+            o.borrow_mut().push((squared.get(), runs_inside.get()));
+        }));
+
+        assert!(dispatch_input_event(id, "7".to_string()));
+        assert_eq!(
+            *observed.borrow(),
+            vec![(49, 1), (64, 1)],
+            "fresh memo values inside the handler, and no effect has run yet"
+        );
+        assert_eq!(effect_runs.get(), 2, "the effect runs once, afterwards");
+    }
+
+    /// The keyboard path is batched too: the interceptor and the dismiss scan
+    /// share one transaction.
+    #[test]
+    fn a_keyboard_interceptor_that_writes_k_signals_flushes_once() {
+        let signals: Vec<Signal<u32>> = (0..WRITES).map(|_| Signal::new(0)).collect();
+        let runs = Rc::new(Cell::new(0));
+        let r = Rc::clone(&runs);
+        let sigs = signals.clone();
+        let _effect = Effect::new(move || {
+            for sig in &sigs {
+                let _ = sig.get();
+            }
+            r.set(r.get() + 1);
+        });
+        runs.set(0);
+
+        let sigs = signals.clone();
+        set_keyboard_interceptor(move |_| {
+            for sig in &sigs {
+                sig.update(|v| *v += 1);
+            }
+            true
+        });
+        let (flushes, _sub) = count_flushes();
+        assert!(dispatch_keyboard_event(&KeyEventData::new("a", "KeyA")));
+        clear_keyboard_interceptor();
+
+        assert_eq!((flushes.get(), runs.get()), (1, 1));
     }
 }

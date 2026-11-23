@@ -7,7 +7,7 @@
 //! [`rinch_core::dom::DomDocument`], so everything works automatically.
 //!
 //! It provides:
-//! - [`WebDocument`] — a [`DomDocument`](rinch_core::dom::DomDocument) implementation over `web_sys`.
+//! - [`WebDocument`] — a [`DomDocument`] implementation over `web_sys`.
 //! - [`setup_event_delegation`] — document-level listeners that bridge browser
 //!   events into rinch's event/drag/render-surface systems.
 //! - [`mount`] — boot a single whole-page app under `#rinch-body`.
@@ -16,8 +16,12 @@
 //!   [`RootHandle`] that can later [`unmount`](RootHandle::unmount) that root.
 //! - [`mount_with_menu_bar`] and its `_into` / `_selector` twins — the same,
 //!   under a menu bar built from [`Menu`] / [`MenuItem`].
+//! - `AppExt` — run a [`rinch::App`] builder chain in the browser, so one
+//!   `App::new(app).title(..).theme(..).menu(..).run()` serves desktop and web.
 //! - [`set_suppress_native_context_menu`] — for a whole-page app that renders
 //!   its own right-click menus.
+//! - [`install_runtime`] — timers, `spawn_local` tasks and polled signals for
+//!   a page that mounts no rinch root.
 //!
 //! ## Menu bar
 //!
@@ -44,6 +48,21 @@
 //! platform; see the [WASM
 //! guide](https://github.com/joeleaver/rinch/blob/main/docs/src/guide/wasm.md).
 //!
+//! ## One entry point for desktop and web
+//!
+//! The desktop's [`rinch::App`] builder runs here too, through `AppExt`; the
+//! only per-target line is the import:
+//!
+//! ```ignore
+//! use rinch::prelude::*;
+//! #[cfg(target_arch = "wasm32")]
+//! use rinch_web::AppExt as _;
+//!
+//! fn main() {
+//!     App::new(app).title("My App").size(800, 600).theme(theme()).run();
+//! }
+//! ```
+//!
 //! ## Whole-page app
 //!
 //! ```ignore
@@ -66,9 +85,13 @@
 //! }
 //! ```
 
+mod bounds;
 mod editor_input;
 mod event_delegation;
+mod highlight;
+mod images;
 mod menu_bar;
+mod pointer_lock;
 pub mod web_document;
 
 use std::cell::{Cell, RefCell};
@@ -79,17 +102,39 @@ use rinch_core::dom::{DomDocument, NodeHandle, RenderScope, clear_render_scope, 
 use rinch_core::element::ThemeProviderProps;
 use rinch_core::events;
 
+#[doc(hidden)]
+pub use bounds::{__bounds_watch_count, __bounds_watch_installed};
 pub use event_delegation::setup_event_delegation;
 #[doc(hidden)]
-pub use event_delegation::{__force_trusted_clicks, __reset_activation_state};
+pub use event_delegation::{
+    __drag_auto_scroll_running, __force_trusted_clicks, __reset_activation_state,
+};
 // Whether a right-click anywhere suppresses the browser's own menu. Off by
 // default: an island mounted into somebody else's page must not take the
 // right-click away from the rest of it.
+/// Test-only: take the page as macOS, or not, for the editor's key bindings
+/// (`navigator.platform` otherwise), so their macOS half runs in CI.
+#[doc(hidden)]
+pub use editor_input::__set_mac_platform;
 pub use event_delegation::{set_suppress_native_context_menu, suppresses_native_context_menu};
+#[doc(hidden)]
+pub use images::__reset_image_sources;
+/// App-resolved image sources: an `<img>` whose `src` has a scheme the app
+/// registered shows what the app resolves it to. `rinch::image::
+/// register_image_scheme` and `rinch::image::reload_image` are the same calls as
+/// on desktop; `register_image_url_scheme` is the browser-only form that answers
+/// with a URL.
+pub use images::{LOGICAL_SRC_ATTR, register_image_url_scheme, unregister_image_url_scheme};
 /// The menu declaration types, re-exported so a web app names them in one place
 /// (`rinch_web::{Menu, MenuItem}`) while its desktop twin builds the very same
 /// values from `rinch::menu`. They are the same types, not a parallel set.
 pub use rinch::menu::{Menu, MenuEntryRef, MenuItem};
+/// How a letter chord's key is matched against a keystroke (issue #1170), and
+/// the setter for it. The desktop twin is `App::shortcut_matching`; on the
+/// web there is no builder to hang it off, so call
+/// `rinch_web::set_shortcut_matching` directly before mounting (it takes
+/// effect on the next keystroke either way — there is nothing to rebuild).
+pub use rinch::menu::{ShortcutMatching, set_shortcut_matching};
 pub use web_document::WebDocument;
 /// Test-only handles on the page scroll lock (#474), so a fixture that fails
 /// between a lock and its unlock cannot leave `<html>` hidden for every test
@@ -97,11 +142,25 @@ pub use web_document::WebDocument;
 #[doc(hidden)]
 pub use web_document::{__reset_scroll_lock, __scroll_lock_depth};
 
+/// How this browser splits a line's leading (see the editor's margin
+/// anchors, #1677): `true` when the half above a text run is floored to a
+/// whole pixel. Test-only.
+#[doc(hidden)]
+pub fn __leading_floors() -> bool {
+    web_document::leading_floors()
+}
+
 // The renderer-agnostic rich-text editor, re-exported so a web app uses the *same*
 // API as desktop: `create_editor()` → `EditorHandle`, mounted via `Editor {}`. The
 // browser input glue (keyboard/pointer/IME/clipboard → the handle) lives in
 // `editor_input`, installed once alongside event delegation.
-pub use rinch_editor_view::{Editor, EditorHandle, create_editor};
+pub use rinch_editor_view::{
+    CaretAffinity, CaretFrom, Editor, EditorHandle, EditorKey, ImageHover, ImageInput,
+    ImageInputSource, LinkClick, LinkHover, LinkSpan, MarginAnchor, MarginAssoc, MarginAt,
+    MarginLine, NODE_VIEW_ATTR, NodeViewCtx, NodeViewRegistration, NodeViewRender, NodeViewSpec,
+    OVERLAY_SLOT_ATTR, ScrollAlign, SelectionAnchor, clear_image_source, create_editor,
+    history_now_ms, set_image_source,
+};
 
 // Collaborative editing (M9), behind the `collaboration` feature. The collab methods
 // live on `EditorHandle` (lit up by the feature); these add the error type and the
@@ -127,6 +186,17 @@ struct MountedRoot {
     /// dropping it is what reclaims the root (issue #141).
     scope: Rc<RefCell<RenderScope>>,
     root: NodeHandle,
+    /// The document's key, kept here so an event's root is found without
+    /// borrowing `web_doc` (a listener may run inside a borrow of it).
+    doc_key: u64,
+    /// The element the root's tree is built in: the island's host, or a
+    /// whole-page root's `#rinch-body`. An event whose target is inside it is
+    /// this root's ([`root_doc_of`]).
+    host: web_sys::Node,
+    /// Made by [`mount`] / [`mount_with_menu_bar`]: the page is its, so an
+    /// event that targets no root (the page's `<body>`, nothing focused) is
+    /// its too.
+    whole_page: bool,
 }
 
 thread_local! {
@@ -139,6 +209,64 @@ thread_local! {
     static GLOBAL_INIT: Cell<bool> = const { Cell::new(false) };
     /// Document-level event listeners are installed exactly once per page.
     static DELEGATION_INSTALLED: Cell<bool> = const { Cell::new(false) };
+    /// The document of the root whose build is running, `0` outside one: an
+    /// event during the build whose target is in no mounted root (the root
+    /// being built is not registered yet) is that root's (#2811).
+    static BUILDING_DOC: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The document of the root whose code an event's handlers run as (#2811):
+/// the deepest mounted root whose host contains `target`. An event that
+/// targets no root's tree is the root being built, during a build (it is not
+/// registered until the build ends); else the whole-page root's, if there is
+/// one, else the only root's when one is mounted; otherwise no root's
+/// (`None`).
+pub(crate) fn root_doc_of(target: Option<&web_sys::Node>) -> Option<u64> {
+    MOUNTED_ROOTS.with(|m| {
+        let m = m.try_borrow().ok()?;
+        let mut deepest: Option<&MountedRoot> = None;
+        if let Some(target) = target {
+            for r in m.values() {
+                if r.host.contains(Some(target))
+                    && deepest.is_none_or(|d| d.host.contains(Some(&r.host)))
+                {
+                    deepest = Some(r);
+                }
+            }
+        }
+        if deepest.is_none() {
+            let building = BUILDING_DOC.with(Cell::get);
+            if building != 0 {
+                return Some(building);
+            }
+        }
+        deepest
+            .or_else(|| m.values().find(|r| r.whole_page))
+            .or_else(|| (m.len() == 1).then(|| m.values().next()).flatten())
+            .map(|r| r.doc_key)
+    })
+}
+
+/// Mark the document of the root `event` belongs to as the dispatching one
+/// until the guard drops (#2811), so the handlers it runs, and the slots it
+/// reads, are that root's: what a root's handler installs in a
+/// document-scoped slot (the keyboard and paste interceptors, the selection
+/// callbacks) is its document's, and the event is served its root's entry.
+/// The desktop marks a window's document around its events the same way.
+///
+/// An event on the editor's capture textarea (which lives in the page's
+/// `<body>`, outside every root) is the focused editor's root's. An event
+/// that belongs to no root marks nothing, leaving whatever is current: a
+/// listener that runs synchronously inside another root's code (a `focus()`
+/// in a handler) stays that root's.
+pub(crate) fn mark_event_root(event: &web_sys::Event) -> Option<rinch_core::DispatchDocGuard> {
+    use wasm_bindgen::JsCast;
+    let target = event
+        .target()
+        .and_then(|t| t.dyn_into::<web_sys::Node>().ok());
+    let doc = editor_input::capture_target_doc(target.as_ref())
+        .or_else(|| root_doc_of(target.as_ref()))?;
+    Some(rinch_core::push_dispatching_doc(doc))
 }
 
 /// A handle to a mounted root. Drop it freely (the root stays mounted); call
@@ -162,6 +290,21 @@ impl RootHandle {
     /// *page-globally* — a menu bar's Escape handler and its keyboard chords —
     /// so an island can be taken out of somebody else's page without leaving
     /// anything of its own behind.
+    ///
+    /// The disposal runs as the root's document's code
+    /// (`rinch_core::push_disposing_doc`), as the root's build, its effects
+    /// and the handlers its events run do (#2811, `mark_event_root`). So
+    /// what the root's code registered (an app key, an interceptor, a
+    /// selection callback), what a cleanup registers as the root goes, and
+    /// what is registered with the document's key (dismiss handlers, parked
+    /// focus and text-selection requests, focus targets) is the document's.
+    /// Then the root's document is swept from the registries keyed by
+    /// document ([`rinch_core::forget_doc`]), which takes all of it.
+    ///
+    /// A document-scoped slot (the keyboard and paste interceptors, the
+    /// selection callbacks) is per root, so a clear in this root's cleanup
+    /// clears this root's entry, or the page's ownerless fallback if that is
+    /// what this root was served, and leaves another root's install alone.
     pub fn unmount(self) {
         let root = MOUNTED_ROOTS.with(|m| m.borrow_mut().remove(&self.id));
         if let Some(r) = root {
@@ -178,13 +321,28 @@ impl RootHandle {
             // an *unrelated* root allocate an id inside the recorded window,
             // which unmounting this root would then delete. A scope's own record
             // has neither problem (issue #141).
-            match Rc::try_unwrap(r.scope) {
-                // The expected path: nothing else can reach the scope, so its
-                // cleanups run with no borrow outstanding anywhere.
-                Ok(cell) => cell.into_inner().dispose(),
-                Err(shared) => shared.borrow_mut().dispose_in_place(),
+            //
+            // The disposal runs as the document's code (#2797), as a desktop
+            // window's does: what its cleanups register is the document's, so
+            // the sweep below takes it. Each root has a document of its own.
+            let doc_key = r.web_doc.borrow().doc_key();
+            {
+                let _disposing = rinch_core::push_disposing_doc(doc_key);
+                match Rc::try_unwrap(r.scope) {
+                    // The expected path: nothing else can reach the scope, so
+                    // its cleanups run with no borrow outstanding anywhere.
+                    Ok(cell) => cell.into_inner().dispose(),
+                    Err(shared) => shared.borrow_mut().dispose_in_place(),
+                }
             }
+            // Before the borrow: a browser runs its focus listeners inside
+            // the removal of a focused node, and a key entry that outlives
+            // this root still reads the document from one (issue #1478).
+            r.root.release_focus_before_detach();
             r.web_doc.borrow_mut().remove_node(r.root.node_id());
+            // The root's document is gone: forget it in every registry keyed
+            // by document, what its cleanups registered just now included.
+            rinch_core::forget_doc(doc_key);
         }
     }
 }
@@ -193,25 +351,25 @@ impl RootHandle {
 // One-time page-global setup
 // ============================================================================
 
-/// The web timer backend: schedule `fire_timeout(id)` via `window.setTimeout`.
+/// Install the web runtime without mounting anything (issue #1956): the
+/// timer backend `set_timeout` and `sleep` run on, the scheduler that polls
+/// `spawn_local` tasks, and the drain that samples `poll_signal`s.
 ///
-/// Only `id` is captured, so the parked callback stays in rinch-core's
-/// main-thread registry. The closure is created with `Closure::once_into_js`,
-/// which hands ownership to the JS GC and drops the boxed `FnOnce` after it fires
-/// — so, unlike `Closure::forget()`, arming thousands of timers over a long
-/// session does not leak a closure per timer. A cancelled timeout
-/// (`clear_timeout`) still wakes here, then finds nothing parked and no-ops.
-fn web_set_timeout(id: u64, delay_ms: u32) {
-    use wasm_bindgen::JsCast;
-    use wasm_bindgen::closure::Closure;
-
-    let cb = Closure::once_into_js(move || rinch_core::fire_timeout(id));
-    if let Some(window) = web_sys::window() {
-        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-            cb.unchecked_ref(),
-            delay_ms as i32,
-        );
-    }
+/// Every `mount*` calls this, so a page that mounts a root needs nothing more.
+/// It is for a page that mounts no rinch DOM but runs rinch code that arms
+/// timers, spawns tasks or polls — a game that owns the canvas, say, or
+/// `rinch-ws` / `rinch-rtc` code with no UI of its own. Call it at startup,
+/// before the first timer: a `set_timeout` armed earlier never fires (a task
+/// spawned earlier is picked up). Idempotent, page-global, and it builds no
+/// DOM: no event delegation, no theme `<style>`, no root.
+///
+/// The same function as `rinch::install_web_runtime`, for an app that
+/// depends on `rinch` alone. An embedded `rinch::embed::RinchContext` installs
+/// the timer backend and task scheduler itself on wasm32.
+pub fn install_runtime() {
+    // A no-op on host builds of this crate (the workspace's clippy and check):
+    // `rinch::install_web_runtime` installs nothing off wasm32.
+    rinch::install_web_runtime();
 }
 
 /// First-mount-only global init shared by every mount. Clearing handlers/context
@@ -227,15 +385,26 @@ fn ensure_global_init() {
         events::clear_handlers();
         rinch_core::clear_context();
 
-        // Drive `rinch_core::set_timeout` off `window.setTimeout`. The browser has
-        // no threads, so rinch-core's built-in shared-thread scheduler cannot run
-        // here — the web runtime supplies the scheduling half.
-        rinch_core::set_timer_backend(web_set_timeout);
+        // Timers, tasks and polls: the same install a page with no root makes
+        // (issue #1956). Idempotent, so a page that called it first is fine.
+        install_runtime();
 
         // Theme CSS is page-global (one shared `<style>`). On any signal change
         // (e.g. dark-mode toggle), refresh it once — regardless of which root
         // changed. Fine-grained DOM updates are handled by effects directly.
+        //
+        // Keyed on the theme's generation, so a flush that did not touch the
+        // theme costs one integer compare rather than a clone of the whole
+        // stylesheet string.
         rinch_core::set_on_signal_change(|| {
+            thread_local! {
+                static APPLIED_THEME_GENERATION: std::cell::Cell<Option<u64>> =
+                    const { std::cell::Cell::new(None) };
+            }
+            let generation = rinch_core::current_theme_css_generation();
+            if APPLIED_THEME_GENERATION.with(|g| g.replace(Some(generation))) == Some(generation) {
+                return;
+            }
             if let Some(css) = rinch_core::get_current_theme_css() {
                 web_document::update_theme_style_global(&css);
             }
@@ -253,6 +422,8 @@ fn ensure_event_delegation(doc: &WebDocument) {
         }
         f.set(true);
         setup_event_delegation(doc);
+        // The browser's pointer lock behind `rinch::window`'s (#2092).
+        pointer_lock::install();
     });
 }
 
@@ -262,21 +433,41 @@ fn ensure_event_delegation(doc: &WebDocument) {
 
 /// Shared mount core: build the tree into `web_doc`'s body, wire theme + event
 /// delegation, register the root, and return its handle.
-fn mount_tree<F>(web_doc: Rc<RefCell<WebDocument>>, build: F) -> RootHandle
+fn mount_tree<F>(web_doc: Rc<RefCell<WebDocument>>, whole_page: bool, build: F) -> RootHandle
 where
     F: FnOnce(&mut RenderScope) -> NodeHandle,
 {
     let doc_as_dom: Rc<RefCell<dyn DomDocument>> = web_doc.clone();
     let body_id = web_doc.borrow().body();
+    let doc_key = web_doc.borrow().doc_key();
+    let host = web_document::registered_node(body_id.0).expect("the root's body is registered");
     let scope = Rc::new(RefCell::new(RenderScope::new(doc_as_dom, body_id)));
 
     set_render_scope(scope.clone());
+
+    // What the build reports to (a node view's host, #2075) must listen
+    // before it runs, on the page's first mount too.
+    editor_input::install_before_build();
 
     // The root scope owns everything this build creates — signals, memos,
     // effects and event handlers — and `unmount` releases them by disposing it
     // (issue #141). Scoped to the build alone: theme injection, event delegation
     // and root registration below are page-global setup with app lifetime.
+    //
+    // The build is the root's document's code (#2811), as a desktop window's
+    // mount is: what it installs in a document-scoped slot is the document's,
+    // and every effect, memo, timer and parked callback it makes records the
+    // document and runs as it later, wherever it is flushed.
     let root = {
+        let _doc = rinch_core::push_dispatching_doc(doc_key);
+        let previous = BUILDING_DOC.with(|b| b.replace(doc_key));
+        struct RestoreBuilding(u64);
+        impl Drop for RestoreBuilding {
+            fn drop(&mut self) {
+                let _ = BUILDING_DOC.try_with(|b| b.set(self.0));
+            }
+        }
+        let _building = RestoreBuilding(previous);
         let _owner = scope.borrow().push_owner();
         let mut scope_ref = scope.borrow_mut();
         build(&mut scope_ref)
@@ -285,6 +476,10 @@ where
     web_doc.borrow_mut().append_child(body_id, root.node_id());
 
     clear_render_scope();
+
+    // Ask the app for the image sources this build gave its `<img>`s, now
+    // that no borrow of the document is held (`images.rs`).
+    images::resolve_pending();
 
     // Inject/refresh the page-global theme `<style>` (idempotent across roots).
     if let Some(css) = rinch_core::get_current_theme_css() {
@@ -306,10 +501,20 @@ where
                 web_doc,
                 scope,
                 root,
+                doc_key,
+                host,
+                whole_page,
             },
         );
     });
     RootHandle { id }
+}
+
+/// The page's document, or `None` where there is none: a Web Worker, where
+/// `rinch::worker` runs a second instance of the app's module and so its start
+/// function (issue #1772).
+fn page_document() -> Option<web_sys::Document> {
+    web_sys::window()?.document()
 }
 
 /// Mount a single whole-page rinch app under `#rinch-body` (appended to
@@ -318,18 +523,31 @@ where
 /// `build` receives the active [`RenderScope`]; a `#[component]` function (which
 /// expands to `fn(&mut RenderScope) -> NodeHandle`) can be passed directly. The
 /// root lives for the lifetime of the page.
+///
+/// Its root never ends, so its document is never swept from the registries
+/// keyed by document ([`rinch_core::forget_doc`]): what it registers there
+/// stays for the page's life. A root that can go is made with a `mount*`
+/// that answers a [`RootHandle`], whose [`unmount`](RootHandle::unmount)
+/// sweeps its document, what its cleanups register as it goes included.
+///
+/// Where there is no `document` — inside a `rinch::worker` Web Worker, which
+/// runs the app's start function too — it returns without mounting.
 pub fn mount<F>(theme: ThemeProviderProps, build: F)
 where
     F: FnOnce(&mut RenderScope) -> NodeHandle,
 {
+    // No page: a worker instance of this module (`rinch::worker`, #1772),
+    // which runs the app's start function too. Nothing to mount.
+    let Some(browser_doc) = page_document() else {
+        return;
+    };
     ensure_global_init();
     rinch::setup_theme_css(&theme);
 
-    let browser_doc = web_sys::window().unwrap().document().unwrap();
     let web_doc = Rc::new(RefCell::new(WebDocument::new(browser_doc)));
 
     // Whole-page app: keep it for the page lifetime (owned by MOUNTED_ROOTS).
-    let _ = mount_tree(web_doc, build);
+    let _ = mount_tree(web_doc, true, build);
 }
 
 /// Mount an independent rinch component tree (an "island") into an existing
@@ -350,7 +568,7 @@ where
         host.clone(),
     )));
 
-    mount_tree(web_doc, build)
+    mount_tree(web_doc, false, build)
 }
 
 /// Mount an island into the first element matching a CSS `selector`
@@ -387,17 +605,22 @@ where
 ///
 /// The menus are read during this call and nothing is kept borrowed afterwards,
 /// which is why the labels may be borrowed `&str`.
+///
+/// Like [`mount`], it returns without mounting where there is no `document`.
 pub fn mount_with_menu_bar<F>(theme: ThemeProviderProps, menus: Vec<(&str, Menu)>, build: F)
 where
     F: FnOnce(&mut RenderScope) -> NodeHandle,
 {
+    // No page: a worker instance (see `mount`).
+    let Some(browser_doc) = page_document() else {
+        return;
+    };
     ensure_global_init();
     rinch::setup_theme_css(&theme);
 
-    let browser_doc = web_sys::window().unwrap().document().unwrap();
     let web_doc = Rc::new(RefCell::new(WebDocument::new(browser_doc)));
 
-    let _ = mount_tree(web_doc, move |scope| {
+    let _ = mount_tree(web_doc, true, move |scope| {
         let content = build(scope);
         menu_bar::wrap(scope, &menus, content)
     });
@@ -445,7 +668,7 @@ where
         host.clone(),
     )));
 
-    mount_tree(web_doc, move |scope| {
+    mount_tree(web_doc, false, move |scope| {
         let content = build(scope);
         menu_bar::wrap(scope, &menus, content)
     })
@@ -465,4 +688,142 @@ where
     let doc = web_sys::window()?.document()?;
     let host = doc.query_selector(selector).ok().flatten()?;
     Some(mount_into_with_menu_bar(&host, theme, menus, build))
+}
+
+// ============================================================================
+// The desktop `App` builder, run in the browser (#1769)
+// ============================================================================
+
+/// Runs a [`rinch::App`] builder chain in the browser, so a cross-platform app
+/// configures itself once and calls `run()` on both targets (#1769).
+///
+/// ```ignore
+/// use rinch::prelude::*;
+/// #[cfg(target_arch = "wasm32")]
+/// use rinch_web::AppExt as _;
+///
+/// fn main() {
+///     App::new(app).title("My App").size(800, 600).theme(theme()).menu(menus()).run();
+/// }
+/// ```
+///
+/// On a desktop build `App::run` is the inherent method and this trait is not
+/// consulted; import it only on `wasm32`, the one target this crate builds it
+/// for.
+///
+/// Forgetting the import fails with `error[E0599]: no method named `run`
+/// found for struct `rinch::App``; the compiler suggests this trait only if the
+/// crate already names `rinch_web` elsewhere.
+///
+/// Implemented once per menu-bar state ([`NoMenuBar`](rinch::app_builder::NoMenuBar),
+/// [`WithMenuBar`](rinch::app_builder::WithMenuBar)), so an app with no
+/// `.menu(..)` does not link the DOM menu bar.
+#[cfg(target_arch = "wasm32")]
+pub trait AppExt {
+    /// Mount the app as a whole-page app under `#rinch-body` and return.
+    ///
+    /// What each builder setting does here:
+    /// - [`theme`](rinch::App::theme): installed, as by [`mount`].
+    /// - [`menu`](rinch::App::menu): the app is mounted under the DOM menu bar,
+    ///   as by [`mount_with_menu_bar`]; without one, as by [`mount`].
+    /// - [`title`](rinch::App::title) (or a non-default `WindowProps::title`):
+    ///   becomes `document.title`. Without one the page keeps its own `<title>`.
+    /// - [`image_scheme`](rinch::App::image_scheme): registered when called, as
+    ///   on the desktop.
+    /// - [`size`](rinch::App::size) and the rest of
+    ///   [`window_props`](rinch::App::window_props): ignored — the page, not the
+    ///   app, sizes a browser window.
+    /// - [`fonts`](rinch::App::fonts): accepted and ignored — the browser loads
+    ///   fonts from the page's CSS (`@font-face`).
+    /// - [`spellcheck`](rinch::App::spellcheck): the browser checks the
+    ///   fields; `false` puts `spellcheck="false"` on `<body>` (see
+    ///   [`apply_spellcheck`]). The dictionaries and skip rules are the
+    ///   browser's.
+    /// - The GPU configuration (`gpu_config`, `external_gpu`, `renderer`): does
+    ///   not exist on a web build — the browser composites, and a
+    ///   `RenderSurface` app owns its own canvas context.
+    fn run(self);
+}
+
+/// Sets `document.title` from the builder, when it names one, and applies
+/// its spellcheck switch.
+#[cfg(target_arch = "wasm32")]
+fn apply_title<F>(parts: &rinch::app_builder::WebParts<F>) {
+    if let (Some(title), Some(doc)) = (&parts.title, web_sys::window().and_then(|w| w.document())) {
+        doc.set_title(title);
+    }
+    apply_spellcheck(&parts.spellcheck);
+}
+
+/// The app's spellcheck switch on the web (#2862): the browser checks the
+/// page's fields itself, so rinch's checker never runs here. Off, `<body>`
+/// gets `spellcheck="false"`, which every field and editable region on the
+/// page inherits (HTML's rule) unless one sets its own; on, the page is left
+/// to the browser's default (fields checked). The rest of the configuration
+/// (dictionaries, skip rules, the interaction and blur options) is the
+/// browser's on the web.
+///
+/// It also keeps `<body>` in step with every later
+/// [`rinch::spellcheck::configure`] / [`rinch::spellcheck::set_enabled`].
+#[cfg(target_arch = "wasm32")]
+pub fn apply_spellcheck(config: &rinch::spellcheck::SpellcheckConfig) {
+    thread_local! {
+        static LISTENING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if !LISTENING.with(|l| l.replace(true)) {
+        rinch::spellcheck::on_config_change(sync_body_spellcheck);
+    }
+    rinch::spellcheck::configure(config.clone());
+    sync_body_spellcheck();
+}
+
+/// `<body>`'s `spellcheck` for the current configuration.
+#[cfg(target_arch = "wasm32")]
+fn sync_body_spellcheck() {
+    let enabled = rinch::spellcheck::config().is_none_or(|c| c.enabled);
+    let Some(body) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.body())
+    else {
+        return;
+    };
+    if enabled {
+        if body.get_attribute("spellcheck").as_deref() == Some("false") {
+            let _ = body.remove_attribute("spellcheck");
+        }
+    } else {
+        let _ = body.set_attribute("spellcheck", "false");
+    }
+}
+
+/// No `.menu()` on the chain: mounted as by [`mount`]. Implemented apart from
+/// the [`WithMenuBar`](rinch::app_builder::WithMenuBar) state so that an app
+/// with no menu bar does not link it.
+#[cfg(target_arch = "wasm32")]
+impl<F> AppExt for rinch::App<F, rinch::app_builder::NoMenuBar>
+where
+    F: FnOnce(&mut RenderScope) -> NodeHandle + 'static,
+{
+    fn run(self) {
+        let parts = self.into_web_parts();
+        apply_title(&parts);
+        mount(parts.theme, parts.component);
+    }
+}
+
+/// `.menu(..)` on the chain: mounted under the DOM menu bar, as by
+/// [`mount_with_menu_bar`].
+#[cfg(target_arch = "wasm32")]
+impl<F> AppExt for rinch::App<F, rinch::app_builder::WithMenuBar>
+where
+    F: FnOnce(&mut RenderScope) -> NodeHandle + 'static,
+{
+    fn run(self) {
+        let parts = self.into_web_parts();
+        apply_title(&parts);
+        let (labels, menus): (Vec<String>, Vec<Menu>) =
+            parts.menus.unwrap_or_default().into_iter().unzip();
+        let menus: Vec<(&str, Menu)> = labels.iter().map(String::as_str).zip(menus).collect();
+        mount_with_menu_bar(parts.theme, menus, parts.component);
+    }
 }

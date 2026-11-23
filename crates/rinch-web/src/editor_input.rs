@@ -54,6 +54,16 @@
 //! For that cycle the field holds the editor's selection between two sentinels
 //! rather than the mirror. See [`start_context_menu_cycle`] for the whole cycle,
 //! CodeMirror 5's `TextareaInput.onContextMenu` for the prior art.
+//!
+//! **Links are the app's.** An editor link is an `<a href>` in the page, which the
+//! browser would follow on a click. A primary press on one is offered to the
+//! editor's `on_link_click` first ([`handle_mousedown`]), the pointer entering and
+//! leaving links is reported to `on_link_hover` ([`update_link_hover`]). A
+//! click is where keyboard activation is offered and where the editor decides
+//! whether the browser follows the link ([`handle_link_click`]): not in an
+//! editable editor or one with a link-click callback, natively in a read-only
+//! one without either. The right-click menu keeps the browser's own link menu
+//! (Open link, Copy link address).
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -61,19 +71,21 @@ use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
-use rinch_editor_core::{CursorMotion, Pos, Selection};
-use rinch_editor_view::{EditorHandle, registry};
+use rinch_editor_core::{CursorMotion, PasteContent, Pos, Selection};
+use rinch_editor_view::{
+    CaretAffinity, EditorHandle, ImageHover, ImageInputSource, LinkClick, LinkHover, LinkSpan,
+    SelectionAnchor, registry, sniff_image_mime,
+};
 
 use crate::event_delegation::{
-    compute_byte_offset_in_block, drag_machine, modifiers_from_key_event, nearest_handler,
-    set_click_context_for, utf16_offset_to_utf8_bytes,
+    drag_machine, modifiers_from_key_event, nearest_handler, set_click_context_for,
 };
 use crate::web_document::{find_text_node_at_byte_offset, get_nid, node_by_nid};
 
 thread_local! {
     /// Container node-id of the focused editor (`None` = no editor focused). Drives
     /// keyboard routing and the caret pass. Set on `mousedown` into an editor.
-    static FOCUSED_EDITOR: Cell<Option<usize>> = const { Cell::new(None) };
+    static FOCUSED_EDITOR: Cell<Option<u64>> = const { Cell::new(None) };
     /// The vertical-motion goal column (viewport x), kept across a run of Up/Down so the
     /// caret holds its horizontal position through short lines. Reset by any other key.
     static GOAL_X: Cell<Option<f32>> = const { Cell::new(None) };
@@ -97,6 +109,14 @@ thread_local! {
     /// `(pointer_id, client_x, client_y)`. A release near that point is a tap rather
     /// than a scroll, and focuses the capture target (see `handle_touch_tap`).
     static TOUCH_TAP: Cell<Option<(i32, f32, f32)>> = const { Cell::new(None) };
+    /// The last touch tap [`handle_touch_tap`] serviced, waiting for the
+    /// compatibility `mousedown` the browser synthesizes for it (issue #302). See
+    /// [`is_compat_mousedown_of_serviced_tap`].
+    static SERVICED_TAP: Cell<Option<ServicedTap>> = const { Cell::new(None) };
+    /// Set by [`handle_mousedown`] when an app's `on_link_click` claimed the press,
+    /// to the editor it landed in — read by [`handle_touch_tap`], which clears it
+    /// before the call, so it can tell a claimed link tap from a caret tap.
+    static LINK_CLAIMED_IN: Cell<Option<u64>> = const { Cell::new(None) };
     /// The context-menu cycle in flight (issue #814): the capture textarea is, or
     /// was just, parked under the pointer and holds the Select-All sentinels rather
     /// than the mirror. `None` when no cycle is live. See
@@ -111,10 +131,10 @@ thread_local! {
     static MENU_KEY_TO_APP: Cell<bool> = const { Cell::new(false) };
 }
 
-fn focused_editor() -> Option<usize> {
+fn focused_editor() -> Option<u64> {
     FOCUSED_EDITOR.with(|c| c.get())
 }
-fn set_focused_editor(id: Option<usize>) {
+fn set_focused_editor(id: Option<u64>) {
     FOCUSED_EDITOR.with(|c| c.set(id));
 }
 fn goal_x() -> Option<f32> {
@@ -125,23 +145,76 @@ fn set_goal_x(x: Option<f32>) {
 }
 
 /// A resolved pointer hit inside an editor: the container + textblock host ids and the
-/// flat UTF-8 byte offset within the textblock's concatenated inline text.
+/// model offset within the textblock's content ([`model_offset_in_block`]).
 struct EditorHit {
-    container_nid: usize,
-    textblock_nid: usize,
-    byte: usize,
+    container_nid: u64,
+    textblock_nid: u64,
+    offset: usize,
 }
 
-/// `document.caretRangeFromPoint(x, y)` — non-standard but available in Chromium/WebKit
-/// (the same call the generic `resolve_text_hit` uses). `None` outside any text.
-fn caret_range_from_point(doc: &web_sys::Document, x: f32, y: f32) -> Option<web_sys::Range> {
-    let func = js_sys::Reflect::get(doc, &"caretRangeFromPoint".into()).ok()?;
-    let func: js_sys::Function = func.dyn_into().ok()?;
-    let val = func.call2(doc, &JsValue::from(x), &JsValue::from(y)).ok()?;
-    if val.is_null() || val.is_undefined() {
-        return None;
+impl EditorHit {
+    /// The model position the hit names.
+    fn pos(&self, handle: &EditorHandle) -> Option<Pos> {
+        handle.pos_in_textblock(self.textblock_nid, self.offset)
     }
-    val.dyn_into::<web_sys::Range>().ok()
+}
+
+/// The model offset, within `textblock`'s content, of the DOM point
+/// `(container, offset)` — a text character and an inline leaf (an element
+/// carrying `data-pm-type`: an image, a hard break) each count one, as in the
+/// model; mark and decoration wrappers count nothing of their own.
+///
+/// Counted from the DOM rather than as a flat byte offset because a leaf has no
+/// text bytes: the byte offset just before a `<br>` and the one just after it
+/// are the same number, which resolved a click at the start of the line after
+/// a Shift+Enter to the position BEFORE the break (#1025). The DOM point knows
+/// the side, whether it is `(text after the <br>, 0)` or an element point
+/// `(<p>, index after the <br>)`.
+fn model_offset_in_block(
+    textblock: &web_sys::Element,
+    container: &web_sys::Node,
+    offset: u32,
+) -> usize {
+    /// Adds what `node` holds up to the point to `n`; `true` once the point is found.
+    fn walk(node: &web_sys::Node, container: &web_sys::Node, offset: u32, n: &mut usize) -> bool {
+        if node.node_type() == web_sys::Node::TEXT_NODE {
+            let text = node.text_content().unwrap_or_default();
+            if node == container {
+                let mut units = 0u32;
+                for c in text.chars() {
+                    if units >= offset {
+                        break;
+                    }
+                    units += c.len_utf16() as u32;
+                    *n += 1;
+                }
+                return true;
+            }
+            *n += text.chars().count();
+            return false;
+        }
+        let kids = node.child_nodes();
+        let stop = if node == container {
+            offset.min(kids.length())
+        } else {
+            kids.length()
+        };
+        for i in 0..stop {
+            let Some(child) = kids.item(i) else { continue };
+            let is_leaf = child
+                .dyn_ref::<web_sys::Element>()
+                .is_some_and(|el| el.has_attribute("data-pm-type"));
+            if is_leaf && !child.contains(Some(container)) {
+                *n += 1;
+            } else if walk(&child, container, offset, n) {
+                return true;
+            }
+        }
+        node == container
+    }
+    let mut n = 0;
+    walk(textblock, container, offset, &mut n);
+    n
 }
 
 /// Resolve a viewport point to an editor position: walk up from the caret range's start
@@ -149,9 +222,7 @@ fn caret_range_from_point(doc: &web_sys::Document, x: f32, y: f32) -> Option<web
 /// `[data-pm-editor]` container, then compute the within-block byte offset. Marks
 /// (`[data-pm-mark]`) are skipped because only blocks carry `data-pm-type`.
 fn resolve_editor_point(doc: &web_sys::Document, x: f32, y: f32) -> Option<EditorHit> {
-    let range = caret_range_from_point(doc, x, y)?;
-    let start = range.start_container().ok()?;
-    let offset = range.start_offset().ok()?;
+    let (start, offset) = crate::event_delegation::caret_point_from_point(doc, x, y)?;
 
     let mut cur: Option<web_sys::Node> = Some(start.clone());
     let mut textblock: Option<web_sys::Element> = None;
@@ -162,6 +233,10 @@ fn resolve_editor_point(doc: &web_sys::Document, x: f32, y: f32) -> Option<Edito
                 container = Some(el);
                 break;
             }
+            // A point inside a node view's component names no editor position.
+            if el.has_attribute(rinch_editor_view::NODE_VIEW_ATTR) && node != start {
+                return None;
+            }
             if textblock.is_none() && el.has_attribute("data-pm-type") {
                 textblock = Some(el);
             }
@@ -171,16 +246,16 @@ fn resolve_editor_point(doc: &web_sys::Document, x: f32, y: f32) -> Option<Edito
     let container_nid = get_nid(&container?.into())?.0;
     let textblock = textblock?;
     let textblock_nid = get_nid(&textblock.clone().into())?.0;
-    let byte = compute_byte_offset_in_block(&textblock, &start, offset);
+    let offset = model_offset_in_block(&textblock, &start, offset);
     Some(EditorHit {
         container_nid,
         textblock_nid,
-        byte,
+        offset,
     })
 }
 
 /// The focused editor's handle, if any (dropping focus if it has unmounted).
-fn focused_handle() -> Option<(usize, EditorHandle)> {
+fn focused_handle() -> Option<(u64, EditorHandle)> {
     let id = focused_editor()?;
     match registry::editor_for(id) {
         Some(h) => Some((id, h)),
@@ -206,6 +281,21 @@ fn refresh_caret() {
     }
 }
 
+/// Queue [`refresh_caret`] for a microtask, if an overlay pass is still owed
+/// then — see [`registry::set_overlay_pass_scheduler`]. Called with an editor's
+/// borrow held, so it only queues.
+fn schedule_overlay_pass() {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let run = wasm_bindgen::closure::Closure::once_into_js(|| {
+        if registry::any_overlay_pass_owed() {
+            refresh_caret();
+        }
+    });
+    window.queue_microtask(run.unchecked_ref());
+}
+
 /// Make the capture textarea `readonly` exactly while the focused editor is
 /// read-only ([`EditorHandle::set_read_only`]).
 ///
@@ -223,7 +313,7 @@ fn refresh_caret() {
 /// which `set_read_only` requests through the overlay refresher.
 fn sync_capture_read_only(handle: &EditorHandle) {
     if let Some(ta) = capture_target() {
-        let read_only = handle.is_read_only();
+        let read_only = handle.refuses_edits();
         if ta.read_only() != read_only {
             ta.set_read_only(read_only);
         }
@@ -247,33 +337,69 @@ fn sync_capture_read_only(handle: &EditorHandle) {
 
 /// The capture textarea's contents as we last wrote them: one textblock's text and the
 /// DOM id of the block it came from.
+///
+/// The text holds one character per model position of the block ([`mirror_text`]): a
+/// hard break is a `\n` and any other inline leaf (an image) a U+FFFC. So a char offset
+/// into it IS the model offset into the block, and an edit a keyboard makes right after
+/// a leaf maps to the position after it (#1025) — a leaf with no character of its own
+/// would make the offset before it and the one after it the same number.
 #[derive(Clone)]
 struct Mirror {
-    textblock_nid: usize,
+    textblock_nid: u64,
     text: String,
     /// The selection we wrote, in UTF-16 code units — what the textarea counts in.
     /// Kept so a redundant re-sync can be skipped.
     sel: (u32, u32),
 }
 
-/// The byte offset of char index `i` (its length in bytes for `i` past the end).
-fn byte_of_char(text: &str, i: usize) -> usize {
-    text.char_indices().nth(i).map_or(text.len(), |(b, _)| b)
+/// The mirror's text for `textblock`: its text, with one character for each inline
+/// leaf (a `[data-pm-type]` element) — `\n` for a hard break, U+FFFC otherwise — so it
+/// has exactly one character per model position (see [`Mirror`]).
+fn mirror_text(textblock: &web_sys::Element) -> String {
+    fn walk(node: &web_sys::Node, out: &mut String) {
+        let kids = node.child_nodes();
+        for i in 0..kids.length() {
+            let Some(child) = kids.item(i) else { continue };
+            if child.node_type() == web_sys::Node::TEXT_NODE {
+                out.push_str(&child.text_content().unwrap_or_default());
+            } else if let Some(el) = child.dyn_ref::<web_sys::Element>()
+                && el.has_attribute("data-pm-type")
+            {
+                out.push(if el.tag_name().eq_ignore_ascii_case("br") {
+                    '\n'
+                } else {
+                    '\u{FFFC}'
+                });
+            } else {
+                walk(&child, out);
+            }
+        }
+    }
+    let mut out = String::new();
+    walk(textblock, &mut out);
+    out
 }
 
 /// The number of UTF-16 code units — the unit `selectionStart`/`selectionEnd` count in
-/// — in `text` up to UTF-8 byte offset `byte`.
-///
-/// Deliberately walks rather than slicing `&text[..byte]`: `byte` comes from the *model*
-/// (`EditorHandle::caret_address`) while `text` comes from the *DOM*, and the two are
-/// only equal as long as nothing renders extra text inside a textblock. A slice at a
-/// non-boundary offset panics, which in wasm takes the whole page down; counting whole
-/// characters instead degrades to a caret at the nearest boundary.
-fn utf16_len_upto(text: &str, byte: usize) -> u32 {
-    text.char_indices()
-        .take_while(|(b, _)| *b < byte)
-        .map(|(_, c)| c.len_utf16() as u32)
-        .sum()
+/// — in the first `chars` characters of `text` (all of it for `chars` past the end).
+fn utf16_of_chars(text: &str, chars: usize) -> u32 {
+    text.chars().take(chars).map(|c| c.len_utf16() as u32).sum()
+}
+
+/// The number of characters of `text` in its first `units` UTF-16 code units — the
+/// inverse of [`utf16_of_chars`]. A unit count inside a surrogate pair counts the
+/// whole character, so a stale selection never splits one.
+fn chars_of_utf16(text: &str, units: u32) -> usize {
+    let mut seen = 0u32;
+    let mut n = 0;
+    for c in text.chars() {
+        if seen >= units {
+            break;
+        }
+        seen += c.len_utf16() as u32;
+        n += 1;
+    }
+    n
 }
 
 /// The minimal replacement turning `base` into `now`: `(from, to, inserted)` where
@@ -329,24 +455,26 @@ fn sync_mirror(handle: &EditorHandle) {
         return;
     };
     let selection = handle.selection();
-    let Some((textblock_nid, head_byte)) = handle.caret_address(selection.head()) else {
+    let Some((textblock_nid, head_off)) = handle.textblock_offset(selection.head()) else {
         // No text caret (a node selection, or an unmounted editor): nothing to mirror.
         clear_mirror(&ta);
         return;
     };
-    let Some(block) = node_by_nid(textblock_nid) else {
+    let Some(block) =
+        node_by_nid(textblock_nid).and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+    else {
         // The caret's block isn't in the host node map (mid-unmount). Leaving the old
         // mirror standing would let the next `input` diff live text against a field
         // that no longer holds it, so drop both rather than half of the pair.
         clear_mirror(&ta);
         return;
     };
-    let text = block.text_content().unwrap_or_default();
-    let head = utf16_len_upto(&text, head_byte);
+    let text = mirror_text(&block);
+    let head = utf16_of_chars(&text, head_off);
     // Mirror the selection too, but only when it lies in this same block — a
     // cross-block selection has no honest representation in one block's text.
-    let anchor = match handle.caret_address(selection.anchor()) {
-        Some((nid, byte)) if nid == textblock_nid => utf16_len_upto(&text, byte),
+    let anchor = match handle.textblock_offset(selection.anchor()) {
+        Some((nid, off)) if nid == textblock_nid => utf16_of_chars(&text, off),
         _ => head,
     };
     let sel = (anchor.min(head), anchor.max(head));
@@ -389,7 +517,8 @@ fn reconcile_mirror(handle: &EditorHandle) -> bool {
     // Splicing a diff at those offsets would corrupt the document, so fail closed and
     // rebuild the mirror from the live block instead.
     if node_by_nid(mirror.textblock_nid)
-        .and_then(|n| n.text_content())
+        .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+        .map(|el| mirror_text(&el))
         .as_deref()
         != Some(mirror.text.as_str())
     {
@@ -399,11 +528,11 @@ fn reconcile_mirror(handle: &EditorHandle) -> bool {
     let Some((from_char, to_char, inserted)) = text_diff(&mirror.text, &ta.value()) else {
         return false;
     };
-    let from_byte = byte_of_char(&mirror.text, from_char);
-    let to_byte = byte_of_char(&mirror.text, to_char);
+    // The mirror has one char per model position, so a char offset is the model
+    // offset into the block.
     let (Some(from), Some(to)) = (
-        handle.pos_at(mirror.textblock_nid, from_byte),
-        handle.pos_at(mirror.textblock_nid, to_byte),
+        handle.pos_in_textblock(mirror.textblock_nid, from_char),
+        handle.pos_in_textblock(mirror.textblock_nid, to_char),
     ) else {
         return false;
     };
@@ -434,17 +563,13 @@ fn reconcile_mirror(handle: &EditorHandle) -> bool {
 /// `t`, so the edit ends at offset 13 while the user expects the caret after "there".
 /// The field already holds the right answer — the browser placed it — so take it from
 /// there rather than inferring it.
-fn adopt_field_caret(
-    handle: &EditorHandle,
-    ta: &web_sys::HtmlTextAreaElement,
-    textblock_nid: usize,
-) {
+fn adopt_field_caret(handle: &EditorHandle, ta: &web_sys::HtmlTextAreaElement, textblock_nid: u64) {
     let text = ta.value();
     let start = ta.selection_start().ok().flatten().unwrap_or(0);
     let end = ta.selection_end().ok().flatten().unwrap_or(start);
     let (Some(from), Some(to)) = (
-        handle.pos_at(textblock_nid, utf16_offset_to_utf8_bytes(&text, start)),
-        handle.pos_at(textblock_nid, utf16_offset_to_utf8_bytes(&text, end)),
+        handle.pos_in_textblock(textblock_nid, chars_of_utf16(&text, start)),
+        handle.pos_in_textblock(textblock_nid, chars_of_utf16(&text, end)),
     ) else {
         return;
     };
@@ -480,6 +605,22 @@ fn capture_target() -> Option<web_sys::HtmlTextAreaElement> {
     CAPTURE.with(|c| c.borrow().clone())
 }
 
+/// When `target` is the capture textarea, the document of the editor it is
+/// typing for, the focused one (#2811). The textarea lives in the page's
+/// `<body>`, outside every root, so its events cannot be placed by where they
+/// land.
+pub(crate) fn capture_target_doc(target: Option<&web_sys::Node>) -> Option<u64> {
+    let ta = CAPTURE.with(|c| c.borrow().clone())?;
+    if target? != AsRef::<web_sys::Node>::as_ref(&ta) {
+        return None;
+    }
+    let focused = focused_editor()?;
+    registry::all_editors()
+        .into_iter()
+        .find(|&(_, container, _)| container == focused)
+        .and_then(|(doc, _, _)| rinch_core::doc_identity(doc))
+}
+
 /// Focus the capture target so the browser routes clipboard / IME events to it.
 /// `preventScroll` keeps focusing the off-screen target from jumping the page.
 fn focus_capture_target(doc: &web_sys::Document, handle: &EditorHandle) {
@@ -493,6 +634,102 @@ fn focus_capture_target(doc: &web_sys::Document, handle: &EditorHandle) {
         // Start from an empty field; the `refresh_caret` that ends every focusing
         // `handle_mousedown` fills it from the caret's block. Clear the mirror with it —
         // an emptied field behind a live mirror reads as "the block was deleted".
+        clear_mirror(&ta);
+    }
+}
+
+/// Give the editor at `container_nid` the keyboard without a press —
+/// [`EditorHandle::focus`], through [`registry::set_focus_handler`]. The focusing
+/// half of [`handle_mousedown`]: the editor becomes the focused one, the capture
+/// textarea takes the browser's focus (`preventScroll`, so nothing jumps; any
+/// other field blurs natively and commits its `change`), and the overlay pass
+/// draws the editor's caret or selection where it already is. Nothing is
+/// selected and nothing scrolls.
+fn focus_editor(container_nid: u64) {
+    let Some(handle) = registry::editor_for(container_nid) else {
+        return;
+    };
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    end_context_menu_cycle();
+    set_focused_editor(Some(container_nid));
+    set_goal_x(None);
+    focus_capture_target(&doc, &handle);
+    refresh_caret();
+}
+
+/// Take the keyboard away from the editor at `container_nid` —
+/// [`EditorHandle::blur`], through [`registry::set_blur_handler`]. Only if that
+/// editor is the focused one: then the capture textarea is blurred, as a press
+/// on page content that takes no focus would blur it, and the browser's focus
+/// goes to the body. The editor is released here rather than left to
+/// [`on_capture_blur`], which keeps the editor while the page itself lacks the
+/// focus (a window switch); a blur from code is meant whatever the window is
+/// doing. Any other editor or field that holds the keyboard is left alone, and
+/// the selection is kept for a later focus.
+fn blur_editor(container_nid: u64) {
+    if focused_editor() != Some(container_nid) {
+        return;
+    }
+    end_context_menu_cycle();
+    // The textarea is blurred while the editor is still the focused one: a
+    // browser ends a live composition inside `ta.blur()` (`compositionend`,
+    // before `blur`), and that has to reach this editor to commit the text
+    // and take its preedit down, as it does when a press moves focus away.
+    if let Some(ta) = capture_target() {
+        let field_active = web_sys::window()
+            .and_then(|w| w.document())
+            .is_some_and(|d| d.active_element().as_ref() == Some(ta.as_ref()));
+        if field_active {
+            let _ = ta.blur();
+        }
+    }
+    // Released here whatever `on_capture_blur` did (it keeps the editor while
+    // the page itself lacks the focus).
+    set_focused_editor(None);
+    set_goal_x(None);
+    refresh_caret();
+}
+
+/// The editor at `container_nid` has unmounted ([`registry::set_unregister_listener`]).
+///
+/// If it was the focused one, the capture textarea still holds the keyboard,
+/// its block's text as the mirror (U+FFFC for an image, `\n` for a break) and
+/// the model selection over it: a Ctrl+C there would be the browser's native
+/// copy of a document that is no longer on the page, and the text would stay
+/// in the DOM (issue #1112). Release the editor, empty the field with its
+/// mirror, and blur it — what a browser does when a focused element leaves the
+/// document. Releasing first keeps the `blur` this raises from refreshing an
+/// editor that is gone.
+///
+/// If it was not the focused one, the field is left alone while it holds the
+/// keyboard — it is then another editor's, mirror and all. But when the field
+/// is **not** `document.activeElement`, no editor is reading it: focus left the
+/// editor for somewhere else before the unmount, and the blur released the
+/// editor while leaving its block in the field. Empty it then too, so that text
+/// does not outlive the editor either. Nothing is lost: the next focus empties
+/// the field anyway ([`focus_capture_target`]) and refills it from that editor's
+/// caret block.
+fn on_editor_unregistered(_doc_key: u64, container_nid: u64) {
+    let ta = capture_target();
+    if focused_editor() == Some(container_nid) {
+        set_focused_editor(None);
+        end_context_menu_cycle();
+        COMPOSING.with(|c| c.set(false));
+        if let Some(ta) = ta {
+            clear_mirror(&ta);
+            let _ = ta.blur();
+        }
+        return;
+    }
+    let Some(ta) = ta else {
+        return;
+    };
+    let field_active = web_sys::window()
+        .and_then(|w| w.document())
+        .is_some_and(|d| d.active_element().as_ref() == Some(ta.as_ref()));
+    if !field_active {
         clear_mirror(&ta);
     }
 }
@@ -595,7 +832,7 @@ enum MenuTrigger {
 struct MenuCycle {
     id: u64,
     /// The host id of the editor the cycle belongs to.
-    container_nid: usize,
+    container_nid: u64,
     trigger: MenuTrigger,
     /// The park holding the textarea under the pointer, if any — the id of that
     /// park, so its timer does not end a later one.
@@ -663,9 +900,25 @@ fn context_menu_claimed_by_app(target: &web_sys::Element) -> bool {
         .is_some_and(|(_, id)| rinch_core::events::has_click_handler(id))
 }
 
+thread_local! {
+    /// A test's answer for [`is_mac`] (`__set_mac_platform`), so the macOS key
+    /// bindings run in CI's Linux browsers. `None`: ask the browser.
+    static MAC_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Make the editor's key handling take the page as macOS (`Some(true)`), as
+/// not macOS (`Some(false)`), or ask the browser again (`None`). Test-only.
+#[doc(hidden)]
+pub fn __set_mac_platform(mac: Option<bool>) {
+    MAC_OVERRIDE.with(|m| m.set(mac));
+}
+
 /// Whether the page runs on macOS, where a Control-click is the context click
 /// (CodeMirror 5 asks `navigator.platform` the same question).
-fn is_mac() -> bool {
+pub(crate) fn is_mac() -> bool {
+    if let Some(mac) = MAC_OVERRIDE.with(std::cell::Cell::get) {
+        return mac;
+    }
     web_sys::window()
         .and_then(|w| js_sys::Reflect::get(&w, &"navigator".into()).ok())
         .and_then(|n| js_sys::Reflect::get(&n, &"platform".into()).ok())
@@ -695,7 +948,7 @@ fn after(ms: i32, f: impl FnOnce() + 'static) {
 /// top-left corner at `spot` (see the section comment above).
 fn start_context_menu_cycle(
     handle: &EditorHandle,
-    container_nid: usize,
+    container_nid: u64,
     trigger: MenuTrigger,
     spot: (f32, f32),
 ) {
@@ -784,7 +1037,7 @@ fn unpark_capture(park: u64) {
 /// (Windows, by reading Chromium), the park from the press is long gone by then,
 /// so a release that no `contextmenu` has preceded parks the textarea again, at
 /// the `spot` it gives for the cycle's editor (`None` parks nothing).
-fn repark_on_release(trigger: MenuTrigger, spot: impl FnOnce(usize) -> Option<(f32, f32)>) {
+fn repark_on_release(trigger: MenuTrigger, spot: impl FnOnce(u64) -> Option<(f32, f32)>) {
     let waiting = MENU_CYCLE.with(|c| {
         c.borrow()
             .as_ref()
@@ -802,7 +1055,7 @@ fn repark_on_release(trigger: MenuTrigger, spot: impl FnOnce(usize) -> Option<(f
 /// `container_nid`, looking past the capture textarea, which may still be parked
 /// there. A right press dragged out of the editor and released over page content
 /// is that content's to answer.
-fn point_over_editor(doc: &web_sys::Document, x: f32, y: f32, container_nid: usize) -> bool {
+fn point_over_editor(doc: &web_sys::Document, x: f32, y: f32, container_nid: u64) -> bool {
     doc.elements_from_point(x, y)
         .iter()
         .filter_map(|v| v.dyn_into::<web_sys::Element>().ok())
@@ -950,6 +1203,124 @@ fn install_capture_listeners(ta: &web_sys::HtmlTextAreaElement) {
     add_target_listener(target, "compositionend", |e: web_sys::CompositionEvent| {
         on_composition_end(&e);
     });
+    // Focus leaving the textarea for somewhere else in the page releases the
+    // editor (issue #271): it owns no key from then on (`handle_keydown`), so it
+    // must paint no caret either — desktop hides a blurred editor's overlays
+    // (`focus.rs`). Typed as a plain `Event`, since page script can dispatch a
+    // bare one named `blur`.
+    add_target_listener(target, "blur", |_e: web_sys::Event| on_capture_blur());
+}
+
+/// The capture textarea lost focus. Release the editor unless the textarea is
+/// still the document's focused element or the page itself lost focus — what a
+/// *window* blur leaves (alt-tab away: focus comes back to it on return, as
+/// desktop's `WindowFocus(false)` keeps the claim, #226). No guard for a #814
+/// menu cycle: a press or key that moves focus ends the cycle first
+/// (`end_context_menu_cycle`), and the `editor_native_context_menu` suite passes
+/// without one.
+fn on_capture_blur() {
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let still_focused = capture_target().is_some_and(|ta| {
+        let ta: &web_sys::Element = ta.as_ref();
+        doc.active_element().as_ref() == Some(ta)
+    });
+    let page_has_focus = doc.has_focus().unwrap_or(false);
+    if still_focused || !page_has_focus {
+        return;
+    }
+    if focused_editor().is_some() {
+        set_focused_editor(None);
+        refresh_caret();
+    }
+}
+
+/// The editor holding the keyboard, as `(container id, container element)`:
+/// the focused editor, while the capture textarea is `doc`'s focused element
+/// (issue #1126).
+///
+/// The capture field lives in `<body>`, outside every editor, so
+/// `document.activeElement` alone says the focus is outside whatever holds the
+/// editor. Every question rinch asks of the focus means the editor there, which
+/// is what this answers. The container may be detached (its overlay's subtree
+/// already taken out); `contains` still answers for it.
+pub(crate) fn keyboard_editor(doc: &web_sys::Document) -> Option<(u64, web_sys::Element)> {
+    let ta = capture_target()?;
+    let ta: &web_sys::Element = ta.as_ref();
+    if doc.active_element().as_ref() != Some(ta) {
+        return None;
+    }
+    let id = focused_editor()?;
+    registry::editor_for(id)?;
+    let el = crate::web_document::registered_node(id)?
+        .dyn_into::<web_sys::Element>()
+        .ok()?;
+    Some((id, el))
+}
+
+/// `doc.activeElement`, except that the capture textarea of the editor that
+/// holds the keyboard answers that editor's container ([`keyboard_editor`]).
+/// What "where is the focus" means to rinch's own focus rules: the overlay
+/// restore, Tab containment, `NodeHandle::active_element`, a removal's focus
+/// release.
+pub(crate) fn effective_active_element(doc: &web_sys::Document) -> Option<web_sys::Element> {
+    keyboard_editor(doc)
+        .map(|(_, el)| el)
+        .or_else(|| doc.active_element())
+}
+
+/// Take the keyboard from the editor at `container_nid`, if it holds it —
+/// [`EditorHandle::blur`]'s path: the capture field is blurred (a live
+/// composition ends into this editor first) and the editor is released.
+pub(crate) fn release_editor(container_nid: u64) {
+    blur_editor(container_nid);
+}
+
+/// Give the editor at `container_nid` the keyboard, as [`EditorHandle::focus`]
+/// does. Answers whether it holds it afterwards.
+/// Refused, as a browser's `focus()` refuses, for an editor whose container is
+/// detached or not rendered.
+pub(crate) fn give_editor_keyboard(doc: &web_sys::Document, container_nid: u64) -> bool {
+    let shown = crate::web_document::registered_node(container_nid)
+        .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+        .is_some_and(|el| el.is_connected() && crate::event_delegation::element_is_visible(&el));
+    if !shown {
+        return false;
+    }
+    focus_editor(container_nid);
+    keyboard_editor(doc).is_some_and(|(id, _)| id == container_nid)
+}
+
+/// Whether an editor holds the keyboard right now: one is focused and the
+/// capture textarea is the document's focused element.
+fn editor_owns_keyboard(doc: &web_sys::Document) -> bool {
+    let on_capture = capture_target().is_some_and(|ta| {
+        let ta: &web_sys::Element = ta.as_ref();
+        doc.active_element().as_ref() == Some(ta)
+    });
+    on_capture && focused_handle().is_some()
+}
+
+/// Whether a press at `target` lands on a `data-rid` handler with nothing
+/// focusable anywhere on its ancestor chain — a DOM menu-bar item, a
+/// `div { onclick }` toolbar button. (A `DropdownMenu` item is a `<button>`, so it is focusable.) The
+/// browser would move focus to `<body>` for such a press; desktop keeps the
+/// editor focused for it (`click_handling.rs`: a press on a `data-rid` preserves
+/// editor focus, only a focusable node claims it), and so does this module, by
+/// `preventDefault`ing the `mousedown`.
+fn is_non_focusable_handler_press(target: &web_sys::Element) -> bool {
+    if target.closest("[data-rid]").ok().flatten().is_none() {
+        return false;
+    }
+    // Any focusable on the chain — the handler itself, inside it, or an
+    // ancestor of it (a `Tree` chevron inside its `tabindex` row) — is what
+    // the browser focuses, as desktop does: leave the press alone.
+    target
+        .closest(crate::event_delegation::PRESS_FOCUSABLE_SELECTOR)
+        .ok()
+        .flatten()
+        .is_none()
 }
 
 // ── Clipboard (copy / cut / paste) ─────────────────────────────────────────────
@@ -966,6 +1337,7 @@ fn on_copy(event: &web_sys::ClipboardEvent) {
     // The menu's Copy: the cycle has served its purpose.
     end_context_menu_cycle();
     let Some((_, handle)) = focused_handle() else {
+        refuse_orphan_clipboard(event);
         return;
     };
     event.prevent_default();
@@ -977,6 +1349,19 @@ fn on_copy(event: &web_sys::ClipboardEvent) {
     }
 }
 
+/// A `copy` or `cut` on the capture textarea with no editor behind it: never the
+/// browser's native one. The field only ever holds a mirror of an editor's text, so
+/// a native copy of it is a copy of text that is not on the page (issue #1112).
+/// [`on_editor_unregistered`] empties and blurs it when the focused editor
+/// unmounts; this is the net for whatever still reaches it (the listener is on the
+/// textarea itself, so every event here is aimed at it).
+fn refuse_orphan_clipboard(event: &web_sys::ClipboardEvent) {
+    event.prevent_default();
+    if let Some(ta) = capture_target() {
+        clear_mirror(&ta);
+    }
+}
+
 /// Cut: copy the selection, then delete it. Nothing at all in a read-only editor,
 /// as in a `readonly` field: the delete would be refused, and a Cut that only
 /// copies has changed the clipboard while appearing to do nothing. (The capture
@@ -985,10 +1370,11 @@ fn on_copy(event: &web_sys::ClipboardEvent) {
 fn on_cut(event: &web_sys::ClipboardEvent) {
     end_context_menu_cycle();
     let Some((_, handle)) = focused_handle() else {
+        refuse_orphan_clipboard(event);
         return;
     };
     event.prevent_default();
-    if handle.is_read_only() {
+    if handle.refuses_edits() {
         return;
     }
     if let Some((html, text)) = handle.selection_clipboard()
@@ -1003,7 +1389,18 @@ fn on_cut(event: &web_sys::ClipboardEvent) {
 }
 
 /// Paste over the selection, preferring rich `text/html`, then a raw image file
-/// (encoded as a `data:` URL via `FileReader`), then `text/plain`.
+/// (encoded as a `data:` URL via `FileReader`), then `text/plain` — the order
+/// desktop's clipboard probe resolves them in.
+///
+/// An editor whose app takes pictures itself (`EditorHandle::on_image_input`)
+/// is offered the clipboard's image files instead, and no `data:` URL is made:
+/// when there is no html, or the html is pictures and nothing else (a
+/// browser's "Copy image" offers an `<img>` beside the file), as on desktop.
+///
+/// Text and html go through `EditorHandle::paste`, the entry point the desktop's
+/// Ctrl+V shares, so the editor's plugins see both flavours first
+/// (`Plugin::handle_paste`) and the default inserts what none claims. A bitmap
+/// with no html wrapper goes in as an image and reaches no plugin, as on desktop.
 fn on_paste(event: &web_sys::ClipboardEvent) {
     end_context_menu_cycle();
     let Some((_, handle)) = focused_handle() else {
@@ -1013,11 +1410,26 @@ fn on_paste(event: &web_sys::ClipboardEvent) {
     let Some(dt) = event.clipboard_data() else {
         return;
     };
-    // 1. Rich HTML — preserves structure, links, marks, and URL-referenced images.
-    if let Ok(html) = dt.get_data("text/html")
-        && !html.trim().is_empty()
-        && handle.replace_selection_with_html(&html)
-    {
+    let paste = PasteContent::new(
+        dt.get_data("text/plain").ok(),
+        dt.get_data("text/html").ok(),
+    );
+    // 0. Pictures, for an app that stores them itself: the files, read as
+    //    their bytes and offered at the selection as it is now, anchored.
+    if handle.has_image_input_callback() && !handle.refuses_edits() {
+        let files = image_files(&dt);
+        let only_pictures = paste
+            .html
+            .as_deref()
+            .is_none_or(|html| html.trim().is_empty() || handle.html_is_only_images(html));
+        if !files.is_empty() && only_pictures {
+            offer_image_files(&handle, ImageInputSource::Paste, files);
+            return;
+        }
+    }
+    // 1. Html (structure, links, marks, URL-referenced images), offered to the
+    //    plugins first with the text beside it; its text if it parses to nothing.
+    if paste.html.is_some() && handle.paste(&paste) {
         refresh_caret();
         return;
     }
@@ -1026,11 +1438,8 @@ fn on_paste(event: &web_sys::ClipboardEvent) {
     if paste_image_from(&dt, &handle) {
         return;
     }
-    // 3. Plain text.
-    if let Ok(text) = dt.get_data("text/plain")
-        && !text.is_empty()
-        && handle.replace_selection_with_text(&text)
-    {
+    // 3. Plain text, offered to the plugins first.
+    if paste.html.is_none() && handle.paste(&paste) {
         refresh_caret();
     }
 }
@@ -1081,6 +1490,182 @@ fn read_image_file(file: &web_sys::File, handle: EditorHandle) {
     reader.set_onload(Some(onload.as_ref().unchecked_ref()));
     *slot.borrow_mut() = Some(onload);
     let _ = reader.read_as_data_url(file);
+}
+
+// ── Pictures offered to the app (`EditorHandle::on_image_input`) ───────────────
+
+/// The image files a paste or a drop carries, in order: every `file` item the
+/// browser calls an image. Taken while the event is being dispatched, which is
+/// the only time a `DataTransfer` can be read; the `File`s stay readable after.
+fn image_files(dt: &web_sys::DataTransfer) -> Vec<web_sys::File> {
+    let items = dt.items();
+    (0..items.length())
+        .filter_map(|i| items.get(i))
+        .filter(|item| item.kind() == "file" && item.type_().starts_with("image/"))
+        .filter_map(|item| item.get_as_file().ok().flatten())
+        .collect()
+}
+
+/// A file read for an `on_image_input` callback.
+struct ReadImage {
+    bytes: Vec<u8>,
+    mime: String,
+    name: Option<String>,
+}
+
+/// Read `files` and offer each to `handle`'s `on_image_input` callback where
+/// the selection is **now** (anchored, so typing while the files are read does
+/// not move it, and an inserted picture moves the anchor past itself):
+/// pictures answered at once land side by side, in order. A document replaced
+/// meanwhile drops the lot.
+fn offer_image_files(handle: &EditorHandle, source: ImageInputSource, files: Vec<web_sys::File>) {
+    let handle = handle.clone();
+    let anchor = handle.anchor_selection();
+    read_images(
+        files.into(),
+        Vec::new(),
+        Box::new(move |images| offer_read_images(&handle, &anchor, source, images)),
+    );
+}
+
+fn offer_read_images(
+    handle: &EditorHandle,
+    anchor: &SelectionAnchor,
+    source: ImageInputSource,
+    images: Vec<ReadImage>,
+) {
+    // At the anchor, not at the live selection: the person's caret is theirs
+    // if they moved while the files were read.
+    for image in images {
+        handle.offer_image_input_at(anchor, source, image.bytes, &image.mime, image.name);
+    }
+    refresh_caret();
+}
+
+/// Read `pending` one after another with a `FileReader` each (a read is
+/// asynchronous in a browser), then hand everything read to `done`. A file
+/// that cannot be read is left out. Its type is what its first bytes say, else
+/// what the browser called it (an SVG, an AVIF).
+fn read_images(
+    mut pending: std::collections::VecDeque<web_sys::File>,
+    mut read: Vec<ReadImage>,
+    done: Box<dyn FnOnce(Vec<ReadImage>)>,
+) {
+    let Some(file) = pending.pop_front() else {
+        done(read);
+        return;
+    };
+    let Ok(reader) = web_sys::FileReader::new() else {
+        read_images(pending, read, done);
+        return;
+    };
+    // `loadend` fires once, after a success or a failure. The closure frees
+    // itself when it has run.
+    let loaded = {
+        let reader = reader.clone();
+        let file = file.clone();
+        Closure::once_into_js(move || {
+            if let Ok(result) = reader.result()
+                && let Ok(buffer) = result.dyn_into::<js_sys::ArrayBuffer>()
+            {
+                let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
+                let mime = sniff_image_mime(&bytes)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| file.type_());
+                let name = Some(file.name()).filter(|n| !n.is_empty());
+                if !bytes.is_empty() {
+                    read.push(ReadImage { bytes, mime, name });
+                }
+            }
+            read_images(pending, read, done);
+        })
+    };
+    reader.set_onloadend(Some(loaded.unchecked_ref()));
+    let _ = reader.read_as_array_buffer(&file);
+}
+
+/// The editor a drag of files is over, when its app takes pictures itself: its
+/// container id and handle. An editor with no callback is not involved in
+/// drops at all. One that has the callback and refuses edits (read-only, a
+/// collaboration freeze) is answered too: it takes nothing, but the drop must
+/// still be prevented ([`on_drop`]).
+fn file_drop_editor(event: &web_sys::DragEvent) -> Option<(u64, EditorHandle)> {
+    let dt = event.data_transfer()?;
+    let types = dt.types();
+    if !(0..types.length()).any(|i| types.get(i).as_string().as_deref() == Some("Files")) {
+        return None;
+    }
+    let target = event.target()?.dyn_into::<web_sys::Node>().ok()?;
+    let element = match target.dyn_ref::<web_sys::Element>() {
+        Some(el) => el.clone(),
+        None => target.parent_element()?,
+    };
+    let container = crate::event_delegation::editor_owning(&element)?;
+    let id = get_nid(&container.into())?.0;
+    let handle = registry::editor_for(id)?;
+    handle.has_image_input_callback().then_some((id, handle))
+}
+
+/// `dragover` of files over an editor that takes pictures: say the drop is
+/// wanted, or the browser never delivers it. Over one that refuses edits the
+/// event is prevented all the same, with the "not here" cursor: left to the
+/// browser, releasing the file would open it in place of the app.
+fn on_drag_over(event: &web_sys::DragEvent) {
+    if let Some((_, handle)) = file_drop_editor(event) {
+        event.prevent_default();
+        if let Some(dt) = event.data_transfer() {
+            dt.set_drop_effect(if handle.refuses_edits() {
+                "none"
+            } else {
+                "copy"
+            });
+        }
+    }
+}
+
+/// Files dropped on an editor that takes pictures: the caret goes to the drop
+/// point, the editor takes the keyboard, and the image files are offered to
+/// the app (`EditorHandle::on_image_input`), in order. The browser's own
+/// handling of the drop (opening the file in place of the page) is prevented
+/// whatever the files are. The files the editor does not take — the others of
+/// a mixed drop, every file when none is a picture or the editor refuses edits
+/// — go to the `ondropfiles` handler under the drop point, if there is one
+/// (issue #1771, desktop's rule). An editor with no callback is not involved
+/// at all. One that refuses edits (read-only) takes nothing: no offer, no
+/// caret move, no focus. A viewer of a read-only note who drops a picture on
+/// it must not lose the app to the browser's navigation.
+fn on_drop(event: &web_sys::DragEvent, doc: &web_sys::Document) {
+    let Some((id, handle)) = file_drop_editor(event) else {
+        return;
+    };
+    event.prevent_default();
+    let files = event
+        .data_transfer()
+        .map(|dt| crate::event_delegation::dropped_files(&dt))
+        .unwrap_or_default();
+    if handle.refuses_edits() {
+        crate::event_delegation::dispatch_dropped_files(event, files);
+        return;
+    }
+    let (images, rest): (Vec<_>, Vec<_>) = files
+        .into_iter()
+        .partition(|file| file.type_().starts_with("image/"));
+    if images.is_empty() {
+        crate::event_delegation::dispatch_dropped_files(event, rest);
+        return;
+    }
+    if let Some(pos) = resolve_editor_point(doc, event.client_x() as f32, event.client_y() as f32)
+        .filter(|hit| hit.container_nid == id)
+        .and_then(|hit| hit.pos(&handle))
+    {
+        handle.set_selection(Selection::cursor(pos));
+    }
+    handle.focus();
+    refresh_caret();
+    offer_image_files(&handle, ImageInputSource::Drop, images);
+    if !rest.is_empty() {
+        crate::event_delegation::dispatch_dropped_files(event, rest);
+    }
 }
 
 // ── IME composition ────────────────────────────────────────────────────────────
@@ -1136,8 +1721,15 @@ enum EditIntent {
     InsertText,
     /// Run a named editor command.
     Command(&'static str),
-    /// Extend the selection over `motion`, then delete it — the word/line deletes a
-    /// soft keyboard asks for, which the base keymap has no single command for.
+    /// Delete to the edge of the **visual** line the caret is on (`forward`: its
+    /// end) — `deleteSoftLine*`, what a soft keyboard or Cmd+Backspace asks for
+    /// (#301). Resolved from the browser's layout by [`visual_line_bound`]; the
+    /// textblock edge without geometry.
+    DeleteToVisualLine { forward: bool },
+    /// Extend the selection over `motion`, then delete it — `deleteHardLine*`,
+    /// which means the textblock's edge. The core has no command for either line
+    /// delete; word deletes are core commands (`deleteWordBackward` /
+    /// `deleteWordForward`, #303) and name them.
     DeleteTo(CursorMotion),
     /// Let the browser make the edit in the mirrored textarea and recover it by diff
     /// on the following `input` — the only honest way to apply an edit whose extent
@@ -1171,14 +1763,15 @@ fn edit_intent(input_type: &str) -> EditIntent {
         "deleteContent" => EditIntent::Command("deleteSelection"),
         "deleteContentBackward" => EditIntent::Command("deleteCharBackward"),
         "deleteContentForward" => EditIntent::Command("deleteCharForward"),
-        "deleteWordBackward" => EditIntent::DeleteTo(CursorMotion::WordLeft),
-        "deleteWordForward" => EditIntent::DeleteTo(CursorMotion::WordRight),
-        "deleteSoftLineBackward" | "deleteHardLineBackward" => {
-            EditIntent::DeleteTo(CursorMotion::LineStart)
-        }
-        "deleteSoftLineForward" | "deleteHardLineForward" => {
-            EditIntent::DeleteTo(CursorMotion::LineEnd)
-        }
+        // The core commands carry the block-edge and inline-atom rules (#303).
+        "deleteWordBackward" => EditIntent::Command("deleteWordBackward"),
+        "deleteWordForward" => EditIntent::Command("deleteWordForward"),
+        // A soft line is the visual line the caret is on; a hard line is the
+        // textblock (#301).
+        "deleteSoftLineBackward" => EditIntent::DeleteToVisualLine { forward: false },
+        "deleteSoftLineForward" => EditIntent::DeleteToVisualLine { forward: true },
+        "deleteHardLineBackward" => EditIntent::DeleteTo(CursorMotion::LineStart),
+        "deleteHardLineForward" => EditIntent::DeleteTo(CursorMotion::LineEnd),
         "historyUndo" => EditIntent::Command("undo"),
         "historyRedo" => EditIntent::Command("redo"),
         // The `cut` / `paste` listeners already ran and applied their own edit.
@@ -1193,15 +1786,47 @@ fn delete_to(handle: &EditorHandle, motion: CursorMotion) -> bool {
     if handle.selection().is_empty() {
         handle.move_cursor(motion, true);
     }
+    delete_extended(handle, !matches!(motion, CursorMotion::LineStart))
+}
+
+/// Delete from the caret to the edge of its visual line ([`visual_line_bound`]),
+/// or to the textblock's edge when there is no geometry to ask. An already
+/// non-empty selection is deleted as it stands.
+fn delete_to_visual_line(handle: &EditorHandle, forward: bool) -> bool {
+    let sel = handle.selection();
+    if sel.is_empty() {
+        let head = sel.head();
+        match visual_line_bound(handle, head, forward) {
+            Some(edge) if edge != head => handle.set_selection(Selection::text(head, edge)),
+            Some(_) => {}
+            None => {
+                handle.move_cursor(
+                    if forward {
+                        CursorMotion::LineEnd
+                    } else {
+                        CursorMotion::LineStart
+                    },
+                    true,
+                );
+            }
+        }
+    }
+    delete_extended(handle, forward)
+}
+
+/// Delete the selection a line delete extended over; if the extension had
+/// nowhere to go, delete one character in its direction instead.
+fn delete_extended(handle: &EditorHandle, forward: bool) -> bool {
     if handle.selection().is_empty() {
-        // The motion had nowhere to go: word and model-line motions are *within* a
-        // textblock, so at a block edge they resolve to the caret's own position and
-        // leave the selection collapsed. A word/line delete there means what Backspace
-        // and Delete mean — join with the adjacent block. Without this the gesture is
-        // swallowed silently, because the `beforeinput` was already `preventDefault`ed.
-        return handle.command(match motion {
-            CursorMotion::WordLeft | CursorMotion::LineStart => "deleteCharBackward",
-            _ => "deleteCharForward",
+        // The motion had nowhere to go: the caret is already at the line's edge —
+        // for a model-line motion, the textblock's. A line delete there means what
+        // Backspace and Delete mean — join with the adjacent block, or at a soft
+        // wrap take the character there. Without this the gesture is swallowed
+        // silently, because the `beforeinput` was already `preventDefault`ed.
+        return handle.command(if forward {
+            "deleteCharForward"
+        } else {
+            "deleteCharBackward"
         });
     }
     handle.command("deleteSelection")
@@ -1249,6 +1874,10 @@ fn on_before_input(event: &web_sys::InputEvent) {
             event.prevent_default();
             delete_to(&handle, motion)
         }
+        EditIntent::DeleteToVisualLine { forward } => {
+            event.prevent_default();
+            delete_to_visual_line(&handle, forward)
+        }
     };
     // Typing is a caret move as much as an edit: drop any vertical-motion goal column
     // so a following Up/Down starts from where the text actually landed.
@@ -1285,9 +1914,251 @@ fn on_input() {
 
 // ── Pointer ──────────────────────────────────────────────────────────────────
 
+/// The link on the character under viewport point `(x, y)`, given the element the
+/// pointer is over (`target`) inside the editor `editor_el`.
+///
+/// The browser's own hit test decides *whether* a link is under the pointer — the
+/// `<a data-pm-mark="link">` it found — and the model decides which one, as a
+/// whole run. The browser's caret-from-point call
+/// (`event_delegation::caret_point_from_point`: `caretRangeFromPoint`, or
+/// `caretPositionFromPoint` where that is missing) answers the nearest caret boundary, which is
+/// the start **or the end** of the character under the pointer, so the character
+/// is the one after that boundary if it carries the element's `href`, and else the
+/// one before it. That is what keeps the space after a link off the link: no `<a>`
+/// is under the pointer there.
+fn link_under_pointer(
+    doc: &web_sys::Document,
+    target: &web_sys::Element,
+    editor_el: &web_sys::Element,
+    handle: &EditorHandle,
+    container_nid: u64,
+    x: f32,
+    y: f32,
+) -> Option<LinkSpan> {
+    let anchor = target
+        .closest("a[data-pm-mark='link']")
+        .ok()
+        .flatten()
+        .filter(|a| editor_el.contains(Some(a)))?;
+    let href = anchor.get_attribute("href").unwrap_or_default();
+    let hit = resolve_editor_point(doc, x, y).filter(|hit| hit.container_nid == container_nid)?;
+    let pos = hit.pos(handle)?;
+    handle
+        .link_at(pos)
+        .filter(|link| link.href == href)
+        .or_else(|| {
+            let before = pos.0.checked_sub(1)?;
+            handle.link_at(Pos(before)).filter(|link| link.href == href)
+        })
+}
+
+/// The client rect of `link`'s run: a DOM `Range` from its first character to past
+/// its last, measured by the browser (a wrapped link is the union of its lines).
+fn link_client_rect(
+    handle: &EditorHandle,
+    doc: &web_sys::Document,
+    link: &LinkSpan,
+) -> Option<rinch_core::ElementBounds> {
+    let (from_nid, from_byte) = handle.caret_address(link.from)?;
+    let (to_nid, to_byte) = handle.caret_address(link.to)?;
+    let (start, start_off) = find_text_node_at_byte_offset(&node_by_nid(from_nid)?, from_byte)?;
+    let (end, end_off) = find_text_node_at_byte_offset(&node_by_nid(to_nid)?, to_byte)?;
+    let range = doc.create_range().ok()?;
+    range.set_start(&start, start_off).ok()?;
+    range.set_end(&end, end_off).ok()?;
+    let r = range.get_bounding_client_rect();
+    Some(rinch_core::ElementBounds {
+        x: r.x() as f32,
+        y: r.y() as f32,
+        width: r.width() as f32,
+        height: r.height() as f32,
+    })
+}
+
+/// Offer a primary press on a link to the editor's `on_link_click`. `true` when the
+/// app claimed it — the caller then places no caret, starts no drag and leaves the
+/// selection alone.
+fn offer_link_click(
+    event: &web_sys::MouseEvent,
+    doc: &web_sys::Document,
+    target: &web_sys::Element,
+    editor_el: &web_sys::Element,
+    handle: &EditorHandle,
+    container_nid: u64,
+) -> bool {
+    let (x, y) = (event.client_x() as f32, event.client_y() as f32);
+    let Some(link) = link_under_pointer(doc, target, editor_el, handle, container_nid, x, y) else {
+        return false;
+    };
+    let (ctrl, meta) = (event.ctrl_key(), event.meta_key());
+    handle.dispatch_link_click(&LinkClick {
+        link,
+        primary: if is_mac() { meta } else { ctrl },
+        ctrl,
+        meta,
+        shift: event.shift_key(),
+        alt: event.alt_key(),
+    })
+}
+
+/// Report the link under the pointer to the editors' `on_link_hover` callbacks,
+/// which the registry fires only on a change. Called for a `mousemove` that is not
+/// a drag-select, and only while some editor has a hover callback. A move over no
+/// link element costs one `closest` walk.
+fn update_link_hover(event: &web_sys::MouseEvent, doc: &web_sys::Document) {
+    let hovered = (|| {
+        let target = event
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())?;
+        // Cheap first: no link element under the pointer, no link.
+        target.closest("a[data-pm-mark='link']").ok().flatten()?;
+        let editor_el = crate::event_delegation::editor_owning(&target)?;
+        let container_nid = get_nid(&editor_el.clone().into())?.0;
+        let handle = registry::editor_for(container_nid)?;
+        let (x, y) = (event.client_x() as f32, event.client_y() as f32);
+        let link = link_under_pointer(doc, &target, &editor_el, &handle, container_nid, x, y)?;
+        let rect = link_client_rect(&handle, doc, &link).unwrap_or_default();
+        Some((handle, LinkHover { link, rect }))
+    })();
+    registry::set_link_hover(None, hovered);
+}
+
+/// Report the image under the pointer to the editors' `on_image_hover`
+/// callbacks, which the registry fires only on a change. Called for a
+/// `mousemove` that is not a drag-select, and only while some editor has an
+/// image hover callback. A move over no editor image costs one `closest` walk.
+fn update_image_hover(event: &web_sys::MouseEvent) {
+    let hovered = (|| {
+        let target = event
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())?;
+        let img = target.closest("[data-pm-type='image']").ok().flatten()?;
+        let editor_el = crate::event_delegation::editor_owning(&img)?;
+        let container_nid = get_nid(&editor_el.clone().into())?.0;
+        let handle = registry::editor_for(container_nid)?;
+        let host_nid = get_nid(&img.clone().into())?.0;
+        let (pos, attrs) = handle.image_at_host(host_nid)?;
+        let r = img.get_bounding_client_rect();
+        let rect = rinch_core::ElementBounds {
+            x: r.x() as f32,
+            y: r.y() as f32,
+            width: r.width() as f32,
+            height: r.height() as f32,
+        };
+        Some((handle, ImageHover { pos, attrs, rect }))
+    })();
+    registry::set_image_hover(None, hovered);
+}
+
+/// The first text node under `node`, in document order.
+fn first_text_node(node: &web_sys::Node) -> Option<web_sys::Node> {
+    let kids = node.child_nodes();
+    for i in 0..kids.length() {
+        let kid = kids.item(i)?;
+        if kid.node_type() == web_sys::Node::TEXT_NODE {
+            return Some(kid);
+        }
+        if let Some(found) = first_text_node(&kid) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// The link whose `<a data-pm-mark="link">` element is `anchor`, as the model's
+/// whole run: the link carrying the element's first character, if it has the
+/// element's `href`. For a click with no pointer (keyboard activation), where
+/// there is no point to ask the character under.
+fn link_of_anchor(anchor: &web_sys::Element, handle: &EditorHandle) -> Option<LinkSpan> {
+    if anchor.get_attribute("data-pm-mark").as_deref() != Some("link") {
+        return None; // an `<a>` a plugin's widget drew: not a link mark
+    }
+    let href = anchor.get_attribute("href").unwrap_or_default();
+    let textblock = {
+        let mut cur = anchor.parent_element();
+        loop {
+            let el = cur?;
+            if el.has_attribute("data-pm-editor") {
+                return None;
+            }
+            if el.has_attribute("data-pm-type") {
+                break el;
+            }
+            cur = el.parent_element();
+        }
+    };
+    let textblock_nid = get_nid(&textblock.clone().into())?.0;
+    let text = first_text_node(anchor)?;
+    let offset = model_offset_in_block(&textblock, &text, 0);
+    let pos = handle.pos_in_textblock(textblock_nid, offset)?;
+    handle.link_at(pos).filter(|link| link.href == href)
+}
+
+/// A `click` (or middle-button `auxclick`) on an `<a href>` inside an editor.
+///
+/// **Keyboard activation first.** An editor link is an ordinary Tab stop (the
+/// editor is not `contenteditable`), and Enter on a focused one arrives as a
+/// `click` with `detail == 0` and no `mousedown` before it, so nothing has
+/// offered it to `on_link_click` yet. It is offered here, with the link found
+/// from the element rather than from a point; a claim prevents the navigation.
+///
+/// **Then the default action.** It is prevented when the editor is
+/// **editable** — a click in an editable editor is an edit gesture (it placed
+/// the caret), so the browser following the link is always wrong, which was a
+/// bug before link events existed — or when it has an `on_link_click`
+/// callback, which is where the app says what a link does. A **read-only**
+/// editor with no callback keeps native link behaviour: a click follows the
+/// link, and a middle click or Ctrl/Cmd+click opens it in a new tab. An
+/// `<a href>` that a plugin's decoration widget drew follows the same rule, and
+/// is never offered to `on_link_click`, which is about link marks. The
+/// right-click menu's "Open link" is never touched.
+fn handle_link_click(event: &web_sys::MouseEvent) {
+    let Some(anchor) = event
+        .target()
+        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        .and_then(|el| el.closest("a[href]").ok().flatten())
+    else {
+        return;
+    };
+    let Some(editor_el) = crate::event_delegation::editor_owning(&anchor) else {
+        return;
+    };
+    let Some(handle) = get_nid(&editor_el.into()).and_then(|nid| registry::editor_for(nid.0))
+    else {
+        return;
+    };
+    if event.type_() == "click"
+        && event.button() == 0
+        && event.detail() == 0
+        && let Some(link) = link_of_anchor(&anchor, &handle)
+    {
+        let (ctrl, meta) = (event.ctrl_key(), event.meta_key());
+        let claimed = handle.dispatch_link_click(&LinkClick {
+            link,
+            primary: if is_mac() { meta } else { ctrl },
+            ctrl,
+            meta,
+            shift: event.shift_key(),
+            alt: event.alt_key(),
+        });
+        if claimed {
+            event.prevent_default();
+            return;
+        }
+    }
+    if !handle.is_read_only() || handle.has_link_click_callback() {
+        event.prevent_default();
+    }
+}
+
 /// Handle a `mousedown`. Returns whether it landed in an editor (so the listener
 /// consumes it). Mirrors `try_new_editor_click`.
 fn handle_mousedown(event: &web_sys::MouseEvent, doc: &web_sys::Document) -> bool {
+    // A touch tap's compatibility `mousedown`, for a tap its `pointerup` already
+    // serviced: consumed, and nothing redone (issue #302).
+    if is_compat_mousedown_of_serviced_tap(event, doc) {
+        return true;
+    }
     // A press of any button means the browser's menu is closed: the cycle ends,
     // and the textarea is back off-screen before this press is resolved.
     end_context_menu_cycle();
@@ -1309,17 +2180,21 @@ fn handle_mousedown(event: &web_sys::MouseEvent, doc: &web_sys::Document) -> boo
         };
         target = beneath;
     }
-    let Some(editor_el) = target.closest("[data-pm-editor]").ok().flatten() else {
-        // Outside any editor. Blur only when moving to another text field, so a
-        // toolbar click keeps the editor focused (and its selection visible).
-        if target
-            .closest("input, textarea, [contenteditable], [data-pm-editor]")
-            .ok()
-            .flatten()
-            .is_some()
-        {
+    let Some(editor_el) = crate::event_delegation::editor_owning(&target) else {
+        // Outside any editor (issue #271). A press on another text field — the
+        // rule keyboard activation uses — takes the keyboard. A press on a
+        // non-focusable `data-rid` handler leaves it with the editor: the browser
+        // would move focus to `<body>`, so the default is prevented. Any other
+        // press (a focusable control, blank page) moves focus natively, and the
+        // capture textarea's `blur` releases the editor and hides its caret.
+        if crate::event_delegation::in_text_control(&target) {
             set_focused_editor(None);
             blur_capture_target();
+        } else if event.button() == 0
+            && editor_owns_keyboard(doc)
+            && is_non_focusable_handler_press(&target)
+        {
+            event.prevent_default();
         }
         return false;
     };
@@ -1335,13 +2210,31 @@ fn handle_mousedown(event: &web_sys::MouseEvent, doc: &web_sys::Document) -> boo
     // to this editor (a non-`contenteditable` `<div>` would receive none).
     focus_capture_target(doc, &handle);
 
-    // A click on a leaf atom (image / horizontal rule) node-selects it.
+    // A click on a leaf atom node-selects it: any node the schema calls a
+    // selectable leaf (an image, a horizontal rule, an `embed` — a node view's
+    // frame), which `node_selection_at_host` decides; the innermost node host is
+    // asked, so a press in a paragraph's text answers `None` and places a caret.
     let leaf_selection = target
-        .closest("[data-pm-type='image'], [data-pm-type='horizontal_rule']")
+        .closest("[data-pm-type]")
         .ok()
         .flatten()
         .and_then(|leaf| get_nid(&leaf.into()).map(|n| n.0))
         .and_then(|leaf_nid| handle.node_selection_at_host(leaf_nid));
+
+    // A single primary press on a link is the app's first (`on_link_click`),
+    // before anything below moves the caret. Not a press on an image (it
+    // node-selects), not a context press, not a double or triple press.
+    if leaf_selection.is_none()
+        && event.button() == 0
+        && !is_context_press(event)
+        && event.detail() <= 1
+        && offer_link_click(event, doc, &target, &editor_el, &handle, container_nid)
+    {
+        LINK_CLAIMED_IN.with(|c| c.set(Some(container_nid)));
+        registry::end_drag(None);
+        refresh_caret();
+        return true;
+    }
 
     // A context press — the right button, or a Control-click on macOS: the caret
     // rule native editors follow — a press *inside* the selection keeps it (that is
@@ -1354,7 +2247,7 @@ fn handle_mousedown(event: &web_sys::MouseEvent, doc: &web_sys::Document) -> boo
             Some(_) => None,
             None => resolve_editor_point(doc, x, y)
                 .filter(|hit| hit.container_nid == container_nid)
-                .and_then(|hit| handle.pos_at(hit.textblock_nid, hit.byte)),
+                .and_then(|hit| hit.pos(&handle)),
         };
         let sel = handle.selection();
         let inside = !sel.is_empty()
@@ -1420,7 +2313,7 @@ fn handle_mousedown(event: &web_sys::MouseEvent, doc: &web_sys::Document) -> boo
         && (x as f64) < content.get_bounding_client_rect().left()
         && let Some(hit) = resolve_editor_point(doc, x, y)
         && hit.container_nid == container_nid
-        && let Some(clicked) = handle.pos_at(hit.textblock_nid, hit.byte)
+        && let Some(clicked) = hit.pos(&handle)
         && handle.toggle_task_checked_at(clicked.0)
     {
         registry::end_drag(None);
@@ -1430,7 +2323,7 @@ fn handle_mousedown(event: &web_sys::MouseEvent, doc: &web_sys::Document) -> boo
 
     if let Some(hit) = resolve_editor_point(doc, x, y)
         && hit.container_nid == container_nid
-        && let Some(clicked) = handle.pos_at(hit.textblock_nid, hit.byte)
+        && let Some(clicked) = hit.pos(&handle)
     {
         match event.detail() {
             2 => {
@@ -1447,7 +2340,10 @@ fn handle_mousedown(event: &web_sys::MouseEvent, doc: &web_sys::Document) -> boo
                 registry::begin_drag(None, container_nid, anchor.0);
             }
             _ => {
-                handle.set_selection(Selection::cursor(clicked));
+                // A press past a wrapped line's end lands on its wrap point,
+                // and belongs to the line pressed on (#301).
+                let affinity = hit_affinity(&handle, clicked, y).0;
+                handle.set_selection_with_affinity(Selection::cursor(clicked), affinity);
                 registry::begin_drag(None, container_nid, clicked.0);
             }
         }
@@ -1474,7 +2370,7 @@ fn handle_mousemove(event: &web_sys::MouseEvent, doc: &web_sys::Document) -> boo
     let y = event.client_y() as f32;
     if let Some(hit) = resolve_editor_point(doc, x, y)
         && hit.container_nid == container_nid
-        && let Some(head) = handle.pos_at(hit.textblock_nid, hit.byte)
+        && let Some(head) = hit.pos(&handle)
     {
         handle.set_selection(Selection::text(Pos(anchor), head));
         refresh_caret();
@@ -1549,6 +2445,103 @@ fn editor_key_binding(
 
 /// Handle a `keydown`. Returns whether the editor consumed the key (so the listener
 /// `preventDefault`s + stops it). Mirrors `dispatch_new_editor_key`.
+/// A key whose target is inside a node view's component, offered to the view
+/// ([`EditorHandle::offer_node_view_key`]): `Some(consumed)` when the target is in
+/// one, `None` otherwise.
+fn offer_node_view_key(event: &web_sys::KeyboardEvent) -> Option<bool> {
+    let target = event
+        .target()
+        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())?;
+    let (editor_el, host) = crate::event_delegation::node_view_around(&target)?;
+    let container_nid = get_nid(&editor_el.into())?.0;
+    let host_nid = get_nid(&host.into())?.0;
+    let handle = registry::editor_for(container_nid)?;
+    let key = event.key();
+    let offered = rinch_editor_view::EditorKey {
+        key: &key,
+        primary: if is_mac() {
+            event.meta_key()
+        } else {
+            event.ctrl_key()
+        },
+        ctrl: event.ctrl_key(),
+        meta: event.meta_key(),
+        shift: event.shift_key(),
+        alt: event.alt_key(),
+        repeat: event.repeat(),
+    };
+    Some(handle.offer_node_view_key(host_nid, &offered))
+}
+
+/// The page's node-view `ResizeObserver` and the hosts it watches, each with its
+/// editor's document key.
+type NodeViewResize = (web_sys::ResizeObserver, Vec<(web_sys::Element, u64)>);
+
+thread_local! {
+    /// One `ResizeObserver` per page, watching every mounted node view's host: a
+    /// view that grows or shrinks owes its editor an overlay pass, so the caret
+    /// and the selection highlight below it follow. Keyed by host element →
+    /// document key.
+    static NODE_VIEW_RESIZE: RefCell<Option<NodeViewResize>> =
+        const { RefCell::new(None) };
+}
+
+/// [`registry::set_node_view_host_listener`]'s listener: observe a mounted
+/// view's host, forget an unmounted one's.
+fn on_node_view_host(
+    doc_key: u64,
+    _container: u64,
+    host: &rinch_core::dom::NodeHandle,
+    mounted: bool,
+) {
+    let Some(el) = crate::web_document::element_of(host) else {
+        return;
+    };
+    NODE_VIEW_RESIZE.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if cell.is_none() {
+            let cb = wasm_bindgen::closure::Closure::<dyn FnMut(js_sys::Array)>::new(
+                |entries: js_sys::Array| {
+                    let keys: Vec<u64> = NODE_VIEW_RESIZE.with(|cell| {
+                        let cell = cell.borrow();
+                        let Some((_, hosts)) = cell.as_ref() else {
+                            return Vec::new();
+                        };
+                        entries
+                            .iter()
+                            .filter_map(|e| e.dyn_into::<web_sys::ResizeObserverEntry>().ok())
+                            .filter_map(|e| {
+                                let t = e.target();
+                                hosts.iter().find(|(h, _)| *h == t).map(|(_, k)| *k)
+                            })
+                            .collect()
+                    });
+                    for key in keys {
+                        registry::owe_overlay_pass_for(key);
+                    }
+                },
+            );
+            let Ok(observer) = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref()) else {
+                return;
+            };
+            cb.forget();
+            *cell = Some((observer, Vec::new()));
+        }
+        let Some((observer, hosts)) = cell.as_mut() else {
+            return;
+        };
+        if mounted {
+            if !hosts.iter().any(|(h, _)| *h == el) {
+                observer.observe(&el);
+                hosts.push((el, doc_key));
+            }
+        } else if let Some(i) = hosts.iter().position(|(h, _)| *h == el) {
+            observer.unobserve(&el);
+            hosts.remove(i);
+        }
+    });
+}
+
 fn handle_keydown(event: &web_sys::KeyboardEvent, doc: &web_sys::Document) -> bool {
     // A key reaching the page means the browser's menu is closed (it takes the
     // keyboard while open); the cycle ends before the key is read, so a typed
@@ -1557,18 +2550,30 @@ fn handle_keydown(event: &web_sys::KeyboardEvent, doc: &web_sys::Document) -> bo
     if event.key() == "ContextMenu" {
         MENU_KEY_TO_APP.with(|c| c.set(false));
     }
-    // Never hijack a key destined for a real form control / editable element (e.g. a
-    // search box the user clicked) — but our own hidden capture textarea
-    // (`data-pm-capture`) IS the editor's focus target, so let its keys through.
-    if let Some(t) = event
+    // A key inside a node view's component (an input in an app's sheet drawn in
+    // an editor) is the view's `on_key`'s first; an Escape it leaves gives the
+    // keyboard back to the editor, caret after the node.
+    if let Some(consumed) = offer_node_view_key(event) {
+        if consumed {
+            refresh_caret();
+        }
+        return consumed;
+    }
+    // The editor owns a key only while its capture textarea holds the keyboard
+    // (issue #271). This listener is on `document` in the capture phase, so it
+    // sees every key on the page: a key whose target is anything else — a search
+    // box, a `<button>` or `tabindex` control the user tabbed or clicked to, the
+    // page body after a click on blank space — belongs to that element. Routing
+    // it to the last editor clicked used to split that editor's paragraph on
+    // Enter and swallow the key, so keyboard activation went inert page-wide once
+    // any editor had been clicked. (A toolbar that must not take the keyboard
+    // from the editor says so with `data-nofocus`, which keeps the capture
+    // textarea focused through the press.)
+    let on_capture = event
         .target()
         .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
-        && !t.has_attribute("data-pm-capture")
-        && t.closest("input, textarea, select, [contenteditable]")
-            .ok()
-            .flatten()
-            .is_some()
-    {
+        .is_some_and(|t| t.has_attribute("data-pm-capture"));
+    if !on_capture {
         return false;
     }
     // During an IME composition, yield every key to the textarea + IME — the composed
@@ -1580,6 +2585,31 @@ fn handle_keydown(event: &web_sys::KeyboardEvent, doc: &web_sys::Document) -> bo
         return false;
     };
     let key = event.key();
+    // The app's `EditorHandle::on_key` sees the key before anything below acts on
+    // it, and may take it: an open autocomplete popup's arrows, Enter and Escape.
+    // A consumed key is `preventDefault`ed and stopped like one the editor
+    // handles. `Unidentified` / `Process` are a soft keyboard's and an input
+    // method's: their input arrives through `beforeinput` and composition.
+    if key != "Unidentified" && key != "Process" {
+        let offered = rinch_editor_view::EditorKey {
+            key: &key,
+            primary: if is_mac() {
+                event.meta_key()
+            } else {
+                event.ctrl_key()
+            },
+            ctrl: event.ctrl_key(),
+            meta: event.meta_key(),
+            shift: event.shift_key(),
+            alt: event.alt_key(),
+            repeat: event.repeat(),
+        };
+        if handle.offer_key(&offered) {
+            // The callback may have edited or moved the selection.
+            refresh_caret();
+            return true;
+        }
+    }
     // The PHYSICAL key, for keymap lookup — `event.key()` is the *resolved* char ("*" for
     // Shift+8, "¡" for Alt+1) which would never match the keymap's physical-key bindings.
     let code = event.code();
@@ -1587,7 +2617,11 @@ fn handle_keydown(event: &web_sys::KeyboardEvent, doc: &web_sys::Document) -> bo
     let shift = event.shift_key();
     let alt = event.alt_key();
 
-    if key != "ArrowUp" && key != "ArrowDown" {
+    // The goal column survives a run of Up / Down and Page Up / Down.
+    if !matches!(
+        key.as_str(),
+        "ArrowUp" | "ArrowDown" | "PageUp" | "PageDown"
+    ) {
         set_goal_x(None);
     }
 
@@ -1604,7 +2638,7 @@ fn handle_keydown(event: &web_sys::KeyboardEvent, doc: &web_sys::Document) -> bo
     // no menu of its own — nor at the release, where Windows opens it (by reading
     // Chromium), which is what `MENU_KEY_TO_APP` withholds.
     if key == "ContextMenu" || (key == "F10" && shift) {
-        let point = key_menu_point(&handle, doc, container_nid);
+        let point = key_menu_point(&handle, container_nid);
         if let Some((menu_el, id)) = key_menu_app_handler(&handle, container_nid) {
             set_click_context_for(
                 &menu_el,
@@ -1651,24 +2685,53 @@ fn handle_keydown(event: &web_sys::KeyboardEvent, doc: &web_sys::Document) -> bo
             },
             shift,
         ),
-        "Home" => handle.move_cursor(
-            if ctrl {
-                CursorMotion::DocStart
-            } else {
-                CursorMotion::LineStart
-            },
+        // Page Up / Down (#2020), Chrome's bindings: on macOS the plain key
+        // scrolls a page and leaves the caret, Option moves it and Shift
+        // extends; elsewhere the key moves and Shift extends. Ctrl (Cmd) and
+        // Alt there are the browser's.
+        "PageUp" | "PageDown" if is_mac() && !event.meta_key() && !event.ctrl_key() => page_step(
+            &handle,
+            container_nid,
+            doc,
+            key == "PageDown",
             shift,
+            !alt && !shift,
         ),
-        "End" => handle.move_cursor(
-            if ctrl {
-                CursorMotion::DocEnd
-            } else {
-                CursorMotion::LineEnd
-            },
-            shift,
-        ),
-        // 2. Tab: table cell-nav (shared) first; else the keymap resolves
+        "PageUp" | "PageDown" if !is_mac() && !ctrl && !alt => {
+            page_step(&handle, container_nid, doc, key == "PageDown", shift, false)
+        }
+        "Home" if ctrl => handle.move_cursor(CursorMotion::DocStart, shift),
+        "End" if ctrl => handle.move_cursor(CursorMotion::DocEnd, shift),
+        // The visual line's edges, as on desktop (#301).
+        "Home" => move_to_line_edge(&handle, false, shift),
+        "End" => move_to_line_edge(&handle, true, shift),
+        // 2. Tab. A read-only editor is a `readonly` field to it (#833): its
+        //    keymap's sink / lift are refused, so Tab and Shift+Tab move the focus
+        //    on from the editor's place in the page instead of being swallowed.
+        //    Otherwise table cell-nav (shared) first; else the keymap resolves
         //    `Tab`→sinkListItem / `Shift-Tab`→liftListItem below. Consumed either way.
+        //    Shift+Tab with no Tab stop before the editor (and no trap) leaves the
+        //    page backward, as from a native `<textarea readonly>` that is the first
+        //    stop: the focus goes to the document, so the capture textarea is
+        //    blurred and the key consumed. The browser's own Shift+Tab would start
+        //    from the capture textarea at the end of `<body>` and land on the
+        //    page's last control instead. Forward past the last stop is left to
+        //    the browser, whose Tab from there leaves the page as native does.
+        "Tab" if !ctrl && !alt && handle.refuses_edits() => {
+            let Some(container) =
+                node_by_nid(container_nid).and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+            else {
+                return false;
+            };
+            if crate::event_delegation::tab_from_editor(doc, &container, shift) {
+                return true;
+            }
+            if shift {
+                blur_editor(container_nid);
+                return true;
+            }
+            return false;
+        }
         "Tab" if handle.tab_cell(shift) => true,
         _ => {
             // 3. THE KEYMAP — the single source of truth for every command key. Letters
@@ -1689,7 +2752,7 @@ fn handle_keydown(event: &web_sys::KeyboardEvent, doc: &web_sys::Document) -> bo
                 // A read-only editor refuses the text but still owns the key, as
                 // on desktop: left unconsumed, a typed letter would go on to the
                 // page's own shortcuts and Space would scroll it.
-                handle.insert_text(&key) || handle.is_read_only()
+                handle.insert_text(&key) || handle.refuses_edits()
             } else {
                 false
             }
@@ -1701,17 +2764,203 @@ fn handle_keydown(event: &web_sys::KeyboardEvent, doc: &web_sys::Document) -> bo
     handled
 }
 
+/// Page Up (`down = false`) or Page Down in the focused editor (#2020), as on
+/// desktop (`RinchApp::page_editor`): the page is 0.875 of the nearest
+/// scroller's `clientHeight` (Chrome's step), at most the window's — the
+/// scroller a scroll lock leaves alone, not past a `position: fixed` box; the
+/// scroller moves a page, and the caret goes to the point a page below (above)
+/// where it is, at the goal column, so with the caret in view it keeps its
+/// place on screen. With the caret scrolled out of view the point is brought
+/// into the scrollport first: the page is from the caret, not the view. A page
+/// that reaches the document's last (first) line, or runs past the editor, puts
+/// the caret at the document's end (start), as Chrome does. `scroll_only`
+/// (macOS's plain key), a read-only editor (Chrome's read-only `<textarea>`)
+/// and a caret with no rect scroll and leave the selection. Always consumed:
+/// the browser's own Page Down would scroll the capture textarea's page.
+fn page_step(
+    handle: &EditorHandle,
+    container_nid: u64,
+    doc: &web_sys::Document,
+    down: bool,
+    extend: bool,
+    scroll_only: bool,
+) -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    let Some(container) =
+        node_by_nid(container_nid).and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+    else {
+        return false;
+    };
+    // The nearest scroller that overflows, the editor itself included, and
+    // that no `lock_scroll` overlay locks out (desktop's `page_scroller`, the
+    // drag auto-scroll's rule) — else the page's scrolling element, on the
+    // same terms. The walk stops at a `position: fixed` box (a modal): the
+    // viewport holds it, so nothing outside it moves it.
+    let mut scroller = None;
+    let mut fixed = false;
+    let mut cur = Some(container.clone());
+    while let Some(el) = cur {
+        let cs = window.get_computed_style(&el).ok().flatten();
+        let prop = |name: &str| {
+            cs.as_ref()
+                .and_then(|cs| cs.get_property_value(name).ok())
+                .unwrap_or_default()
+        };
+        let overflow = prop("overflow-y");
+        if (overflow == "auto" || overflow == "scroll")
+            && el.scroll_height() > el.client_height()
+            && !crate::web_document::scroll_locked_out(&el)
+        {
+            scroller = Some(el);
+            break;
+        }
+        if prop("position") == "fixed" {
+            fixed = true;
+            break;
+        }
+        cur = el.parent_element();
+    }
+    let page_el = doc.scrolling_element();
+    let page_locked = page_el
+        .as_ref()
+        .is_none_or(crate::web_document::scroll_locked_out);
+    if scroller.is_none() && !fixed && !page_locked {
+        scroller = page_el.clone();
+    }
+    let view = window
+        .inner_height()
+        .ok()
+        .and_then(|h| h.as_f64())
+        .unwrap_or(f64::MAX);
+    let port = scroller
+        .as_ref()
+        .map_or(view, |s| f64::from(s.client_height()))
+        .min(view);
+    let page = (port * 0.875).round().max(1.0);
+    let step = if down { page } else { -page };
+    let head = handle.selection().head();
+    let from = if scroll_only || handle.refuses_edits() {
+        None
+    } else {
+        head_screen_rect(handle, head)
+    };
+    let scroll_by = |s: &web_sys::Element, dy: f64| {
+        let before = f64::from(s.scroll_top());
+        s.set_scroll_top((before + dy).round() as i32);
+        f64::from(s.scroll_top()) - before
+    };
+    let scrolled = scroller.as_ref().map_or(0.0, |s| scroll_by(s, step));
+    let Some((hx, hy, hh)) = from else {
+        return true;
+    };
+    let gx = goal_x().unwrap_or(hx);
+    set_goal_x(Some(gx));
+    // A page from the caret's middle, where the caret is drawn now —
+    // measured, so a scroller that did not carry the editor moves nothing.
+    let now_y =
+        head_screen_rect(handle, head).map_or(f64::from(hy) - scrolled, |(_, y, _)| f64::from(y));
+    let mut ty = (now_y + f64::from(hh * 0.5) + step) as f32;
+    let view_h = view.min(f64::from(i32::MAX)) as f32;
+    // The caret scrolled out of the scroller's view (the wheel): the point a
+    // page from it is outside the scrollport too, where
+    // `caretPositionFromPoint` finds nothing or another element. Chrome 155
+    // and Firefox 155 move the caret a page from where it is, wherever the
+    // view is: bring the point into the scrollport first, half a caret in
+    // from the edge it is past.
+    if let Some(s) = &scroller {
+        let band = if page_el.as_ref().is_some_and(|p| p.is_same_node(Some(s))) {
+            (0.0, view_h)
+        } else {
+            let r = s.get_bounding_client_rect();
+            let top = r.top() as f32 + s.client_top() as f32;
+            (top.max(0.0), (top + s.client_height() as f32).min(view_h))
+        };
+        let (lo, hi) = (band.0 + hh * 0.5, band.1 - hh * 0.5);
+        let over = if ty < lo {
+            ty - lo
+        } else if ty > hi {
+            ty - hi
+        } else {
+            0.0
+        };
+        if over != 0.0 && lo <= hi {
+            ty -= scroll_by(s, f64::from(over)) as f32;
+        }
+    }
+    // A point still off the window resolves to nothing: with the scroller
+    // running past the window's edge (and stopped at its end), bring the
+    // point in by the window, as the caret's reveal would have afterwards —
+    // unless a scroll lock holds the page, or the editor is in a fixed box,
+    // which the window does not move.
+    let off = if ty < 0.0 {
+        ty - hh
+    } else if ty >= view_h {
+        ty - view_h + hh
+    } else {
+        0.0
+    };
+    if off != 0.0 && !page_locked && !fixed {
+        let before = window.scroll_y().unwrap_or(0.0);
+        window.scroll_by_with_x_and_y(0.0, f64::from(off));
+        ty -= (window.scroll_y().unwrap_or(0.0) - before) as f32;
+    }
+    let edge = || {
+        let doc = handle.doc();
+        if down {
+            Selection::at_end(&doc).head()
+        } else {
+            Selection::at_start(&doc).head()
+        }
+    };
+    let target = resolve_editor_point(doc, gx, ty)
+        .filter(|hit| hit.container_nid == container_nid)
+        .and_then(|hit| hit.pos(handle))
+        .map(|p| {
+            let (affinity, rect) = hit_affinity(handle, p, ty);
+            (p, affinity, rect)
+        })
+        // On the document's last (first) line: Chrome goes to its end.
+        .filter(|&(_, _, rect)| {
+            let end = head_screen_rect(handle, edge());
+            !matches!((rect, end), (Some((_, py, ph)), Some((_, ey, _)))
+                if (py - ey).abs() < ph * 0.5)
+        });
+    let Some((p, affinity, _)) = target else {
+        let motion = if down {
+            CursorMotion::DocEnd
+        } else {
+            CursorMotion::DocStart
+        };
+        handle.move_cursor(motion, extend);
+        return true;
+    };
+    let sel = if extend {
+        Selection::text(handle.selection().anchor(), p)
+    } else {
+        Selection::cursor(p)
+    };
+    handle.set_selection_with_affinity(sel, affinity);
+    true
+}
+
 /// Vertical caret movement: hit-test at the goal column one line above/below the head's
 /// current screen position. Mirrors the desktop `vertical_step` with browser geometry.
 fn vertical_step(
     handle: &EditorHandle,
-    container_nid: usize,
+    container_nid: u64,
     doc: &web_sys::Document,
     down: bool,
     extend: bool,
 ) -> bool {
+    let dir = if down { 1 } else { -1 };
+    // Shift+Up/Down over a cell selection steps its head cell (#1847).
+    if extend && matches!(handle.selection(), Selection::Cell(_)) {
+        return handle.shift_arrow_cells(rinch_editor_core::Axis::Vert, dir, None);
+    }
     let head = handle.selection().head();
-    let Some((hx, hy, hh)) = head_screen_rect(handle, doc, head) else {
+    let Some((hx, hy, hh)) = head_screen_rect(handle, head) else {
         return false;
     };
     let gx = goal_x().unwrap_or(hx);
@@ -1724,25 +2973,61 @@ fn vertical_step(
     // threshold. Otherwise the probe snapped back to the current line (the target line
     // is an empty block with no text to hit-test, or a block atom is in the way).
     let head_tb = handle.caret_address(head).map(|(t, _)| t);
+    // The hit and the side of a soft wrap it belongs to (#301): a goal column
+    // past the target line's end lands on its wrap point, which is drawn on
+    // that line only upstream.
     let geo_head = resolve_editor_point(doc, gx, ty)
         .filter(|hit| hit.container_nid == container_nid)
-        .and_then(|hit| handle.pos_at(hit.textblock_nid, hit.byte))
-        .filter(|&p| {
+        .and_then(|hit| hit.pos(handle))
+        .map(|p| (p, hit_affinity(handle, p, ty)))
+        .filter(|&(p, (_, rect))| {
             if handle.caret_address(p).map(|(t, _)| t) != head_tb {
                 return true; // different textblock — a real line change
             }
-            match head_screen_rect(handle, doc, p) {
+            match rect {
                 Some((_, py, _)) if down => py > hy + hh * 0.5,
                 Some((_, py, _)) => py < hy - hh * 0.5,
                 None => false,
             }
-        });
+        })
+        .map(|(p, (affinity, _))| (p, affinity));
 
     // Stuck — step to the adjacent textblock in the model so the caret can still land
     // on a blank line above/below (or past a block atom). Mirrors the desktop fallback.
-    let Some(new_head) =
-        geo_head.or_else(|| handle.vertical_block_fallback(down).map(|s| s.head()))
-    else {
+    // Leaving the caret's textblock never steps over a node an app draws with a
+    // node view: it is node-selected and offered the caret, as on desktop.
+    let leaves = match &geo_head {
+        Some((p, _)) => handle.caret_address(*p).map(|(t, _)| t) != head_tb,
+        None => true,
+    };
+    if !extend
+        && leaves
+        && let Some(sel) = handle.vertical_node_view(down)
+    {
+        let from = if down {
+            rinch_editor_view::CaretFrom::Above
+        } else {
+            rinch_editor_view::CaretFrom::Below
+        };
+        handle.select_from_arrow(sel, from);
+        return true;
+    }
+    let step = geo_head.or_else(|| {
+        let target = handle.vertical_block_fallback(down)?.head();
+        // Into a table from outside it: the cell under the goal column, not
+        // the table's last (first) cell in document order (#1847).
+        let entry = handle.vertical_table_entry(target, down, gx, |p| {
+            head_screen_rect(handle, p).map(|(x, _, _)| x)
+        });
+        Some((entry.unwrap_or(target), CaretAffinity::Downstream))
+    });
+    // Shift+Up/Down at a cell's top or bottom line selects cells, as
+    // prosemirror-tables' `shiftArrow` does (#1847).
+    if extend && handle.shift_arrow_cells(rinch_editor_core::Axis::Vert, dir, step.map(|(p, _)| p))
+    {
+        return true;
+    }
+    let Some((new_head, affinity)) = step else {
         return false;
     };
 
@@ -1751,38 +3036,261 @@ fn vertical_step(
     } else {
         Selection::cursor(new_head)
     };
-    handle.set_selection(sel);
+    handle.set_selection_with_affinity(sel, affinity);
     true
 }
 
-/// The viewport `(x, y, height)` of the caret at model `pos`. Prefers a collapsed
-/// `Range` at the host text node; for an *empty* block (no text node) falls back to the
-/// block element's own box so vertical motion off a blank line still works.
-fn head_screen_rect(
+/// Which side of a soft wrap a caret placed at `pos` by a hit at viewport `y`
+/// belongs to (#301), and its rect on that side: `Upstream` when the upstream
+/// caret is **nearer** `y` than the downstream one — a hit past a wrapped
+/// line's end, which lands on the wrap point — else `Downstream`. Anywhere but
+/// a wrap point both sides are one caret and the answer is `Downstream`.
+///
+/// Nearness, not containment: a caret rect covers the glyphs, not the line
+/// box, so a hit in the leading above or below them lies in neither rect.
+/// Vertical motion probes 1.5 caret heights below the caret's top, which on a
+/// face with a short caret in a tall line is exactly there.
+fn hit_affinity(
     handle: &EditorHandle,
-    doc: &web_sys::Document,
     pos: Pos,
-) -> Option<(f32, f32, f32)> {
-    let (tb_nid, byte) = handle.caret_address(pos)?;
-    let block = node_by_nid(tb_nid)?;
-    if let Some((text_node, off)) = find_text_node_at_byte_offset(&block, byte)
-        && let Ok(range) = doc.create_range()
-        && range.set_start(&text_node, off).is_ok()
-        && range.set_end(&text_node, off).is_ok()
-    {
-        let r = range.get_bounding_client_rect();
-        if r.height() > 0.0 {
-            return Some((r.x() as f32, r.y() as f32, r.height() as f32));
+    y: f32,
+) -> (CaretAffinity, Option<(f32, f32, f32)>) {
+    let rect = |affinity| {
+        handle
+            .caret_rect_with_affinity(pos, affinity)
+            .map(|r| (r.x, r.y, r.height))
+    };
+    // Nearness, not containment: a caret rect covers the glyphs, not the
+    // line box, so a hit in the leading above or below them lies in neither.
+    // Distance from `y` to the rect's vertical span, 0 inside it.
+    let distance = |r: Option<(f32, f32, f32)>| {
+        r.map_or(f32::INFINITY, |(_, ry, rh)| {
+            (ry - y).max(y - (ry + rh)).max(0.0)
+        })
+    };
+    let down = rect(CaretAffinity::Downstream);
+    if distance(down) > 0.0 {
+        let up = rect(CaretAffinity::Upstream);
+        if distance(up) < distance(down) {
+            return (CaretAffinity::Upstream, up);
         }
     }
-    let el = block.dyn_into::<web_sys::Element>().ok()?;
-    let r = el.get_bounding_client_rect();
-    let h = if r.height() > 0.0 {
-        r.height() as f32
-    } else {
-        18.0
+    (CaretAffinity::Downstream, down)
+}
+
+/// Home / End: move the head to the edge of its visual line, collapsing or
+/// (`extend`, Shift) extending. The textblock's edge without geometry — an empty
+/// block, or a caret with no rect.
+fn move_to_line_edge(handle: &EditorHandle, end: bool, extend: bool) -> bool {
+    let sel = handle.selection();
+    let head = sel.head();
+    let Some(edge) = visual_line_bound(handle, head, end) else {
+        return handle.move_cursor(
+            if end {
+                CursorMotion::LineEnd
+            } else {
+                CursorMotion::LineStart
+            },
+            extend,
+        );
     };
-    Some((r.x() as f32, r.y() as f32, h))
+    // At a soft wrap the end of a line and the start of the next are one model
+    // position. End's is the upper line's, so it is drawn there (upstream);
+    // Home's is the lower line's (downstream, the default) (#301).
+    let affinity = if end && is_wrap_below(handle, head, edge) {
+        CaretAffinity::Upstream
+    } else {
+        CaretAffinity::Downstream
+    };
+    handle.set_selection_with_affinity(
+        if extend {
+            Selection::text(sel.anchor(), edge)
+        } else {
+            Selection::cursor(edge)
+        },
+        affinity,
+    );
+    true
+}
+
+/// Whether `edge`, the end of the visual line the caret at `head` is drawn on,
+/// is a soft-wrap point: a downstream caret there is drawn on a later line.
+fn is_wrap_below(handle: &EditorHandle, head: Pos, edge: Pos) -> bool {
+    let (Some((_, hy, hh)), Some(down)) = (
+        head_screen_rect(handle, head),
+        handle.caret_rect_with_affinity(edge, CaretAffinity::Downstream),
+    ) else {
+        return false;
+    };
+    down.y > hy + hh * 0.5
+}
+
+/// The model position at the start (`end == false`) or end of the visual line
+/// the caret at `head` is drawn on — the web twin of desktop's
+/// `RinchApp::visual_line_bound`.
+///
+/// Found from caret geometry alone: a visual line holds a contiguous run of
+/// logical positions, so the positions whose caret is drawn above, on and below
+/// the caret's line are three consecutive runs, and a binary search over the
+/// caret's hard line (the textblock, cut at its hard breaks — [`hard_line`])
+/// finds the edge in a handful of `Range` rects. That holds for the rects only
+/// as long as each says where its position is drawn: beside an image it reads
+/// the image's own box ([`leaf_rect`]), and the downstream rect after a
+/// soft-hyphen break is the glyph's, not the range's (#1115). End takes the last position
+/// whose **upstream** caret is not below the line, so the end of a wrapped
+/// line is the wrap point (the next line's start, drawn upstream); Home the
+/// first whose **downstream** caret is not above it. Because nothing is hit
+/// tested, a caret line scrolled out of the viewport or its scroller, or
+/// covered by another box, answers the same as a visible one (#1026 — the
+/// previous `caretRangeFromPoint` probes answered nothing off screen, and the
+/// callers fell back to the textblock's edge; desktop's twin reads the line
+/// from its text layout, #1107). What it answers are the line's *logical* edges: a right-to-left
+/// line's start is at its right edge, and a line that mixes directions answers
+/// its first and last logical positions wherever they are drawn.
+///
+/// `None` without geometry: no caret rect for `head` or for a position the
+/// search asks about. The callers then fall back to the textblock's edge.
+fn visual_line_bound(handle: &EditorHandle, head: Pos, end: bool) -> Option<Pos> {
+    use std::cmp::Ordering;
+    let (_, hy, hh) = head_screen_rect(handle, head)?;
+    let (lo, hi) = hard_line(handle, head)?;
+    // Where the caret at `p` is drawn against the caret's own line: on it when
+    // the two rects share more than half the shorter one's height (adjacent
+    // lines at `line-height: 1` overlap by a sliver, a taller span on the same
+    // line contains the caret), else above or below by their middles.
+    let doc = handle.doc();
+    let side = |p: usize, affinity: CaretAffinity| -> Option<Ordering> {
+        let r = match leaf_rect(handle, &doc, Pos(p), affinity) {
+            Some(r) => r,
+            None => handle.caret_rect_with_affinity(Pos(p), affinity)?,
+        };
+        let overlap = (r.y + r.height).min(hy + hh) - r.y.max(hy);
+        Some(if overlap > 0.5 * r.height.min(hh) {
+            Ordering::Equal
+        } else {
+            (r.y + r.height * 0.5).total_cmp(&(hy + hh * 0.5))
+        })
+    };
+    if end {
+        // The last p in [head, hi] not drawn below the line; `head` itself is not.
+        let (mut ok, mut bad) = (head.0, hi + 1);
+        while bad - ok > 1 {
+            let mid = ok + (bad - ok) / 2;
+            if side(mid, CaretAffinity::Upstream)? == Ordering::Greater {
+                bad = mid;
+            } else {
+                ok = mid;
+            }
+        }
+        Some(Pos(ok))
+    } else {
+        // The first p in [lo, head] not drawn above the line; `head` itself is not.
+        let (mut bad, mut ok) = (lo as isize - 1, head.0 as isize);
+        while ok - bad > 1 {
+            let mid = bad + (ok - bad) / 2;
+            if side(mid as usize, CaretAffinity::Downstream)? == Ordering::Less {
+                bad = mid;
+            } else {
+                ok = mid;
+            }
+        }
+        Some(Pos(ok as usize))
+    }
+}
+
+/// The box of the inline leaf — an image — on `affinity`'s side of `p`: the
+/// one just before `p` upstream, just after it downstream. `None` when that
+/// side holds text, a hard break (which [`hard_line`] already cuts at) or
+/// nothing.
+///
+/// The view gives an inline leaf no bytes, so the caret rects of the positions
+/// on its two sides are one rect — the text before it upstream, the character
+/// after it downstream — and neither says which line the leaf itself is on.
+/// Read from them, [`visual_line_bound`]'s End stepped past an image that
+/// starts the next line and Home stopped before one that ends the previous
+/// line. The leaf's own box answers that. Found as the nth `[data-pm-type]`
+/// element under the textblock, which is the nth leaf child in the model:
+/// marks wrap leaves without carrying the attribute.
+fn leaf_rect(
+    handle: &EditorHandle,
+    doc: &rinch_editor_core::Node,
+    p: Pos,
+    affinity: CaretAffinity,
+) -> Option<rinch_core::reactive::ElementBounds> {
+    let r = doc.resolve(p).ok()?;
+    if r.text_offset() > 0 {
+        return None;
+    }
+    let parent = r.parent();
+    let after = r.index(r.depth());
+    let i = match affinity {
+        CaretAffinity::Upstream => after.checked_sub(1)?,
+        CaretAffinity::Downstream => after,
+    };
+    if i >= parent.child_count() {
+        return None;
+    }
+    let leaf = parent.child(i);
+    if leaf.is_text() || leaf.type_name() == "hard_break" {
+        return None;
+    }
+    let nth = (0..i).filter(|&j| !parent.child(j).is_text()).count();
+    let (tb, _) = handle.caret_address(p)?;
+    let el = node_by_nid(tb)?.dyn_into::<web_sys::Element>().ok()?;
+    let b = el
+        .query_selector_all("[data-pm-type]")
+        .ok()?
+        .item(nth as u32)?
+        .dyn_into::<web_sys::Element>()
+        .ok()?
+        .get_bounding_client_rect();
+    Some(rinch_core::reactive::ElementBounds {
+        x: b.x() as f32,
+        y: b.y() as f32,
+        width: b.width() as f32,
+        height: b.height() as f32,
+    })
+}
+
+/// The model range `(start, end)` of the hard line `head` is on: its
+/// textblock's content, cut at the hard breaks on either side of it. A hard
+/// break ends a visual line, and the view gives it no bytes, so the positions
+/// on its two sides share one byte offset and one upstream caret rect —
+/// [`visual_line_bound`]'s search must not be offered the far side. `None`
+/// outside a textblock.
+fn hard_line(handle: &EditorHandle, head: Pos) -> Option<(usize, usize)> {
+    let doc = handle.doc();
+    let r = doc.resolve(head).ok()?;
+    let parent = r.parent();
+    if !parent.is_textblock() {
+        return None;
+    }
+    let start = r.start(r.depth());
+    let off = r.parent_offset();
+    let (mut lo, mut hi) = (0, parent.content_size());
+    let mut at = 0;
+    for i in 0..parent.child_count() {
+        let child = parent.child(i);
+        let size = child.node_size();
+        if child.type_name() == "hard_break" {
+            if at + size <= off {
+                lo = at + size;
+            } else if at >= off {
+                hi = at;
+                break;
+            }
+        }
+        at += size;
+    }
+    Some((start + lo, start + hi))
+}
+
+/// The viewport `(x, y, height)` of the caret at model `pos`:
+/// [`EditorHandle::caret_rect`], the same answer an app gets (a collapsed `Range`
+/// at the host text node; an *empty* block's own box, so vertical motion off a
+/// blank line still works).
+fn head_screen_rect(handle: &EditorHandle, pos: Pos) -> Option<(f32, f32, f32)> {
+    handle.caret_rect(pos).map(|r| (r.x, r.y, r.height))
 }
 
 /// Where a key-invoked menu opens, in viewport coordinates: at the caret, on its
@@ -1790,20 +3298,18 @@ fn head_screen_rect(
 /// position, and nor does Select All in a document ending with one — at the
 /// selected node's outline, and failing that at the editor's own box, so a park
 /// there still carries the selection the menu's Copy acts on.
-fn key_menu_point(
-    handle: &EditorHandle,
-    doc: &web_sys::Document,
-    container_nid: usize,
-) -> Option<(f32, f32)> {
-    if let Some((x, y, h)) = head_screen_rect(handle, doc, handle.selection().head()) {
+fn key_menu_point(handle: &EditorHandle, container_nid: u64) -> Option<(f32, f32)> {
+    if let Some((x, y, h)) = head_screen_rect(handle, handle.selection().head()) {
         return Some((x, y + h / 2.0));
     }
     let editor = node_by_nid(container_nid)?
         .dyn_into::<web_sys::Element>()
         .ok()?;
-    let outline = editor
-        .query_selector("[data-pm-selected]")
-        .ok()
+    // Only a live node selection has an outline to park at. The overlay stays
+    // in the DOM (hidden with `visibility`, which keeps its box) once the
+    // selection moves on, so its client rect alone cannot say it is live.
+    let outline = matches!(handle.selection(), Selection::Node(_))
+        .then(|| editor.query_selector("[data-pm-selected]").ok().flatten())
         .flatten()
         .map(|el| el.get_bounding_client_rect())
         .filter(|r| r.width() > 0.0 && r.height() > 0.0);
@@ -1821,7 +3327,7 @@ fn key_menu_point(
 /// editor itself when the caret has none).
 fn key_menu_app_handler(
     handle: &EditorHandle,
-    container_nid: usize,
+    container_nid: u64,
 ) -> Option<(web_sys::Element, rinch_core::events::EventHandlerId)> {
     handle
         .caret_address(handle.selection().head())
@@ -1853,7 +3359,7 @@ fn pointer_targets_editor(event: &web_sys::PointerEvent) -> bool {
     event
         .target()
         .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
-        .and_then(|el| el.closest("[data-pm-editor]").ok().flatten())
+        .and_then(|el| crate::event_delegation::editor_owning(&el))
         .is_some()
 }
 
@@ -1891,8 +3397,10 @@ fn note_touch_down(event: &web_sys::PointerEvent) {
 /// will raise the on-screen keyboard for a programmatic `.focus()` — and on a page that
 /// consumes the pointer sequence it may never be synthesized at all, leaving the editor
 /// visibly focused but with no model focus, so every keystroke went nowhere. Running
-/// the same handler here, from the real touch event, makes the tap self-sufficient; the
-/// compatibility `mousedown` that may follow is idempotent (same point, same caret).
+/// the same handler here, from the real touch event, makes the tap self-sufficient. The
+/// compatibility `mousedown` that may follow is then recognised as this tap's and runs
+/// nothing ([`is_compat_mousedown_of_serviced_tap`], issue #302) — except a double
+/// tap's, whose `detail == 2` still selects the word.
 ///
 /// A contact that drifted past the shared touch slop was a scroll, not a tap, and is
 /// dropped — panning a manuscript must not pop the keyboard.
@@ -1915,10 +3423,110 @@ fn handle_touch_tap(event: &web_sys::PointerEvent, doc: &web_sys::Document) {
     // `PointerEvent` *is* a `MouseEvent`, so the click handler takes it as-is. Its
     // `detail` is 0 for touch, which lands on the plain place-the-caret arm; a
     // double-tap's word select still comes from the compatibility `mousedown`.
-    handle_mousedown(event.as_ref(), doc);
+    SERVICED_TAP.with(|c| c.set(None));
+    LINK_CLAIMED_IN.with(|c| c.set(None));
+    let serviced = handle_mousedown(event.as_ref(), doc);
     // Drag-select follows `mousemove` with a button held — unreachable from touch — so
     // never leave a touch tap's anchor armed behind it.
     registry::end_drag(None);
+    // Remember the tap, so the compatibility `mousedown` that follows it does not
+    // run the press a second time (issue #302). Touch only: a pen's compatibility
+    // `mousedown` comes *before* its `pointerup` (measured, Chrome 153), so a pen
+    // tap's record would never be consumed and would swallow the next press there.
+    if !serviced || event.pointer_type() != "touch" {
+        return;
+    }
+    let link_claimed_in = LINK_CLAIMED_IN.with(|c| c.take());
+    let tap = match (link_claimed_in, focused_editor()) {
+        (Some(nid), _) => Some((nid, true)),
+        (None, Some(nid)) => Some((nid, false)),
+        (None, None) => None,
+    };
+    if let Some((container_nid, link_claimed)) = tap {
+        SERVICED_TAP.with(|c| {
+            c.set(Some(ServicedTap {
+                x: event.client_x() as f32,
+                y: event.client_y() as f32,
+                at_ms: event.time_stamp(),
+                container_nid,
+                link_claimed,
+            }))
+        });
+    }
+}
+
+/// A touch tap [`handle_touch_tap`] has already run the press for: where it came up,
+/// when, and which editor it focused.
+#[derive(Clone, Copy)]
+struct ServicedTap {
+    x: f32,
+    y: f32,
+    /// The `pointerup`'s `timeStamp`, in the page's time origin (as every event's).
+    at_ms: f64,
+    container_nid: u64,
+    /// The tap was a press on a link that the app's `on_link_click` claimed. Its
+    /// compatibility `mousedown` is consumed whatever the focus state then: a claim
+    /// commonly moves focus (a link popover's input), and running the press again
+    /// would offer the link a second time.
+    link_claimed: bool,
+}
+
+/// How long after a serviced tap its compatibility `mousedown` is still recognised
+/// as that tap's. Browsers synthesize it right after `pointerup`, or after a
+/// double-tap-to-zoom delay of roughly 300 ms on a page that allows zooming; a
+/// `mousedown` later than this is treated as a press of its own. In Chrome 153 the
+/// compatibility `mousedown` carries the `pointerup`'s own `timeStamp` (elapsed 0).
+const TAP_COMPAT_WINDOW_MS: f64 = 800.0;
+
+/// Whether `event` is the compatibility `mousedown` of a touch tap that
+/// [`handle_touch_tap`] already serviced, and the press it would run has nothing
+/// left to do (issue #302).
+///
+/// The tap's `pointerup` ran [`handle_mousedown`] in full: focus, the capture
+/// field emptied and re-mirrored, the caret placed. Running it again from the
+/// compatibility event redoes all of that — a second empty-and-refill of the field
+/// under an attached soft keyboard, a second selection transaction, a second
+/// `on_link_click` offer. So the first `mousedown` after a serviced tap **consumes**
+/// the record, whatever it is, and answers `true` only when it is a single primary
+/// press (`detail <= 1`, no modifier) at the tap's point, inside the window, with
+/// that tap's editor still focused and the capture textarea still holding the
+/// browser's focus — i.e. when the press would leave everything as it already is.
+/// (For a tap an app's `on_link_click` claimed, the focus is not asked; see
+/// [`ServicedTap::link_claimed`].) The record is also dropped by the tap's `click`,
+/// which fires even when a page's `preventDefault` on `pointerdown` suppressed the
+/// compatibility `mousedown`, so a tap that never gets one cannot swallow a later
+/// press.
+///
+/// A double tap's compatibility `mousedown` carries `detail == 2` (the browser
+/// counts clicks across taps) and is never matched, so its word select still runs.
+fn is_compat_mousedown_of_serviced_tap(
+    event: &web_sys::MouseEvent,
+    doc: &web_sys::Document,
+) -> bool {
+    if event.type_() != "mousedown" {
+        return false;
+    }
+    let Some(tap) = SERVICED_TAP.with(|c| c.take()) else {
+        return false;
+    };
+    let elapsed = event.time_stamp() - tap.at_ms;
+    event.button() == 0
+        && event.detail() <= 1
+        && !event.shift_key()
+        && !event.alt_key()
+        && !is_context_press(event)
+        && (0.0..=TAP_COMPAT_WINDOW_MS).contains(&elapsed)
+        && is_tap(
+            (tap.x, tap.y),
+            (event.client_x() as f32, event.client_y() as f32),
+        )
+        && (tap.link_claimed
+            || (focused_editor() == Some(tap.container_nid)
+                // Not implied by the line above: `on_capture_blur` keeps the
+                // focused editor across a *window* blur (#226), which leaves the
+                // capture textarea inactive with the claim still standing — and
+                // then the press has focus to restore.
+                && editor_owns_keyboard(doc)))
 }
 
 /// Add a capture-phase `document` listener leaked for the page lifetime.
@@ -1954,13 +3562,15 @@ pub(crate) fn add_capture_on<E: JsCast + 'static>(
 
 /// Add a (bubble-phase) listener to a specific `target`, leaked for its lifetime.
 /// Used for the capture textarea's clipboard / composition events, which target it
-/// directly (no need for document-level capture).
+/// directly (no need for document-level capture). Each runs as the focused
+/// editor's root's code (#2811, `crate::mark_event_root`).
 fn add_target_listener<E: JsCast + 'static>(
     target: &web_sys::EventTarget,
     name: &str,
     handler: impl Fn(E) + 'static,
 ) {
     let closure = Closure::wrap(Box::new(move |e: web_sys::Event| {
+        let _root = crate::mark_event_root(&e);
         if let Ok(ev) = e.dyn_into::<E>() {
             handler(ev);
         }
@@ -1972,11 +3582,11 @@ fn add_target_listener<E: JsCast + 'static>(
 }
 
 /// A small web-only override of the shared editor default stylesheet. The shared
-/// stylesheet (`rinch_editor_view`'s `styles.rs`) sets `li { display: flex }` so the
-/// *desktop* renderer (rinch-dom, which emits list markers as block siblings) can align
-/// them inline with their content. On the web the browser draws the native `::marker`,
-/// which `display: flex` suppresses — so bullets and numbers vanish. Restoring
-/// `display: list-item` brings them back. Scoped one level deeper (`ul/ol > li`) than the
+/// stylesheet (`rinch_editor_view`'s `styles.rs`) gives `li` no `display` of its own
+/// and hangs the *desktop* renderer's generated marker span (rinch-dom has no
+/// `list-item`) outside the item, while the editor's UA sheet makes `li` a block — so
+/// on the web, where the browser draws the native `::marker`, bullets and numbers would
+/// vanish. Restoring `display: list-item` brings them back. Scoped one level deeper (`ul/ol > li`) than the
 /// base `li` rule so it wins by specificity regardless of `<style>` source order.
 const EDITOR_WEB_CSS: &str =
     "[data-pm-editor] ul > li, [data-pm-editor] ol > li { display: list-item; }";
@@ -2002,6 +3612,18 @@ fn ensure_editor_web_styles(doc: &web_sys::Document) {
     }
 }
 
+/// What must be in place before a mount's build runs, because the build itself
+/// reports to it: a node view mounted by an editor in the build tells the
+/// node-view host listener its host, once, there and then. Installed after the
+/// build (with the rest of [`install`]), the page's first mount told nobody, so
+/// its views were never observed and a view that grew left the caret and the
+/// highlight below it where they were (#2075). Called from `mount_tree` before
+/// the build. Setting the listener again is harmless.
+pub(crate) fn install_before_build() {
+    // A node view that resizes moves what is below it (the caret, a highlight).
+    registry::set_node_view_host_listener(on_node_view_host);
+}
+
 /// Install the editor input listeners once. Called from `mount_tree` alongside
 /// `ensure_event_delegation`. Idempotent.
 pub(crate) fn install(browser_doc: &web_sys::Document) {
@@ -2018,16 +3640,50 @@ pub(crate) fn install(browser_doc: &web_sys::Document) {
     // `EditorHandle::set_read_only` arrives through none of them either, and the
     // same refresh is what carries it to the capture textarea's `readonly`.
     registry::set_overlay_refresher(refresh_caret);
+    // A selection moved by app code — a timer, an effect, a toolbar button's
+    // click — arrives through none of them either (#1001): the handle owes an
+    // overlay pass, and this runs it once the current task's code is done.
+    registry::set_overlay_pass_scheduler(schedule_overlay_pass);
+    // A selection moved before this ran — during the first mount's build —
+    // was owed with no scheduler to tell, and a later owe of an already-owed
+    // document tells none either: run that pass now it can be scheduled.
+    if registry::any_overlay_pass_owed() {
+        schedule_overlay_pass();
+    }
+    // `EditorHandle::focus`: the keyboard reaches an editor only through the
+    // capture textarea, so a programmatic focus has to go through the same
+    // steps a press does.
+    registry::set_focus_handler(focus_editor);
+    // `EditorHandle::blur`: its other half.
+    registry::set_blur_handler(blur_editor);
+    // An editor unmounting while it holds the keyboard must take its text out
+    // of the capture textarea with it (#1112).
+    registry::set_unregister_listener(on_editor_unregistered);
+    // The node-view host listener was installed before the build
+    // (`install_before_build`).
 
     let doc = browser_doc.clone();
     add_capture(browser_doc, "keydown", move |e: web_sys::KeyboardEvent| {
+        // The editor's hooks run as its root's code (#2811).
+        let _root = crate::mark_event_root(&e);
         if handle_keydown(&e, &doc) {
             e.prevent_default();
             e.stop_propagation();
         }
     });
+    // Files dragged from outside the page onto an editor whose app takes
+    // pictures itself (`EditorHandle::on_image_input`).
+    add_capture(browser_doc, "dragover", |e: web_sys::DragEvent| {
+        on_drag_over(&e);
+    });
+    let doc = browser_doc.clone();
+    add_capture(browser_doc, "drop", move |e: web_sys::DragEvent| {
+        let _root = crate::mark_event_root(&e);
+        on_drop(&e, &doc);
+    });
     let doc = browser_doc.clone();
     add_capture(browser_doc, "mousedown", move |e: web_sys::MouseEvent| {
+        let _root = crate::mark_event_root(&e);
         if handle_mousedown(&e, &doc) {
             e.prevent_default();
             e.stop_propagation();
@@ -2077,6 +3733,38 @@ pub(crate) fn install(browser_doc: &web_sys::Document) {
     add_capture(browser_doc, "mousemove", move |e: web_sys::MouseEvent| {
         if handle_mousemove(&e, &doc) {
             e.prevent_default();
+        } else {
+            if registry::link_hover_wanted() {
+                update_link_hover(&e, &doc);
+            }
+            if registry::image_hover_wanted() {
+                update_image_hover(&e);
+            }
+        }
+    });
+    // The pointer leaving the window leaves whatever link or image it was over.
+    add_capture(browser_doc, "mouseout", |e: web_sys::MouseEvent| {
+        if e.related_target().is_none() {
+            if registry::link_hover_wanted() {
+                registry::set_link_hover(None, None);
+            }
+            if registry::image_hover_wanted() {
+                registry::set_image_hover(None, None);
+            }
+        }
+    });
+    // Whether an editor link navigates, and keyboard activation of one (see
+    // `handle_link_click`).
+    add_capture(browser_doc, "click", |e: web_sys::MouseEvent| {
+        // A tap's `click` ends it: any compatibility `mousedown` came before it.
+        SERVICED_TAP.with(|c| c.set(None));
+        let _root = crate::mark_event_root(&e);
+        handle_link_click(&e);
+    });
+    add_capture(browser_doc, "auxclick", |e: web_sys::MouseEvent| {
+        if e.button() == 1 {
+            let _root = crate::mark_event_root(&e);
+            handle_link_click(&e);
         }
     });
     let doc = browser_doc.clone();
@@ -2094,7 +3782,6 @@ pub(crate) fn install(browser_doc: &web_sys::Document) {
     });
     // The menu key's release, for the same platform (issue #814). One whose press
     // went to an app's `data-oncontextmenu` is withheld from the browser as well.
-    let doc = browser_doc.clone();
     add_capture(browser_doc, "keyup", move |e: web_sys::KeyboardEvent| {
         if e.key() != "ContextMenu" {
             return;
@@ -2105,7 +3792,7 @@ pub(crate) fn install(browser_doc: &web_sys::Document) {
         }
         repark_on_release(MenuTrigger::Key, |_| {
             focused_handle()
-                .and_then(|(id, handle)| key_menu_point(&handle, &doc, id))
+                .and_then(|(id, handle)| key_menu_point(&handle, id))
                 .map(|(x, y)| park_right_of(x, y))
         });
     });
@@ -2113,6 +3800,7 @@ pub(crate) fn install(browser_doc: &web_sys::Document) {
     // phase, so the generic delegation's own `contextmenu` listener sees the same
     // target it always would.
     add_capture(browser_doc, "contextmenu", |e: web_sys::MouseEvent| {
+        let _root = crate::mark_event_root(&e);
         handle_contextmenu(&e);
     });
     // Focus moving to any other element ends a menu cycle: whatever the menu was, it
@@ -2140,9 +3828,17 @@ pub(crate) fn install(browser_doc: &web_sys::Document) {
             refresh_caret();
         }
     }) as Box<dyn FnMut(web_sys::Event)>);
-    browser_doc
-        .add_event_listener_with_callback("mousedown", refresh.as_ref().unchecked_ref())
-        .ok();
+    // The same after a command run with no pointer event while the editor keeps
+    // the keyboard (issue #271): assistive technology or `element.click()` on a
+    // toolbar `<button>` fires only a `click`, and no input event this module
+    // refreshes from. (A command run by Enter or Space on a focused toolbar
+    // control needs no refresh: focus left the capture textarea, whose `blur`
+    // released the editor, so it paints no caret to move.)
+    for name in ["mousedown", "click"] {
+        browser_doc
+            .add_event_listener_with_callback(name, refresh.as_ref().unchecked_ref())
+            .ok();
+    }
     refresh.forget();
 
     // Caret blink (530 ms half-period — the platform default).
@@ -2195,25 +3891,34 @@ mod tests {
             edit_intent("deleteContentForward"),
             EditIntent::Command("deleteCharForward")
         );
+        // Word deletes are the core's commands (#303), not a motion + delete.
         assert_eq!(
             edit_intent("deleteWordBackward"),
-            EditIntent::DeleteTo(CursorMotion::WordLeft)
+            EditIntent::Command("deleteWordBackward")
         );
         assert_eq!(
             edit_intent("deleteWordForward"),
-            EditIntent::DeleteTo(CursorMotion::WordRight)
+            EditIntent::Command("deleteWordForward")
         );
-        // "soft" and "hard" line deletes differ only in how the browser found the
-        // boundary; both mean "to the edge of this line" on the model.
-        for t in ["deleteSoftLineBackward", "deleteHardLineBackward"] {
-            assert_eq!(
-                edit_intent(t),
-                EditIntent::DeleteTo(CursorMotion::LineStart)
-            );
-        }
-        for t in ["deleteSoftLineForward", "deleteHardLineForward"] {
-            assert_eq!(edit_intent(t), EditIntent::DeleteTo(CursorMotion::LineEnd));
-        }
+        // A soft line is the visual line (#301) — resolved from layout, which
+        // `tests/editor_soft_line.rs` drives in Chrome — and a hard line is the
+        // textblock, the model's line edge.
+        assert_eq!(
+            edit_intent("deleteSoftLineBackward"),
+            EditIntent::DeleteToVisualLine { forward: false }
+        );
+        assert_eq!(
+            edit_intent("deleteSoftLineForward"),
+            EditIntent::DeleteToVisualLine { forward: true }
+        );
+        assert_eq!(
+            edit_intent("deleteHardLineBackward"),
+            EditIntent::DeleteTo(CursorMotion::LineStart)
+        );
+        assert_eq!(
+            edit_intent("deleteHardLineForward"),
+            EditIntent::DeleteTo(CursorMotion::LineEnd)
+        );
     }
 
     #[test]
@@ -2343,42 +4048,35 @@ mod tests {
     }
 
     #[test]
-    fn char_offsets_convert_back_to_byte_offsets() {
-        let s = "café!";
-        assert_eq!(byte_of_char(s, 0), 0);
-        assert_eq!(byte_of_char(s, 3), 3);
-        // `é` is two bytes, so everything after it shifts.
-        assert_eq!(byte_of_char(s, 4), 5);
-        assert_eq!(byte_of_char(s, 5), 6);
-        // Past the end clamps to the length, so a stale mirror cannot panic.
-        assert_eq!(byte_of_char(s, 99), s.len());
-    }
-
-    #[test]
     fn utf16_lengths_are_what_the_textarea_counts_in() {
-        assert_eq!(utf16_len_upto("abc", 3), 3);
-        assert_eq!(utf16_len_upto("café", "café".len()), 4);
+        assert_eq!(utf16_of_chars("abc", 3), 3);
+        assert_eq!(utf16_of_chars("café", 4), 4);
         // Astral characters are surrogate pairs — two units, one char.
-        assert_eq!(utf16_len_upto("👋", 4), 2);
-        // Partial counts: `é` starts at byte 3 and is two bytes wide.
-        assert_eq!(utf16_len_upto("café!", 3), 3);
-        assert_eq!(utf16_len_upto("café!", 5), 4);
+        assert_eq!(utf16_of_chars("👋", 1), 2);
+        assert_eq!(utf16_of_chars("hi 👋!", 4), 5);
+        // Past the end counts the whole text, so a stale mirror cannot panic.
+        assert_eq!(utf16_of_chars("hi 👋!", 99), 6);
+        assert_eq!(utf16_of_chars("hi 👋!", 0), 0);
     }
 
     #[test]
-    fn a_byte_offset_off_a_char_boundary_never_panics() {
-        // The model supplies the byte offset and the DOM supplies the text; if they
-        // ever disagree, counting must degrade, not blow the page up on a bad slice.
-        // Byte 4 is inside the emoji: it counts as the whole character, not a panic.
-        assert_eq!(utf16_len_upto("hi 👋!", 4), 5);
-        assert_eq!(utf16_len_upto("hi 👋!", 99), 6); // past the end
-        assert_eq!(utf16_len_upto("hi 👋!", 0), 0);
+    fn textarea_offsets_convert_back_to_chars() {
+        assert_eq!(chars_of_utf16("hi 👋!", 3), 3);
+        assert_eq!(chars_of_utf16("hi 👋!", 5), 4);
+        // Inside the surrogate pair: the whole character, never half of it.
+        assert_eq!(chars_of_utf16("hi 👋!", 4), 4);
+        assert_eq!(chars_of_utf16("hi 👋!", 99), 5);
+        for text in ["", "plain", "café", "hi 👋 there", "a\nb\u{FFFC}c"] {
+            let n = text.chars().count();
+            assert_eq!(chars_of_utf16(text, utf16_of_chars(text, n)), n, "{text:?}");
+        }
     }
 
     #[test]
     fn a_textarea_caret_offset_converts_back_to_a_byte_offset() {
         // The shared converter from `event_delegation` — the same one the pointer
         // hit-test uses to read a browser selection offset.
+        use crate::event_delegation::utf16_offset_to_utf8_bytes;
         assert_eq!(utf16_offset_to_utf8_bytes("abc", 0), 0);
         assert_eq!(utf16_offset_to_utf8_bytes("abc", 3), 3);
         // `é` is one UTF-16 unit but two bytes.
@@ -2393,8 +4091,9 @@ mod tests {
 
     #[test]
     fn utf16_offsets_round_trip_through_bytes() {
+        use crate::event_delegation::utf16_offset_to_utf8_bytes;
         for text in ["", "plain", "café", "hi 👋 there", "aaa"] {
-            let units = utf16_len_upto(text, text.len());
+            let units = utf16_of_chars(text, text.chars().count());
             assert_eq!(
                 utf16_offset_to_utf8_bytes(text, units),
                 text.len(),

@@ -18,9 +18,15 @@
 //! cargo test -p rinch --test debug_event_latency -- --ignored
 //! ```
 //!
+//! The first command is not optional: the test does not build the probe
+//! itself (#275). It looks for it beside its own binary, in the `examples/`
+//! directory of the same target dir and profile, and fails naming the command
+//! when it is not there — so build it again after changing rinch, or the test
+//! measures the probe as it was last built.
+//!
 //! Headless: start `Xvfb :99 -screen 0 1280x720x24 &` and run both commands
 //! with `DISPLAY=:99` (or wrap them in `xvfb-run -a`).
-#![cfg(feature = "desktop")] // serde_json comes in via the desktop feature
+#![cfg(feature = "windowing")] // serde_json comes in via the windowing feature
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -64,35 +70,43 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Build (no-op when fresh) and locate the probe example binary.
-fn build_probe_binary() -> PathBuf {
-    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let status = Command::new(cargo)
-        .args([
-            "build",
-            "-p",
-            "rinch",
-            "--example",
-            "debug_click_latency",
-            "--features",
-            "debug",
-        ])
-        .current_dir(&workspace_root)
-        .status()
-        .expect("run cargo build for probe example");
-    assert!(status.success(), "probe example build failed");
-
-    let target_dir = std::env::var("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| workspace_root.join("target"));
-    target_dir.join("debug/examples/debug_click_latency")
+/// Locate the probe example that the cargo invocation running this test built.
+///
+/// Found from this test binary's own location, at run time: a test binary
+/// lives in `<target>/<profile>/deps/`, and an example of the same build in
+/// `<target>/<profile>/examples/`. Two things this deliberately does not do
+/// any more (#275). It does not bake a path in with `env!("CARGO_MANIFEST_DIR")`
+/// — a shared target dir can hand this test the binary a since-deleted git
+/// worktree built, and a baked path keeps pointing into that worktree. And it
+/// does not run `cargo build` itself: a cargo spawned from inside a test
+/// contends for the target-dir lock the invoking cargo may hold, which under a
+/// full-workspace run is a hang rather than an error. A missing probe is a
+/// failure that says how to build it, never a skip.
+fn probe_binary() -> PathBuf {
+    let exe = std::env::current_exe().expect("this test binary's own path");
+    let profile_dir = exe
+        .parent()
+        .and_then(|deps| deps.parent())
+        .expect("a test binary lives in <target>/<profile>/deps/");
+    let probe = profile_dir.join("examples").join(format!(
+        "debug_click_latency{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    assert!(
+        probe.is_file(),
+        "probe example not found at {} — build it first with the same \
+         profile and target dir as this test:\n  \
+         cargo build -p rinch --example debug_click_latency --features debug",
+        probe.display()
+    );
+    probe
 }
 
 #[test]
 #[ignore = "needs a display (X11/Wayland or Xvfb); see module docs"]
 fn back_to_back_debug_clicks_are_not_serialized_behind_paints() {
-    let binary = build_probe_binary();
+    let binary = probe_binary();
+    println!("probe: {}", binary.display());
 
     // Reserve a free port for the probe's debug server.
     let port = {
@@ -123,8 +137,24 @@ fn back_to_back_debug_clicks_are_not_serialized_behind_paints() {
     stream.set_nodelay(true).ok();
     stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
 
-    // Handshake.
-    write_frame(&mut stream, br#"{"protocol":"rinch-debug","version":1}"#);
+    // Handshake, with the token from the probe's discovery file (#2481). The
+    // file is written before the server accepts, so it exists by now.
+    let token = {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".into());
+        let file = PathBuf::from(home)
+            .join(".rinch")
+            .join("debug")
+            .join(format!("{}.json", guard.0.id()));
+        let entry: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&file).expect("read the probe's discovery file"),
+        )
+        .expect("parse the discovery file");
+        entry["token"].as_str().expect("a token").to_string()
+    };
+    let hello = serde_json::json!({"protocol": "rinch-debug", "version": 1, "token": token});
+    write_frame(&mut stream, &serde_json::to_vec(&hello).unwrap());
     let handshake: serde_json::Value =
         serde_json::from_slice(&read_frame(&mut stream)).expect("parse handshake");
     assert_eq!(handshake["protocol"], "rinch-debug");

@@ -14,11 +14,13 @@ use crate::Slice;
 use crate::model::{AttrValue, Attrs, Fragment, Mark, Node, NodeType};
 use crate::pos::Pos;
 use crate::schema::Schema;
+use crate::transform::fit;
 use crate::transform::node_range::NodeRange;
 use crate::transform::step::{Step, StepError};
 use crate::transform::step_map::Mapping;
 use crate::transform::steps::{
-    AddMarkStep, RemoveMarkStep, ReplaceAroundStep, ReplaceStep, SetDocAttrStep, SetNodeAttrStep,
+    AddMarkStep, BatchEdit, BatchStep, RemoveMarkStep, ReplaceAroundStep, ReplaceStep,
+    SetDocAttrStep, SetNodeAttrStep,
 };
 
 /// An abstraction over a document that accumulates [`Step`]s.
@@ -29,6 +31,24 @@ pub struct Transform<'a> {
     steps: Vec<Box<dyn Step>>,
     docs: Vec<Node>,
     mapping: Mapping,
+}
+
+/// Whether a [`Transform::split`] of `depth` levels at `pos` in `doc` would
+/// cut no [isolating](crate::schema::NodeSpec::isolating) node: the
+/// isolating half of ProseMirror's `canSplit`. The nodes a split cuts are the
+/// `depth` innermost ancestors of `pos` (the parent first); a table cell is
+/// isolating, so a split stops at it. Whether the halves are valid content is
+/// the step's own check. `false` for a position outside `doc` or a depth of 0
+/// or past the position's depth.
+pub fn can_split(doc: &Node, pos: usize, depth: usize) -> bool {
+    match doc.resolve(Pos(pos)) {
+        Ok(r) => depth >= 1 && depth <= r.depth() && !cuts_isolating(&r, depth),
+        Err(_) => false,
+    }
+}
+
+fn cuts_isolating(r: &crate::pos::ResolvedPos, depth: usize) -> bool {
+    (r.depth() + 1 - depth.min(r.depth())..=r.depth()).any(|d| r.node(d).node_type().is_isolating())
 }
 
 impl<'a> Transform<'a> {
@@ -120,6 +140,65 @@ impl<'a> Transform<'a> {
         self.step(Box::new(ReplaceStep::new(from, to, slice)))
     }
 
+    /// Replace `from..to` with `slice`, **fitted** to the range: the paste
+    /// primitive. Where [`replace`](Self::replace) refuses a slice whose open
+    /// depths or content do not line up with the range, this closes or splits
+    /// the nodes around the range as the content needs
+    /// (ProseMirror's `replaceRange`; the rules are in
+    /// [`transform::fit`](crate::transform)'s module doc):
+    ///
+    /// - content open at the slice's start continues the textblock the range
+    ///   starts in, and the inline content after the range joins the
+    ///   textblock the slice ends in;
+    /// - code pasted in a textblock that is not code, over anything but
+    ///   exactly that textblock's whole content, is a textblock for each of
+    ///   its lines, not one holding line ends and not a code block that
+    ///   takes the line's own text;
+    /// - a block that is closed splits the textblock (leaving no empty block
+    ///   when the range is at the textblock's edge);
+    /// - over a whole textblock — a caret in an empty one included — a slice
+    ///   that starts in a [defining](crate::schema::NodeSpec::defining) node
+    ///   (a list item, a heading, a quote) replaces the textblock, keeping
+    ///   that node.
+    ///
+    /// One step is added. Returns the position right after the inserted
+    /// content, in the new document. Errors, adding nothing, when no fit is
+    /// valid, or when `slice` holds a node that is not valid content (the
+    /// nodes open at its edges aside).
+    ///
+    /// A range whose ends are in different
+    /// [isolating](crate::schema::NodeSpec::isolating) nodes (from text in a
+    /// table cell to text outside its table) is fitted like any other, as
+    /// ProseMirror fits it (#1930): the fit can take cells out of a row, which
+    /// the selection gestures repair (`Transaction::with_table_repair`) and a
+    /// transaction an app builds from positions does not.
+    pub fn replace_range(
+        &mut self,
+        from: usize,
+        to: usize,
+        slice: Slice,
+    ) -> Result<usize, StepError> {
+        if slice.size() == 0 {
+            self.delete(from, to)?;
+            return Ok(from);
+        }
+        if !fit::slice_is_sound(&slice) {
+            return Err(StepError::new("the slice holds an invalid node"));
+        }
+        let slice =
+            fit::code_lines_as_blocks(self.schema, &self.doc, from, to, &slice).unwrap_or(slice);
+        for (a, b, candidate) in fit::range_candidates(&self.doc, from, to, &slice) {
+            if let Some(found) = fit::fit_step(&self.doc, a, b, &candidate)
+                && self.step(found.step).is_ok()
+            {
+                return Ok(found.end);
+            }
+        }
+        let end = from + slice.size();
+        self.step(Box::new(ReplaceStep::new(from, to, slice)))?;
+        Ok(end)
+    }
+
     /// Replace `from..to` with the (flat) `content`.
     pub fn replace_with(
         &mut self,
@@ -131,8 +210,40 @@ impl<'a> Transform<'a> {
     }
 
     /// Delete the range `from..to`.
+    ///
+    /// A range whose ends are at the same depth is one plain
+    /// [`replace`](Self::replace). One whose ends are not (from a list item
+    /// into the item nested under it, from a paragraph into a list) has no
+    /// plain replacement, so it is fitted as
+    /// [`replace_range`](Self::replace_range) fits a slice: what is left of
+    /// the node the range ends in joins the node it starts in, and what
+    /// followed it stays where it can (ProseMirror's `Transform.delete`).
+    /// Like `replace_range`, a range whose ends are in different isolating
+    /// nodes (from text in a table cell to text outside its table, #1930) is
+    /// fitted too, as ProseMirror fits it; one that holds only the tokens
+    /// between two textblocks that cannot join (code, then marked text),
+    /// which would delete nothing, is refused. One step is added, or none
+    /// and the plain replacement's error.
     pub fn delete(&mut self, from: usize, to: usize) -> Result<&mut Self, StepError> {
-        self.replace(from, to, Slice::empty())
+        let Some(plain) = self
+            .step(Box::new(ReplaceStep::new(from, to, Slice::empty())))
+            .err()
+        else {
+            return Ok(self);
+        };
+        // A fit that only closes and reopens the nodes between the two ends
+        // deletes nothing (the document is the same size): that is a refusal,
+        // not an empty step in the history.
+        if let Some(found) = fit::fit_step(&self.doc, from, to, &Slice::empty())
+            && found
+                .step
+                .apply(&self.doc)
+                .is_ok_and(|doc| doc.content_size() < self.doc.content_size())
+            && self.step(found.step).is_ok()
+        {
+            return Ok(self);
+        }
+        Err(plain)
     }
 
     /// Insert `text` replacing `from..to` (collapsed when `from == to`).
@@ -154,6 +265,12 @@ impl<'a> Transform<'a> {
     /// Split the node(s) at `pos`, `depth` levels deep. `types_after` optionally
     /// gives the type+attrs of the block(s) created after the split (e.g. Enter at
     /// the end of a heading making a paragraph). Port of `Transform.split`.
+    ///
+    /// Errors, adding nothing, when the split would cut an
+    /// [isolating](crate::schema::NodeSpec::isolating) node — see [`can_split`].
+    /// ProseMirror leaves that check to the caller (`canSplit`); rinch makes it
+    /// here too, so no command can split a table cell (#1232: a split cell is a
+    /// row with one cell more than its table has columns).
     pub fn split(
         &mut self,
         pos: usize,
@@ -171,6 +288,9 @@ impl<'a> Transform<'a> {
             return Err(StepError::new(
                 "split depth exceeds the depth of the split position",
             ));
+        }
+        if cuts_isolating(&r, depth) {
+            return Err(StepError::new("a split may not cut an isolating node"));
         }
         let mut before = Fragment::empty();
         let mut after = Fragment::empty();
@@ -195,7 +315,10 @@ impl<'a> Transform<'a> {
     }
 
     /// Change the type (and attrs) of every textblock overlapping `from..to`.
-    /// Port of `Transform.setBlockType` (size-preserving, so no remapping needed).
+    /// Port of `Transform.setBlockType`: each block's content is first cleared of
+    /// what the new type does not allow ([`clear_incompatible`](Self::clear_incompatible)),
+    /// so a paragraph with bold text and a hard break made a code block is plain
+    /// text with a line break (#1227), never content its schema forbids.
     pub fn set_block_type(
         &mut self,
         from: usize,
@@ -213,7 +336,17 @@ impl<'a> Transform<'a> {
             }
             true
         });
-        for (pos, size, marks) in conversions {
+        let map_from = self.mapping.len();
+        for (pos, _size, marks) in conversions {
+            // Positions were collected in the document as it was; clearing an earlier
+            // block can have shrunk it.
+            let pos = self.mapping.slice(map_from, self.mapping.len()).map(pos, 1);
+            self.clear_incompatible(pos, &typ)?;
+            let Some(size) = self.doc.node_at(pos).map(|n| n.node_size()) else {
+                return Err(StepError::new(
+                    "set_block_type: block not found after clearing",
+                ));
+            };
             let new_block =
                 Node::new_branch(typ.clone(), attrs.clone(), Fragment::empty()).with_marks(marks);
             let slice = Slice::new(Fragment::from_node(new_block), 0, 0);
@@ -226,6 +359,70 @@ impl<'a> Transform<'a> {
                 1,
                 true,
             )))?;
+        }
+        Ok(self)
+    }
+
+    /// Remove from the textblock at `pos` whatever a block of type `typ` cannot
+    /// hold. Port of ProseMirror's `clearIncompatible` with its `linebreakReplacement`
+    /// half: a mark `typ` does not allow is removed, a `hard_break` going into a
+    /// [`code`](crate::schema::NodeSpec::code) block becomes the text `"\n"`, and any
+    /// other child `typ`'s content expression does not take is deleted.
+    pub fn clear_incompatible(
+        &mut self,
+        pos: usize,
+        typ: &NodeType,
+    ) -> Result<&mut Self, StepError> {
+        let Some(node) = self.doc.node_at(pos) else {
+            return Err(StepError::new(
+                "clear_incompatible: no node at the position",
+            ));
+        };
+        let content = typ.content_match();
+        let code = typ.spec().code;
+        let mut state = content.start();
+        let mut marks_off: Vec<(usize, usize, Mark)> = Vec::new();
+        // (from, to, replacement): a child deleted or turned into a line break.
+        let mut replaced: Vec<(usize, usize, Option<Node>)> = Vec::new();
+        let mut cur = pos + 1;
+        for i in 0..node.child_count() {
+            let child = node.child(i);
+            let end = cur + child.node_size();
+            let next = content.advance(&state, child.type_name());
+            if next.is_dead() {
+                let line_break = (code && child.type_name() == "hard_break")
+                    .then(|| content.advance(&state, "text"))
+                    .filter(|after| !after.is_dead());
+                match line_break {
+                    Some(after) => {
+                        let text = self
+                            .schema
+                            .text("\n")
+                            .map_err(|e| StepError::new(format!("clear_incompatible: {e}")))?;
+                        replaced.push((cur, end, Some(text)));
+                        state = after;
+                    }
+                    None => replaced.push((cur, end, None)),
+                }
+            } else {
+                state = next;
+                for m in child.marks() {
+                    if !typ.spec().marks.allows(m.type_name()) {
+                        marks_off.push((cur, end, m.clone()));
+                    }
+                }
+            }
+            cur = end;
+        }
+        for (from, to, mark) in marks_off {
+            self.step(Box::new(RemoveMarkStep::new(from, to, mark)))?;
+        }
+        for (from, to, with) in replaced.into_iter().rev() {
+            let slice = match with {
+                Some(n) => Slice::new(Fragment::from_node(n), 0, 0),
+                None => Slice::empty(),
+            };
+            self.step(Box::new(ReplaceStep::new(from, to, slice)))?;
         }
         Ok(self)
     }
@@ -467,6 +664,17 @@ impl<'a> Transform<'a> {
             self.step(Box::new(RemoveMarkStep::new(f, t, mark.clone())))?;
         }
         Ok(self)
+    }
+
+    // -- batch -----------------------------------------------------------
+
+    /// Apply disjoint `edits`, stated in the current document's coordinates,
+    /// as one [`BatchStep`]. Nothing is recorded for an empty list.
+    pub fn batch(&mut self, edits: Vec<BatchEdit>) -> Result<&mut Self, StepError> {
+        if edits.is_empty() {
+            return Ok(self);
+        }
+        self.step(Box::new(BatchStep::new(edits)?))
     }
 
     // -- attrs -----------------------------------------------------------

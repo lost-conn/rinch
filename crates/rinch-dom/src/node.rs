@@ -1,6 +1,6 @@
 //! Node tree data structures for rinch-dom.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -23,8 +23,100 @@ use style::shared_lock::{Locked, SharedRwLock};
 
 use crate::computed_style::ComputedStyle;
 
-/// Raw node ID (index into slab).
-pub type RawNodeId = usize;
+/// A node id inside `rinch-dom`: the packed bits of `rinch_core::dom::NodeId`
+/// (slot index in the low 32 bits, generation in the high 32; issue #723).
+/// `NodeId(raw)` and `id.0` convert between the two for free. Index the node
+/// storage with it ([`crate::node_slab::NodeSlab`]); a table indexed by slot
+/// takes [`crate::node_slab::slot_of`].
+pub type RawNodeId = u64;
+
+thread_local! {
+    /// The epoch of the "later siblings already marked" stamps
+    /// (`Node::later_siblings_marked`, #2627). A stamp is trusted only while it
+    /// equals this; anything that can take a restyle hint off an element, or
+    /// consume what marking it queued, moves it on.
+    static SIBLING_MARK_EPOCH: Cell<u64> = const { Cell::new(1) };
+}
+
+/// The current epoch of the sibling-mark stamps (#2627).
+pub(crate) fn sibling_mark_epoch() -> u64 {
+    SIBLING_MARK_EPOCH.with(Cell::get)
+}
+
+/// Distrust every sibling-mark stamp (#2627): something may have taken a
+/// restyle hint off an element (a cascade, element data dropped or replaced),
+/// or consumed what `mark_restyle` queued (the style roots, the dirty nodes).
+/// Thread-wide rather than per document, so a second document's resolve only
+/// costs this one a full sweep, never a missed restyle.
+pub(crate) fn invalidate_sibling_marks() {
+    SIBLING_MARK_EPOCH.with(|e| e.set(e.get().wrapping_add(1)));
+}
+
+/// A node's Stylo `ElementData`, present or absent.
+///
+/// Stylo 0.22's `TElement::borrow_data`/`mutate_data`/`ensure_data` return
+/// `ElementDataRef`/`ElementDataMut`, which only an `ElementDataWrapper` can
+/// hand out (it replaced the `AtomicRefCell<ElementData>` of 0.11; its borrow
+/// checks run in debug builds only). The wrapper is kept for the node's whole
+/// life and `present` says whether it holds data, so "no data" reads as `None`
+/// exactly as the `Option<ElementData>` this replaces did; clearing resets the
+/// data to its default, dropping the styles it held.
+#[derive(Default)]
+pub struct StyloData {
+    data: style::data::ElementDataWrapper,
+    present: AtomicBool,
+}
+
+impl StyloData {
+    /// Whether the node has element data (it may still hold no primary style).
+    #[inline]
+    pub fn has_data(&self) -> bool {
+        self.present.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The node's element data, if it has any.
+    #[inline]
+    pub fn borrow(&self) -> Option<style::data::ElementDataRef<'_>> {
+        self.has_data().then(|| self.data.borrow())
+    }
+
+    /// The node's element data, mutably, if it has any.
+    #[inline]
+    pub fn borrow_mut(&self) -> Option<style::data::ElementDataMut<'_>> {
+        self.has_data().then(|| self.data.borrow_mut())
+    }
+
+    /// The node's element data, created (default) if it had none.
+    #[inline]
+    pub fn ensure(&self) -> style::data::ElementDataMut<'_> {
+        let mut data = self.data.borrow_mut();
+        if !self.has_data() {
+            invalidate_sibling_marks();
+            *data = style::data::ElementData::default();
+            self.present
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        data
+    }
+
+    /// Replace the node's element data.
+    pub fn set(&self, value: style::data::ElementData) {
+        invalidate_sibling_marks();
+        *self.data.borrow_mut() = value;
+        self.present
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Drop the node's element data (the next style pass recascades it).
+    pub fn clear(&self) {
+        if self.has_data() {
+            invalidate_sibling_marks();
+            *self.data.borrow_mut() = style::data::ElementData::default();
+            self.present
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
 
 bitflags! {
     /// Tracks what needs updating for a node.
@@ -78,17 +170,32 @@ pub enum NodeContext {
     /// Image element with intrinsic dimensions (0x0 while loading).
     Image {
         src: String,
-        /// Intrinsic width (0 while loading).
-        width: u32,
-        /// Intrinsic height (0 while loading).
-        height: u32,
+        /// The decoded image's natural size and ratio
+        /// ([`crate::image_cache::DecodedImage::natural`]); `None` while
+        /// loading or after a failure. An SVG file may lack a dimension or
+        /// both (#2111).
+        natural: Option<crate::svg_image::NaturalSize>,
+        /// The element's computed `aspect-ratio` (#1286), which carries the
+        /// ratio its `width` and `height` attributes map to (#684,
+        /// `aspect-ratio: auto w / h`, [`crate::replaced::attribute_ratio`])
+        /// unless an author rule replaced it: it sizes the image while it has
+        /// no natural size, and a `<ratio>` without `auto` replaces a loaded
+        /// image's own ratio. Kept current by
+        /// `crate::replaced::sync_replaced_measure`.
+        aspect: crate::computed_style::AspectRatioValue,
+        /// The `alt` text an image with no picture shows in its place (#2309,
+        /// [`crate::img_placeholder`]), shaped: `Some` while it is a
+        /// placeholder with alt text. An inline one is measured from it
+        /// (`crate::replaced::measure_image`); paint draws it re-broken.
+        /// Kept current by `crate::RinchDocument::sync_img_placeholder`.
+        alt: Option<crate::img_placeholder::AltText>,
     },
     /// IFC root that needs Parley TreeBuilder measurement.
     ///
-    /// **The IFC leaf invariant (#466).** Taffy 0.12 consults a measure
-    /// function only on a node with zero children (`taffy_tree.rs:303-327`,
-    /// the `(_, false)` arm of the `match (display_mode, has_children)`
-    /// dispatch). Therefore the Taffy node carrying a live `InlineRoot` must
+    /// **The IFC leaf invariant (#466).** Taffy (0.12 and 0.14 alike) consults a
+    /// measure function only on a node with zero children
+    /// (`taffy_tree.rs:310-326` in 0.14, the `(_, false)` arm of the
+    /// `match (display_mode, has_children)` dispatch). Therefore the Taffy node carrying a live `InlineRoot` must
     /// be childless: the IFC root's own node when inline detachment emptied
     /// it, or its dedicated measure-leaf when out-of-flow children remain
     /// attached. After `setup_inline_formatting_contexts`, no Taffy node with
@@ -105,11 +212,43 @@ pub enum NodeContext {
     /// would silently report 0 instead of its estimate.
     ///
     /// `setup_inline_formatting_contexts` enforces this: it sweeps the stale
-    /// context off any non-leaf not (re)marked a root this pass, and a
+    /// context off any node not (re)marked a root this pass (a leaf's too,
+    /// #896: Taffy would measure it as an empty IFC), and a
     /// `debug_assertions` validator
     /// ([`crate::RinchDocument::ifc_leaf_invariant_violations`]) checks the
     /// invariant after every setup pass.
-    InlineRoot(usize), // stores the RawNodeId of the IFC root
+    InlineRoot(RawNodeId), // stores the RawNodeId of the IFC root
+    /// A text-entry form control — `<textarea>`, or an `<input>` of a
+    /// text-like type — whose value is an attribute rather than a child, so
+    /// nothing in the tree gives it a content size (#297). The measure
+    /// answers `content_width` (its `size` or `cols` in average characters,
+    /// #1177) and `content_height` (its rows times its line height); Taffy
+    /// adds the padding and border. Written and kept current by
+    /// `crate::form_control::sync_form_control_measure`.
+    FormControl {
+        /// Content-box width: `size` / `cols` times the primary font's average
+        /// character width (`crate::form_control::form_control_content_width`).
+        content_width: f32,
+        /// Content-box height: `rows × line-height` (one row for an `<input>`).
+        content_height: f32,
+    },
+    /// A `<canvas>`, `<video>` or `<iframe>` (#1173): a replaced element with
+    /// no content of its own, sized from its natural dimensions —
+    /// `width`/`height` attributes on a canvas, the 300x150 default object
+    /// size otherwise. The measure is `crate::replaced::measure`; written
+    /// and kept current by `crate::replaced::sync_replaced_measure`.
+    Replaced {
+        /// Natural content-box width.
+        width: f32,
+        /// Natural content-box height.
+        height: f32,
+        /// The natural aspect ratio (width / height): a canvas's when both
+        /// dimensions are non-zero; a video and an iframe have none.
+        ratio: Option<f32>,
+        /// The element's computed `aspect-ratio` (#1286; a video's carries
+        /// the ratio its `width` and `height` attributes map to, #684).
+        aspect: crate::computed_style::AspectRatioValue,
+    },
 }
 
 /// Text measurement context for Parley.
@@ -131,11 +270,14 @@ pub struct TextMeasure {
     /// Empty means use font metrics default.
     pub line_height_css: String,
     /// DOM node ID for caching the layout after measurement.
-    pub node_id: usize,
+    pub node_id: RawNodeId,
     /// Text color (inherited from parent).
     pub color: AlphaColor<Srgb>,
     /// Whether text wrapping is disabled (white-space: nowrap/pre).
     pub no_wrap: bool,
+    /// The parent's `white-space`: how the text's white space is collapsed,
+    /// and whether its spaces hang (#1279, #1672).
+    pub white_space: crate::computed_style::WhiteSpaceValue,
     /// Extra advance after every typographic character unit, in CSS pixels
     /// (inherited from parent; 0 is `normal`).
     pub letter_spacing: f32,
@@ -144,6 +286,15 @@ pub struct TextMeasure {
     pub word_spacing: f32,
     /// Overflow wrap mode (controls emergency line-breaking).
     pub overflow_wrap: crate::computed_style::OverflowWrapValue,
+    /// The parent's `word-break` (#2388).
+    pub word_break: crate::computed_style::WordBreakValue,
+    /// The parent's `line-break` (#2388).
+    pub line_break: crate::computed_style::LineBreakValue,
+    /// The parent's `hyphens: none` (#2621).
+    pub hyphens_none: bool,
+    /// The parent's `text-indent` (#2628): the text is a flex or grid
+    /// container's own, an anonymous item whose first line it indents.
+    pub text_indent: crate::computed_style::TextIndentValue,
     /// Text overflow mode (clip or ellipsis).
     pub text_overflow: crate::computed_style::TextOverflowValue,
     /// Whether parent has overflow: hidden (needed for text-overflow to apply).
@@ -157,9 +308,12 @@ pub struct TextMeasure {
 /// containing block's padding box and the parent's border is added back), so
 /// an absolutely-positioned child with `left: 0` inside a parent with a `5px`
 /// left border has `x == 5`. The one exception is `position: fixed`, which
-/// `read_layout_results` rewrites to be **viewport**-relative with no border
-/// or margin applied (CSS puts a fixed box's *margin* edge at its inset, so
-/// ignoring the margin is a known deviation of that override, not of Taffy).
+/// `read_layout_results` rewrites to be **viewport**-relative
+/// (`out_of_flow::place_fixed`): its margin edge at its inset, as CSS puts
+/// it, and `auto` margins sharing what two insets leave (#1980, #2002).
+/// A fixed box whose containing block is a transformed (or paint-contained)
+/// ancestor is no exception: it is placed parent-relative, as an absolute box
+/// resolved against that ancestor (#1372, [`Node::box_position`]).
 /// Every consumer — paint, hit testing,
 /// `compute_absolute_position` — accumulates this field up the parent chain,
 /// so only Taffy (or that fixed override) may write it (#236).
@@ -288,7 +442,7 @@ impl DisplayMode {
     /// Adding `inline-grid` here (#607) is **half** of its flow fix — the half
     /// those five passes read. The other half is that `DisplayMode::InlineGrid`
     /// is not `Block`, so [`Self::is_block_container`] answers `false` and the
-    /// anonymous-box generation — that predicate's only four readers, all in
+    /// anonymous-box generation — that predicate's only readers, all in
     /// `ifc.rs`; grep it — stops treating the box as a container. The two
     /// predicates are **independently** load-bearing: a mutant that admits
     /// `InlineGrid` into `is_block_container` while leaving this function alone
@@ -303,10 +457,11 @@ impl DisplayMode {
     /// **Nor the complement of [`Self::is_block_container`] any more** (#592).
     /// `inline-block` answers `true` to both: atomic on the outside, a block
     /// container on the inside. The two predicates ask about opposite halves of
-    /// the box and the intersection is exactly that one variant, which is why
-    /// `apply_empty_block_line_floor` — the one caller that means "block-level
-    /// block container" — has to say `is_block_container() && !is_atomic_inline()`
-    /// rather than either alone.
+    /// the box and the intersection is exactly that one variant, so a caller
+    /// that means "block-level block container" has to say
+    /// `is_block_container() && !is_atomic_inline()` rather than either alone.
+    /// (The one-line floor for childless blocks was such a caller until #296
+    /// removed it.)
     pub fn is_atomic_inline(self) -> bool {
         matches!(
             self,
@@ -324,7 +479,7 @@ impl DisplayMode {
     /// [`DisplayMode::InlineFlex`] / [`DisplayMode::InlineGrid`] are not: all
     /// three are inline-level boxes, and only the first is a block container
     /// inside (css-display-3 §2.5). It used to be spelled as the complement of
-    /// "inline-level or a flex container" at the four IFC sites that ask it,
+    /// "inline-level or a flex container" at the IFC sites that ask it,
     /// which is how `inline-block` came to be excluded: an
     /// `inline-block` with mixed content laid its children out in a row and
     /// generated no anonymous boxes at all, and — because it was therefore
@@ -334,11 +489,11 @@ impl DisplayMode {
     ///
     /// **`is_block_container` and [`Self::is_atomic_inline`] are not
     /// complements.** They intersect at `inline-block`. A caller that means
-    /// "block-level block container" — `apply_empty_block_line_floor`, the one
-    /// site of the four that is a rinch divergence rather than a CSS rule —
-    /// must say `is_block_container() && !is_atomic_inline()`; the floor
-    /// applied to a childless `inline-block` made every source-less `<img>` one
-    /// line tall, `<img>` being an `inline-block` in the UA sheet.
+    /// "block-level block container" must say
+    /// `is_block_container() && !is_atomic_inline()`: the one-line floor for
+    /// childless blocks (removed in #296) once asked the bare question and made
+    /// every source-less `<img>` one line tall, `<img>` being an `inline-block`
+    /// in the UA sheet.
     ///
     /// It answers from this enum alone, so it inherits the coarsening in the
     /// type's doc: block-level `display: grid` arrives as
@@ -385,10 +540,12 @@ pub enum InlineFlowRole {
     /// Inline-level content: a text node, or an element with display
     /// `inline` / `inline-block` / `inline-flex`.
     Inline,
-    /// An out-of-flow box — `position: absolute`/`fixed` (CSS 2.1 §9.3).
-    /// Not inline content, yet it neither forces anonymous boxes (§9.2.1.1)
-    /// nor breaks an inline formatting context (§9.4.2): inline siblings
-    /// carry on across it, on the same line.
+    /// An out-of-flow box — `position: absolute`/`fixed`, or a float (CSS
+    /// 2.1 §9.3). Not inline content, yet it neither forces anonymous boxes
+    /// (§9.2.1.1) nor breaks an inline formatting context (§9.4.2): inline
+    /// siblings carry on across it, on the same line. A float stays a Taffy
+    /// child of its IFC root, before the root's measure leaf, which places it
+    /// at the top of the line it stands in (`float_wrap`).
     OutOfFlow,
     /// An in-flow block-level box — the one thing that breaks the inline
     /// flow.
@@ -406,18 +563,79 @@ pub struct IfcTextRange {
     /// Byte range end (exclusive) in the IFC `text_content`.
     pub flat_end: usize,
     /// DOM node ID: text node for text, `<br>` element for `<br>`.
-    pub node_id: usize,
+    pub node_id: RawNodeId,
     /// Byte offset within the text node (0 for most; nonzero when a node
     /// is split across multiple style spans).
     pub node_offset: usize,
     /// True for `<br>` entries (which map to `"\n"` in the flat text).
     pub is_br: bool,
-    /// Length of the original DOM text content (before tab expansion).
-    /// When equal to `flat_end - flat_start`, no tabs were expanded.
+    /// Length of the DOM text content (after `text-transform`, before white
+    /// space was collapsed or a tab expanded).
     pub dom_text_len: usize,
-    /// Original DOM text content (before tab expansion). Only set when
-    /// tabs were expanded; empty string when no tabs are present.
-    pub dom_text: String,
+    /// Where this node's laid-out text stops being its DOM text byte for byte
+    /// (#1180): each `(flat, dom)` pair, local to the range, starts a stretch
+    /// in which both advance together. It is pushed where a collapsed run or
+    /// an expanded tab leaves the two out of step, so it is empty for text
+    /// pushed as is. Implicitly the stretches start at `(0, 0)` and end at
+    /// `(flat_end - flat_start, dom_text_len)`; a position inside something
+    /// removed or expanded maps to the end of it. Read it through
+    /// [`Self::dom_for_flat`] and [`Self::flat_for_dom`].
+    pub offset_map: Vec<(usize, usize)>,
+    /// The colour this range's glyphs were shaped in — what
+    /// `crate::ifc::text_color` answered for the text node when the layout
+    /// was built. Paint asks again and draws in the answer it gets then, so
+    /// a colour written with no re-shape (a transition or animation frame)
+    /// is on screen without one (#679). Unused for a `<br>`.
+    pub color: peniko::Color,
+}
+
+impl IfcTextRange {
+    /// The stretch starts, `(0, 0)` first unless the map starts at flat 0.
+    fn stretches(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        let implicit = match self.offset_map.first() {
+            Some(&(0, _)) => None,
+            _ => Some((0, 0)),
+        };
+        implicit.into_iter().chain(self.offset_map.iter().copied())
+    }
+
+    /// The DOM byte (local to the node, `node_offset` not added) that the
+    /// range-local flat byte `flat` lays out.
+    pub fn dom_for_flat(&self, flat: usize) -> usize {
+        if self.offset_map.is_empty() && self.flat_end - self.flat_start == self.dom_text_len {
+            return flat;
+        }
+        let end = (self.flat_end - self.flat_start, self.dom_text_len);
+        let mut out = 0;
+        let mut stretches = self.stretches().peekable();
+        while let Some((f, d)) = stretches.next() {
+            if f > flat {
+                break;
+            }
+            let next = stretches.peek().copied().unwrap_or(end);
+            out = (d + (flat - f)).min(next.1);
+        }
+        out
+    }
+
+    /// The range-local flat byte for the DOM byte `dom` (local to the node).
+    pub fn flat_for_dom(&self, dom: usize) -> usize {
+        let flat_len = self.flat_end - self.flat_start;
+        if self.offset_map.is_empty() && flat_len == self.dom_text_len {
+            return dom.min(flat_len);
+        }
+        let end = (flat_len, self.dom_text_len);
+        let mut out = 0;
+        let mut stretches = self.stretches().peekable();
+        while let Some((f, d)) = stretches.next() {
+            if d > dom {
+                break;
+            }
+            let next = stretches.peek().copied().unwrap_or(end);
+            out = (f + (dom - d)).min(next.0);
+        }
+        out
+    }
 }
 
 /// A background span for inline elements within an IFC.
@@ -425,6 +643,10 @@ pub struct IfcTextRange {
 /// Records the byte range in the flat IFC text that has a background color,
 /// along with padding values for visual extension of the background rect.
 pub struct InlineBackgroundSpan {
+    /// The inline element whose background this is. Paint reads its
+    /// `visibility` at draw time, so hiding the element needs no re-layout
+    /// (#829).
+    pub owner: RawNodeId,
     /// Byte range start in the IFC `text_content`.
     pub start: usize,
     /// Byte range end (exclusive) in the IFC `text_content`.
@@ -443,6 +665,22 @@ pub struct InlineBackgroundSpan {
     pub border_radius: f32,
 }
 
+/// The misspelled words of a text control's value (#2862): byte ranges of
+/// `text`, the value they were found in. Paint draws them only while the
+/// control still shows exactly `text`, so a value the app rewrote never shows
+/// a squiggle under the wrong letters before the checker catches up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpellingMarks {
+    /// The value the ranges are of.
+    pub text: String,
+    /// The misspelled words, sorted byte ranges of `text`.
+    pub ranges: Vec<std::ops::Range<usize>>,
+    /// Show them on a single-line `<input>` that does not have the keyboard
+    /// too. `false` is Chrome's behaviour (hidden until it is focused again);
+    /// a `<textarea>` always shows them.
+    pub show_when_blurred: bool,
+}
+
 /// A **wavy underline** span within an IFC — the spellcheck squiggle.
 ///
 /// Every other `text-decoration` is a straight line Parley already strokes from
@@ -451,13 +689,85 @@ pub struct InlineBackgroundSpan {
 /// byte range over the flat IFC text, and painted as a zigzag path — the same
 /// shape [`InlineBackgroundSpan`] takes, and for the same reason.
 pub struct InlineDecorationSpan {
+    /// The element whose underline this is. Paint reads the colour from its
+    /// current style, as it reads a glyph's (#679).
+    pub owner: RawNodeId,
     /// Byte range start in the IFC `text_content`.
     pub start: usize,
     /// Byte range end (exclusive) in the IFC `text_content`.
     pub end: usize,
     /// The line's colour, already resolved: `text-decoration-color` when the
-    /// element set one, otherwise the element's own `color` (CSS `currentcolor`).
+    /// element set one, otherwise the element's own `color` (CSS `currentcolor`)
+    /// — as of the build, and drawn only if `owner` is gone by paint.
     pub color: peniko::Color,
+}
+
+/// A `vertical-align: sub|super|<length>|<percentage>` span within an IFC
+/// (#724).
+///
+/// Parley places the glyphs and grows the line for it (#1357: the span's
+/// parley `VerticalAlign`, `ifc::span_vertical_align`); this records, as a byte
+/// range over the flat IFC text, where it put them: `shift_px` is the offset of
+/// the element's baseline from its line's, in *layout* pixels (positive = down,
+/// rinch's Y-down convention — see `ifc::vertical_align_shift_px`'s doc for the
+/// sign and the calibration), the shifts of the elements around it added up
+/// and rounded as parley does (`ifc::composed_vertical_align_shift`). What is
+/// measured from the line box rather than the glyphs reads it: the caret, the
+/// glyph bounds, the element's background and border.
+#[derive(Debug, Clone, Copy)]
+pub struct InlineVerticalAlignSpan {
+    /// The element whose `vertical-align` this is. Its background and border
+    /// move with its text (`InlineLayout::element_shift`, #1817).
+    pub owner: RawNodeId,
+    /// Byte range start in the IFC `text_content`.
+    pub start: usize,
+    /// Byte range end (exclusive) in the IFC `text_content`.
+    pub end: usize,
+    /// The shift to apply to every glyph in this range, in unscaled layout
+    /// pixels. Positive moves the glyph down (`sub`, a negative `<length>`),
+    /// negative moves it up (`super`, a positive `<length>`/`<percentage>`).
+    /// Unused when [`Self::from_layout`].
+    pub shift_px: f32,
+    /// Whether the shift is read from the layout (`InlineLayout::layout_baseline_shift`)
+    /// rather than [`Self::shift_px`]: the element, or one around it, has a
+    /// `vertical-align` parley places by font metrics or by the line
+    /// (`top`/`middle`/`bottom`/`text-top`/`text-bottom`, #1357), so where its
+    /// baseline goes depends on the line it lands on.
+    pub from_layout: bool,
+}
+
+/// A `position: relative` **inline** element within an IFC (#1425, #2346).
+///
+/// Such an element has no box of its own: its text is part of the root's
+/// lines and its atomic inlines are placed by them. CSS 2.1 §9.4.3 moves
+/// everything it holds by its offset after the line is laid out, so like
+/// [`InlineVerticalAlignSpan`] this is a post-layout move, recorded as a byte
+/// range over the flat IFC text and applied by the painter, the text-position
+/// queries and the selection rectangles; its atomic inlines are moved where
+/// their boxes are written (`write_inline_positions`), so layout, hit testing
+/// and the painted box follow them; a box it is the containing block of hangs
+/// from its moved fragments (`out_of_flow`).
+///
+/// Unlike `vertical-align`, offsets **compose**: a relative span inside
+/// another moves by both (`InlineLayout::relative_offset_at` sums every span
+/// covering a byte).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InlineRelativeSpan {
+    /// The relatively positioned inline element.
+    pub owner: RawNodeId,
+    /// Byte range start in the IFC `text_content`.
+    pub start: usize,
+    /// Byte range end (exclusive) in the IFC `text_content`; equal to `start`
+    /// for an element with no text (one holding only atomic inlines), which
+    /// still moves them.
+    pub end: usize,
+    /// The resolved horizontal offset in layout px, positive to the right:
+    /// `left`, else the negated `right` (CSS 2.1 §9.4.3; `left` wins over an
+    /// over-constrained `right` in a left-to-right block).
+    pub dx: f32,
+    /// The resolved vertical offset in layout px, positive down: `top`, else
+    /// the negated `bottom`.
+    pub dy: f32,
 }
 
 /// Cached Parley inline layout for an IFC (Inline Formatting Context) root.
@@ -472,13 +782,705 @@ pub struct InlineLayout {
     pub child_positions: Vec<(RawNodeId, LayoutResult)>,
     /// Map from IFC flat byte ranges to DOM text nodes / `<br>` elements.
     pub text_ranges: Vec<IfcTextRange>,
+    /// The flat bytes of the bidi control characters an element's
+    /// `unicode-bidi` put around its content (#2588), ascending: `(start,
+    /// end, closing)`, `closing` for the PDF/PDI after the content. No text
+    /// node owns them; a caller counting the DOM's or a model's text steps
+    /// over them (`DomDocument::generated_flat_ranges`).
+    pub bidi_control_ranges: Vec<(usize, usize, bool)>,
+    /// The colour the root's own style gave the layout
+    /// (`crate::ifc::root_text_color` at the build): what text no range
+    /// covers was shaped in. See [`IfcTextRange::color`].
+    pub root_color: peniko::Color,
     /// Background spans for inline elements (code, mark, etc.).
     pub background_spans: Vec<InlineBackgroundSpan>,
     /// Wavy-underline spans (`text-decoration-style: wavy`), which Parley cannot
     /// express as a style and the painter draws itself.
     pub decoration_spans: Vec<InlineDecorationSpan>,
+    /// `vertical-align` spans (#724) — see [`InlineVerticalAlignSpan`].
+    pub vertical_align_spans: Vec<InlineVerticalAlignSpan>,
+    /// `position: relative` inline elements (#1425, #2346) — see
+    /// [`InlineRelativeSpan`]. Empty unless some inline element in the IFC is
+    /// relatively positioned with a non-zero offset, which every consumer
+    /// checks first.
+    pub relative_spans: Vec<InlineRelativeSpan>,
+    /// The relative inline elements of these lines whose offset resolved to
+    /// zero: kept out of [`Self::relative_spans`], so they cost paint
+    /// nothing, and kept at all so that a later resolve
+    /// (`RinchDocument::refresh_relative_spans`) can move them — a
+    /// percentage `top` whose block's height became definite (#2457), an
+    /// inset changed from `auto` (#2412).
+    pub relative_spans_resting: Vec<InlineRelativeSpan>,
     /// The max_width used to build this layout (for cache invalidation).
     pub max_width: f32,
+    /// The content width a paragraph that does not wrap was aligned within
+    /// (#1237), `f32::INFINITY` when none was given: with `max_width`, what
+    /// decides whether the paint layout must be built again. The two differ
+    /// by an auto-width root's pixel of breaking slack.
+    pub align_width: f32,
+    /// Whether spaces at the end of a line can be content, not collapsed
+    /// away: the IFC holds text under `pre`, `pre-wrap` or `break-spaces` (any element's,
+    /// #1192), or is a contenteditable root. Not `pre-line`'s, which collapses
+    /// spaces and removes them at the end of a line (CSS Text 3 §4.1.3).
+    /// Read by [`Self::measured_width`].
+    pub preserves_spaces: bool,
+    /// The flat byte ranges of `break-spaces` text, sorted and disjoint: its
+    /// spaces and tabs never hang, so a line ending in them is as wide as
+    /// they make it (#1043). Read by [`Self::measured_width`].
+    pub break_spaces: Vec<std::ops::Range<usize>>,
+    /// What hanging the preserved spaces at a soft wrap cost this layout
+    /// (the `ifc_hang_*` perf counters).
+    pub hang: crate::ifc::HangStats,
+    /// Where each positioned inline span an absolute box hangs from lies in
+    /// these lines (#631), or `None` for one with no fragment in them. Empty
+    /// when the lines are built; filled by
+    /// `RinchDocument::measure_inline_containing_blocks`, so an answer here
+    /// is about exactly these lines.
+    pub(crate) span_fragments:
+        std::collections::HashMap<RawNodeId, Option<crate::out_of_flow::SpanFragments>>,
+    /// Where each out-of-flow box met among this content would have sat in
+    /// these lines — its static position (#632, #634). In the order the walk
+    /// met them. A box hoisted out of an inline element inside an anonymous
+    /// box's run is met in the element and again after it; the first note is
+    /// its place, and the one its `Node::static_ifc_root` indexes. Empty for
+    /// nearly every layout.
+    pub(crate) out_of_flow: Vec<OutOfFlowMark>,
+    /// Where `text-overflow: ellipsis` cuts these lines (#1100), or `None`
+    /// for a layout with no line cut — nearly every one. The lines
+    /// themselves are not changed: paint hides what is past each cut and
+    /// draws a "…" there.
+    pub ellipsis: Option<Box<EllipsisCut>>,
+    /// How far lines were moved down to clear floats beside the root that
+    /// they did not fit beside (`crate::ifc::Broken::float_drop`); `0` for
+    /// nearly every layout. `Self::content_height` counts it.
+    pub float_drop: f32,
+    /// The root's `line_clamp` (#1703): past this many lines the box ends
+    /// (`Self::content_height`) and the last kept line ends in "…"; the
+    /// lines after it are laid out and painted as they are. `None` for
+    /// nearly every layout.
+    pub line_clamp: Option<usize>,
+    /// The clamp's content goes on past [`Self::line_clamp`]'s last line
+    /// even when it is this layout's last (#2581: a clamp counted through
+    /// block children, `Node::clamp_lines`), so that line ends in "…".
+    pub clamp_continues: bool,
+    /// The room the floats beside the root left its lines when they were
+    /// broken, `None` for lines given the whole width.
+    pub(crate) float_bands: Option<crate::float_wrap::FloatBands>,
+    /// Where the lines' glyphs reach past the lines' own room, in CSS px
+    /// `[x0, y0, x1, y1]` from the content origin, or `None` when they stay
+    /// inside it — nearly every layout ([`Self::glyph_overflow_of`], #1724,
+    /// #1632). Read by the damage ink and the clip proof
+    /// (`paint::text::inline_ink_past_lines`).
+    pub(crate) glyph_overflow: Option<[f32; 4]>,
+}
+
+/// Where `text-overflow: ellipsis` cuts an IFC root's lines (#1100): what
+/// paint hides on each line whose content overflows the box, and where it
+/// draws the "…".
+///
+/// The cut is made at paint time over the lines as they were laid out, as
+/// Chrome makes it: every grapheme (a ligature with every cluster its glyph
+/// covers) and atomic inline that passes the point where the "…" still fits
+/// at the line's end edge — the side the line leaves the box by — is hidden
+/// whole, decorations and shadows with it, and the "…" is drawn right after
+/// what is kept, in the block container's font and colour, undecorated.
+/// Inline backgrounds and borders are not cut: an inline element keeps its
+/// extent and the root's clip cuts it at the root's padding edge, as Chrome
+/// 155 draws a pill the cut falls in. Text offsets, hit testing and caret
+/// mapping read the lines, so they are unaffected by the cut.
+#[derive(Clone)]
+pub struct EllipsisCut {
+    /// The layout byte ranges hidden, sorted and disjoint.
+    pub hidden: Vec<std::ops::Range<usize>>,
+    /// The atomic inlines hidden, whose box does not fit before the "…".
+    pub hidden_boxes: Vec<RawNodeId>,
+    /// One per cut line, in line order.
+    pub marks: Vec<EllipsisMark>,
+    /// The "…" shaped in the root's style, at the layout's origin.
+    pub glyph: parley::layout::Layout<Brush>,
+}
+
+/// Where one cut line draws its "…": the top-left of
+/// [`EllipsisCut::glyph`], in the lines' own coordinates, placed so the
+/// "…"'s baseline is the line's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EllipsisMark {
+    /// The line's index in the layout.
+    pub line: usize,
+    /// The left edge of the "…".
+    pub x: f32,
+    /// The top of the "…"'s layout.
+    pub y: f32,
+    /// When the "…" is at the line's right: the x past which everything on
+    /// the line is hidden, so paint need not walk what lies past it.
+    pub hidden_past: Option<f32>,
+}
+
+/// An out-of-flow box (`position: absolute` or `fixed`) met in an inline
+/// formatting context's content, and where its box would have been had it
+/// stayed in the flow — its **static position** (CSS 2.1 §10.3.7, §10.6.4).
+/// The box takes no room in the lines; this only remembers its place.
+///
+/// Positions are in the lines' own coordinates (the root's content box), and
+/// both answers are kept because which one applies is the box's own style
+/// (`ComputedStyle::inline_level_before_blockify`), which can change with no
+/// rebuild of these lines.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct OutOfFlowMark {
+    /// The out-of-flow box.
+    pub id: RawNodeId,
+    /// The flat-text byte the box sits at: everything before it was pushed
+    /// before the box was met.
+    pub flat: usize,
+    /// The last atomic inline pushed before the box and the flat byte it was
+    /// pushed at. It is the content right before the box when the two bytes
+    /// are the same (an inline box takes no byte of the text).
+    pub after_box: Option<(RawNodeId, usize)>,
+    /// For a box that was inline-level: where the content before it ends on
+    /// its line, and that line's top (Chrome 153: the line box's top,
+    /// whatever makes the line tall).
+    pub inline: (f32, f32),
+    /// For a block-level box: below the line holding the content before it,
+    /// or the first line's top when nothing precedes it. Its x is the content
+    /// box's left edge whatever the `text-align`, moved only by the relative
+    /// inline elements around the box (`block_x`, #1425).
+    pub block_y: f32,
+    /// The horizontal move of a block-level box's static position: the
+    /// offset of the relative inline elements around it (#1425), else 0.
+    pub block_x: f32,
+}
+
+impl InlineLayout {
+    /// Where each atomic inline (an `inline-block`, `inline-flex`,
+    /// `inline-grid`, inline table or replaced element) stands in
+    /// [`Self::text_content`]: the flat byte offset of the text after it, in
+    /// order. Not an element's edge box nor a float's mark, which are no
+    /// content of a line.
+    pub fn atomic_inline_offsets(&self) -> impl Iterator<Item = usize> + '_ {
+        self.atomic_inlines().map(|(_, at)| at)
+    }
+
+    /// Each atomic inline of [`Self::atomic_inline_offsets`] with its node id
+    /// (its box's id in [`Self::layout`]), in order.
+    pub fn atomic_inlines(&self) -> impl Iterator<Item = (RawNodeId, usize)> + '_ {
+        self.layout
+            .inline_boxes()
+            .filter(|b| !crate::ifc::is_edge_box(b.id) && b.kind == parley::InlineBoxKind::InFlow)
+            .map(|b| (b.id, b.index))
+    }
+
+    /// The height of the lines: parley's layout height, which sums the
+    /// lines' heights, and the gaps left above lines moved down below a
+    /// float.
+    pub(crate) fn content_height(&self) -> f32 {
+        if let Some(line) = self.clamped_line() {
+            return line.metrics().block_max_coord + self.float_drop;
+        }
+        self.layout.height() + self.float_drop
+    }
+
+    /// The last line [`Self::line_clamp`] keeps, when there are lines past
+    /// it.
+    pub(crate) fn clamped_line(&self) -> Option<parley::layout::Line<'_, Brush>> {
+        let n = self.line_clamp?;
+        if n == 0 || self.layout.len() < n || (self.layout.len() == n && !self.clamp_continues) {
+            return None;
+        }
+        self.layout.get(n - 1)
+    }
+
+    /// Where `layout`'s glyphs reach, in CSS px `[x0, y0, x1, y1]` from the
+    /// content origin, when that is past the room the lines were given: each
+    /// line's content (not its line box) from where it is placed to where it ends ([`parley`]'s
+    /// `offset` and `advance` — a `nowrap` line or an unbreakable word wider
+    /// than its box overflows it, #1632), and from the top to the bottom of
+    /// its content area (the fonts' ascent and descent, which leave a line
+    /// box whose `line-height` is less than their sum, #1724). The room is
+    /// `[0, width] x [0, layout height]`, where `width` is the width the
+    /// lines were broken or aligned within (`max_width`, `align_width`), or
+    /// the layout's own when neither is finite. `None` when every line stays
+    /// inside it, so the paint prune's fast path stays one compare.
+    ///
+    /// Measured from the font metrics, not the glyph outlines: a diacritic
+    /// taller than the font's ascent, an italic's overhang and faux bold's
+    /// thickening are not counted.
+    pub(crate) fn glyph_overflow_of(
+        layout: &parley::layout::Layout<Brush>,
+        max_width: f32,
+        align_width: f32,
+    ) -> Option<[f32; 4]> {
+        let room = if max_width.is_finite() && align_width.is_finite() {
+            max_width.min(align_width)
+        } else if max_width.is_finite() {
+            max_width
+        } else if align_width.is_finite() {
+            align_width
+        } else {
+            layout.width()
+        };
+        let height = layout.height();
+        let mut reach: Option<[f32; 4]> = None;
+        for line in layout.lines() {
+            let m = line.metrics();
+            let start = m.inline_min_coord + m.offset;
+            // The content only: a line box holds no ink of its own, and an
+            // auto-width root's lines are given a pixel of breaking slack
+            // past its box (`max_width`), which is not drawn into.
+            let r = [
+                start,
+                m.content_block_min_coord,
+                start + m.advance,
+                m.content_block_max_coord,
+            ];
+            reach = Some(reach.map_or(r, |a| {
+                [
+                    a[0].min(r[0]),
+                    a[1].min(r[1]),
+                    a[2].max(r[2]),
+                    a[3].max(r[3]),
+                ]
+            }));
+        }
+        reach.filter(|r| r[0] < 0.0 || r[1] < 0.0 || r[2] > room || r[3] > height)
+    }
+
+    /// The width of what paint draws of the lines, for the clip proof: the
+    /// layout's width, or no wider than the box for lines cut by
+    /// `text-overflow: ellipsis` (#1100), whose glyphs past the box are not
+    /// drawn.
+    pub(crate) fn painted_width(&self) -> f32 {
+        let w = self.layout.width();
+        if self.ellipsis.is_some() {
+            w.min(self.max_width)
+        } else {
+            w
+        }
+    }
+
+    /// The text paint draws on each line — what the line holds (less a
+    /// forced break's newline) less what `text-overflow: ellipsis` hides,
+    /// with a "…" where it cuts; `None` when no line is cut. For tests.
+    #[doc(hidden)]
+    pub fn painted_lines(&self) -> Option<Vec<String>> {
+        let cut = self.ellipsis.as_ref()?;
+        let hidden = |b: usize| {
+            let i = cut.hidden.partition_point(|r| r.end <= b);
+            cut.hidden.get(i).is_some_and(|r| r.start <= b)
+        };
+        let mut lines = Vec::new();
+        for (index, line) in self.layout.lines().enumerate() {
+            let range = line.text_range();
+            let mut s: String = self
+                .text_content
+                .get(range.clone())
+                .unwrap_or("")
+                .char_indices()
+                .filter(|&(i, c)| c != '\n' && !hidden(range.start + i))
+                .map(|(_, c)| c)
+                .collect();
+            if cut.marks.iter().any(|m| m.line == index) {
+                s.push('\u{2026}');
+            }
+            lines.push(s);
+        }
+        Some(lines)
+    }
+
+    /// [`Self::painted_lines`] joined by `\n`. For tests.
+    #[doc(hidden)]
+    pub fn painted_text(&self) -> Option<String> {
+        Some(self.painted_lines()?.join("\n"))
+    }
+
+    /// The `vertical-align` shift an inline element's own box is drawn at —
+    /// its background, border and edge boxes: the shift of the nearest
+    /// element from `owner` up whose `vertical-align` moved it (#1817). Its
+    /// text moves by the same amount ([`Self::vertical_align_shift_at`]),
+    /// unless something inside it is shifted again. `get` looks a node up.
+    pub(crate) fn element_shift<'a>(
+        &self,
+        owner: RawNodeId,
+        get: impl Fn(RawNodeId) -> Option<&'a Node>,
+    ) -> f32 {
+        if self.vertical_align_spans.is_empty() {
+            return 0.0;
+        }
+        let mut cur = Some(owner);
+        // Inline nesting is shallow; the bound only guards a cycle.
+        for _ in 0..64 {
+            let Some(id) = cur else { break };
+            if let Some(s) = self.vertical_align_spans.iter().find(|s| s.owner == id) {
+                return self.span_shift(s, s.start);
+            }
+            cur = get(id).and_then(|n| n.parent);
+        }
+        0.0
+    }
+
+    /// The `position: relative` offset (#1425, #2346) an inline element's own
+    /// box is drawn at — its background, border and edge boxes, and the
+    /// atomic inlines it holds: the sum of the offsets of `owner` and every
+    /// relatively positioned inline element around it in this IFC. `(0, 0)`
+    /// when nothing is relatively positioned. `get` looks a node up.
+    pub(crate) fn element_relative_offset<'a>(
+        &self,
+        owner: RawNodeId,
+        get: impl Fn(RawNodeId) -> Option<&'a Node>,
+    ) -> (f32, f32) {
+        let mut sum = (0.0, 0.0);
+        if self.relative_spans.is_empty() {
+            return sum;
+        }
+        let mut cur = Some(owner);
+        // Inline nesting is shallow; the bound only guards a cycle.
+        for _ in 0..64 {
+            let Some(id) = cur else { break };
+            if let Some(s) = self.relative_spans.iter().find(|s| s.owner == id) {
+                sum.0 += s.dx;
+                sum.1 += s.dy;
+            }
+            cur = get(id).and_then(|n| n.parent);
+        }
+        sum
+    }
+
+    /// The `position: relative` offset (#1425, #2346) of inline box `box_id`
+    /// of these lines: an atomic inline's (that of the relative inline
+    /// elements around it, as `write_inline_positions` moves it), or an edge
+    /// box's (its element's, as its background moves). `(0, 0)` when nothing
+    /// is relatively positioned. `get` looks a node up.
+    pub(crate) fn inline_box_relative_offset<'a>(
+        &self,
+        box_id: u64,
+        get: impl Fn(RawNodeId) -> Option<&'a Node>,
+    ) -> (f32, f32) {
+        if self.relative_spans.is_empty() {
+            return (0.0, 0.0);
+        }
+        let owner = match crate::ifc::edge_box_owner(box_id) {
+            Some((element, _)) => Some(element),
+            None if crate::ifc::is_edge_box(box_id) => None,
+            None => get(box_id).and_then(|n| n.parent),
+        };
+        owner.map_or((0.0, 0.0), |o| self.element_relative_offset(o, get))
+    }
+
+    /// The `position: relative` offset (#1425, #2346) of the glyph at layout
+    /// byte `byte`: the sum of every relative span covering it, so nested
+    /// relative spans compose. `(0, 0)` when none does.
+    pub(crate) fn relative_offset_at(&self, byte: usize) -> (f32, f32) {
+        let mut sum = (0.0, 0.0);
+        for s in &self.relative_spans {
+            if s.start <= byte && byte < s.end {
+                sum.0 += s.dx;
+                sum.1 += s.dy;
+            }
+        }
+        sum
+    }
+
+    /// Where the glyph at layout byte `byte` is drawn relative to where its
+    /// line put it: its relative offset (#1425). A `vertical-align` (#724)
+    /// is not in it: parley places the glyph by it, in its line, which grows
+    /// to hold it (#1357). The one lookup paint and every text query share.
+    pub(crate) fn glyph_offset_at(&self, byte: usize) -> (f32, f32) {
+        self.relative_offset_at(byte)
+    }
+
+    /// Whether any glyph of this IFC is drawn off its line: a
+    /// `vertical-align` span (#724) or a relative inline element (#1425).
+    pub(crate) fn shifts_glyphs(&self) -> bool {
+        !self.vertical_align_spans.is_empty() || !self.relative_spans.is_empty()
+    }
+
+    /// The `vertical-align` shift (#724) at layout byte `byte`, or `0.0` when
+    /// no span covers it (the common case: no descendant declared a non-
+    /// `baseline` `vertical-align`).
+    ///
+    /// A **linear** scan, deliberately not `crate::paint::text::TextMask`'s
+    /// binary search: unlike a background or a wavy underline, two of these
+    /// spans *can* nest byte-for-byte (`<sub><sup>x</sup></sub>`), and
+    /// `ifc::walk_inline_children` pushes a descendant's span before its
+    /// ancestor's (post-order — a `push_inline_spans` call closes a stretch,
+    /// which happens as each element's own walk returns). So the first match
+    /// in **insertion order** is always the innermost one covering `byte`,
+    /// and its `shift_px` already holds its ancestors' shifts (#1357). The
+    /// list stays this short in practice (elements with a non-`baseline`
+    /// `vertical-align` are rare), so the scan costs nothing a sort-then-
+    /// search would have saved.
+    pub(crate) fn vertical_align_shift_at(&self, byte: usize) -> f32 {
+        self.vertical_align_spans
+            .iter()
+            .find(|s| s.start <= byte && byte < s.end)
+            .map(|s| self.span_shift(s, byte))
+            .unwrap_or(0.0)
+    }
+
+    /// `span`'s shift at layout byte `byte`.
+    fn span_shift(&self, span: &InlineVerticalAlignSpan, byte: usize) -> f32 {
+        if span.from_layout {
+            self.layout_baseline_shift(byte)
+        } else {
+            span.shift_px
+        }
+    }
+
+    /// Where parley put the baseline of the glyph run holding layout byte
+    /// `byte`, from its line's baseline (Y-down; `0.0` when no run holds it):
+    /// the shift of a span placed by its font metrics or by the line (#1357).
+    /// A glyph run is one style's stretch of a run (a shaped run can hold
+    /// several styles), so the byte's cluster names the style to look for.
+    pub(crate) fn layout_baseline_shift(&self, byte: usize) -> f32 {
+        let Some(cluster) = parley::layout::Cluster::from_byte_index(&self.layout, byte) else {
+            return 0.0;
+        };
+        let style = cluster.style_index();
+        let run = cluster.run().text_range();
+        let line = cluster.line();
+        let baseline = line.metrics().baseline;
+        for item in line.items() {
+            if let parley::layout::PositionedLayoutItem::GlyphRun(g) = item
+                && g.style_index() == style
+                && g.run().text_range() == run
+            {
+                return g.baseline() - baseline;
+            }
+        }
+        0.0
+    }
+
+    /// The width this inline content asks for: what the IFC root's measure
+    /// reports to Taffy.
+    ///
+    /// Parley's [`Layout::width`](parley::Layout::width) leaves out every
+    /// line's trailing white space. That is right for collapsible spaces and
+    /// for spaces hanging at a soft wrap, but a preserved space at the end of
+    /// the text (or before a forced break) is content: Chrome's max-content
+    /// width of a `pre-wrap` `"bullet text "` is the text *and* its space
+    /// (78.91px on the bundled Inter at 16px, against 74.41px without). A box
+    /// sized to the narrower width then had to fit the space too, and it
+    /// wrapped onto a line of its own. So here a line that ends at a soft wrap
+    /// drops its trailing spaces (they hang) and any other line keeps them,
+    /// but only as far as the available width reaches: past it they hang
+    /// (CSS Text 4 §4.3, "conditionally hang"), so a width the text fits in is
+    /// never exceeded because of its spaces.
+    ///
+    /// Collapsible spaces at a line's end hang, but an NBSP there does not
+    /// (#1154): parley counts U+00A0 in a line's `trailing_whitespace`, and
+    /// so leaves it out of `Layout::width`, where CSS Text 3 §4.1.3 hangs
+    /// only spaces and tabs. `x&nbsp;` is as wide as `x` and its NBSP in
+    /// Chrome. See `width_keeping_nbsp`.
+    pub fn measured_width(&self) -> f32 {
+        measured_width_of(
+            &self.layout,
+            &self.text_content,
+            self.preserves_spaces,
+            self.max_width,
+            &self.break_spaces,
+        )
+    }
+
+    /// The width a box sized fit-content takes for these lines, broken at
+    /// [`Self::max_width`] (#2330): CSS's `min(max-content, max(min-content,
+    /// available))`. Lines that wrapped softly (a line ended `Regular` or
+    /// `Emergency`) say the max-content width is more than the room, so the
+    /// answer is the room, or the widest line when a piece that cannot break
+    /// is wider still; lines that did not wrap are the max-content width,
+    /// [`Self::measured_width`]. The width of the widest line alone is no
+    /// CSS width: a float holding `alpha beta … kappa` in 300px was 277 wide
+    /// where Chrome 156 makes it 300.
+    pub(crate) fn fit_content_width(&self) -> f32 {
+        let measured = self.measured_width();
+        if !self.max_width.is_finite() {
+            return measured;
+        }
+        use parley::layout::BreakReason;
+        let wrapped = self.layout.lines().any(|line| {
+            matches!(
+                line.break_reason(),
+                BreakReason::Regular | BreakReason::Emergency
+            )
+        });
+        if wrapped {
+            measured
+                .max(self.max_width)
+                .max(unbroken_min_content(&self.layout))
+        } else {
+            measured
+        }
+    }
+}
+
+/// The min-content width of `layout` when its lines took an emergency break,
+/// else 0: what a measure that broke them must not report less than (#2363).
+///
+/// `overflow-wrap: break-word` lets the line breaker split a word too wide
+/// for its line (a `BreakReason::Emergency` line), but CSS Text 3 §5.2 keeps
+/// those breaks out of the min-content width: "soft wrap opportunities
+/// introduced by the break are not considered when calculating min-content
+/// intrinsic sizes". `overflow-wrap: anywhere` and `word-break: break-all`
+/// add real soft wrap opportunities. So a measure that laid the text out at
+/// a room (or at 0, for a min-content width) and broke a word there had
+/// answered a width narrower than the word, and a float, an inline-block, a
+/// flex or grid item or a table cell was sized to it. Chrome 157: a float
+/// holding `Supercalifragilistic` (139.70 wide) in 100px is 139.70 x 20
+/// under `break-word`, 100 x 40 under `anywhere`.
+///
+/// Parley's own content widths ([`parley::Layout::calculate_content_widths`])
+/// count `anywhere` and its soft wrap opportunities but not `break-word`'s
+/// emergency breaks, so their `min` is that width. Only a layout with an
+/// emergency line asks for it: other lines were broken at real
+/// opportunities, which the measure's own width already counts.
+///
+/// Parley also ends a line `Emergency` after an inline box too wide for
+/// an empty line, which splits nothing: such a line holds only that box,
+/// and is not asked about. Parley's content widths do not see every
+/// opportunity rinch's own lines take (a `normal` span's boxes inside a
+/// `nowrap` root, `atomic_inline_soft_wrap_1238_tests.rs` k34), so they
+/// are read only when a word was split.
+///
+/// Or when a line ends inside a ligature (#2381): its lines draw both sides
+/// shaped on their own, and Chrome's min-content width does not reshape, it
+/// counts the ligature whole with the text after the break, as parley's
+/// content widths do (Chrome 157: Inter's `a->b` broken in no room is `a-`,
+/// 16.34, and `>b`, 20.39, and its min-content width is 25.06, the arrow and
+/// `b`). Known gap: in a paragraph that also holds one of the opportunities
+/// parley's content widths miss (k34 above), the floor can be too wide.
+pub(crate) fn unbroken_min_content(layout: &parley::Layout<Brush>) -> f32 {
+    use parley::layout::{BreakReason, PositionedLayoutItem};
+    if layout.breaks_inside_ligature() {
+        return layout.calculate_content_widths().min;
+    }
+    let emergency = layout.lines().any(|line| {
+        line.break_reason() == BreakReason::Emergency
+            && line
+                .items()
+                .any(|item| matches!(item, PositionedLayoutItem::GlyphRun(g) if g.advance() > 0.0))
+    });
+    if emergency {
+        layout.calculate_content_widths().min
+    } else {
+        0.0
+    }
+}
+
+/// [`InlineLayout::measured_width`] for any laid-out text: `layout` built
+/// from `text`, broken at `max_width` (`f32::INFINITY` for none), with
+/// `preserves_spaces` and the `break-spaces` ranges `break_spaces` as the
+/// layout was built with. A text leaf (a flex or grid item's own text) is
+/// measured by it too (#1279).
+pub(crate) fn measured_width_of(
+    layout: &parley::Layout<Brush>,
+    text: &str,
+    preserves_spaces: bool,
+    max_width: f32,
+    break_spaces: &[std::ops::Range<usize>],
+) -> f32 {
+    let width = indented_width(layout);
+    if !preserves_spaces {
+        return width_keeping_nbsp(layout, text, break_spaces, width);
+    }
+    use parley::layout::BreakReason;
+    let mut extent = width;
+    for line in layout.lines() {
+        if matches!(
+            line.break_reason(),
+            BreakReason::Regular | BreakReason::Emergency
+        ) {
+            continue;
+        }
+        let m = line.metrics();
+        extent = extent.max(m.inline_min_coord + m.indent + m.advance);
+    }
+    // An NBSP never hangs, not even conditionally (#1154).
+    extent
+        .min(max_width.max(width))
+        .max(width_keeping_nbsp(layout, text, break_spaces, width))
+}
+
+/// [`parley::Layout::width`], with a negative `text-indent` taken off the
+/// lines it indents (#2628). parley counts a positive indent in a line's
+/// extent and a negative one as 0; Chrome 157 takes a negative one off the
+/// max-content width (a `-17px` float holding `alpha beta`, 79.03, is 62.03
+/// wide). Not below 0.
+fn indented_width(layout: &parley::Layout<Brush>) -> f32 {
+    let width = layout.width();
+    if !layout.lines().any(|line| line.metrics().indent < 0.0) {
+        return width;
+    }
+    layout
+        .lines()
+        .map(|line| {
+            let m = line.metrics();
+            m.inline_min_coord + m.indent + m.advance - m.hanging_advance
+        })
+        .fold(0.0, f32::max)
+}
+
+/// `width` (parley's, which drops every line's trailing white space)
+/// widened to the lines whose trailing white space holds an NBSP: such a
+/// line keeps everything up to and including its last NBSP, and drops
+/// only the spaces, tabs and newline after it. Not clamped to the
+/// available width: an NBSP never hangs, not even conditionally, so a
+/// min-content measure must count it. A `break-spaces` space or tab is
+/// kept like an NBSP: it never hangs either (#1043). A text with no NBSP
+/// and no `break-spaces` text (every ordinary one) returns `width` after
+/// one scan of its bytes.
+fn width_keeping_nbsp(
+    layout: &parley::Layout<Brush>,
+    text_content: &str,
+    break_spaces: &[std::ops::Range<usize>],
+    width: f32,
+) -> f32 {
+    if !text_content.contains('\u{a0}') && break_spaces.is_empty() {
+        return width;
+    }
+    let in_break_spaces = |byte: usize| {
+        let i = break_spaces.partition_point(|r| r.end <= byte);
+        break_spaces.get(i).is_some_and(|r| r.contains(&byte))
+    };
+    let mut extent = width;
+    for line in layout.lines() {
+        let m = line.metrics();
+        if m.hanging_advance <= 0.0 {
+            continue;
+        }
+        // The line's clusters in logical order, last first: the trailing
+        // end is logical whatever the direction.
+        let mut clusters: Vec<(usize, f32, bool)> = Vec::new();
+        for run in line.runs() {
+            for c in run.clusters() {
+                let range = c.text_range();
+                // A `break-spaces` space or tab is kept the same way: it
+                // never hangs either (#1043).
+                let nbsp = text_content.get(range.clone()) == Some("\u{a0}")
+                    || (!break_spaces.is_empty()
+                        && matches!(text_content.get(range.clone()), Some(" " | "\t"))
+                        && in_break_spaces(range.start));
+                clusters.push((range.start, c.advance(), nbsp));
+            }
+        }
+        clusters.sort_by_key(|&(start, _, _)| start);
+        let mut hung = 0.0;
+        let mut kept_nbsp = false;
+        for &(start, advance, nbsp) in clusters.iter().rev() {
+            if nbsp {
+                kept_nbsp = true;
+                break;
+            }
+            let t = text_content.get(start..).unwrap_or("");
+            if !t.starts_with([' ', '\t', '\n', '\r']) {
+                break;
+            }
+            hung += advance;
+        }
+        if kept_nbsp {
+            extent = extent.max(m.inline_min_coord + m.indent + m.advance - hung);
+        }
+    }
+    // Unlike a preserved space, an NBSP never hangs, so no clamp to the
+    // available width: a min-content measure (width 0) must keep it.
+    extent
 }
 
 impl std::fmt::Debug for InlineLayout {
@@ -489,6 +1491,10 @@ impl std::fmt::Debug for InlineLayout {
             .finish()
     }
 }
+
+/// A text control's displayed text: `(caret x, caret y, full width, height)`
+/// in logical px (#1721, #827).
+pub(crate) type InputLineMetrics = (f32, f32, f32, f32);
 
 /// A node in the DOM tree.
 pub struct Node {
@@ -546,16 +1552,122 @@ pub struct Node {
     /// instead: a direct write of `id` fails loudly in every debug test rather
     /// than silently un-fixing #675. The assert is compiled out in release.
     id_atom: Option<Atom>,
+    /// Whether the node carries `data-text-sel="true"`, the read-only text
+    /// selection the shell writes on an IFC root. Kept by
+    /// [`Node::write_attribute`] / [`Node::erase_attribute`] like `id_atom`, so
+    /// the paint and damage paths ask a `bool` per IFC root rather than hash an
+    /// attribute name (review of #1706: the lookup cost a hover frame 3.6%).
+    text_sel: bool,
+    /// The node whose content this positioned box highlights
+    /// ([`rinch_core::dom::DomDocument::set_highlight_owner`], #2666): paint
+    /// draws it as part of that node's paint, over its backgrounds and under
+    /// its text, rather than in its own place in the stacking order.
+    pub(crate) highlight_owner: Option<RawNodeId>,
+    /// The misspelled words a text control shows (#2862), written by the
+    /// runtime's spellchecker through `RinchDocument::set_spelling_marks`.
+    /// `None` for every node that has none, which is every node of an app
+    /// whose fields were never checked.
+    pub(crate) spelling: Option<Box<SpellingMarks>>,
+    /// A `<textarea>`'s dirty value flag, for the one state the `value`
+    /// attribute cannot carry: **dirty with no attribute**, which removing the
+    /// attribute leaves (#1222). While the attribute is present its presence
+    /// is the flag ([`crate::form_control::control_value`]); this records that
+    /// it was removed, so the field shows `""` rather than falling back to its
+    /// text children. rinch-web's removal writes `.value = ""`, which sets the
+    /// browser's flag, and only a form reset clears that — which desktop does
+    /// not model — so nothing clears this either.
+    pub value_dirty: bool,
+    /// An `<img>` alt placeholder too small for its box shows its alt text
+    /// inline with its `width`/`height` dropped from its Taffy style (#2309,
+    /// [`crate::img_placeholder::ignores_size`]): whether the style it was
+    /// last given dropped them, so `sync_img_placeholder` knows when to
+    /// rebuild it (a failure or a picture arriving changes it without a
+    /// restyle).
+    pub img_size_ignored: bool,
+    /// A single-line `<input>`'s horizontal scroll, in logical px: how far its
+    /// one unwrapped line of text is moved left so the caret stays in view
+    /// (#1721). `NaN` until the field is focused (and again after it loses
+    /// focus), which [`crate::form_control::input_scroll_x`] reads as "start
+    /// from 0 and centre the caret if it is out of view", Chrome 155's focus
+    /// reveal. Read and written only through that function, which every
+    /// consumer of the field's text geometry asks.
+    pub input_scroll_x: Cell<f32>,
     /// Dirty flags for incremental updates.
     pub dirty: DirtyFlags,
-    /// Scroll offset (x, y).
+    /// Scroll offset (x, y), on the device pixel grid once
+    /// [`NodeTree::mark_scrolled`] has seen it (#1543).
     pub scroll_offset: (f64, f64),
+    /// The part of the last wheel scroll that fell below the device pixel
+    /// grid (x, y), under one device pixel. The wheel adds it back before
+    /// its next delta, so a run of sub-pixel deltas (a slow touchpad) still
+    /// adds up rather than snapping back to where it started (#1543).
+    pub scroll_remainder: (f64, f64),
     /// Taffy layout node ID.
     pub taffy_id: Option<taffy::NodeId>,
     /// Computed layout result.
     pub layout: LayoutResult,
-    /// Previous frame's layout (for dirty region computation).
+    /// For an atomic inline with an entry in
+    /// `NodeTree::keyword_inline_cb_width` (or, for a box with a percentage
+    /// inline size, in `NodeTree::percent_inline_cb_width`, regress-017):
+    /// the size it had before
+    /// `resolve_percentage_inline_blocks` first resolved it against a
+    /// containing block — measured as `auto`, under max-content space, which
+    /// for an `auto`-width box is its **max-content contribution** (#1476).
+    /// `layout` is the size it has now, which that pass may have capped; an
+    /// inline formatting context asked how wide the box *could* be must line
+    /// it up at this one, or a container sized from that answer stays as
+    /// narrow as the cap made it. Not meaningful without the entry: the box
+    /// then has its natural size.
+    pub(crate) natural_inline_size: (f32, f32),
+    /// The unrounded max-content width the last shrink-to-fit resolution of
+    /// this atomic inline measured — current under the same condition as
+    /// `natural_inline_size`, and what lets a still-resolved box be resolved
+    /// against another width without measuring it again.
+    pub(crate) natural_max_width: f32,
+    /// An atomic inline's baseline, from its border-box top, as its detached
+    /// compute last laid it out (`RinchDocument::measure_inline_blocks`):
+    /// what it hands parley as its `InlineBox::baseline` (#663). `None` lines
+    /// it up by its bottom edge — a replaced element, a box with no line in
+    /// it or one whose `overflow` is not `visible` (CSS 2.1 §10.8.1).
+    pub(crate) atomic_baseline: Option<f32>,
+    /// Whether `atomic_baseline` has been computed: the box has been measured
+    /// as an atomic inline at least once. A box that became one by a
+    /// restyle around it (a flex item whose container became a block) has
+    /// not, and is measured before the IFC that lines it up (#663).
+    pub(crate) atomic_baseline_known: bool,
+    /// The box this node was last **painted** in, for dirty-region
+    /// computation: where its old pixels are, and so what a frame that moves it
+    /// has to clear.
+    ///
+    /// Not "the previous layout pass's box". Layout never writes this field;
+    /// it changes `layout` and pushes the node to `paint_dirty_nodes`, and
+    /// [`NodeTree::consume_paint_dirty`] — run by the paint that consumes the
+    /// region — brings it level with `layout`. So any number of layout passes
+    /// between two paints is safe. It used to be overwritten by every pass,
+    /// which lost the painted rect whenever a frame resolved twice (the
+    /// editor's caret pass does, and so do two pointer moves between paints)
+    /// and left the old caret, selection or dragged panel painted where it
+    /// was — papered over with a full repaint per keystroke until the
+    /// ownership moved here.
+    ///
+    /// Meaningful only while [`Self::painted`] is `Some`: a node that has not
+    /// been painted since it was created or removed has no old pixels.
     pub prev_layout: LayoutResult,
+    /// The rest of what this node was last painted *with*, beside
+    /// `prev_layout`: its own ink reach and its own transform. `None` until a
+    /// paint consumes the node, and again once a removal has recorded its old
+    /// rect. Written only by [`NodeTree::consume_paint_dirty`].
+    ///
+    /// Everything here is **parent-relative**, like `prev_layout`, so the
+    /// absolute rect a node was painted in is the sum of these up its box-tree
+    /// chain (`paint::previous_painted_rect`) — exact whether it was the node
+    /// or an ancestor that moved, and exact when its ink or transform changed
+    /// in the same frame, because what is summed is what was painted rather
+    /// than today's values moved back by a delta. Relative storage is also why
+    /// only the nodes a paint consumes need updating: a node that was not
+    /// paint-dirty was not moved, restyled or re-transformed, so what it was
+    /// painted with is still what it has.
+    pub painted: Option<PaintedState>,
     /// CSS display mode (parsed from style attribute).
     pub display_mode: DisplayMode,
     /// If this node is an inline child, which IFC root owns it.
@@ -675,12 +1787,14 @@ pub struct Node {
     /// that contribute their children's boxes rather than one of their own
     /// (#513).
     ///
-    /// Total over the slab, and derived state: recomputed from scratch at the
-    /// top of every `ifc_dirty` pass by
-    /// `RinchDocument::recompute_contributes_in_flow_block`, exactly as
-    /// `ifc_root` is. Never invalidated per mutation site — creating or
-    /// destroying an in-flow block-level box takes a structural change or a
-    /// `display`/`position` change, and every one of those sets `ifc_dirty`.
+    /// Derived state, recomputed by
+    /// `RinchDocument::recompute_contributes_in_flow_block` at the top of every
+    /// structural pass, exactly as `ifc_root` is: over the whole slab on a
+    /// whole-document pass (`ifc_dirty`), over the regions it sets up on a
+    /// scoped one (`crate::ifc_scope`). Never invalidated per mutation site —
+    /// creating or destroying an in-flow block-level box takes a structural
+    /// change or a `display`/`position` change, and every one of those seeds a
+    /// structural pass reaching the node's region.
     ///
     /// The rule, in one place:
     ///
@@ -749,10 +1863,85 @@ pub struct Node {
     /// `box_tree_children` down its unit-collecting path for exactly the
     /// containers and inlines that need it, and nothing else.
     pub hosts_hoisted_out_of_flow: bool,
+    /// On an **out-of-flow box**: the inline formatting context root whose
+    /// lines hold its static position, and the index of its note among
+    /// theirs (`InlineLayout::out_of_flow`), as of the last time those lines
+    /// were built with the box among their content (#632). A hint, checked
+    /// where it is read (`out_of_flow::static_location`): the root must
+    /// still hold this box's note there. The index is what keeps a look at
+    /// one box from walking the notes of every other box in its paragraph.
+    pub(crate) static_ifc_root: Option<(RawNodeId, usize)>,
+    /// On an **anonymous block box**: the out-of-flow boxes that sit inside
+    /// its run, each with the index of the member it comes right before (0
+    /// for one before the first, `run_members.len()` for one after the
+    /// last). An out-of-flow box joins no run (#406), so the run's own list
+    /// does not say where it was; its static position needs that (#632). A
+    /// box before the first member is here too: Taffy's sibling order puts
+    /// it at the run's top, but an inline-level one starts the first *line*,
+    /// wherever `text-align` puts that. One with an in-flow block between it
+    /// and the run is not: it belongs to no line.
+    pub(crate) run_out_of_flow: Vec<(usize, RawNodeId)>,
+    /// Whether this box lies strictly between an absolute box and the
+    /// containing block that box was placed against at the last layout — a
+    /// non-parent ancestor or the initial containing block (#386) — so that
+    /// its scroll offset is part of that box's position
+    /// (`out_of_flow::place_absolute`). A scroll of a node without the flag
+    /// re-places nothing. Set by the layout read-back; cleared by the next.
+    pub(crate) on_abs_chain: bool,
+    /// Whether this is a `position: fixed` box whose containing block is an
+    /// ancestor — one with a `transform` or `contain: paint`/`layout`
+    /// ([`Node::establishes_fixed_containing_block`]) — and not the viewport
+    /// (#1372). Such a box is placed, clipped, scrolled, painted and hit as
+    /// an absolute box resolved against that ancestor, so
+    /// [`Node::box_position`] answers `absolute` for it. Kept by the cascade
+    /// (`RinchDocument::sync_fixed_containment`): set when the box is styled,
+    /// and for every fixed descendant of a box that starts or stops being
+    /// such a containing block.
+    pub(crate) fixed_contained: bool,
+    /// Whether this node is in [`NodeTree::ancestor_absolutes`]: the set's
+    /// membership test without the lookup, for the two places that ask it of
+    /// every absolute box (a style site, the layout read-back).
+    pub(crate) abs_ancestor_recorded: bool,
+    /// Whether this node's Taffy style currently carries a size baked from a
+    /// **non-parent ancestor's** padding box
+    /// (`OutOfFlowKind::AncestorAbsolute`) — so that a box which stops
+    /// resolving against an ancestor with no restyle of its own (a box
+    /// between them became `display: contents`) can be put back. Only ever
+    /// set on a node in [`NodeTree::ancestor_absolutes`].
+    pub(crate) abs_ancestor_baked: bool,
+    /// Where this absolute box's **static position** lies on the inline
+    /// axis of its containing block, as the last layout found it — start,
+    /// centre or end, by how it is aligned (`out_of_flow::StaticAnchor`,
+    /// `RinchDocument::resolve_static_shrink_to_fit`, #1404). An auto-width
+    /// box with both inline insets `auto` is shrunk to fit in the room that
+    /// leaves it, and every bake of its size reads it. `StaticAnchor::EDGE`
+    /// (the block's start edge: the whole width) on every other box.
+    pub(crate) abs_static_anchor: crate::out_of_flow::StaticAnchor,
     /// Whether this node is a CSS pseudo-element (::before or ::after).
     /// Pseudo-element nodes are synthetic children created during style resolution
     /// and are cleaned up before re-resolution to avoid duplicates.
     pub is_pseudo_element: bool,
+    /// Whether this generated box is an `::after` — its element's **last**
+    /// child box. Every other generated box (a `::before`, a list marker)
+    /// is the first. The insertion verbs read it to keep a child they insert
+    /// between the two (#1629, `RinchDocument::clamp_between_generated`).
+    pub(crate) is_generated_after: bool,
+    /// This node is the `outside` list marker `resolve_list_marker` generated
+    /// for its parent `<li>` (#1356): a box out of flow that
+    /// [`crate::list_marker`] places beside the item's first line box,
+    /// hanging in the list's padding, as a browser places an outside
+    /// `::marker`. `None` for every other node.
+    pub(crate) outside_marker: Option<crate::list_marker::OutsideMarker>,
+    /// On an `<li>` whose outside marker found no line box to sit on (an
+    /// empty item, one holding only a picture or an empty block): the
+    /// height of the marker's own line, which the item's content box is
+    /// then at least as tall as (Chrome 156: `<li></li>` is one line high,
+    /// `<li><div style="height:30px">` stays 30). Applied as a minimum height
+    /// by `taffy_style_from_computed`; `None` on every other node.
+    pub(crate) marker_line_floor: Option<f32>,
+    /// The marker pass that last walked up through this node
+    /// (`NodeTree::marker_walk_stamp`).
+    pub(crate) marker_walk: u64,
     /// Typed computed style derived from Stylo.
     /// This is the primary source for layout and paint after Stylo migration.
     pub computed_style: ComputedStyle,
@@ -763,11 +1952,19 @@ pub struct Node {
     /// Whether this node has been styled at least once.
     /// Prevents transitions from firing on initial style application.
     pub has_been_styled: bool,
+    /// First styled since the last layout: it has never been rendered, so it
+    /// has no before-change style and a re-cascade in the same frame starts
+    /// no transition (css-transitions-1 §3). An insertion cascades its new
+    /// subtree on the spot and a later insertion in the same frame can move
+    /// it (`li:nth-child(odd)` under two prepends); that second cascade is
+    /// still its first rendered style. Cleared by `resolve_layout` after the
+    /// frame's style pass, from `NodeTree::styled_unrendered`.
+    pub styled_unrendered: bool,
 
     // === Stylo CSS engine fields ===
     /// Stylo element data containing computed CSS values.
     /// This is the primary source of truth for CSS after Stylo migration.
-    pub stylo_element_data: AtomicRefCell<Option<style::data::ElementData>>,
+    pub stylo_element_data: StyloData,
     /// Selector flags set during CSS matching.
     pub selector_flags: AtomicRefCell<ElementSelectorFlags>,
     /// Whether this node has a snapshot for animation/transition.
@@ -779,6 +1976,36 @@ pub struct Node {
     /// Cached parsed inline style attribute (Stylo PropertyDeclarationBlock).
     /// Populated when style attribute is set, used by Stylo for cascade.
     pub style_attribute_cache: Option<ServoArc<Locked<PropertyDeclarationBlock>>>,
+    /// The declarations this element's presentational attributes map to
+    /// (#684): `width` / `height` on an `<img>`, `<video>` or `<iframe>`.
+    /// Stylo cascades them below every author rule and above the UA sheet's
+    /// normal rules
+    /// (`synthesize_presentational_hints_for_legacy_attributes`). Rebuilt by
+    /// `RinchDocument::sync_presentational_hints` on each write or removal of
+    /// a mapped attribute; `None` when no attribute maps to anything.
+    pub presentational_hints: Option<ServoArc<Locked<PropertyDeclarationBlock>>>,
+    /// This element's style **without** its running `color` / `font-size`
+    /// transitions and animations, when it has any (#777, #787); `None`
+    /// otherwise.
+    ///
+    /// Such an element is cascaded twice: once as the rules alone give it
+    /// (this), and once with the samples added at Stylo's animation and
+    /// transition levels, which is the primary style — what its descendants
+    /// inherit and its own `em` lengths resolve against. The cascade's
+    /// transition diff, a keyframe's underlying value and the transition and
+    /// animation specs are read from this one, so a sample is never mistaken
+    /// for a change of the cascaded value. See
+    /// `RinchDocument::animation_override`.
+    pub base_style: Option<ServoArc<style::properties::ComputedValues>>,
+    /// This cell's or caption's place in its table (`table_layout`).
+    pub table_cell: Option<Box<crate::table_layout::TableCell>>,
+    /// This table's columns and spacing (`table_layout`).
+    pub table_box: Option<Box<crate::table_layout::TableBox>>,
+    /// A cell standing in an anonymous inline-table's place
+    /// (`ComputedStyle::anonymous_inline_table`): what its `vertical-align`
+    /// moved, as [`crate::table_layout::TableCell`]'s `shift` and
+    /// `kids_shift` say for a table's cell (#2514).
+    pub anon_cell: Option<Box<crate::table_layout::CellShift>>,
     /// An `<option>`'s **live selectedness**, once something has set it (#692).
     ///
     /// HTML gives an `<option>` two states, and they come apart. The `selected`
@@ -815,11 +2042,143 @@ pub struct Node {
     pub active_sensitive: Cell<bool>,
     /// Set by Stylo when `:focus` is evaluated during selector matching.
     pub focus_sensitive: Cell<bool>,
+    /// Whether this element's last cascade resolved a viewport unit (`vw`,
+    /// `vh`, `vmin`, `vmax`, and their `s`/`l`/`d` variants) — in its own
+    /// style or in one of its `::before` / `::after` styles. Read from Stylo's
+    /// `ComputedValueFlags::USES_VIEWPORT_UNITS` at every cascade of the node.
+    ///
+    /// A viewport resize that flips no media query restyles exactly the
+    /// elements carrying this flag (and what inherits from them), instead of
+    /// the whole document. See `RinchDocument::restyle_for_viewport_change`.
+    pub uses_viewport_units: Cell<bool>,
+    /// Whether this element's **layout parent** (its DOM parent, or the
+    /// nearest ancestor that is not `display: contents` when it is — #998)
+    /// is a flex or grid container, by either outside (`flex`/`inline-flex`,
+    /// `grid`/`inline-grid`).
+    ///
+    /// Set at every cascade of this node from `layout_parent_style` — the same
+    /// style Stylo's adjuster blockifies against — so it stays in step with
+    /// blockification for free: a container's `display` moving to or from
+    /// flex/grid re-cascades its children (`child_cascade` follows an inherited
+    /// *or* `display` change), and a `display: contents` wrapper's own move
+    /// reaches its effective children the same way blockification does.
+    ///
+    /// The one thing [`Node::creates_stacking_context`] cannot answer from
+    /// `self.computed_style` alone (#542): per css-flexbox-1 §5.4 and
+    /// css-grid-1 §6, `z-index` applies to a flex or grid *item* as though it
+    /// were positioned, even at `position: static`, and that needs this fact
+    /// about the parent rather than anything the item's own cascade computes.
+    pub is_flex_or_grid_item: Cell<bool>,
+    /// [`crate::computed_style::ComputedStyle::has_filter`], cached at the
+    /// same cascade-time moment as [`Self::is_flex_or_grid_item`] (#542, perf
+    /// review). `creates_stacking_context` and the containing-block
+    /// predicates read this field instead of asking the style on every
+    /// hit-test and paint walk; see [`Self::has_filter`].
+    pub filter_creates_stacking_context: Cell<bool>,
+    /// The last offscreen raster paint drew for this box's `filter` (#2719),
+    /// kept with what it was drawn from: a later paint with the same key
+    /// draws it as an image instead of painting and filtering again.
+    /// Cleared when it may have gone stale (`paint::raster_cache`).
+    pub(crate) raster_cache:
+        std::cell::RefCell<Option<Box<crate::paint::raster_cache::RasterCache>>>,
+    /// For an IFC root: whether its containing block's content height is
+    /// **definite** — the root's own height, or its parent's for an
+    /// anonymous block box — as Taffy took it at the root's last final
+    /// layout (#2427): a percentage `top`/`bottom` of a relative inline
+    /// element resolves against that height only then
+    /// (`crate::ifc::leaf_height_is_definite`).
+    pub containing_block_height_definite: Cell<bool>,
+    /// Some descendant of this element needs its style recomputed — the path
+    /// Stylo's invalidator marks from an invalidated element down to each
+    /// descendant it invalidated (`TElement::set_dirty_descendants`), and the
+    /// one `resolve_styles` follows. Cleared as the resolve walks it.
+    pub style_dirty_descendants: Cell<bool>,
+    /// This child, and every child after it in its parent's list, carries the
+    /// subtree restyle a structural selector's sweep gives it
+    /// (`RinchDocument::mark_children_from`), as of the sibling-mark epoch
+    /// stored here (`node::sibling_mark_epoch`; `0` is never). A sweep stops
+    /// at the first child stamped with the current epoch, so discarding or
+    /// inserting rows one call at a time under `li:nth-child(odd)` marks each
+    /// later sibling once per frame instead of once per call (#2627).
+    pub later_siblings_marked: Cell<u64>,
+    /// This element's style, or its `::before` / `::after` content, uses
+    /// `attr()`: any attribute write restyles it, whether or not a generated
+    /// box exists yet (`invalidation::note_attribute_change`). Cleared before
+    /// each cascade of the element and set when that cascade, or a pseudo
+    /// resolution after it, asks `TElement::get_attr` for an attribute.
+    pub content_reads_attrs: Cell<bool>,
+    /// The inline `style` block was replaced since this element last matched
+    /// selectors, so its rule node holds the old one (#2571). Set by
+    /// `RinchDocument::cache_inline_style`, cleared by a match. A write
+    /// through `set_styles` that is not inset-only restyles the element
+    /// anyway; the inset fast path does not, and a later recascade-only
+    /// cascade (an inherited change above it) must match again rather than
+    /// keep the rule node with the old insets.
+    pub inline_style_unmatched: Cell<bool>,
+    /// The document's style sheets stop at this node (#2357,
+    /// `DomDocument::isolate_styles`): its descendants answer `false` to
+    /// Stylo's `TElement::matches_user_and_content_rules`, so they match
+    /// only user-agent rules, presentational hints and their `style`
+    /// attribute — Stylo's own gate for native anonymous content, the same
+    /// one a shadow root's contents pass. Inheritance is untouched.
+    pub style_isolated: bool,
+    /// Whether an ancestor has [`Self::style_isolated`] set, as of this
+    /// element's last style visit (`resolve_styles_recursive` sets it from
+    /// the parent's, top-down, on every visit). `matches_user_and_content_rules` reads it, so the check is O(1)
+    /// rather than a walk of the ancestors per cascade, per pseudo-element
+    /// and per invalidation (review of #2366: +3.7% on 15 full restyles of
+    /// 6,040 elements 40 deep).
+    pub under_isolated: Cell<bool>,
+    /// A closed `<select>`'s widest option label width in CSS px, with the
+    /// hash of what it was shaped from (the labels and the font) — so a
+    /// restyle that moves neither re-shapes nothing (#1098). `None` until an
+    /// auto-width select is first sized.
+    pub(crate) select_label_width: Cell<Option<(u64, f32)>>,
+    /// A text-entry control's primary-font metrics, per em, with the hash of
+    /// the font properties they were read under — so a restyle that moves no
+    /// font property shapes nothing to size the control (#1177). `None` until
+    /// the control is first sized.
+    pub(crate) form_char_metrics: Cell<Option<(u64, crate::form_control::CharMetrics)>>,
+    /// A `submit`/`reset`/`button` `<input>`'s shaped label width, or a
+    /// date/time-family/`file` `<input>`'s shaped representative-string
+    /// width, with the hash of the label text and font properties it was
+    /// shaped under (#1195, review of #1302) — so a restyle that moves
+    /// neither shapes nothing. `None` until the control is first sized.
+    pub(crate) form_label_width: Cell<Option<(u64, f32)>>,
+    /// A text control's displayed text, `(caret x, caret y, full width,
+    /// height)`, under the hash of what it was shaped from
+    /// (`form_control::displayed_metrics`): a focused single-line `<input>`'s
+    /// line for its horizontal scroll (#1721), a `<textarea>`'s text for its
+    /// caret reveal and its scroll extent (#827).
+    pub(crate) input_line_metrics: Cell<Option<(u64, InputLineMetrics)>>,
+    /// A **focused** text control's displayed text as shaped for
+    /// [`Self::input_line_metrics`], under the hash of everything it is
+    /// shaped from except the caret, so a caret move reads its new position
+    /// off this layout instead of shaping the whole text again (review of
+    /// #2023: ten arrows in a 15 KB textarea shaped it ten times). Dropped
+    /// when the control is shaped unfocused, so only the field being edited
+    /// keeps one.
+    pub(crate) input_text_layout: RefCell<Option<(u64, parley::layout::Layout<Brush>)>>,
 
     /// When set, this block uses a fixed estimated height in Taffy instead of
     /// measuring via Parley. Used by contenteditable block virtualization to
     /// collapse off-screen blocks. IFC building and painting are skipped.
     pub estimated_height: Option<f32>,
+
+    /// The lines a `-webkit-line-clamp` on an ancestor leaves this IFC root
+    /// (#2581): it holds the clamp's last line, which is its line `.0`, and
+    /// `.1` says whether anything follows that line in the clamp (so the
+    /// line ends in "…" even when it is this root's last). Set by
+    /// `RinchDocument::resolve_block_line_clamps`; `None` on every other
+    /// node.
+    pub(crate) clamp_lines: Option<(usize, bool)>,
+    /// The border-box and content-box heights a `-webkit-line-clamp` gives a
+    /// box on the way from the clamp to its last line (#2581): the box ends
+    /// right after the line, or after the box holding it, whatever follows
+    /// it. Applied as the Taffy height by `taffy_style_from_computed`; set
+    /// by `RinchDocument::resolve_block_line_clamps`; `None` on every other
+    /// node.
+    pub(crate) clamp_height: Option<(f32, f32)>,
 
     /// True while a `sync_display_contents` pass has this node's children
     /// spliced into an ancestor's Taffy child list (and the node's own Taffy
@@ -835,6 +2194,13 @@ pub struct Node {
     /// `taffy_detach_contribution` consults it: computed display alone
     /// cannot distinguish a healed wrapper from a stale-spliced one.
     pub contents_spliced: bool,
+
+    /// Paint tells the painter when it starts this node
+    /// (`Painter::note_node_start`): the runtime places a change in paint
+    /// order against a split surface (#1865 S4,
+    /// `paint::set_paint_order_watch`). A flag on the node, so a paint with
+    /// nothing watched pays one load per node it already holds.
+    pub paint_watch: std::cell::Cell<bool>,
 }
 
 impl std::fmt::Debug for Node {
@@ -855,7 +2221,147 @@ impl std::fmt::Debug for Node {
     }
 }
 
+/// The Taffy style of a `display: contents` wrapper: `Display::None` over
+/// every other field's default.
+///
+/// **The one spelling of it.** `sync_display_contents` writes it when it
+/// splices the wrapper's children into the nearest box-generating ancestor, and
+/// every pass that rebuilds a Taffy style from `computed_style` and compares it
+/// with the stored one must produce this same value for such a node — see
+/// [`Node::taffy_style_owned_by_contents_splice`]. `ComputedStyle::to_taffy_style`
+/// maps `contents` to `Display::Flex`, so a comparison that used it saw a
+/// "display change" on every restyle of every wrapper, set `ifc_dirty`, and
+/// turned a colour-only `:hover` over any `rsx!` reactive text into a
+/// whole-document IFC setup pass and Taffy compute.
+pub(crate) fn display_contents_taffy_style() -> taffy::Style {
+    taffy::Style {
+        display: taffy::Display::None,
+        ..Default::default()
+    }
+}
+
+/// The Taffy-style overrides `<body>` carries over what its computed style
+/// says. The **one** copy: the cascade's sync and both tick re-syncs call it.
+///
+/// `<html>` is a fixed flex column the size of the viewport (its Taffy style
+/// is set once, in [`NodeTree::new`], and never rebuilt from its computed
+/// style) and `<body>` is the only child rinch gives it. So `<body>` grows to
+/// fill the viewport (`flex-grow` is at least 1) and is as wide as it
+/// (`width: 100%` of its border box, [`body_fills_with_its_border_box`]).
+///
+/// **And when nothing about `<body>`'s own height depends on its content, its
+/// flex basis is `0`** (#1260). That is the UA sheet's `overflow-y: auto`
+/// body — a scroll container, so its automatic minimum height is `0` — with
+/// `height` and `flex-basis` both `auto` and `flex-shrink` above zero. A sole
+/// flex item of a definite-height column that can both grow and shrink ends at
+/// the column's height less its margins, clamped by its `min-height` and
+/// `max-height`, whatever its basis — so the basis is not worth measuring, and
+/// measuring it costs a whole `ComputeSize` pass over everything in `<body>`,
+/// every compute in which anything inside it is dirty: for a 500-row flex
+/// list, every row's cache probed a second time per edit. Any other `<body>`
+/// (an author `overflow: visible`, `flex-basis`, `height` or
+/// `flex-shrink: 0`) keeps the basis its style gives it.
+/// `tests/body_flex_basis_tests.rs` pins the box. (A second in-flow child of
+/// `<html>` — reachable only by appending to the raw `NodeTree::html_id` —
+/// would share the column with `<body>` by basis, and there the fold would
+/// change the split.)
+/// As wide as `<html>` is the border box's width, as a browser's auto body
+/// fills it: a `content-box` body given `width: 100%` would overflow the
+/// viewport by its padding and border (#1278). So the body is made a border
+/// box, with each of its own length sizes grown by its padding and border to
+/// stay the content-box size it says (`padding: 20px; max-width: 600px` caps
+/// the border box at 640, as in Chrome). Only where every one of them is a
+/// length or `auto`: a percentage padding or size would need `calc()`, and
+/// such a body stays `content-box`. (`width: stretch` sizes it the same way
+/// but measures its whole content once more in every compute.)
+fn body_fills_with_its_border_box(style: &mut taffy::Style) {
+    use taffy::style::CompactLength;
+    if style.box_sizing == taffy::BoxSizing::BorderBox {
+        return;
+    }
+    let px = |raw: CompactLength| (raw.tag() == CompactLength::LENGTH_TAG).then(|| raw.value());
+    let side = |p: taffy::LengthPercentage, b: taffy::LengthPercentage| {
+        Some(px(p.into_raw())? + px(b.into_raw())?)
+    };
+    let (Some(l), Some(r), Some(t), Some(b)) = (
+        side(style.padding.left, style.border.left),
+        side(style.padding.right, style.border.right),
+        side(style.padding.top, style.border.top),
+        side(style.padding.bottom, style.border.bottom),
+    ) else {
+        return;
+    };
+    let grown = |d: taffy::Dimension, by: f32| -> Option<taffy::Dimension> {
+        if d.is_auto() {
+            Some(d)
+        } else {
+            px(d.into_raw()).map(|v| taffy::Dimension::length(v + by))
+        }
+    };
+    let grown_limit = |d: taffy::LengthPercentageAuto, by: f32| {
+        if d.is_auto() {
+            Some(d)
+        } else {
+            px(d.into_raw()).map(|v| taffy::LengthPercentageAuto::length(v + by))
+        }
+    };
+    let (Some(min_w), Some(max_w), Some(h), Some(min_h), Some(max_h)) = (
+        grown_limit(style.min_size.width, l + r),
+        grown_limit(style.max_size.width, l + r),
+        grown(style.size.height, t + b),
+        grown_limit(style.min_size.height, t + b),
+        grown_limit(style.max_size.height, t + b),
+    ) else {
+        return;
+    };
+    style.min_size.width = min_w;
+    style.max_size.width = max_w;
+    style.size.height = h;
+    style.min_size.height = min_h;
+    style.max_size.height = max_h;
+    style.box_sizing = taffy::BoxSizing::BorderBox;
+}
+
+pub(crate) fn body_taffy_overrides(style: &mut taffy::Style) {
+    if style.flex_grow == 0.0 {
+        style.flex_grow = 1.0;
+    }
+    if style.size.width == taffy::Dimension::auto() {
+        style.size.width = taffy::Dimension::percent(1.0);
+        body_fills_with_its_border_box(style);
+    }
+    if style.flex_basis == taffy::Dimension::auto()
+        && style.size.height == taffy::Dimension::auto()
+        // Below 1 a factor scales the free space it distributes (flexbox
+        // §9.7.4c), so the basis would show through: `flex-grow: 0.5` over
+        // short content, or `flex-shrink: 0.5` over tall content.
+        && style.flex_grow >= 1.0
+        && style.flex_shrink >= 1.0
+        && style.overflow.y.is_scroll_container()
+    {
+        style.flex_basis = taffy::Dimension::length(0.0);
+    }
+}
+
 impl Node {
+    /// Whether this node's Taffy style belongs to `sync_display_contents`
+    /// rather than to its computed style: an **author** element computing
+    /// `display: contents`. Its Taffy style is
+    /// [`display_contents_taffy_style`], and a pass rebuilding Taffy styles
+    /// from computed values must use that, or it compares unlike with unlike.
+    ///
+    /// An anonymous block box can compute `contents` too (it inherits the
+    /// value from a wrapper, [`ComputedStyle::for_anonymous_box`]), but it is a
+    /// real box whose Taffy style `create_anonymous_block_boxes` owns, and
+    /// `sync_display_contents` skips it — so it is excluded here by the same
+    /// guard.
+    ///
+    /// [`ComputedStyle::for_anonymous_box`]: crate::computed_style::ComputedStyle::for_anonymous_box
+    pub(crate) fn taffy_style_owned_by_contents_splice(&self) -> bool {
+        self.computed_style.display == crate::computed_style::DisplayValue::Contents
+            && !self.is_anonymous_block_box
+    }
+
     /// Write one attribute, keeping the interned `id` in step (#675).
     ///
     /// The write path that keeps the interned `id` correct, and therefore the
@@ -868,6 +2374,8 @@ impl Node {
     pub fn write_attribute(&mut self, name: &str, value: &str) {
         if name == "id" {
             self.id_atom = Some(Atom::from(value));
+        } else if name == "data-text-sel" {
+            self.text_sel = value == "true";
         }
         self.attributes.insert(name.to_string(), value.to_string());
     }
@@ -880,6 +2388,8 @@ impl Node {
     pub fn erase_attribute(&mut self, name: &str) {
         if name == "id" {
             self.id_atom = None;
+        } else if name == "data-text-sel" {
+            self.text_sel = false;
         }
         self.attributes.remove(name);
     }
@@ -898,6 +2408,27 @@ impl Node {
         self.id_atom.as_ref()
     }
 
+    /// The node whose content this box is painted as a highlight of, if any
+    /// (#2666, [`rinch_core::dom::DomDocument::set_highlight_owner`]).
+    #[inline]
+    pub fn highlight_owner(&self) -> Option<RawNodeId> {
+        self.highlight_owner
+    }
+
+    /// Whether the node carries `data-text-sel="true"` (a read-only text
+    /// selection), without hashing the attribute name.
+    #[inline]
+    pub fn carries_text_selection(&self) -> bool {
+        debug_assert_eq!(
+            self.text_sel,
+            self.attributes.get("data-text-sel").map(String::as_str) == Some("true"),
+            "Node::text_sel drifted from `data-text-sel` — something wrote \
+             `attributes` directly instead of through `write_attribute` / \
+             `erase_attribute`",
+        );
+        self.text_sel
+    }
+
     /// Create a new document root node.
     pub fn document(id: RawNodeId, guard: SharedRwLock) -> Self {
         Self {
@@ -907,11 +2438,23 @@ impl Node {
             children: Vec::new(),
             attributes: HashMap::new(),
             id_atom: None,
+            text_sel: false,
+            highlight_owner: None,
+            spelling: None,
+            value_dirty: false,
+            img_size_ignored: false,
+            input_scroll_x: Cell::new(f32::NAN),
             dirty: DirtyFlags::empty(),
             scroll_offset: (0.0, 0.0),
+            scroll_remainder: (0.0, 0.0),
             taffy_id: None,
             layout: LayoutResult::default(),
+            natural_inline_size: (0.0, 0.0),
+            natural_max_width: 0.0,
+            atomic_baseline: None,
+            atomic_baseline_known: false,
             prev_layout: LayoutResult::default(),
+            painted: None,
             display_mode: DisplayMode::Block,
             ifc_root: None,
             text_layout: None,
@@ -928,23 +2471,59 @@ impl Node {
             contributes_in_flow_block: false,
             hoisted_out_of_flow_to: None,
             hosts_hoisted_out_of_flow: false,
+            static_ifc_root: None,
+            run_out_of_flow: Vec::new(),
+            on_abs_chain: false,
+            fixed_contained: false,
+            abs_ancestor_recorded: false,
+            abs_ancestor_baked: false,
+            abs_static_anchor: crate::out_of_flow::StaticAnchor::EDGE,
             is_pseudo_element: false,
+            is_generated_after: false,
+            outside_marker: None,
+            marker_line_floor: None,
+            marker_walk: 0,
             computed_style: ComputedStyle::default(),
             transition_specs: Vec::new(),
             animation_specs: Vec::new(),
             has_been_styled: false,
+            styled_unrendered: false,
             // Stylo fields
-            stylo_element_data: AtomicRefCell::new(None),
+            stylo_element_data: StyloData::default(),
             selector_flags: AtomicRefCell::new(ElementSelectorFlags::empty()),
             has_snapshot: false,
             snapshot_handled: AtomicBool::new(false),
             guard,
             style_attribute_cache: None,
+            base_style: None,
+            presentational_hints: None,
+            table_cell: None,
+            table_box: None,
+            anon_cell: None,
             selectedness: None,
             hover_sensitive: Cell::new(false),
             active_sensitive: Cell::new(false),
             focus_sensitive: Cell::new(false),
+            uses_viewport_units: Cell::new(false),
+            is_flex_or_grid_item: Cell::new(false),
+            containing_block_height_definite: Cell::new(false),
+            filter_creates_stacking_context: Cell::new(false),
+            raster_cache: std::cell::RefCell::new(None),
+            style_dirty_descendants: Cell::new(false),
+            later_siblings_marked: Cell::new(0),
+            content_reads_attrs: Cell::new(false),
+            inline_style_unmatched: Cell::new(false),
+            style_isolated: false,
+            under_isolated: Cell::new(false),
+            select_label_width: Cell::new(None),
+            form_char_metrics: Cell::new(None),
+            form_label_width: Cell::new(None),
+            input_line_metrics: Cell::new(None),
+            input_text_layout: RefCell::new(None),
             estimated_height: None,
+            clamp_lines: None,
+            clamp_height: None,
+            paint_watch: std::cell::Cell::new(false),
             contents_spliced: false,
             ifc_detached: false,
         }
@@ -962,11 +2541,23 @@ impl Node {
             children: Vec::new(),
             attributes: HashMap::new(),
             id_atom: None,
+            text_sel: false,
+            highlight_owner: None,
+            spelling: None,
+            value_dirty: false,
+            img_size_ignored: false,
+            input_scroll_x: Cell::new(f32::NAN),
             dirty: DirtyFlags::STYLE | DirtyFlags::LAYOUT,
             scroll_offset: (0.0, 0.0),
+            scroll_remainder: (0.0, 0.0),
             taffy_id: None,
             layout: LayoutResult::default(),
+            natural_inline_size: (0.0, 0.0),
+            natural_max_width: 0.0,
+            atomic_baseline: None,
+            atomic_baseline_known: false,
             prev_layout: LayoutResult::default(),
+            painted: None,
             display_mode,
             ifc_root: None,
             text_layout: None,
@@ -983,23 +2574,59 @@ impl Node {
             contributes_in_flow_block: false,
             hoisted_out_of_flow_to: None,
             hosts_hoisted_out_of_flow: false,
+            static_ifc_root: None,
+            run_out_of_flow: Vec::new(),
+            on_abs_chain: false,
+            fixed_contained: false,
+            abs_ancestor_recorded: false,
+            abs_ancestor_baked: false,
+            abs_static_anchor: crate::out_of_flow::StaticAnchor::EDGE,
             is_pseudo_element: false,
+            is_generated_after: false,
+            outside_marker: None,
+            marker_line_floor: None,
+            marker_walk: 0,
             computed_style: ComputedStyle::default(),
             transition_specs: Vec::new(),
             animation_specs: Vec::new(),
             has_been_styled: false,
+            styled_unrendered: false,
             // Stylo fields
-            stylo_element_data: AtomicRefCell::new(None),
+            stylo_element_data: StyloData::default(),
             selector_flags: AtomicRefCell::new(ElementSelectorFlags::empty()),
             has_snapshot: false,
             snapshot_handled: AtomicBool::new(false),
             guard,
             style_attribute_cache: None,
+            base_style: None,
+            presentational_hints: None,
+            table_cell: None,
+            table_box: None,
+            anon_cell: None,
             selectedness: None,
             hover_sensitive: Cell::new(false),
             active_sensitive: Cell::new(false),
             focus_sensitive: Cell::new(false),
+            uses_viewport_units: Cell::new(false),
+            is_flex_or_grid_item: Cell::new(false),
+            containing_block_height_definite: Cell::new(false),
+            filter_creates_stacking_context: Cell::new(false),
+            raster_cache: std::cell::RefCell::new(None),
+            style_dirty_descendants: Cell::new(false),
+            later_siblings_marked: Cell::new(0),
+            content_reads_attrs: Cell::new(false),
+            inline_style_unmatched: Cell::new(false),
+            style_isolated: false,
+            under_isolated: Cell::new(false),
+            select_label_width: Cell::new(None),
+            form_char_metrics: Cell::new(None),
+            form_label_width: Cell::new(None),
+            input_line_metrics: Cell::new(None),
+            input_text_layout: RefCell::new(None),
             estimated_height: None,
+            clamp_lines: None,
+            clamp_height: None,
+            paint_watch: std::cell::Cell::new(false),
             contents_spliced: false,
             ifc_detached: false,
         }
@@ -1016,11 +2643,23 @@ impl Node {
             children: Vec::new(),
             attributes: HashMap::new(),
             id_atom: None,
+            text_sel: false,
+            highlight_owner: None,
+            spelling: None,
+            value_dirty: false,
+            img_size_ignored: false,
+            input_scroll_x: Cell::new(f32::NAN),
             dirty: DirtyFlags::LAYOUT,
             scroll_offset: (0.0, 0.0),
+            scroll_remainder: (0.0, 0.0),
             taffy_id: None,
             layout: LayoutResult::default(),
+            natural_inline_size: (0.0, 0.0),
+            natural_max_width: 0.0,
+            atomic_baseline: None,
+            atomic_baseline_known: false,
             prev_layout: LayoutResult::default(),
+            painted: None,
             display_mode: DisplayMode::Inline,
             ifc_root: None,
             text_layout: None,
@@ -1037,23 +2676,59 @@ impl Node {
             contributes_in_flow_block: false,
             hoisted_out_of_flow_to: None,
             hosts_hoisted_out_of_flow: false,
+            static_ifc_root: None,
+            run_out_of_flow: Vec::new(),
+            on_abs_chain: false,
+            fixed_contained: false,
+            abs_ancestor_recorded: false,
+            abs_ancestor_baked: false,
+            abs_static_anchor: crate::out_of_flow::StaticAnchor::EDGE,
             is_pseudo_element: false,
+            is_generated_after: false,
+            outside_marker: None,
+            marker_line_floor: None,
+            marker_walk: 0,
             computed_style: ComputedStyle::default(),
             transition_specs: Vec::new(),
             animation_specs: Vec::new(),
             has_been_styled: false,
+            styled_unrendered: false,
             // Stylo fields
-            stylo_element_data: AtomicRefCell::new(None),
+            stylo_element_data: StyloData::default(),
             selector_flags: AtomicRefCell::new(ElementSelectorFlags::empty()),
             has_snapshot: false,
             snapshot_handled: AtomicBool::new(false),
             guard,
             style_attribute_cache: None,
+            base_style: None,
+            presentational_hints: None,
+            table_cell: None,
+            table_box: None,
+            anon_cell: None,
             selectedness: None,
             hover_sensitive: Cell::new(false),
             active_sensitive: Cell::new(false),
             focus_sensitive: Cell::new(false),
+            uses_viewport_units: Cell::new(false),
+            is_flex_or_grid_item: Cell::new(false),
+            containing_block_height_definite: Cell::new(false),
+            filter_creates_stacking_context: Cell::new(false),
+            raster_cache: std::cell::RefCell::new(None),
+            style_dirty_descendants: Cell::new(false),
+            later_siblings_marked: Cell::new(0),
+            content_reads_attrs: Cell::new(false),
+            inline_style_unmatched: Cell::new(false),
+            style_isolated: false,
+            under_isolated: Cell::new(false),
+            select_label_width: Cell::new(None),
+            form_char_metrics: Cell::new(None),
+            form_label_width: Cell::new(None),
+            input_line_metrics: Cell::new(None),
+            input_text_layout: RefCell::new(None),
             estimated_height: None,
+            clamp_lines: None,
+            clamp_height: None,
+            paint_watch: std::cell::Cell::new(false),
             contents_spliced: false,
             ifc_detached: false,
         }
@@ -1068,11 +2743,23 @@ impl Node {
             children: Vec::new(),
             attributes: HashMap::new(),
             id_atom: None,
+            text_sel: false,
+            highlight_owner: None,
+            spelling: None,
+            value_dirty: false,
+            img_size_ignored: false,
+            input_scroll_x: Cell::new(f32::NAN),
             dirty: DirtyFlags::empty(),
             scroll_offset: (0.0, 0.0),
+            scroll_remainder: (0.0, 0.0),
             taffy_id: None,
             layout: LayoutResult::default(),
+            natural_inline_size: (0.0, 0.0),
+            natural_max_width: 0.0,
+            atomic_baseline: None,
+            atomic_baseline_known: false,
             prev_layout: LayoutResult::default(),
+            painted: None,
             display_mode: DisplayMode::Inline,
             ifc_root: None,
             text_layout: None,
@@ -1089,26 +2776,78 @@ impl Node {
             contributes_in_flow_block: false,
             hoisted_out_of_flow_to: None,
             hosts_hoisted_out_of_flow: false,
+            static_ifc_root: None,
+            run_out_of_flow: Vec::new(),
+            on_abs_chain: false,
+            fixed_contained: false,
+            abs_ancestor_recorded: false,
+            abs_ancestor_baked: false,
+            abs_static_anchor: crate::out_of_flow::StaticAnchor::EDGE,
             is_pseudo_element: false,
+            is_generated_after: false,
+            outside_marker: None,
+            marker_line_floor: None,
+            marker_walk: 0,
             computed_style: ComputedStyle::default(),
             transition_specs: Vec::new(),
             animation_specs: Vec::new(),
             has_been_styled: false,
+            styled_unrendered: false,
             // Stylo fields
-            stylo_element_data: AtomicRefCell::new(None),
+            stylo_element_data: StyloData::default(),
             selector_flags: AtomicRefCell::new(ElementSelectorFlags::empty()),
             has_snapshot: false,
             snapshot_handled: AtomicBool::new(false),
             guard,
             style_attribute_cache: None,
+            base_style: None,
+            presentational_hints: None,
+            table_cell: None,
+            table_box: None,
+            anon_cell: None,
             selectedness: None,
             hover_sensitive: Cell::new(false),
             active_sensitive: Cell::new(false),
             focus_sensitive: Cell::new(false),
+            uses_viewport_units: Cell::new(false),
+            is_flex_or_grid_item: Cell::new(false),
+            containing_block_height_definite: Cell::new(false),
+            filter_creates_stacking_context: Cell::new(false),
+            raster_cache: std::cell::RefCell::new(None),
+            style_dirty_descendants: Cell::new(false),
+            later_siblings_marked: Cell::new(0),
+            content_reads_attrs: Cell::new(false),
+            inline_style_unmatched: Cell::new(false),
+            style_isolated: false,
+            under_isolated: Cell::new(false),
+            select_label_width: Cell::new(None),
+            form_char_metrics: Cell::new(None),
+            form_label_width: Cell::new(None),
+            input_line_metrics: Cell::new(None),
+            input_text_layout: RefCell::new(None),
             estimated_height: None,
+            clamp_lines: None,
+            clamp_height: None,
+            paint_watch: std::cell::Cell::new(false),
             contents_spliced: false,
             ifc_detached: false,
         }
+    }
+
+    /// Whether this is a generated `::before` / `::after` box: a
+    /// pseudo-element node carrying its originator's pseudo cascade (a list
+    /// marker is a pseudo-element node with none). Such a box is kept across
+    /// a cascade of its originator while its pseudo still generates (#1023),
+    /// so a pass that drops every cached style must leave its pseudo style in
+    /// place — it is how the originator's cascade finds the box again.
+    pub fn is_generated_box(&self) -> bool {
+        self.is_pseudo_element
+            && self
+                .stylo_element_data
+                .borrow()
+                .as_ref()
+                .and_then(|d| d.styles.primary.as_ref())
+                .is_some_and(|s| s.is_pseudo_style())
     }
 
     /// Whether this is an element node.
@@ -1134,43 +2873,37 @@ impl Node {
     /// A stacking context is formed when any of:
     /// - `position` is not `static` AND `z-index` is explicitly set (not `auto`)
     /// - `position` is `fixed` or `sticky`, whatever the `z-index`
+    /// - this node is a flex or grid **item** — its layout parent's `display`
+    ///   is flex/inline-flex/grid/inline-grid ([`Self::is_flex_or_grid_item`])
+    ///   — with `z-index` explicitly set, even at `position: static`
+    ///   (css-flexbox-1 §5.4, css-grid-1 §6; #542)
     /// - `opacity < 1.0`
-    /// - `transform` is non-identity
+    /// - a non-`none` `filter` ([`Self::has_filter`]; CSS Filter Effects
+    ///   §2.1, #542, #2719)
+    /// - `transform` is not `none` **and applies** ([`Self::has_transform`]) —
+    ///   an identity such as `translateX(0)` counts (#415), a non-atomic
+    ///   `display: inline` element does not, since it is not transformable
+    ///   (#1080; see [`Self::transform_applies`])
     ///
     /// **Not the whole CSS list, and the shortfall is not only an
     /// expressibility one.** `clip-path`, `mask`, `isolation`,
     /// `mix-blend-mode`, `contain: paint` and `will-change` are absent from
     /// `ComputedStyle` altogether, so those need new style plumbing per
-    /// property. But two creators are representable **today** and still
-    /// missing, measured rather than assumed:
+    /// property — tracked separately from #542, which closed the two creators
+    /// that needed none: the filter arm above, and the flex/grid item one.
     ///
-    /// - **a non-`none` `filter`** (CSS Filter Effects §2.1). `filter:
-    ///   brightness(0.5)` reaches `ComputedStyle::filter_brightness` and paint
-    ///   consumes it, and this function still answers `false`. (`blur()` is the
-    ///   genuinely unexpressed part — only the four scalars survive
-    ///   `from_stylo`.)
-    /// - **a flex or grid item with a `z-index` other than `auto`**, even at
-    ///   `position: static` (css-flexbox-1 §5.4, css-grid-1 §6). Both the
-    ///   `z_index` and the parent's `display` are already here.
+    /// **The filter arm** is any `filter` other than `none` (#2719): an
+    /// identity function (`brightness(1)`) and a `blur()` count, as in
+    /// Chrome 157. Before #2719 `ComputedStyle` kept only four colour
+    /// scalars, so both were missed.
     ///
-    /// Neither is folded in here, because adding a creator changes which boxes
-    /// hoist — the very axis stage B is re-founding — and landing both at once
-    /// would make a regression impossible to attribute. **Tracked as #542.**
-    /// The six properties `ComputedStyle` does not carry at all (and `blur()`,
-    /// which really is unexpressed) need per-property style plumbing and are a
-    /// separate piece of work again.
-    ///
-    /// Related, and probably to be fixed together: **#415**, this same function
-    /// answering `false` for a `transform` that composes to the identity, where
-    /// CSS keys on `not none`. Same class of gap — a creator this predicate can
-    /// see and does not count.
-    ///
-    /// One honest consequence of stage B: a box declaring **both** a filter and
-    /// a clipping `overflow` used to get a stacking context by accident, via
-    /// the `overflow` arm this function no longer has. Its clipping survives —
-    /// the chain carries that — but its ordering does not, so stage B slightly
-    /// widens #542's exposure rather than leaving it untouched. A filter box
-    /// without an `overflow` was already wrong before.
+    /// One honest consequence of stage B, closed by #542: a box declaring
+    /// **both** a filter (or a static flex/grid item's `z-index`) and a
+    /// clipping `overflow` used to get a stacking context by accident, via the
+    /// `overflow` arm this function no longer has — its clipping survived (the
+    /// chain carries that) but its ordering did not. Both arms above now make
+    /// such a box a stacking context on its own declared creator, so the
+    /// ordering is correct again rather than merely latent.
     ///
     /// **`overflow` is not on the list.** It used to be, so that a hoisted
     /// descendant stayed inside the clip bracket paint opened around one
@@ -1183,8 +2916,18 @@ impl Node {
     /// is [`Node::clips_overflow`] and stacking is this, and nothing needs them
     /// to be the same question.
     pub fn creates_stacking_context(&self) -> bool {
-        use crate::computed_style::PositionValue;
+        use crate::computed_style::{DisplayValue, PositionValue};
 
+        // A `display: contents` element generates no box (css-display-3 §2.5),
+        // so nothing on the list above can make it a stacking context — nor
+        // does `opacity` or `transform` apply to it at all (#1038, measured in
+        // Chrome 153: its children paint at full strength and untranslated,
+        // and a `z-index` on it scopes nothing). Answering `true` made the
+        // collector stop at it, so everything under it was drawn inside the
+        // clip chain of the wrapper's own entry, escaping boxes included.
+        if self.computed_style.display == DisplayValue::Contents {
+            return false;
+        }
         match self.computed_style.position {
             // A fixed box is viewport-level content and a sticky box is
             // repositioned during scroll; both create a stacking context
@@ -1192,7 +2935,18 @@ impl Node {
             // than being hoisted out into a sequence they no longer share a
             // coordinate space with.
             PositionValue::Fixed | PositionValue::Sticky => return true,
-            PositionValue::Static => {}
+            PositionValue::Static => {
+                // css-flexbox-1 §5.4 / css-grid-1 §6: `z-index` applies to a
+                // flex or grid item as though it were positioned, so a
+                // `position: static` item with a non-`auto` `z-index` is a
+                // stacking context too (#542) — `z_index.is_some()` alone
+                // would be wrong here, since most of this repo's static,
+                // non-item boxes never declare one, but a bare `z-index` on a
+                // plain block does nothing in CSS and must not create one.
+                if self.is_flex_or_grid_item.get() && self.computed_style.z_index.is_some() {
+                    return true;
+                }
+            }
             _ => {
                 if self.computed_style.z_index.is_some() {
                     return true;
@@ -1202,10 +2956,160 @@ impl Node {
         if self.computed_style.opacity < 1.0 {
             return true;
         }
-        if !self.computed_style.transform.is_identity {
+        // css-masking-1 §7.1: a `mask-image` other than `none` (#1798).
+        if !self.computed_style.mask_image.is_empty() {
+            return true;
+        }
+        if self.has_filter() {
+            return true;
+        }
+        if self.has_transform() {
             return true;
         }
         false
+    }
+
+    /// Whether this node's `filter` is not `none` (#542, #2719): it is then a
+    /// stacking context and the containing block of its absolute and fixed
+    /// descendants.
+    ///
+    /// **A cached read, not a computation** (#542, perf review). The style
+    /// question is [`crate::computed_style::ComputedStyle::has_filter`], run
+    /// once at cascade time (`style_resolution/mod.rs`,
+    /// `style_resolution/pseudo.rs`) into
+    /// [`Self::filter_creates_stacking_context`]; this method just reads
+    /// that field. `creates_stacking_context` is on the hit-test and paint
+    /// hot paths — walked once per node per pointer move and per frame — and
+    /// computing from `self.computed_style` there showed up as a real
+    /// instruction-count regression in CI's Perf job
+    /// (`shell::pointer_move_warm.warm_x50` +11.95%,
+    /// `pointer_move_cold.cold` +9.76%, `hover_frame.partial_repaint`
+    /// +3.56%).
+    pub fn has_filter(&self) -> bool {
+        self.filter_creates_stacking_context.get()
+    }
+
+    /// Whether `transform` **applies** to this node: it is not a non-atomic
+    /// `display: inline` element (issue #1080).
+    ///
+    /// CSS Transforms 1 §1 applies `transform` to *transformable elements* —
+    /// block-level, atomic inline-level and replaced ones. A plain `<span>` is
+    /// none of those, so its `transform` moves nothing, establishes no
+    /// containing block and creates no stacking context. Measured in Chrome
+    /// 153: an `inline-block` inside `span { transform: translateX(30px) }`
+    /// sits exactly where it does with no transform, and an absolute under
+    /// that span resolves against the initial containing block
+    /// (`offsetParent` is `BODY`). The **computed** value is kept —
+    /// `getComputedStyle(span).transform` reports the matrix — so this is asked
+    /// wherever the transform's *effect* is read, never by rewriting the
+    /// style.
+    ///
+    /// The set is the one [`Self::clips_overflow`] excludes, for the same
+    /// reason: an element whose [`DisplayMode`] is `Inline`, flowed, split or
+    /// unmarked alike. A replaced element or form control at `display: inline`
+    /// needs no carve-out: its `display_mode` is `InlineBlock` (#1089,
+    /// [`is_atomic_at_display_inline`]), so a transform applies to it, as in
+    /// Chrome.
+    ///
+    /// `display: contents` is **not** decided here: the two predicates below
+    /// exclude it themselves, and paint's transform composition treats it by
+    /// its own (zero-size) rule.
+    pub fn transform_applies(&self) -> bool {
+        !(self.is_element() && self.display_mode == DisplayMode::Inline)
+    }
+
+    /// Whether this node carries a `transform` other than `none` that
+    /// [applies](Self::transform_applies) — the question a transform's **side
+    /// effects** ask: [`Self::creates_stacking_context`] and
+    /// [`Self::establishes_abs_containing_block`] (#415).
+    ///
+    /// CSS keys both on the computed value not being `none`, not on the matrix
+    /// it composes to, so `transform: translateX(0)`, `rotate(0deg)` and
+    /// `scale(1)` count. Measured in Chrome 153: an `inset: 0` absolute under
+    /// a `rotate(0deg)` div fills the div, and a `z-index: 5` box inside a
+    /// `translateX(0)` parent paints below a `z-index: 1` sibling of that
+    /// parent. rinch used to ask [`Self::has_applied_transform`] here, so a
+    /// no-op transform did neither.
+    ///
+    /// Implied by [`Self::has_applied_transform`], never the other way round:
+    /// an identity transform creates the context but has nothing to paint.
+    pub fn has_transform(&self) -> bool {
+        !self.computed_style.transform.is_none && self.transform_applies()
+    }
+
+    /// Whether this node carries a non-identity `transform` that
+    /// [applies](Self::transform_applies) — the question every consumer of the
+    /// transform's **geometry** asks: paint's composition
+    /// ([`crate::paint::compose_node_transform`]), the painted state the
+    /// damage walk replays, and hit testing's inverse. An identity transform
+    /// answers `false`, so those skip a matrix that moves nothing; whether the
+    /// box is a stacking context or a containing block is
+    /// [`Self::has_transform`]'s question (#415).
+    pub fn has_applied_transform(&self) -> bool {
+        !self.computed_style.transform.is_identity && self.transform_applies()
+    }
+
+    /// The `position` this element's **box** is placed, anchored and stacked
+    /// with: its computed `position`, except `static` for a `display:
+    /// contents` element, which generates no box (css-display-3 §2.5) and so
+    /// has nothing for `position` to apply to (#1038).
+    ///
+    /// Ask this, not `computed_style.position`, wherever the answer decides
+    /// where a box — or anything under it — is anchored: a coordinate walk that
+    /// stops at a `fixed` ancestor read a contents wrapper's `0,0` layout as a
+    /// viewport position and put its whole subtree at the window's origin,
+    /// where Chrome 153 lays it out in its parent. The computed value itself is
+    /// untouched (`get_computed_styles` reports `fixed`, as Chrome's
+    /// `getComputedStyle` does).
+    ///
+    /// A `position: fixed` box whose containing block is a transformed (or
+    /// paint-contained) ancestor answers `absolute` (#1372): it is anchored,
+    /// clipped and scrolled as an absolute box resolved against that ancestor
+    /// (CSS Transforms 1 §2; Chrome 151 gives it the same box). It is still a
+    /// stacking context ([`Node::creates_stacking_context`] reads the computed
+    /// value).
+    pub fn box_position(&self) -> crate::computed_style::PositionValue {
+        if self.computed_style.display == crate::computed_style::DisplayValue::Contents {
+            crate::computed_style::PositionValue::Static
+        } else if self.fixed_contained {
+            crate::computed_style::PositionValue::Absolute
+        } else {
+            self.computed_style.position
+        }
+    }
+
+    /// Whether this is a `position: fixed` box whose containing block is an
+    /// ancestor rather than the viewport (#1372): see [`Node::box_position`].
+    pub fn is_contained_fixed(&self) -> bool {
+        self.fixed_contained
+    }
+
+    /// Whether this element is a **scroll container** on the vertical axis:
+    /// `overflow-y` is `auto` or `scroll`, and it generates a box. A
+    /// `display: contents` element answers `false` (#1038): it has no box to
+    /// scroll, and Chrome 153 scrolls the scroller above it. Every scroll finder
+    /// asks this rather than matching `overflow_y` — the wheel's
+    /// `find_scroll_container`, the scrollbar geometry, scroll-into-view,
+    /// `clamp_scroll_offsets` — because a finder that picked a contents element
+    /// wrote a `scroll_offset` onto a box-less node: nothing painted moved, but
+    /// `compute_absolute_position` moved its children by the scroll.
+    pub fn scrolls_y(&self) -> bool {
+        use crate::computed_style::{DisplayValue, OverflowValue};
+        self.computed_style.display != DisplayValue::Contents
+            && matches!(
+                self.computed_style.overflow_y,
+                OverflowValue::Auto | OverflowValue::Scroll
+            )
+    }
+
+    /// [`Self::scrolls_y`] on the horizontal axis.
+    pub fn scrolls_x(&self) -> bool {
+        use crate::computed_style::{DisplayValue, OverflowValue};
+        self.computed_style.display != DisplayValue::Contents
+            && matches!(
+                self.computed_style.overflow_x,
+                OverflowValue::Auto | OverflowValue::Scroll
+            )
     }
 
     /// Whether this box clips content that overflows it.
@@ -1261,13 +3165,62 @@ impl Node {
     /// down would leave hit testing's `check_children` gate and the dirty-region
     /// prune still believing the span clips.
     pub fn clips_overflow(&self) -> bool {
+        let (x, y) = self.clip_axes();
+        x || y
+    }
+
+    /// The same question as [`Self::clips_overflow`], asked of the
+    /// inline/horizontal axis alone (`overflow-x`) — issue #535.
+    ///
+    /// CSS clips per axis; rinch used to clip per box, pushing one bracket
+    /// covering both axes whenever either one asked for it, which is
+    /// indistinguishable from the per-axis answer for `hidden`/`scroll`/`auto`
+    /// (Stylo never pairs one of those with a `visible` on the other axis —
+    /// see `paint::clip`'s module doc) but wrong for `clip`, the one value the
+    /// spec lets stay asymmetric. [`crate::paint::clip_shape`] is what reads
+    /// this and [`Self::clips_overflow_y`] separately to decide which axis, if
+    /// either, actually bounds the clip shape.
+    ///
+    /// A caller that needs **both** axes (`check_children`'s per-axis gate,
+    /// `flow_extent`, `mark_scrolled`, the dirty-region prune's both-axes
+    /// test) should call [`Self::clip_axes`] once instead of this and
+    /// [`Self::clips_overflow_y`] separately — each of those re-runs the
+    /// shared `display`/`contents` guards below from scratch, and this
+    /// predicate sits on the pointer-move hit-testing hot path, where that
+    /// doubling measured as a +12% regression on `pointer_move_warm` (#535
+    /// Perf CI, Callgrind) before `clip_axes` landed.
+    pub fn clips_overflow_x(&self) -> bool {
+        self.clip_axes().0
+    }
+
+    /// [`Self::clips_overflow_x`], for `overflow-y`. See its doc for why a
+    /// caller that needs both axes should use [`Self::clip_axes`] instead.
+    pub fn clips_overflow_y(&self) -> bool {
+        self.clip_axes().1
+    }
+
+    /// `(`[`Self::clips_overflow_x`]`, `[`Self::clips_overflow_y`]`)`, the
+    /// shared `display`/`display: contents` guards run once instead of twice.
+    /// The hot-path entry point for any caller that needs both axes.
+    #[inline]
+    pub fn clip_axes(&self) -> (bool, bool) {
         use crate::computed_style::OverflowValue;
 
         if self.is_element() && self.display_mode == DisplayMode::Inline {
-            return false;
+            return (false, false);
         }
-        !matches!(self.computed_style.overflow_x, OverflowValue::Visible)
-            || !matches!(self.computed_style.overflow_y, OverflowValue::Visible)
+        // A `display: contents` element generates no box, so there is nothing
+        // for `overflow` to clip to (#1038; Chrome 153 clips nothing). Its
+        // `layout` is `0x0`, so a clip derived from it hid everything a
+        // descendant carried it to — hit testing's `check_children` gate, and
+        // the chain of a positioned descendant hoisted past it.
+        if self.computed_style.display == crate::computed_style::DisplayValue::Contents {
+            return (false, false);
+        }
+        (
+            !matches!(self.computed_style.overflow_x, OverflowValue::Visible),
+            !matches!(self.computed_style.overflow_y, OverflowValue::Visible),
+        )
     }
 
     /// Whether this node establishes a containing block for absolutely
@@ -1275,21 +3228,89 @@ impl Node {
     ///
     /// Per CSS that is any *positioned* element — `position` other than
     /// `static` — plus, since a transform makes an element the containing block
-    /// for all its descendants, any element with a non-identity `transform`.
+    /// for all its descendants, any element with a `transform` other than
+    /// `none` that **applies** ([`Self::has_transform`]) — an identity such as
+    /// `rotate(0deg)` included (#415, Chrome 153: an `inset: 0` absolute under
+    /// it fills it, `offsetParent` is the transformed div). A plain
+    /// `display: inline` span is not transformable, so `span { transform: … }`
+    /// contains nothing while `span { position: relative }` does (issue #1080,
+    /// measured in Chrome 153 — the absolute's `offsetParent` is `BODY` in the
+    /// first case and the span in the second).
     /// Overflow deliberately does not count. It never established a containing
     /// block; it used to form a *stacking context*, and this line used to cite
     /// that as the reason the two questions are separate. Since #324 stage B it
     /// forms neither — see [`Node::creates_stacking_context`] — so `overflow` is
     /// simply absent from both lists, and the answer here is unchanged.
     ///
+    /// A `display: contents` element answers `false` whatever its `position`
+    /// and `transform` compute to (issue #994): it generates no box, so it
+    /// establishes no containing block (css-display-3 §2.5), and `transform`
+    /// does not apply to it. Measured in Chrome 153: an `inset: 0` absolute
+    /// under a `display: contents; position: relative` wrapper fills the
+    /// initial containing block. Asking here rather than at each caller is what
+    /// keeps `out_of_flow_kind`, `contributes_to_scrollable_overflow`,
+    /// `stacking::Collector`'s `cb_depth`, `layer_bounds`' `clipper_below_cb`,
+    /// the damage clip chain (`paint::clip_chain_bounds`, through
+    /// [`PaintedState::contains_abs`]) and the cascade's containing-block
+    /// re-sync in agreement — each spells its own `match` on `position` but all
+    /// of them ask this for the containing-block half. A caller that spells the
+    /// rule itself goes out of step with paint: the damage clip chain did until
+    /// #994's review, and a moved absolute under a positioned contents wrapper
+    /// was damaged to nothing and ghosted. (Whether a contents element makes a
+    /// *stacking context* is a separate question, `creates_stacking_context`,
+    /// which also answers `false` for one — #1038.)
+    ///
+    /// `display: none` is deliberately **not** excluded, and
+    /// `display_contents_containing_block_tests` pins that: nothing under it is
+    /// laid out, so the answer there changes no box, and excluding it would add
+    /// a containing-block flip — so an absolute-descendant re-sync in the
+    /// cascade — to every `none` toggle of a positioned element.
+    ///
     /// This is what stops the walk in `out_of_flow::out_of_flow_kind`, which is
     /// how issue #204's ICB case is told apart from a layout Taffy already gets
     /// right.
     pub fn establishes_abs_containing_block(&self) -> bool {
+        if matches!(
+            self.computed_style.display,
+            crate::computed_style::DisplayValue::Contents
+        ) {
+            return false;
+        }
         !matches!(
             self.computed_style.position,
             crate::computed_style::PositionValue::Static
-        ) || !self.computed_style.transform.is_identity
+        ) || self.has_transform()
+            // A filter makes one too (Filter Effects 1 §5, #2719; Chrome 157:
+            // an `inset: 0` absolute under a `filter: blur(0)` box fills it).
+            || self.has_filter()
+    }
+
+    /// Whether this box is the containing block of a `position: fixed`
+    /// descendant in place of the viewport (#1372): it has a `transform` that
+    /// applies ([`Self::has_transform`], an identity included), or one of the
+    /// other properties [`crate::computed_style::ComputedStyle::contains_fixed`]
+    /// lists — `contain: paint`/`layout`, a `filter`, `backdrop-filter` or
+    /// `perspective`, a `will-change` naming one (CSS Transforms 1 §2, CSS
+    /// Containment 2 §3.2-3.3). A `display: contents` element generates no
+    /// box and contains nothing. A `position: fixed` box itself is not one
+    /// (Chrome 151: a fixed box inside a fixed box inside a transformed div
+    /// is placed against the div).
+    ///
+    /// The walk that asks this is `out_of_flow::fixed_containing_block_is_viewport`,
+    /// whose answer the cascade keeps on each fixed box (`Node::fixed_contained`,
+    /// read through [`Self::box_position`]).
+    pub fn establishes_fixed_containing_block(&self) -> bool {
+        if matches!(
+            self.computed_style.display,
+            crate::computed_style::DisplayValue::Contents
+        ) {
+            return false;
+        }
+        // `contain` and `perspective` apply to a box, as `transform` does; a
+        // filter applies to a non-atomic inline too (Chrome 151).
+        self.has_transform()
+            || self.computed_style.contains_fixed_inline
+            || (self.computed_style.contains_fixed && self.transform_applies())
     }
 
     /// Whether this box is taken **out of flow** — CSS 2.1 §9.3.
@@ -1306,15 +3327,17 @@ impl Node {
     /// question is "is this inline content" and the **wrong** one where it is
     /// "does this break the flow" — which is issues #406 and #289.
     ///
-    /// Keys on `position` alone. `PositionValue::Static` is the default, so a
-    /// text node — which never goes through style resolution — answers `false`,
-    /// which is what #342 was about when a wrong default hoisted text nodes.
+    /// Keys on `position`, and on an outside list marker (#1356), which is
+    /// `static` for paint but out of flow for layout. `PositionValue::Static`
+    /// is the default, so a text node — which never goes through style
+    /// resolution — answers `false`, which is what #342 was about when a
+    /// wrong default hoisted text nodes.
     pub fn is_out_of_flow(&self) -> bool {
         matches!(
             self.computed_style.position,
             crate::computed_style::PositionValue::Absolute
                 | crate::computed_style::PositionValue::Fixed
-        )
+        ) || self.outside_marker.is_some()
     }
 
     /// Get the text content if this is a text node.
@@ -1394,8 +3417,8 @@ impl Node {
     ///    flattened in-flow boxes stayed attached — the non-leaf carrier the
     ///    #466 validator exists to catch.
     /// 4. Inline-level content is [`InlineFlowRole::Inline`].
-    /// 5. Only now does `position` speak: `absolute`/`fixed` is
-    ///    [`InlineFlowRole::OutOfFlow`].
+    /// 5. Only now do `position` and `float` speak: `absolute`/`fixed`, or a
+    ///    float, is [`InlineFlowRole::OutOfFlow`].
     /// 6. Everything left is an in-flow block-level box,
     ///    [`InlineFlowRole::InFlowBlock`].
     ///
@@ -1416,7 +3439,7 @@ impl Node {
         if self.is_inline() {
             return InlineFlowRole::Inline;
         }
-        if self.is_out_of_flow() {
+        if self.is_out_of_flow() || self.computed_style.float.is_floated() {
             return InlineFlowRole::OutOfFlow;
         }
         InlineFlowRole::InFlowBlock
@@ -1501,6 +3524,53 @@ impl Node {
     }
 }
 
+/// Whether an element with this tag is an **atomic** inline-level box even
+/// when its computed `display` is `inline` (#1089).
+///
+/// A replaced element (`img`, `svg`, `video`, `canvas`, `iframe`) is atomic
+/// whatever its `display` says — css-display-3 §2.6's `inline` produces an
+/// atomic inline for a replaced element — and HTML's rendering rules make the
+/// form controls (`input`, `button`, `select`, `textarea`, `meter`,
+/// `progress`) behave as `inline-block` at `display: inline`. Measured in
+/// Chrome 153, every one of these gives the **identical** box at `inline` and
+/// at `inline-block` (`replaced_inline_tests`); `embed` and `object` without
+/// content, and `audio`, are left out — the first two measure `0x0` there and
+/// the third renders nothing without `controls`.
+///
+/// The UA sheet already gives `img`, `input`, `button`, `select`,
+/// `textarea` and `svg` `inline-block`, so for those six this only decides
+/// anything when author CSS writes `display: inline`. The UA sheet names none
+/// of `video`, `canvas`, `iframe`, `meter` and `progress`, so they are
+/// `display: inline` by **default** and this changes their default rendering:
+/// an atomic box sized by author CSS, where they used to be flowed. Chrome's
+/// intrinsic default sizes (300x150, 80x16, 160x16) are not modelled, and
+/// fallback content inside them is still laid out, inside the box, where
+/// Chrome renders none. Without this rule such an element was a *flowed*
+/// inline element (IFC content with no box) and measured `0x0`.
+///
+/// Read in exactly one place, the `display_mode` sync in
+/// `RinchDocument::apply_stylo_styles_to_taffy`, which maps `display: inline`
+/// on one of these tags to [`DisplayMode::InlineBlock`]. Every layout, clip,
+/// hit-test and paint question asks `display_mode`, so none of them has to
+/// know about replaced elements. `ComputedStyle::display` keeps `inline`, as
+/// `getComputedStyle` does for `img`/`svg` in Chrome.
+pub fn is_atomic_at_display_inline(tag: &str) -> bool {
+    matches!(
+        tag,
+        "img"
+            | "svg"
+            | "video"
+            | "canvas"
+            | "iframe"
+            | "input"
+            | "button"
+            | "select"
+            | "textarea"
+            | "meter"
+            | "progress"
+    )
+}
+
 /// Default display mode based on HTML tag name.
 fn default_display_for_tag(tag: &str) -> DisplayMode {
     match tag {
@@ -1512,10 +3582,94 @@ fn default_display_for_tag(tag: &str) -> DisplayMode {
     }
 }
 
+/// One IFC root's entry in [`NodeTree::ifc_measure_cache`].
+///
+/// A root's measure is built (`RinchDocument::build_inline_layout`) from its
+/// members — which nodes, in what order, their text, their `display` and
+/// `position`, the size of each atomic inline among them — from every
+/// member's typography, and from the available width. The width is the key of
+/// each size; typography is covered by the cascade's per-node comparison,
+/// which drops the sizes of the root a restyled member belongs to; and the
+/// rest is `signature`, a hash of the root's content that the structural pass
+/// recomputes and compares.
+#[derive(Debug, Default, Clone)]
+pub struct IfcRootMeasures {
+    /// The content signature this root had when the structural pass last
+    /// looked at it, or `None` if it has not seen it since the entry was
+    /// created. See `RinchDocument::refresh_ifc_signatures`.
+    pub signature: Option<u64>,
+    /// `signature` no longer describes what `sizes` were measured from: an
+    /// atomic inline in the root changed size outside a structural pass, and
+    /// the root was measured again against the new size while `signature`
+    /// still records the old one. The next structural pass treats the root as
+    /// changed whatever it computes, or a chip that goes back to its earlier
+    /// size makes the signature match again and the sizes measured at the
+    /// size in between are served (review of #1627).
+    pub stale: bool,
+    /// `(available-width bits, measure)`, one per available space the
+    /// measure function was asked about, newest last, at most
+    /// [`IfcRootMeasures::MAX_SIZES`].
+    pub sizes: Vec<(u32, IfcMeasure)>,
+}
+
+/// One measure's line baselines, `(content width, content height, first,
+/// last)`, the baselines from the content-box top
+/// ([`NodeTree::atomic_line_baselines`], #663).
+pub(crate) type LineBaselines = (f32, f32, Option<f32>, Option<f32>);
+
+/// What an IFC root's measure answered under one available width: the content
+/// size Taffy was given and the first line's baseline (#1013), both from the
+/// same Parley build.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IfcMeasure {
+    /// The content-box width (`InlineLayout::measured_width`).
+    pub width: f32,
+    /// The content-box height.
+    pub height: f32,
+    /// The first line's baseline, from the top of the **content** box, or
+    /// `None` when the root laid out no line. The measure closure adds the
+    /// box's top padding and border before handing it to Taffy, which
+    /// measures baselines from the border-box top.
+    pub first_baseline: Option<f32>,
+    /// The content height and first baseline of the lines broken at
+    /// [`Self::width`] when it is wider than the room: what a box sized by
+    /// its content is laid out with (#2425), where a box given the room as
+    /// its width keeps [`Self::height`]. `None` until a measure of such a box
+    /// has broken them.
+    pub at_width: Option<(f32, Option<f32>)>,
+}
+
+impl IfcRootMeasures {
+    /// A root is typically measured under three or four available spaces per
+    /// width (min-content, max-content, the definite width, and a flex
+    /// item's re-measures). Eight keeps a live resize from growing the entry
+    /// without bound: every new width used to be one more entry for as long
+    /// as the root lived.
+    pub const MAX_SIZES: usize = 8;
+
+    /// The measure answered under `bits`, if any.
+    pub fn get(&self, bits: u32) -> Option<IfcMeasure> {
+        self.sizes
+            .iter()
+            .rev()
+            .find(|(b, _)| *b == bits)
+            .map(|&(_, s)| s)
+    }
+
+    /// Record the measure answered under `bits`, replacing an older one.
+    pub fn insert(&mut self, bits: u32, size: IfcMeasure) {
+        self.sizes.retain(|(b, _)| *b != bits);
+        if self.sizes.len() >= Self::MAX_SIZES {
+            self.sizes.remove(0);
+        }
+        self.sizes.push((bits, size));
+    }
+}
+
 /// The node tree, stored in a slab for stable IDs.
 pub struct NodeTree {
     /// All nodes, indexed by RawNodeId.
-    pub nodes: slab::Slab<Node>,
+    pub nodes: crate::node_slab::NodeSlab,
     /// The root document node ID.
     pub root_id: RawNodeId,
     /// The html element node ID.
@@ -1531,12 +3685,123 @@ pub struct NodeTree {
     /// Stored at removal time because the nodes are deleted from the tree
     /// before `compute_dirty_region` runs.
     pub paint_dirty_removed_rects: Vec<(f64, f64, f64, f64)>,
+    /// The parents the removed and moved subtrees left (#770's follow-up):
+    /// a scroll container above one may have lost range, and its bars move
+    /// with no node of its own dirty. Read by
+    /// [`crate::paint::bar_watch_scrollers`], cleared by
+    /// [`NodeTree::consume_paint_dirty`].
+    pub(crate) bar_check_parents: Vec<RawNodeId>,
+    /// Each scroll container's bars as the last paint consumed them, at
+    /// scale 1 ([`crate::paint::scrollbar::scrollbars`]), for the containers
+    /// [`crate::paint::bar_watch_scrollers`] has named. A bar is drawn from
+    /// the container's **range**, which a change below it moves without
+    /// making it dirty (a box moved past its edge, a row grown or removed),
+    /// so the damage compares the bars now against these and names the
+    /// container's bar strips when they differ — or when it has none here.
+    pub(crate) painted_bars: HashMap<RawNodeId, crate::paint::scrollbar::Scrollbars>,
+    /// Set when the whole document was restyled (a stylesheet, the theme, the
+    /// viewport, the device pixel ratio or the root font-size changed —
+    /// [`NodeTree::note_full_restyle`]). Such a restyle can change the paint of
+    /// any node while pushing none of them to `paint_dirty_nodes`, so the paint
+    /// that consumes it repaints in full. Cleared by
+    /// [`NodeTree::consume_paint_dirty`].
+    pub whole_document_damaged: bool,
+    /// Whether an inline element (or a `display: contents` wrapper) has ever
+    /// computed a `text-shadow` other than its parent's (#1048), or a
+    /// `-webkit-text-stroke` reaching further than its parent's (#2719). Until one
+    /// has, every text run casts its IFC root's list, and paint, damage and
+    /// the painted state skip the per-run walk that finds the others. Set by
+    /// the cascade; sticky — clearing it would need a count nobody keeps.
+    pub inline_text_shadows: bool,
+    /// Whether any element has ever computed a `filter` that moves pixels
+    /// (`blur()`, `drop-shadow()`, #2719). Until one has, damage does not
+    /// walk a dirty node's ancestors for the blur reach that spreads its
+    /// change (`paint::filter::ancestor_reach`). Set by the cascade; sticky.
+    pub raster_filters: bool,
+    /// Whether any element has ever computed a `backdrop-filter` that changes
+    /// something (`ComputedStyle::has_backdrop_effect`, #2719).
+    /// Until one has, paint keeps no stack of backdrop roots and damage
+    /// grows nothing for one. Set by the cascade; sticky.
+    pub backdrop_filters: bool,
+    /// The elements that have computed such a `backdrop-filter`, each once
+    /// (#2719): damage grows a rect that meets one (`paint::backdrop`). A
+    /// removed one, or one whose filter went away, stays in the list;
+    /// readers skip it.
+    pub backdrop_nodes: Vec<RawNodeId>,
+    /// The nodes holding a [`Node::raster_cache`] entry, each once: what
+    /// `paint::raster_cache` looks at, so a tree with no cached raster
+    /// pays nothing for it.
+    pub(crate) raster_cached: std::cell::RefCell<Vec<RawNodeId>>,
+    /// The bytes all kept rasters hold (`paint::raster_cache::BUDGET_BYTES`).
+    pub(crate) raster_cache_bytes: Cell<usize>,
+    /// Counts `paint_document` calls: when a kept raster was last drawn.
+    pub(crate) raster_serial: Cell<u64>,
+    /// Whether any element has ever computed `font-synthesis-weight: none`
+    /// (#2296). Until one has, paint draws every faux-bold run emboldened
+    /// without looking per element. Set by the cascade; sticky.
+    pub font_synthesis_weight_off: bool,
+    /// Whether any element has ever computed a `-webkit-text-fill-color`,
+    /// a `-webkit-text-stroke` or a `background-clip: text` (#2719). Until
+    /// one has, paint draws every run in its brush without looking per
+    /// element. Set by the cascade; sticky.
+    pub text_paint_effects: bool,
     /// IDs of nodes whose styles were recomputed and need Taffy sync.
     pub style_dirty_nodes: Vec<RawNodeId>,
+    /// Tables owed a `RinchDocument::resolve_tables` rebuild: a part restyled,
+    /// a child inserted, moved or removed.
+    pub tables_owed: Vec<RawNodeId>,
+    /// Parsed `legacy_hints::cell_hints_css` blocks, by their CSS text.
+    pub cell_hints: std::sync::Mutex<HashMap<String, ServoArc<Locked<PropertyDeclarationBlock>>>>,
+    /// Cells read back (or restyled) this layout and owed their
+    /// `vertical-align`.
+    pub cells_to_align: Vec<RawNodeId>,
+    /// Boxes the cascade computed as floated; dead or unfloated ones are
+    /// dropped before each layout (`floats`).
+    pub floats: Vec<RawNodeId>,
+    /// Boxes the cascade computed with a `-webkit-line-clamp` (#1703); freed
+    /// ones are dropped by `remove_subtree`, unclamped ones (and, through its
+    /// checked lookup, any freed another way) by `resolve_block_line_clamps`.
+    pub(crate) line_clamp_roots: Vec<RawNodeId>,
+    /// The nodes `resolve_block_line_clamps` gave a `clamp_lines` or a
+    /// `clamp_height`, to take them back. An anonymous block box in it is
+    /// freed by the inline pass, not `remove_subtree`, so it is read checked
+    /// (#2748).
+    pub(crate) line_clamped: Vec<RawNodeId>,
+    /// The boxes `floats` gave containment, to take it back.
+    pub float_avoiders: Vec<RawNodeId>,
+    /// The blank anonymous boxes beside floats that `floats` hid.
+    pub float_blank_runs: Vec<RawNodeId>,
+    /// The room the floats beside an IFC root leave its lines, for every
+    /// root the last layout laid out beside one (`float_wrap`). The paint
+    /// layout is broken around the same bands the measure was.
+    pub(crate) ifc_float_bands: rustc_hash::FxHashMap<RawNodeId, crate::float_wrap::FloatBands>,
+    /// Every table rebuilt so far; dead ids are dropped before each layout.
+    pub tables: Vec<RawNodeId>,
     /// Roots of subtrees needing style resolution. When non-empty,
     /// `resolve_styles()` resolves only these subtrees instead of the
     /// full tree — turning O(tree) into O(changed_subtree).
     pub style_roots: Vec<RawNodeId>,
+    /// Entries `remove_subtree` scanned pruning the lists keyed by node id,
+    /// summed over the document's life. A work count, not a perf counter (it
+    /// is in no baseline): `discard_churn_tests` pins it linear in the
+    /// number of rows discarded one call at a time (#2627).
+    pub free_prune_steps: u64,
+    /// Children a structural selector's sweep visited to mark them for restyle
+    /// (`RinchDocument::mark_children_from`), summed over the document's
+    /// life. A work count like `free_prune_steps` (#2627).
+    pub sibling_mark_steps: u64,
+    /// The next `resolve_styles()` walks the whole document from `<html>`,
+    /// whatever `style_roots` holds.
+    ///
+    /// Set by every whole-document restyle (a stylesheet, theme, device pixel
+    /// ratio or media-query change) after it drops every node's cached style.
+    /// Nothing else asks for a full walk: an empty `style_roots` with this flag
+    /// clear means nothing was invalidated, and the resolve does no walk at
+    /// all. It used to walk the whole document whenever `style_roots` was
+    /// empty, which a synchronous insertion restyle leaves it — so the frame
+    /// after appending one row visited every node in the document to cascade
+    /// none of them.
+    pub full_style_walk: bool,
     /// True if any style-affecting change occurred since last resolve.
     pub styles_dirty: bool,
     /// True if any layout-affecting Taffy style changed since last compute.
@@ -1546,13 +3811,125 @@ pub struct NodeTree {
     /// Used during bulk DOM operations (block re-render) to batch style resolution
     /// into a single pass instead of one per child.
     pub suppress_inline_restyle: bool,
-    /// True when an absolute/fixed element moved via the inset fast path.
-    /// The app checks this to force a full scene repaint (clearing old position).
-    pub full_repaint_needed: bool,
-    /// True if the tree structure changed (node insert/remove) or display mode
-    /// changed since last IFC setup. When false, IFC rebuild is skipped and
-    /// Taffy's internal cache is preserved — only dirty nodes get re-measured.
+    /// A **whole-document** IFC structural pass is pending.
+    ///
+    /// Since the scoped pass (`crate::ifc_scope`) this is the fallback, not the
+    /// common route: the mutation verbs record *where* the tree changed in
+    /// [`Self::ifc_seeds`] and the next layout re-sets-up only the formatting
+    /// containers those seeds reach. Setting this flag instead asks for the old
+    /// behaviour — every splice, anonymous box, split, measure leaf and atomic
+    /// inline in the document rebuilt — and it is what every writer that does
+    /// not say where it changed the tree gets. So a direct `ifc_dirty = true`
+    /// (a test forcing a pass, or a site nobody converted) stays **correct**,
+    /// merely slow; say why through [`Self::request_full_ifc`] so the
+    /// `ifc_full_*` counters can attribute it.
     pub ifc_dirty: bool,
+    /// Why [`Self::ifc_dirty`] was set, for the `ifc_full_*` counters. `None`
+    /// with the flag set means somebody wrote the flag directly
+    /// (`ifc_full_unattributed`).
+    pub ifc_full_reason: Option<crate::ifc_scope::IfcFullReason>,
+    /// Where the tree changed since the last structural pass: the seeds of the
+    /// next **scoped** IFC setup pass (`crate::ifc_scope`). Ignored — and
+    /// cleared — when [`Self::ifc_dirty`] asks for a whole-document pass.
+    pub ifc_seeds: Vec<(RawNodeId, crate::ifc_scope::IfcSeed)>,
+    /// Every node the structural passes made an IFC root, as of the last pass
+    /// that reached it. A **superset**: readers filter it with the same
+    /// predicate `build_ifc_layouts` always used (a block container one of
+    /// whose IFC children names it), which is what makes it safe for a root to
+    /// stop being one between passes (a subtree moved out from under it clears
+    /// the marks). It exists so paint-layout building iterates roots instead of
+    /// scanning the slab for them (layout audit F12).
+    pub ifc_root_registry: BTreeSet<RawNodeId>,
+    /// Every atomic inline the structural passes placed in an IFC, as of the
+    /// last pass that reached it. A superset, filtered at use by
+    /// `inline_block_measure_roots`' own predicate, for the same reason as
+    /// [`Self::ifc_root_registry`]: the percentage re-measure that runs after
+    /// every compute and the whole-document inline-block pass iterate this
+    /// rather than the slab.
+    pub atomic_inline_registry: BTreeSet<RawNodeId>,
+    /// The `position: absolute` nodes whose containing block is an ancestor
+    /// that is **not** the box Taffy lays them out in
+    /// (`OutOfFlowKind::AncestorAbsolute`, #386), as of the last
+    /// style-application site that synced each
+    /// (`out_of_flow::bake_at_style_site`) — plus any the layout read-back
+    /// found the sites had not recorded (`out_of_flow::note_kind_at_read`).
+    /// A superset, filtered at use: `RinchDocument::resolve_ancestor_absolutes`
+    /// iterates it after each compute and drops an entry that is freed, no
+    /// longer absolute, or no longer ancestor-resolved. An absolute box Taffy
+    /// already resolves correctly — a child of its own positioned parent — is
+    /// never in it, so a document of those pays one `is_empty` per compute.
+    pub ancestor_absolutes: BTreeSet<RawNodeId>,
+    /// Every absolute box the last layout read-back placed against a
+    /// containing block Taffy does not know — a non-parent ancestor or the
+    /// initial containing block — with the kind it was placed as, in read
+    /// order (parents first). What `out_of_flow::replace_all` and
+    /// `replace_after_scroll` iterate. Rebuilt by every layout
+    /// (`out_of_flow::begin_read`).
+    pub(crate) placed_absolutes: Vec<(RawNodeId, crate::out_of_flow::OutOfFlowKind)>,
+    /// Every `absolute` box the layout read back, with its
+    /// [`crate::out_of_flow::out_of_flow_kind`] (`listed`): the boxes whose
+    /// **scrollable overflow** may belong to a scroll container that is not
+    /// the box they are laid out in (#770) — the nearest scroll container at or
+    /// above the containing block (`out_of_flow::overflow_scroller`).
+    /// Rebuilt by every layout read-back (`out_of_flow::begin_read`), and only
+    /// listed there: which container each box belongs to, and where it is in
+    /// that container's frame, is worked out once per geometry, by the first
+    /// scroll range asked for after it changed — `content_extents`' memo,
+    /// beside the list. Boxed: a document is moved by value, and this is
+    /// one pointer of it.
+    pub(crate) overflow_absolutes: Box<crate::paint::scrollbar::OverflowAbsolutes>,
+    /// Each scroll container's in-flow reach measured unrounded, for the
+    /// current geometry (#2116): `content_extents`' memo of the one walk that
+    /// reads Taffy's unrounded rects. Boxed for the reason above.
+    pub(crate) exact_flow: Box<crate::paint::scrollbar::ExactFlow>,
+    /// Moved by every layout pass (and a text-only IFC rebuild), by
+    /// `out_of_flow::replace_all` and by a subtree's removal: everything that
+    /// can move a box's rect, and nothing that only restyles or scrolls. What
+    /// [`Self::exact_flow`] is keyed on — `HitCache::shape_generation` also
+    /// moves on every paint-only restyle (a hover), and the unrounded walk
+    /// it would then repeat is the cost #2116's memo is there to save.
+    pub(crate) layout_epoch: u64,
+    /// Moved by every [`Self::mark_scrolled`]: a scroll offset written,
+    /// which moves the scroller's content without a layout. With
+    /// [`Self::layout_epoch`] it makes [`Self::geometry_epoch`].
+    scroll_epoch: u64,
+    /// The placed boxes among those that are **shrunk to fit from their
+    /// static position** (#1404): an `auto` (or `fit-content`) width and both
+    /// inline insets `auto`. What
+    /// `RinchDocument::resolve_static_shrink_to_fit` iterates once the lines
+    /// are built; rebuilt by every layout read-back, and empty in a document
+    /// with no such box.
+    pub(crate) abs_static_fits: Vec<(RawNodeId, Option<crate::out_of_flow::OutOfFlowKind>)>,
+    /// The nodes carrying [`Node::on_abs_chain`], so the next read-back can
+    /// clear them without walking the slab.
+    pub(crate) abs_chain_marked: Vec<RawNodeId>,
+    /// The layout read-back found an absolute box whose kind is not the one
+    /// the style sites recorded (`out_of_flow::note_kind_at_read`);
+    /// `resolve_layout` resolves, computes and reads once more before it
+    /// returns.
+    pub(crate) abs_resolve_owed: bool,
+    /// Whether, since the last layout read-back began, a box's position or
+    /// a scroll offset was written **after** that read-back placed the
+    /// absolute boxes: an anonymous block box read back, an atomic inline
+    /// moved by its inline formatting context (on the text-only path of
+    /// `resolve_layout` too, where no read-back runs), a scroll offset
+    /// clamped. `out_of_flow::replace_all` has nothing to do when none was,
+    /// and clears it.
+    pub(crate) abs_late_moves: bool,
+    /// Whether the last read-back met an absolute box whose containing block
+    /// is an inline span (#631, `out_of_flow::has_inline_containing_block`).
+    /// Such a block is measured in the lines `build_ifc_layouts` builds
+    /// after the read-back, so `resolve_layout` checks those boxes' sizes
+    /// and places them again once the lines exist — and does neither when
+    /// this is `false`, which is every document without such a box.
+    pub(crate) abs_inline_cb_seen: bool,
+    /// Whether any element has cascaded with an HTML `align` that aligns
+    /// blocks (`ComputedStyle::html_align`). Sticky: set by the cascade,
+    /// never cleared. `read_layout_results` asks `html_align_dx` about every
+    /// box only when it is set, so a document without the attribute does not
+    /// pay a parent lookup per box per layout (PR #2213 cost +1.4–3.6% on the
+    /// Perf benches without it).
+    pub(crate) html_align_seen: bool,
     /// Taffy layout tree.
     pub taffy: taffy::TaffyTree<NodeContext>,
     /// Reverse map from Taffy node ID to slab node ID.
@@ -1563,6 +3940,12 @@ pub struct NodeTree {
     pub hovered_node: Option<RawNodeId>,
     /// Currently focused node ID (for CSS :focus).
     pub focused_node: Option<RawNodeId>,
+    /// The container of the rich-text editor holding the keyboard, when one
+    /// does (issue #1126). Kept by the runtime's focus arbiter; an editor takes
+    /// no CSS `:focus`, so it is not [`Self::focused_node`]. What
+    /// `DomDocument::active_element` answers for it, so an overlay opened from
+    /// an editor remembers the editor as its opener.
+    pub keyboard_editor: Option<RawNodeId>,
     /// Currently active (mouse-pressed) node ID (for CSS :active).
     pub active_node: Option<RawNodeId>,
     /// The roots of every overlay currently holding a **scroll lock** (#474) —
@@ -1596,17 +3979,66 @@ pub struct NodeTree {
     /// the first one is also the count: pushing the popup there would exempt it
     /// and *take a lock*, freezing the page whenever any `<select>` was open.
     ///
-    /// Anything else that portals a **scroll container** to `<body>` needs an
-    /// entry here, with the same push-on-open / release-on-close lifetime.
-    /// `ContextMenu` (`rinch-components`' `context_menu.rs`) is the other body
-    /// portal today and needs none: its dropdown declares no `overflow` and no
-    /// `max-height`, so it is not a scroll container. Give it either and it
-    /// inherits this trap silently.
+    /// This list is the runtime's own, for a node it builds with the concrete
+    /// document in hand. A scroll container built through `RenderScope` /
+    /// `NodeHandle` — a component's, or an app's — says the same thing with
+    /// the `data-scroll-lock-exempt` attribute (#701), which
+    /// [`NodeTree::scroll_locked_out`] reads on the same walk and which needs
+    /// no release: it goes with its node. `ContextMenu` (`rinch-components`'
+    /// `context_menu.rs`) is the other body portal today and carries neither:
+    /// its dropdown declares no `overflow` and no `max-height`, so it is not a
+    /// scroll container. Give it either and it needs the attribute.
     pub scroll_lock_exempt: Vec<RawNodeId>,
+    /// `<select>` elements whose own `value` attribute is currently the
+    /// *freshest* selection write — the one `resolve_selected_index`'s step 1
+    /// should answer from (issue #757).
+    ///
+    /// A `<select>`'s `value` attribute is rinch's own invention (HTML has no
+    /// such content attribute); the desktop popup's pick writes it
+    /// (`app/select_widget.rs`'s `commit_select`), and so does the `value:`
+    /// rsx prop. A live `<option selected>` write is the other way to move
+    /// the selection. Chrome and rinch-web have only the second mechanism, so
+    /// whichever happens most recently is "the" selection there; desktop used
+    /// to let the `value` attribute win unconditionally once present, which
+    /// meant a user's pick could never be overtaken by a later script write —
+    /// the opposite of every other browser-matched behaviour in this file.
+    ///
+    /// A select's id is inserted here by every live `value` attribute write
+    /// (`RinchDocument::set_attribute`) and removed by
+    /// `crate::select::set_option_selectedness` whenever one of ITS options'
+    /// selectedness is set to `true` through a **live** write — so the most
+    /// recent of the two kinds of write wins, matching a browser's single
+    /// "last write wins" model despite rinch tracking the two as separate
+    /// mechanisms. `crate::select::options_inserted` — which re-applies an
+    /// already-decided selectedness when a detached option (built with its
+    /// `selected` attribute already present, the common `rsx!` construction
+    /// order) is attached to its select — deliberately does **not** clear an
+    /// entry here: that call is materializing state decided earlier while
+    /// detached, not a new write, and must not let attachment order override
+    /// a `value:` prop set at the same time
+    /// (`select_value_attribute_wins_over_selected_attribute` in
+    /// `select_tests.rs` pins this half). Removed outright when the `value`
+    /// attribute is removed, and when the select node itself is freed.
+    pub select_value_fresh: HashSet<RawNodeId>,
+    /// The selection each text control had when it last lost the keyboard,
+    /// or the one stashed for its next focus — `(start, end, direction)` in
+    /// UTF-16 code units, written by the desktop runtime — so
+    /// `DomDocument::text_selection_range` answers for an unfocused control as
+    /// a browser does (issue #1678). Dropped with the node.
+    pub text_selections: HashMap<RawNodeId, (usize, usize, rinch_core::dom::SelectionDirection)>,
+    /// How many live nodes have [`Node::style_isolated`] set (#2357). While
+    /// it is `0`, `TElement::matches_user_and_content_rules` answers `true`
+    /// without reading the element, so a document with no isolated subtree
+    /// (an app with no `HtmlView`) pays only the walk's one parent read per
+    /// visited element, which keeps [`Node::under_isolated`] current. Raised by `isolate_styles`, lowered by
+    /// [`Self::remove_subtree`] when it frees such a node.
+    pub isolated_nodes: usize,
     /// Shared lock for Stylo CSS engine.
     pub guard: SharedRwLock,
     /// IDs of anonymous block box nodes created during layout.
-    /// Tracked for cleanup at the start of each layout pass.
+    /// Tracked for cleanup at the start of each layout pass. A box minted
+    /// again for the same run reuses the old box's slab id, and keeps its paint
+    /// layout and cached measures (#964, `ifc::RetiredAnonBoxes`).
     pub anonymous_block_boxes: Vec<RawNodeId>,
     /// The `display: inline` elements the last IFC pass **split** around
     /// block-level content (#513) — [`Node::is_split_inline`].
@@ -1638,44 +4070,84 @@ pub struct NodeTree {
     /// because their constant samples are still written into `computed_style`
     /// on every cascade. So "is this map non-empty" is not "does anything need
     /// another frame"; that is [`NodeTree::has_running_animations`] (#763,
-    /// #782).
+    /// #782). A finished animation **without** a fill is not here: it is in
+    /// [`NodeTree::finished_animations`].
     pub active_animations: HashMap<RawNodeId, Vec<ActiveAnimation>>,
+    /// Finished `@keyframes` animations that do not fill forwards
+    /// (`animation-fill-mode: none` / `backwards`, #783), kept per node as
+    /// markers with no effect.
+    ///
+    /// The cascade looks an animation up by name in both maps
+    /// ([`crate::animation::start_animations`]), so finding one here keeps a
+    /// still-declared animation from starting again from t=0 — a browser does
+    /// not replay it on an unrelated restyle, a pause or a theme change. A
+    /// restyle that gives it more iterations moves it back to
+    /// [`NodeTree::active_animations`]; one that drops its name drops it.
+    ///
+    /// **Its own map, so that a tick never walks it** (review of #2000): a
+    /// list of rows with a one-shot entrance animation leaves one marker per
+    /// row for the rows' lives, and when they sat in `active_animations` every
+    /// frame of an unrelated spinner cloned all of them (2000 rows: 0.003 ms →
+    /// ~5 ms per tick, debug). Nothing here writes a sample, so nothing reads
+    /// it but the cascade.
+    pub finished_animations: HashMap<RawNodeId, Vec<ActiveAnimation>>,
+    /// Nodes on which a tick has just **finished** an animation that does not
+    /// fill forwards (`animation-fill-mode: none` / `backwards`, #783).
+    ///
+    /// `animation::tick_animations` pushes the node and moves the entry to
+    /// [`NodeTree::finished_animations`] as a finished marker
+    /// ([`ActiveAnimation::settled`]); `computed_style` still
+    /// holds the last sample, and only a cascade knows the values underneath
+    /// it. `RinchDocument::tick_animations` restyles each node pushed here (its
+    /// originator, for a generated box), and that cascade reads the list for
+    /// one more thing: the change from the last sample back to the cascaded
+    /// value is not a style change a `transition` starts from —
+    /// css-transitions-1's before-change style is the one *updated to the
+    /// current time*, at which the animation has no effect. The cascade
+    /// clears the list when it is done.
+    pub ended_animations: Vec<RawNodeId>,
     /// Whether transitions are armed (false until the first layout completes).
     ///
     /// **Transitions only** (issue #762). `@keyframes` animations do not read
     /// it: an animation has no before-change style to be wrong about, so it
     /// runs on the very first frame the element exists, as in a browser.
-    /// `resolve_styles` also reads this as a "has the first layout happened"
-    /// proxy, to choose the full tree walk over the targeted one.
+    /// Style resolution does **not** read it (#1247): it used to, as a "has
+    /// the first layout happened" proxy that chose the whole-document walk
+    /// for every resolve and insertion before the first layout.
     pub transitions_enabled: bool,
-    /// Whether `recompute_all_styles_full` is re-cascading the document, so a
-    /// running animation that survives the cascade by name takes its keyframes,
-    /// stops and timing afresh and keeps only its clock (see
-    /// `animation::start_animations`).
-    ///
-    /// **A flag of its own, not `!transitions_enabled`.** That flag is also
-    /// false for every cascade before the first layout, and the two questions
-    /// have nothing to do with each other — asking one flag both is what #762
-    /// was. Scoped to `recompute_all_styles_full` because that is the pass a
-    /// theme toggle takes and it runs rarely; a refresh on every cascade would
-    /// cost a keyframes lookup and a stop extraction per animated node per
-    /// hover.
-    ///
-    /// It is **not** the only pass that re-cascades the whole document. A
-    /// `<style>` append (`maybe_load_style_css`) and a viewport change in
-    /// `resolve_layout` drop every node's cached style too, and do not set this
-    /// flag, so a running animation keeps stale stops and timing across them —
-    /// measured, a `<style>` appended after the first layout that redefines a
-    /// running `@keyframes` leaves the animation on its old body. Tracked on
-    /// #781.
-    pub refreshing_animations: bool,
     /// Cache of loaded and decoded images.
     pub image_cache: ImageCache,
     /// Image loader for fetching image data (file, network, etc.).
     pub image_loader: Option<Arc<dyn ImageLoader>>,
+    /// `background-image` and `mask-image` URLs a cascade produced that were not in
+    /// `image_cache` at the time, for `request_background_image_loads` to
+    /// start. The cascade is the only producer of a
+    /// `BackgroundValue::Image` (`from_stylo`, in `resolve_styles` and the
+    /// pseudo-element path), so collecting there replaces a walk of every
+    /// node in the slab on every layout — which was O(document) on a
+    /// one-row hover. Kept (not drained) while `image_loader` is `None`,
+    /// so a loader installed later still starts them.
+    pub pending_background_urls: Vec<String>,
     /// IFC roots whose text content changed since last layout.
     /// Used to skip expensive Parley rebuilds for unchanged IFC roots.
-    pub dirty_ifc_text_roots: HashSet<RawNodeId>,
+    pub dirty_ifc_text_roots: rustc_hash::FxHashSet<RawNodeId>,
+    /// IFC roots whose kept lines owe their relative inline offsets a new
+    /// resolve (#2412): an inset of a relative `display: inline` element in
+    /// them changed, and nothing else. Lets `resolve_layout` reach
+    /// `build_ifc_layouts` (which refreshes every kept root with a relative
+    /// span) on a pass with no compute and no text change; emptied there.
+    pub relative_offset_roots: rustc_hash::FxHashSet<RawNodeId>,
+    /// Bumped every time a text layout (an IFC root's `text_layout`, a text
+    /// leaf's `cached_text_parley`) is built; the value is the stamp of that
+    /// build ([`Self::text_layout_stamps`]).
+    pub text_layout_epoch: u64,
+    /// The stamp of the last text layout built for each node that had one
+    /// built: a node whose stamp is unchanged has the lines it had. The
+    /// editor's margin pass (#1677) measures an anchor's block again only when
+    /// its stamp or a box it reads changed. An entry of a freed (and reused)
+    /// id is harmless: it is read only while the node has a layout, and every
+    /// build writes it.
+    pub text_layout_stamps: rustc_hash::FxHashMap<RawNodeId, u64>,
     /// How many times `run_taffy_compute` has run over this tree.
     ///
     /// Instrumentation, not state: `resolve_layout`'s `!layout_dirty` early
@@ -1685,7 +4157,73 @@ pub struct NodeTree {
     /// pin the cheap path (issue #678, whose repair widens what sets
     /// `layout_dirty` and so could have swallowed it). One `u64` increment per
     /// compute.
+    ///
+    /// Kept beside [`perf`](Self::perf)'s `taffy_root_computes`, which counts
+    /// the same thing per frame; this one is never reset.
     pub taffy_computes: u64,
+    /// How many times `resolve_layout` has taken its `ifc_dirty` branch — the
+    /// structural pass (`sync_display_contents`, IFC setup, anonymous boxes,
+    /// atomic-inline sizing) over the whole document.
+    ///
+    /// Instrumentation, like [`Self::taffy_computes`]: a restyle that changes
+    /// no structure must not pay for this pass, and nothing else observable
+    /// says whether it ran.
+    ///
+    /// Twin of [`perf`](Self::perf)'s `ifc_setup_passes`, which counts the
+    /// same pass per frame; this one is never reset.
+    pub ifc_setup_passes: u64,
+    /// Per-frame performance counters (see [`crate::perf`]). Instrumentation,
+    /// not state: nothing reads them to decide anything.
+    pub perf: crate::perf::PerfCounters,
+    /// Moved by `RinchDocument::note_fonts_registered` whenever faces are
+    /// registered on the document's `font_cx` after it was laid out. A text
+    /// control's cached font metrics are keyed on it (#1177).
+    pub font_generation: u64,
+    /// The hit tester's memo (subtree extents, stacking sequences), valid
+    /// until something bumps its generation. See [`crate::hit_cache`].
+    pub hit_cache: crate::hit_cache::HitCache,
+    /// Moved by a transition or animation tick that writes a `transform`, or
+    /// moves a background or border colour across alpha 0 (#2741): what a
+    /// window's input region depends on that the hit cache's generation does
+    /// not see (it keys only whether a transform is `none`, and no colour).
+    /// Kept apart so a pointer move keeps its memo through such a tick; read
+    /// only by a window whose `InputRegion` is `Painted` or `Marked`.
+    pub region_generation: u64,
+    /// The rasterised background tiles the pattern path draws from (#468),
+    /// bounded and aged per painted frame (#1156, #1157). The document's own,
+    /// so it is freed with the document.
+    #[cfg(feature = "software-renderer")]
+    pub(crate) background_tiles: std::cell::RefCell<crate::paint::background::TileCache>,
+    /// Nodes whose picture the last paint drew from its full pixels because
+    /// that frame's minify budget was spent (#2456): the next layout marks
+    /// them paint-dirty, so the next frame draws their filtered copy. Filled
+    /// during paint, which holds the tree shared.
+    pub(crate) minify_deferred: std::cell::RefCell<Vec<RawNodeId>>,
+    /// How many `data-onmousemove` attributes `set_attribute` has written and
+    /// `remove_attribute` has not taken back. Never under-counts (a node freed
+    /// with the attribute on keeps its share), so `0` proves no node in the
+    /// document carries one and the shell can skip the dispatch walk on a
+    /// pointer move.
+    pub mousemove_handlers: usize,
+    /// How many `title` attributes `set_attribute` has written and
+    /// `remove_attribute` has not taken back, plus every `<title>` element
+    /// ever created (an SVG element's title is its `<title>` child) —
+    /// `mousemove_handlers`' twin, and never under-counting for the same
+    /// reason. `0` proves no node has a title, and the desktop runtime's title
+    /// tooltip (#1646) then skips its ancestor walk on a pointer move.
+    pub title_sources: usize,
+    /// How many `<option>` elements this document has ever created. Never
+    /// decremented, so `0` proves no node is an option, and
+    /// `note_select_content_changed` (which walks a mutated node's ancestors
+    /// looking for one) returns at once (#1128).
+    pub option_elements: usize,
+    /// How many `<textarea>` elements this document has ever created. Never
+    /// decremented, so `0` proves no node is a textarea, and the textarea
+    /// extent refresh (`clamp_scroll_offsets`' scan of every node, #827) and
+    /// [`Self::push_dirty`]'s textarea check are skipped — the scan cost
+    /// every layout of a document without one ~3% (`inset_move.list_500`,
+    /// review of batch #2031).
+    pub textarea_elements: usize,
     /// Text nodes whose Taffy measure context (`NodeContext::Text`) no longer
     /// matches the typography their parent now computes (issue #678).
     ///
@@ -1746,12 +4284,150 @@ pub struct NodeTree {
     /// Do not swap it back for a `HashSet`. The set holds a handful of entries
     /// and its `O(log n)` insert is not on any path the cost harness measures.
     pub dirty_atomic_inlines: BTreeSet<RawNodeId>,
-    /// Cached IFC measure results from previous frames.
-    /// Key: (ifc_root_node_id, wrap_width_bits) → (width, height).
-    /// Invalidated per-root when text content changes.
-    pub ifc_measure_cache: HashMap<(RawNodeId, u32), (f32, f32)>,
+    /// An atomic inline sized by a `fit-content`/`stretch` width (#691), or
+    /// by an `auto` one, which is shrink-to-fit (#658), and the
+    /// containing-block inner width it was last sized at by
+    /// `resolve_percentage_inline_blocks`. Any other measure of the box (all
+    /// of which measure it with no containing-block width, as `auto`) removes
+    /// its entry, so an entry still here at the same width means nothing that
+    /// sizes the box moved and it need not be measured again.
+    pub(crate) keyword_inline_cb_width: HashMap<RawNodeId, f32>,
+    /// The same record for an atomic inline with a **percentage** inline
+    /// size (`width`, `min-width` or `max-width`, #120): the
+    /// containing-block inner width `resolve_percentage_inline_blocks` last
+    /// resolved it against. Kept apart from `keyword_inline_cb_width`
+    /// because that map also says "lined up at a resolved, not its natural,
+    /// size" to the measure ([`crate::ifc::AtomicContributions`]), which a
+    /// percentage box has never meant. Dropped by the same events: any
+    /// measure of the box as `auto` (a change inside it or to its own
+    /// style, a structural pass, phase 1's reset of the boxes inside one
+    /// being resolved) and the node being freed. Until #2136 a percentage
+    /// box was laid out twice on every pass whatever moved — a `max-width:
+    /// 100%` pill on each of 430 grid cards was 860 computes a layout.
+    pub(crate) percent_inline_cb_width: HashMap<RawNodeId, f32>,
+    /// For an atomic inline whose own block-axis size resolves against its
+    /// containing block's height (`height: 50%`, `height: stretch`, #1420,
+    /// #1277): the content height `resolve_percentage_inline_blocks` last
+    /// resolved it against, `None` where that height was indefinite. Beside
+    /// the box's `keyword_inline_cb_width` or `percent_inline_cb_width`
+    /// entry, and dropped with it: an entry at the same width *and* height
+    /// means the box need not be measured again.
+    pub(crate) atomic_cb_height: HashMap<RawNodeId, Option<f32>>,
+    /// The `auto`-width atomic inlines whose own Taffy subtree holds a
+    /// percentage that resolves against the box's width (#662), as found
+    /// the last time the box was measured with no containing-block width.
+    /// Measured that way the percentage had no basis, so even a box whose
+    /// max-content width fits its containing block — which
+    /// `resolve_percentage_inline_blocks` otherwise leaves alone — has to be
+    /// laid out again at the width it has.
+    pub(crate) auto_inline_percent_content: HashSet<RawNodeId>,
+    /// The **min-content** width (unrounded) of
+    /// an `auto`-width atomic inline, measured the first time an inline
+    /// formatting context was asked for a width the box does not fit in
+    /// (#1476) — its min-content contribution, and the floor of its
+    /// shrink-to-fit width. Absent until asked for: a box that fits every
+    /// width it is lined up in never pays the compute. Dropped when anything
+    /// inside the box changes (`RinchDocument::mark_atomic_inline_dirty`,
+    /// and the passes that measure a changed box).
+    pub(crate) atomic_min_content: HashMap<RawNodeId, f32>,
+    /// The boxes whose `atomic_min_content` entry a change inside them
+    /// dropped and that have not been measured again yet (review 2 of
+    /// #1488). Measured again at the size it had, such a box still
+    /// contributes something else to a line narrower than it, so the line
+    /// around it has to be measured again whether or not the box moved.
+    pub(crate) atomic_min_dropped: HashSet<RawNodeId>,
+    /// The boxes a measure function wanted an `atomic_min_content` entry
+    /// for and did not find. A measure runs inside a Taffy compute and
+    /// cannot start another, so it lines the box up at its max-content size
+    /// and asks here; `resolve_percentage_inline_blocks` measures them after
+    /// the compute and has it run again.
+    pub(crate) atomic_min_requests: std::cell::RefCell<Vec<RawNodeId>>,
+    /// Whether the last `resolve_percentage_inline_blocks` found a box in
+    /// `atomic_min_requests`: a measure before it lined that box up at a
+    /// stand-in size, so the compute after it can size a container
+    /// differently, and the pass has to look at the boxes once more after
+    /// that compute.
+    pub(crate) atomic_contributions_changed: bool,
+    /// The nodes whose `Node::styled_unrendered` is set, for `resolve_layout`
+    /// to clear after the frame's style pass.
+    pub styled_unrendered: Vec<RawNodeId>,
+    /// Nodes whose last cascade did not see the `color` / `font-size`
+    /// samples they have now — a transition or animation the same pass started
+    /// or ended (#777, #787) — and the nodes a tick moved such a sample on.
+    /// `resolve_layout` cascades them once more before the frame is laid out,
+    /// so the frame that starts a transition already hands its start value
+    /// down, and every tick's value reaches what inherits it.
+    pub animated_recascade: Vec<RawNodeId>,
+    /// What the Taffy measure function measured for each IFC root, kept across
+    /// frames, **keyed by root** so invalidating one is O(1).
+    ///
+    /// Two rules drop an entry's sizes, and between them they have to cover
+    /// every input a root's measure is built from (see
+    /// [`IfcRootMeasures`]):
+    ///
+    /// - a **restyle or content change** drops the roots it reaches, through
+    ///   [`NodeTree::forget_ifc_measures`] — the cascade's per-node
+    ///   `same_text_layout_inputs` comparison, `set_text_content`, and the
+    ///   atomic-inline re-measures;
+    /// - a **structural pass** recomputes the content signature of every root
+    ///   it reached — every root on a whole-document pass (`ifc_dirty`), its
+    ///   own containers' roots on a scoped one — and drops the roots whose
+    ///   signature moved (`RinchDocument::refresh_ifc_signatures`). It used to clear the whole
+    ///   map instead, which re-shaped every paragraph in the document to
+    ///   measure one appended row.
+    ///
+    /// An entry is removed outright when its node is freed
+    /// ([`NodeTree::remove_subtree`]), so a recycled slab id never inherits a
+    /// previous node's sizes.
+    pub ifc_measure_cache: rustc_hash::FxHashMap<RawNodeId, IfcRootMeasures>,
+    /// The Parley layouts the detached atomic-inline compute
+    /// (`RinchDocument::measure_inline_blocks`) built for the text leaves it
+    /// measured — the text of an `inline-flex` / `inline-grid`, which is a flex
+    /// or grid item and no IFC member — keyed like the root compute's own
+    /// text-layout cache, `(node, wrap width bits)`. Held only until this
+    /// layout pass hands them to `copy_cached_text_layouts` with the root
+    /// compute's, which is what makes them each leaf's `cached_text_parley`.
+    /// Before #904 they were dropped where they were built, so paint shaped
+    /// every such label again on every frame.
+    pub(crate) atomic_leaf_layouts: HashMap<(RawNodeId, u32), parley::layout::Layout<Brush>>,
+    /// The first and last line baselines (from the content-box top) of each
+    /// IFC root and text leaf the detached atomic-inline compute measured, by
+    /// the content size it was laid out at: `(width, height, first, last)`, newest
+    /// last, a few per node. What an atomic inline's baseline is read from
+    /// once its compute is done (`ifc::atomic_inline_baseline`, #663) — Taffy
+    /// keeps no baseline in a node's layout, and may answer a later compute
+    /// from its cache without measuring again.
+    pub(crate) atomic_line_baselines: rustc_hash::FxHashMap<RawNodeId, Vec<LineBaselines>>,
+    /// The roots whose `atomic_line_baselines` were measured from content
+    /// they no longer have ([`Self::forget_line_baselines`]): the next record
+    /// for one moves its entries to `stale_line_baselines`.
+    pub(crate) line_baselines_superseded: rustc_hash::FxHashSet<RawNodeId>,
+    /// A root's line baselines from before its content last changed, set
+    /// aside by its first record since: they answer only for a box of exactly
+    /// their size (`ifc::atomic_inline_baseline`).
+    pub(crate) stale_line_baselines: rustc_hash::FxHashMap<RawNodeId, Vec<LineBaselines>>,
+    /// The outside list markers generated since the last marker pass
+    /// (#1356), which it places whatever moved. A marker is generated again
+    /// on every cascade of its item, so this also holds every restyled item's.
+    pub(crate) outside_markers: Vec<RawNodeId>,
+    /// Whether any outside marker was ever generated: until one is, the
+    /// read-back records nothing for [`Self::marker_moves`].
+    pub(crate) has_outside_markers: bool,
+    /// The boxes whose layout (or, for an IFC root, lines) changed since the
+    /// last marker pass, each with whether its size changed: the marker pass
+    /// re-places only the markers of the items above them (review of #2271:
+    /// placing every marker on every layout cost 2000 `<li><p>` items 0.9ms
+    /// an unrelated relayout).
+    pub(crate) marker_moves: Vec<(RawNodeId, bool)>,
+    /// Stamped on the nodes one marker pass walked up through
+    /// (`Node::marker_walk`), so no ancestor chain is walked twice.
+    pub(crate) marker_walk_stamp: u64,
     /// Nodes that have requested scroll-into-view (deferred until after layout).
     pub scroll_into_view_requests: Vec<RawNodeId>,
+    /// Nodes that have requested a scroll to a fraction of their scroll
+    /// container's height, as `(node, fraction, margin)` (deferred until after
+    /// layout, applied after `scroll_into_view_requests`).
+    pub scroll_to_fraction_requests: Vec<(RawNodeId, f32, f32)>,
     /// Scroll offsets clamped by the layout engine, pending event dispatch.
     /// Layout must not mutate observable scroll state silently (#144), but it
     /// also can't fire handlers mid-resolve (the facade holds the document
@@ -1759,6 +4435,20 @@ pub struct NodeTree {
     /// here — coalesced per node, last value wins, since layout may resolve
     /// more than once per frame — for the facade to drain after layout.
     pub pending_scroll_clamps: Vec<(RawNodeId, f64)>,
+    /// `<textarea>`s whose value may have changed since the last resolve —
+    /// a `value` write, or a write to one of its text children — noted by
+    /// [`Self::push_dirty`] (review of #2023). A textarea's scroll range is
+    /// its text's height, which no layout measures, so a value change runs
+    /// no layout: the resolve that skips layout refreshes these ones' extent
+    /// and clamps their scroll, as `clamp_scroll_offsets` does for every
+    /// scroll container when layout runs.
+    pub(crate) textarea_extent_dirty: Vec<RawNodeId>,
+    /// The device pixels per CSS px this document is painted at — the
+    /// display scale, set with the Stylo device pixel ratio
+    /// (`RinchDocument::set_device_pixel_ratio`). A scroll offset is kept on
+    /// this grid ([`Self::snap_scroll_offset`], #1543), so scrolled content
+    /// moves by whole device pixels.
+    pub device_scale: f64,
     /// Scale factor for text rendering (1.0 on desktop, >1.0 on HiDPI/mobile).
     /// Applied to Parley font sizes so glyphs rasterize at physical pixel resolution.
     pub text_scale: f32,
@@ -1775,8 +4465,8 @@ pub struct NodeTree {
     ///
     /// **In shipped code this is provably zero**, not hopefully zero:
     /// `compute_taffy_child_index` returns an in-range index by construction,
-    /// and the clamp makes `insert_child_at_index` total (`taffy 0.12.2` can
-    /// only fail it with `ChildIndexOutOfBounds`). So a non-zero value is not a
+    /// and the clamp makes `insert_child_at_index` total (`taffy 0.14.0`, like
+    /// 0.12.2, can only fail it with `ChildIndexOutOfBounds`). So a non-zero value is not a
     /// tolerable condition to be handled — it is evidence that a regression of
     /// the #477 class has been reintroduced.
     ///
@@ -1784,7 +4474,7 @@ pub struct NodeTree {
     /// not *"did it diverge this frame"* — a per-frame question would need a
     /// snapshot-and-compare at the call site, which nothing needs yet.
     ///
-    /// See [`crate::RinchDocument::attach_taffy_child_at`].
+    /// See `crate::RinchDocument::attach_taffy_child_at`.
     //
     // Note for a future field: `NodeTree` is `pub` with all-`pub` fields and is
     // not `#[non_exhaustive]`, so adding one is strictly breaking for any
@@ -1800,9 +4490,46 @@ impl Default for NodeTree {
 }
 
 impl NodeTree {
+    /// Whether the last paint left a picture unfiltered for want of that
+    /// frame's minify budget (#2456): the next frame owes it a repaint, which
+    /// a host whose loop runs only when something is dirty must ask about
+    /// (`App::has_dirty_nodes` does).
+    pub fn has_deferred_minify(&self) -> bool {
+        !self.minify_deferred.borrow().is_empty()
+    }
+
+    /// Mark the nodes [`Self::has_deferred_minify`] names paint-dirty
+    /// (`resolve_layout` does too, for a host that calls only that).
+    pub fn drain_deferred_minify(&mut self) {
+        for id in std::mem::take(self.minify_deferred.get_mut()) {
+            self.mark_paint_dirty(id);
+        }
+    }
+
+    /// The bytes of rasterised background tiles this document holds (#1157).
+    #[cfg(feature = "software-renderer")]
+    pub fn background_tile_cache_bytes(&self) -> usize {
+        self.background_tiles.borrow().bytes()
+    }
+
+    /// Record `style`'s `background-image` URLs (every layer's, #1142) and
+    /// its `mask-image` ones (#2099) for
+    /// `RinchDocument::request_background_image_loads` if it is not cached
+    /// yet. Called by the cascade for every style it produces.
+    #[inline]
+    pub(crate) fn note_background_image(&mut self, style: &crate::computed_style::ComputedStyle) {
+        for url in style.paint_image_urls() {
+            if !self.image_cache.contains(url)
+                && !self.pending_background_urls.iter().any(|u| u == url)
+            {
+                self.pending_background_urls.push(url.to_string());
+            }
+        }
+    }
+
     /// Create a new node tree with root and body nodes.
     pub fn new() -> Self {
-        let mut nodes = slab::Slab::new();
+        let mut nodes = crate::node_slab::NodeSlab::new();
         let mut taffy = taffy::TaffyTree::new();
         let mut taffy_map = HashMap::new();
 
@@ -1878,38 +4605,120 @@ impl NodeTree {
             dirty_nodes: HashSet::new(),
             paint_dirty_nodes: Vec::new(),
             paint_dirty_removed_rects: Vec::new(),
+            bar_check_parents: Vec::new(),
+            painted_bars: HashMap::new(),
+            whole_document_damaged: false,
+            inline_text_shadows: false,
+            raster_filters: false,
+            backdrop_filters: false,
+            backdrop_nodes: Vec::new(),
+            raster_cached: std::cell::RefCell::new(Vec::new()),
+            raster_cache_bytes: Cell::new(0),
+            raster_serial: Cell::new(0),
+            font_synthesis_weight_off: false,
+            text_paint_effects: false,
             style_dirty_nodes: Vec::new(),
+            tables_owed: Vec::new(),
+            tables: Vec::new(),
+            floats: Vec::new(),
+            line_clamp_roots: Vec::new(),
+            line_clamped: Vec::new(),
+            float_avoiders: Vec::new(),
+            float_blank_runs: Vec::new(),
+            ifc_float_bands: Default::default(),
+            cells_to_align: Vec::new(),
+            cell_hints: Default::default(),
             style_roots: Vec::new(),
-            styles_dirty: true, // Initial render needs styles
-            layout_dirty: true, // Initial render needs layout
+            free_prune_steps: 0,
+            sibling_mark_steps: 0,
+            full_style_walk: true, // The first resolve styles everything
+            styles_dirty: true,    // Initial render needs styles
+            layout_dirty: true,    // Initial render needs layout
             suppress_inline_restyle: false,
-            full_repaint_needed: false,
             ifc_dirty: true, // Initial render needs IFC setup
+            ifc_full_reason: Some(crate::ifc_scope::IfcFullReason::Initial),
+            ifc_seeds: Vec::new(),
+            ifc_root_registry: BTreeSet::new(),
+            atomic_inline_registry: BTreeSet::new(),
+            ancestor_absolutes: BTreeSet::new(),
+            placed_absolutes: Vec::new(),
+            overflow_absolutes: Default::default(),
+            exact_flow: Default::default(),
+            layout_epoch: 0,
+            scroll_epoch: 0,
+            abs_static_fits: Vec::new(),
+            abs_chain_marked: Vec::new(),
+            abs_resolve_owed: false,
+            abs_late_moves: false,
+            abs_inline_cb_seen: false,
+            html_align_seen: false,
             taffy,
             taffy_map,
             viewport: crate::layout::Viewport::default(),
             hovered_node: None,
             focused_node: None,
+            keyboard_editor: None,
             active_node: None,
             scroll_lock_roots: Vec::new(),
             scroll_lock_exempt: Vec::new(),
+            select_value_fresh: HashSet::new(),
+            text_selections: HashMap::new(),
+            isolated_nodes: 0,
             guard,
             anonymous_block_boxes: Vec::new(),
             split_inlines: Vec::new(),
             ifc_measure_leaves: HashMap::new(),
             active_transitions: HashMap::new(),
             active_animations: HashMap::new(),
+            finished_animations: HashMap::new(),
+            ended_animations: Vec::new(),
             transitions_enabled: false,
-            refreshing_animations: false,
             image_cache: ImageCache::new(),
             image_loader: None,
-            dirty_ifc_text_roots: HashSet::new(),
+            pending_background_urls: Vec::new(),
+            dirty_ifc_text_roots: Default::default(),
+            text_layout_epoch: 0,
+            text_layout_stamps: Default::default(),
+            relative_offset_roots: Default::default(),
             taffy_computes: 0,
+            ifc_setup_passes: 0,
+            perf: crate::perf::PerfCounters::default(),
+            font_generation: 0,
+            hit_cache: Default::default(),
+            region_generation: 0,
+            #[cfg(feature = "software-renderer")]
+            background_tiles: Default::default(),
+            minify_deferred: Default::default(),
+            mousemove_handlers: 0,
+            title_sources: 0,
+            option_elements: 0,
+            textarea_elements: 0,
             dirty_text_contexts: HashSet::new(),
             dirty_atomic_inlines: BTreeSet::new(),
-            ifc_measure_cache: HashMap::new(),
+            keyword_inline_cb_width: HashMap::new(),
+            percent_inline_cb_width: HashMap::new(),
+            atomic_cb_height: HashMap::new(),
+            auto_inline_percent_content: HashSet::new(),
+            atomic_min_content: HashMap::new(),
+            atomic_min_dropped: HashSet::new(),
+            atomic_min_requests: std::cell::RefCell::new(Vec::new()),
+            atomic_contributions_changed: false,
+            styled_unrendered: Vec::new(),
+            animated_recascade: Vec::new(),
+            ifc_measure_cache: Default::default(),
+            atomic_leaf_layouts: HashMap::new(),
+            atomic_line_baselines: Default::default(),
+            line_baselines_superseded: Default::default(),
+            stale_line_baselines: Default::default(),
+            outside_markers: Vec::new(),
+            has_outside_markers: false,
+            marker_moves: Vec::new(),
+            marker_walk_stamp: 0,
             scroll_into_view_requests: Vec::new(),
+            scroll_to_fraction_requests: Vec::new(),
             pending_scroll_clamps: Vec::new(),
+            textarea_extent_dirty: Vec::new(),
+            device_scale: 1.0,
             text_scale: 1.0,
             taffy_attach_faults: 0,
         }
@@ -1920,9 +4729,25 @@ impl NodeTree {
         self.nodes.contains(id)
     }
 
-    /// Get a reference to a node.
+    /// The node an id names, checking its generation: for any id from outside
+    /// the tree (see [`crate::node_slab`]).
     pub fn get(&self, id: RawNodeId) -> Option<&Node> {
         self.nodes.get(id)
+    }
+
+    /// The bytes the rasters kept for `filter` and `backdrop-filter` hold
+    /// (#2719), at most [`crate::paint::RASTER_CACHE_BUDGET_BYTES`].
+    pub fn raster_cache_bytes(&self) -> usize {
+        self.raster_cache_bytes.get()
+    }
+
+    /// The node a **tree-internal** id names — see
+    /// [`crate::node_slab::NodeSlab::get_live`]: for ids the tree handed itself
+    /// during a walk; the generation is asserted in debug builds only.
+    #[inline]
+    #[track_caller]
+    pub fn get_live(&self, id: RawNodeId) -> Option<&Node> {
+        self.nodes.get_live(id)
     }
 
     /// Whether a **scroll gesture** landing on `node_id` must be refused because
@@ -1932,7 +4757,14 @@ impl NodeTree {
     /// the empty-`Vec` early return is the whole cost there.
     ///
     /// Inclusive of the locking root itself: an overlay that is its own scroller
-    /// scrolls. The walk is up `parent`, so an anonymous block box or a split
+    /// scrolls. A node carrying `data-scroll-lock-exempt`
+    /// ([`rinch_core::events::SCROLL_LOCK_EXEMPT_ATTRIBUTE`], #701) ends the
+    /// walk the same way, as does an entry of [`Self::scroll_lock_exempt`]: a
+    /// scroll container outside every overlay that is not the page behind one.
+    /// The attribute is read only here, so only while a lock is held, and a
+    /// mark on a node that holds a locking root below it is ignored
+    /// (`holds_scroll_lock_root`): marking `<body>` cannot unlock the
+    /// page. The walk is up `parent`, so an anonymous block box or a split
     /// inline between the two does not break the chain — they carry parents like
     /// any other node.
     ///
@@ -1949,9 +4781,44 @@ impl NodeTree {
             if self.scroll_lock_roots.contains(&id) || self.scroll_lock_exempt.contains(&id) {
                 return false;
             }
-            current = self.nodes.get(id).and_then(|n| n.parent);
+            let Some(node) = self.nodes.get(id) else {
+                break;
+            };
+            if node
+                .attributes
+                .get(rinch_core::events::SCROLL_LOCK_EXEMPT_ATTRIBUTE)
+                .is_some_and(|v| rinch_core::dom::data_attr_is_on(v))
+                && !self.holds_scroll_lock_root(id)
+            {
+                return false;
+            }
+            current = node.parent;
         }
         true
+    }
+
+    /// Whether a locking root lies strictly below `ancestor`.
+    ///
+    /// A `data-scroll-lock-exempt` mark on such a node is **ignored** by
+    /// [`Self::scroll_locked_out`]: the exemption is for a container outside
+    /// the overlay, and a mark on `<body>` or on a wrapper around the overlay
+    /// would otherwise reach the page behind it and switch the lock off
+    /// (review of #1443). `ancestor` itself being a root never gets here — the
+    /// walk returns at a root first.
+    ///
+    /// Asked only when the walk meets a mark while a lock is held; one parent
+    /// walk per locking root, of which there are a handful.
+    fn holds_scroll_lock_root(&self, ancestor: RawNodeId) -> bool {
+        self.scroll_lock_roots.iter().any(|&root| {
+            let mut current = self.nodes.get(root).and_then(|n| n.parent);
+            while let Some(id) = current {
+                if id == ancestor {
+                    return true;
+                }
+                current = self.nodes.get_live(id).and_then(|n| n.parent);
+            }
+            false
+        })
     }
 
     /// Exempt `node_id`'s subtree from every scroll lock — see
@@ -1985,7 +4852,7 @@ impl NodeTree {
     /// because a tick has nothing left to move for either: a **paused**
     /// animation, whose elapsed time is frozen (#763), and a **finished
     /// `forwards`/`both`** animation whose fill a tick has already written
-    /// ([`crate::animation::ActiveAnimation::fill_settled`], #782). A finished
+    /// ([`crate::animation::ActiveAnimation::settled`], #782). A finished
     /// animation *is* counted until that tick runs, which is what lets the
     /// frame that shows its end be presented.
     ///
@@ -1997,35 +4864,643 @@ impl NodeTree {
         self.active_animations
             .values()
             .flatten()
-            .any(|anim| !anim.is_paused() && !anim.fill_settled)
+            .any(|anim| !anim.is_paused() && !anim.settled)
+    }
+
+    /// Start every pending animation at `now` (#768): the frame that renders
+    /// its element is here. Until it, a pending animation sampled t = 0
+    /// (`ActiveAnimation::pending`), so the first frame shows it at its start
+    /// however long the tree took to build.
+    pub fn start_pending_animations(&mut self, now: f64) {
+        for anim in self.active_animations.values_mut().flatten() {
+            if anim.pending {
+                anim.pending = false;
+                anim.start_time_ms = now;
+            }
+        }
+    }
+
+    /// Record a whole-document restyle: count it under `reason`, and mark the
+    /// document damaged everywhere ([`Self::whole_document_damaged`]).
+    pub fn note_full_restyle(&mut self, reason: crate::perf::FullRestyleReason) {
+        self.perf.full_restyle(reason);
+        self.whole_document_damaged = true;
+    }
+
+    /// Mark `id` paint-dirty: its pixels changed without any DOM write the
+    /// document saw (a shell-owned attribute such as the read-only selection's
+    /// `data-text-sel`, a scroll offset). The paint then repaints where it is
+    /// and where it was last painted.
+    pub fn mark_paint_dirty(&mut self, id: RawNodeId) {
+        if let Some(node) = self.nodes.get_mut(id) {
+            node.dirty.insert(DirtyFlags::PAINT);
+            self.push_dirty(id);
+        }
     }
 
     /// Push a node ID to the dirty list (deduplicated).
     pub fn push_dirty(&mut self, id: RawNodeId) {
+        self.hit_cache.invalidate();
         self.dirty_nodes.insert(id);
         self.paint_dirty_nodes.push(id);
+        self.note_textarea_extent_dirty(id);
     }
 
-    /// Remove a node and all its descendants from the slab.
+    /// Queue `id`'s `onscroll` for an offset the engine wrote itself — a
+    /// clamp, a caret reveal — in [`Self::pending_scroll_clamps`], coalesced
+    /// per node (last value wins): layout can resolve more than once per
+    /// frame, and a consumer must see one event per drain (#144).
+    pub(crate) fn queue_scroll_clamp(&mut self, id: RawNodeId, offset: f64) {
+        if let Some(pending) = self
+            .pending_scroll_clamps
+            .iter_mut()
+            .find(|(n, _)| *n == id)
+        {
+            pending.1 = offset;
+        } else {
+            self.pending_scroll_clamps.push((id, offset));
+        }
+    }
+
+    /// If `id` is a `<textarea>` or one of its text children, queue the
+    /// textarea for the extent refresh and scroll clamp the next resolve owes
+    /// it ([`Self::textarea_extent_dirty`]).
+    fn note_textarea_extent_dirty(&mut self, id: RawNodeId) {
+        if self.textarea_elements == 0 {
+            return;
+        }
+        let Some(node) = self.nodes.get(id) else {
+            return;
+        };
+        let textarea = if node.tag() == Some("textarea") {
+            id
+        } else if node.is_text()
+            && let Some(parent) = node.parent
+            && self.nodes.get(parent).and_then(Node::tag) == Some("textarea")
+        {
+            parent
+        } else {
+            return;
+        };
+        if !self.textarea_extent_dirty.contains(&textarea) {
+            self.textarea_extent_dirty.push(textarea);
+        }
+    }
+
+    /// `v`, a scroll offset in CSS px, on this document's device pixel grid
+    /// (#1543): the nearest multiple of `1 / device_scale` **at or nearer 0
+    /// than** it (at or below a positive offset, at or above an rtl
+    /// container's negative `scrollLeft`, #2546), so a snapped offset never
+    /// passes the scroll range `v` was clamped to.
+    ///
+    /// The software painter places each glyph at a whole device pixel on its
+    /// own, so content scrolled to a fractional device position re-spaced its
+    /// glyphs and lines at every scroll step. On the grid, a scroll is a
+    /// rigid move by whole device pixels, as in Chrome.
+    ///
+    /// Idempotent: a value already on the grid (within floating error) comes
+    /// back unchanged rather than one pixel lower.
+    pub fn snap_scroll_offset(&self, v: f64) -> f64 {
+        snap_to_device(v, self.device_scale)
+    }
+
+    /// Put every scroll offset back on the grid after `device_scale`
+    /// changed (a window moved to a display of another scale), through
+    /// [`Self::mark_scrolled`] for each one that moves. One pass over the
+    /// nodes, on a scale change only.
+    pub fn resnap_scroll_offsets(&mut self) {
+        let scale = self.device_scale;
+        let moved: Vec<RawNodeId> = self
+            .nodes
+            .iter()
+            .filter(|(_, n)| {
+                let (x, y) = n.scroll_offset;
+                snap_to_device(x, scale) != x || snap_to_device(y, scale) != y
+            })
+            .map(|(id, _)| id)
+            .collect();
+        for id in moved {
+            self.mark_scrolled(id);
+        }
+    }
+
+    /// Moves whenever a box may have moved on screen: by every layout pass
+    /// that can move a rect (`layout_epoch`: a full or text-only layout, the
+    /// placing of absolute boxes, a subtree's removal) and every scroll
+    /// offset written ([`Self::mark_scrolled`]). Not by a paint-only restyle
+    /// (a colour, a `:hover` background), a transition or animation tick, or
+    /// a DOM write whose layout has not run yet. Two reads that agree bracket
+    /// a span in which nothing under a resting pointer can have moved, which
+    /// is how the shell decides whether to hit-test again at the pointer's
+    /// last position after a frame (#2766).
+    pub fn geometry_epoch(&self) -> u64 {
+        self.layout_epoch.wrapping_add(self.scroll_epoch)
+    }
+
+    /// `id`'s `scroll_offset` has just been written, and nothing else about
+    /// it: mark it paint-dirty (the whole container repaints, as its content
+    /// and its scrollbar thumb both moved) and tell the hit cache.
+    ///
+    /// This is [`Self::mark_paint_dirty`] with the hit cache's *scroll*
+    /// invalidation in place of the blanket one — the generation still moves,
+    /// but the extents inside the scroller survive (#911). Every
+    /// scroll-offset write that changes nothing else should come through
+    /// here; one that changes more (a layout, a style) must invalidate in
+    /// full as well.
+    ///
+    /// It also puts the offset just written on the device pixel grid
+    /// ([`Self::snap_scroll_offset`], #1543), before anything below reads it.
+    /// So every reader — paint on both backends, hit testing, damage, the
+    /// absolute boxes placed past the scroller, `scroll_top()` — sees one
+    /// snapped offset, and scrolled content moves rigidly.
+    pub fn mark_scrolled(&mut self, id: RawNodeId) {
+        let scale = self.device_scale;
+        if let Some(node) = self.nodes.get_mut(id) {
+            self.scroll_epoch = self.scroll_epoch.wrapping_add(1);
+            node.scroll_offset = (
+                snap_to_device(node.scroll_offset.0, scale),
+                snap_to_device(node.scroll_offset.1, scale),
+            );
+            // A writer that is not the wheel chose this offset: the
+            // wheel's sub-pixel remainder is not part of it (the wheel
+            // writes its own back after this call).
+            node.scroll_remainder = (0.0, 0.0);
+            node.dirty.insert(DirtyFlags::PAINT);
+            // Per-axis (#535): `flow_extent` folds children into whichever
+            // axis does not clip, so it reads this node's own scroll offset
+            // whenever *either* axis is open, not only when both are —
+            // `!clips_overflow()` (both clip) would under-invalidate a box
+            // clipping on one axis alone.
+            let (clip_x, clip_y) = node.clip_axes();
+            let extent_reads_scroll = !clip_x || !clip_y;
+            self.hit_cache.invalidate_scroll(extent_reads_scroll);
+            self.dirty_nodes.insert(id);
+            self.paint_dirty_nodes.push(id);
+            // An absolute box whose containing block is above this scroller
+            // is not its content and must not ride it (#386): its `layout`
+            // is parent-relative, so it is written again against the new
+            // offset. That moves a box, which a scroll otherwise does not —
+            // and it needs no more of the hit cache than the scroll already
+            // dropped: an absolute box is positioned, so no ancestor's flow
+            // extent holds it, and the stacking sequences that hold its
+            // offset went with `invalidate_scroll` above. One flag read when
+            // this node is between no such box and its containing block.
+            crate::out_of_flow::replace_after_scroll(self, id);
+        }
+    }
+
+    /// Note for the outside-marker pass that `node_id`'s box moved (or, with
+    /// `resized`, changed size, or for an IFC root got new lines): the items
+    /// above it re-place their markers (`crate::list_marker`). Nothing is
+    /// recorded in a document that never had an outside marker.
+    #[inline]
+    pub(crate) fn note_marker_move(&mut self, node_id: RawNodeId, resized: bool) {
+        if !self.has_outside_markers {
+            return;
+        }
+        // Inline content's own box says nothing about a line: an IFC root's
+        // new lines are noted for the root itself.
+        if self
+            .nodes
+            .get(node_id)
+            .is_some_and(|n| n.ifc_root.is_some())
+        {
+            return;
+        }
+        self.marker_moves.push((node_id, resized));
+    }
+
+    /// The paint that consumed `paint_dirty_nodes` has run: forget them, and
+    /// record that each one's pixels are now at its current box
+    /// (`prev_layout = layout`, see [`Node::prev_layout`]).
+    ///
+    /// Every paint that drains the dirty lists must call this — the software
+    /// dirty-region frame, a full software repaint and a GPU scene build alike
+    /// — or a node's `prev_layout` keeps naming a box it has since been
+    /// repainted out of, and a later frame clears that stale rect too
+    /// (over-repaint, never ghosting, but it can push a small change over the
+    /// full-repaint threshold). Every writer of `layout` that changes it in
+    /// `read_layout_results` pushes the node to `paint_dirty_nodes`, which is
+    /// what makes the list enough to find every node whose `prev_layout` is
+    /// behind.
+    ///
+    /// It also snapshots what each one was painted *with* into
+    /// [`Node::painted`] — own ink reach and own transform — which is O(1) per
+    /// node: nothing here walks a subtree.
+    pub fn consume_paint_dirty(&mut self) {
+        // The kept filter and backdrop rasters these changes made stale,
+        // before the lists they are read from are drained (#2719): every
+        // shell path drains them before it paints.
+        crate::paint::raster_cache::invalidate(self);
+        // The containers whose bars this paint may have moved, asked before
+        // the painted boxes below are rewritten (`bar_watch_scrollers` reads
+        // `prev_layout`), and their bars recorded after.
+        let watched = crate::paint::bar_watch_scrollers(self);
+        let members = self.inline_text_shadows;
+        let taffy = &self.taffy;
+        let nodes = &mut self.nodes;
+        // Each state is read with the slab borrowed shared (an IFC root's ink
+        // reads its inline elements' styles, #1048), then written.
+        let refresh = |nodes: &mut crate::node_slab::NodeSlab, id: RawNodeId, layout: bool| {
+            let Some(node) = nodes.get(id) else {
+                return;
+            };
+            let mut state = PaintedState::of_in(node, members, |i| nodes.get(i));
+            state.unrounded = unrounded_rect(taffy, node);
+            let node = &mut nodes[id];
+            if layout {
+                node.prev_layout = node.layout;
+            }
+            node.painted = Some(state);
+        };
+        // A whole-document restyle changes styles without pushing the nodes
+        // it changed, and the paint consuming it drew *every* node with the
+        // restyled values. So every painted node's state is re-read here, or
+        // a node not pushed since would keep describing a style the pixels on
+        // screen were never drawn with — its ink and transform, and the
+        // clipping and position the damage's clip chain reads (#909). O(n),
+        // on a frame that has just restyled and repainted all n.
+        if self.whole_document_damaged {
+            let painted: Vec<RawNodeId> = nodes
+                .iter()
+                .filter(|(_, n)| n.painted.is_some())
+                .map(|(id, _)| id)
+                .collect();
+            for id in painted {
+                refresh(nodes, id, false);
+            }
+        }
+        let mut dirty = std::mem::take(&mut self.paint_dirty_nodes);
+        // Once per node, however many times it was pushed.
+        dirty.sort_unstable();
+        dirty.dedup();
+        // A box-less inline's own `text-shadow`, background, border,
+        // `vertical-align` shift and wavy underline are ink of the IFC root
+        // that draws them, and the paint that consumes it redrew that root
+        // with them as they are now (#1048, #1815). A root whose painted ink
+        // stayed behind would name a pill's old padding nowhere once the pill
+        // shrinks again. Each root once, after its members, and not at all
+        // when it was itself dirty (refreshed above): a root's ink walks its
+        // spans' lines, and once per member was quadratic in the pills of a
+        // paragraph (review of #1837: one text edit among 500 pills, 500 ms).
+        let mut roots: Vec<RawNodeId> = Vec::new();
+        for &id in &dirty {
+            refresh(nodes, id, true);
+            if let Some(root) = nodes.get(id).and_then(|n| n.ifc_root)
+                && root != id
+            {
+                roots.push(root);
+            }
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        for root in roots {
+            if dirty.binary_search(&root).is_ok() {
+                continue;
+            }
+            let Some(r) = nodes.get(root).filter(|r| r.painted.is_some()) else {
+                continue;
+            };
+            let ink = crate::paint::ink_outsets_in(r, members, |i| nodes.get(i));
+            if let Some(state) = nodes[root].painted.as_mut() {
+                state.ink = ink;
+            }
+        }
+        self.perf.add(
+            crate::perf::Counter::InlineSpanLineVisits,
+            crate::paint::take_span_line_visits(),
+        );
+        dirty.clear();
+        self.paint_dirty_nodes = dirty;
+        self.paint_dirty_removed_rects.clear();
+        // The bars as this paint drew them. A whole-document restyle may have
+        // changed any box's (made it a scroll container, changed its
+        // `scrollbar-width` or its palette) with none of them pushed, so every
+        // scroll container is read then — the record must hold every bar on
+        // screen, since the damage takes a container with none for one that
+        // painted none. O(n), on a frame that repainted all n.
+        let mut record: Vec<RawNodeId> = watched;
+        if self.whole_document_damaged {
+            self.painted_bars.clear();
+            record.extend(
+                self.nodes
+                    .iter()
+                    .filter(|(_, n)| n.scrolls_x() || n.scrolls_y())
+                    .map(|(id, _)| id),
+            );
+        }
+        for id in record {
+            if self.nodes.get(id).is_some() {
+                let bars = crate::paint::scrollbar::scrollbars(self, id, 1.0);
+                self.painted_bars.insert(id, bars);
+            } else {
+                self.painted_bars.remove(&id);
+            }
+        }
+        self.bar_check_parents.clear();
+        self.whole_document_damaged = false;
+    }
+
+    /// Drop the sizes the measure function cached for IFC root `root`, so the
+    /// next compute that measures it shapes it again. O(1): the cache is keyed
+    /// by root (it was a `retain` over every entry, per call, per node).
+    ///
+    /// Keeps the entry's content signature — this is a *style or content*
+    /// invalidation, and whether the root's structure moved is still the
+    /// structural pass's question to answer.
+    pub fn forget_ifc_measures(&mut self, root: RawNodeId) {
+        self.perf
+            .bump(crate::perf::Counter::IfcMeasureInvalidations);
+        if let Some(entry) = self.ifc_measure_cache.get_mut(&root) {
+            entry.sizes.clear();
+        }
+        self.forget_line_baselines(root);
+    }
+
+    /// Mark the line baselines an atomic inline's compute recorded for IFC
+    /// root `root` ([`Self::atomic_line_baselines`]) as measured from content
+    /// it no longer has, with its sizes: the next record for `root` sets them
+    /// aside (`stale_line_baselines`) rather than joining them. Kept beside a
+    /// new record, the lookup that picks the entry nearest the box's size
+    /// took one from the old text when the new one was measured at another
+    /// width (a `width: 110px` item whose four lines became one: the old
+    /// 80px-tall entry was nearer its 110px width than the new 35px one), and
+    /// lined the chip around it up by a line it no longer had. Set aside, not
+    /// dropped: a compute Taffy answers from its cache records nothing, so an
+    /// old entry of exactly the box's size is still the best answer there is,
+    /// and a root with no entry at all has no baseline.
+    pub(crate) fn forget_line_baselines(&mut self, root: RawNodeId) {
+        if self.atomic_line_baselines.contains_key(&root) {
+            self.line_baselines_superseded.insert(root);
+        }
+    }
+
+    /// Drop the sizes cached for IFC root `root`, as
+    /// [`Self::forget_ifc_measures`] does, **and mark its content signature
+    /// stale** ([`IfcRootMeasures::stale`]): for a root an atomic inline in
+    /// which changed size outside a structural pass. The signature hashes that
+    /// size, so it no longer describes what the root is measured from next;
+    /// the next structural pass that signs the root treats it as changed
+    /// whatever signature it computes, and clears the mark.
+    pub fn forget_ifc_measures_and_signature(&mut self, root: RawNodeId) {
+        self.forget_ifc_measures(root);
+        if let Some(entry) = self.ifc_measure_cache.get_mut(&root) {
+            entry.stale = true;
+        }
+    }
+
+    /// Test access to [`Self::atomic_min_content`] (#1476): the fixtures that
+    /// pin where an entry is dropped have to see, and plant, one.
+    #[doc(hidden)]
+    pub fn atomic_min_content_for_tests(&mut self) -> &mut HashMap<RawNodeId, f32> {
+        &mut self.atomic_min_content
+    }
+
+    /// Test access to [`Self::atomic_min_dropped`].
+    #[doc(hidden)]
+    pub fn atomic_min_dropped_for_tests(&mut self) -> &mut HashSet<RawNodeId> {
+        &mut self.atomic_min_dropped
+    }
+
+    /// Test access: have the next layout run the whole-document IFC pass.
+    #[doc(hidden)]
+    pub fn request_full_ifc_for_tests(&mut self) {
+        self.ifc_dirty = true;
+    }
+
+    /// Remove a node and all its descendants from the slab, freeing their
+    /// slots and their Taffy nodes.
+    ///
+    /// The one route that frees a subtree (#723): `set_inner_html`, the
+    /// pseudo-element pruning on restyle, and `RinchDocument::discard_node` all
+    /// reach it. Each freed slot's generation moves on (`NodeSlab::remove`), so
+    /// an id kept from before names nothing, and every table this tree keeps by
+    /// node id forgets the freed ids here, so no entry outlives its node to be
+    /// read unchecked (`get_live`, indexing) against the slot's next occupant.
+    /// That includes the hit cache (whose cached paint orders `hit_testing`
+    /// reads unchecked), each node's `active_transitions`/`active_animations`
+    /// entries, and `taffy_map` alongside `taffy.remove`.
+    ///
+    /// The caller detaches the root from its parent's child list (and its
+    /// Taffy contribution) and records its painted pixels
+    /// (`RinchDocument::mark_subtree_paint_dirty`) first: both read the nodes
+    /// this frees. An `id` that names no live node is a no-op.
     pub fn remove_subtree(&mut self, id: RawNodeId) {
+        if !self.nodes.contains(id) {
+            return;
+        }
+        self.hit_cache.invalidate();
+        self.layout_epoch = self.layout_epoch.wrapping_add(1);
         // Collect all descendant IDs first
         let mut to_remove = Vec::new();
         self.collect_descendants(id, &mut to_remove);
         for node_id in &to_remove {
             self.active_transitions.remove(node_id);
             self.active_animations.remove(node_id);
+            // Guarded: `remove` hashes the key even on an empty map (#783).
+            if !self.finished_animations.is_empty() {
+                self.finished_animations.remove(node_id);
+            }
+            // The slab recycles slots: a node created later may be handed this
+            // one, and must not inherit this node's measured sizes.
+            self.ifc_measure_cache.remove(node_id);
+            self.atomic_line_baselines.remove(node_id);
+            self.line_baselines_superseded.remove(node_id);
+            self.stale_line_baselines.remove(node_id);
+            self.text_layout_stamps.remove(node_id);
+            // Nor a freshness flag meant for a now-gone `<select>` (#757).
+            self.select_value_fresh.remove(node_id);
+            // Nor a selection remembered for a now-gone text control (#1678).
+            if !self.text_selections.is_empty() {
+                self.text_selections.remove(node_id);
+            }
+            // Nor what was recorded about a now-gone atomic inline (#1476;
+            // the first two leaked until then, review of #1477).
+            if !self.keyword_inline_cb_width.is_empty() {
+                self.keyword_inline_cb_width.remove(node_id);
+            }
+            if !self.percent_inline_cb_width.is_empty() {
+                self.percent_inline_cb_width.remove(node_id);
+            }
+            if !self.atomic_cb_height.is_empty() {
+                self.atomic_cb_height.remove(node_id);
+            }
+            if !self.auto_inline_percent_content.is_empty() {
+                self.auto_inline_percent_content.remove(node_id);
+            }
+            if !self.atomic_min_content.is_empty() {
+                self.atomic_min_content.remove(node_id);
+            }
+            if !self.atomic_min_dropped.is_empty() {
+                self.atomic_min_dropped.remove(node_id);
+            }
+            // The rest of the tables keyed by node id (#723 PR 2). Each is
+            // guarded the way the ones above are: most are empty between
+            // frames, and a discard of a long list asks once per node.
+            if !self.dirty_nodes.is_empty() {
+                self.dirty_nodes.remove(node_id);
+            }
+            if !self.painted_bars.is_empty() {
+                self.painted_bars.remove(node_id);
+            }
+            if !self.ifc_float_bands.is_empty() {
+                self.ifc_float_bands.remove(node_id);
+            }
+            if !self.ifc_root_registry.is_empty() {
+                self.ifc_root_registry.remove(node_id);
+            }
+            if !self.atomic_inline_registry.is_empty() {
+                self.atomic_inline_registry.remove(node_id);
+            }
+            if !self.ancestor_absolutes.is_empty() {
+                self.ancestor_absolutes.remove(node_id);
+            }
+            if !self.dirty_ifc_text_roots.is_empty() {
+                self.dirty_ifc_text_roots.remove(node_id);
+            }
+            if !self.relative_offset_roots.is_empty() {
+                self.relative_offset_roots.remove(node_id);
+            }
+            if !self.dirty_text_contexts.is_empty() {
+                self.dirty_text_contexts.remove(node_id);
+            }
+            if !self.dirty_atomic_inlines.is_empty() {
+                self.dirty_atomic_inlines.remove(node_id);
+            }
+            // A measure leaf is a Taffy node of the root's own, absent from
+            // `taffy_map` (#466).
+            if !self.ifc_measure_leaves.is_empty()
+                && let Some(leaf) = self.ifc_measure_leaves.remove(node_id)
+            {
+                let _ = self.taffy.remove(leaf);
+            }
+            // The interaction state names one node each.
+            for slot in [
+                &mut self.hovered_node,
+                &mut self.focused_node,
+                &mut self.keyboard_editor,
+                &mut self.active_node,
+            ] {
+                if *slot == Some(*node_id) {
+                    *slot = None;
+                }
+            }
         }
+        // The lists keyed by node id, once per call rather than once per node.
+        // A short subtree (a list row) is searched linearly.
+        //
+        // Four frame-scoped lists are not pruned here: `paint_dirty_nodes`,
+        // `bar_check_parents`, `ifc_seeds` and `styled_unrendered`. Every
+        // insertion and removal pushes to them, so between two frames they grow
+        // with the churn, and pruning them on each free made discarding a long
+        // list quadratic (1000 rows discarded per round for nine rounds without
+        // a frame: minutes in a debug build). Each is drained by the next frame
+        // and read only through checked lookups (`compute_damage_impl`,
+        // `consume_paint_dirty`, `bar_watch_scrollers`, `compute_ifc_scope`,
+        // the `styled_unrendered` drain in `resolve_layout`), so a freed id in
+        // one is skipped there and gone after the frame.
+        //
+        // Nor are the two style lists, `style_roots` and `style_dirty_nodes`,
+        // for the same reason (#2627): a structural selector pushes a root per
+        // invalidated sibling, so discarding N rows one call at a time under
+        // `li:nth-child(odd)` scanned a list of about 2N roots per call. Both
+        // are drained by the next resolve, and both drains look ids up through
+        // the generation-checked `NodeSlab::get` (`depth_if_connected` in
+        // `resolve_styles_inner`, `apply_stylo_styles_to_taffy`), so a freed id
+        // is dropped there. That holds when its slot has already been reused:
+        // the new node has a later generation, so the stale id still names
+        // nothing (`discard_churn_tests::a_stale_style_root_does_not_style_the_node_in_its_slot`).
+        let set: rustc_hash::FxHashSet<RawNodeId> = if to_remove.len() > 16 {
+            to_remove.iter().copied().collect()
+        } else {
+            Default::default()
+        };
+        let gone = |x: &RawNodeId| {
+            if set.is_empty() {
+                to_remove.contains(x)
+            } else {
+                set.contains(x)
+            }
+        };
+        fn prune<T>(v: &mut Vec<T>, gone: impl Fn(&T) -> bool, steps: &mut u64) {
+            if !v.is_empty() {
+                *steps += v.len() as u64;
+                v.retain(|x| !gone(x));
+            }
+        }
+        let mut steps = 0u64;
+        prune(&mut self.tables_owed, gone, &mut steps);
+        prune(&mut self.cells_to_align, gone, &mut steps);
+        prune(&mut self.floats, gone, &mut steps);
+        prune(&mut self.line_clamp_roots, gone, &mut steps);
+        prune(&mut self.line_clamped, gone, &mut steps);
+        prune(&mut self.float_avoiders, gone, &mut steps);
+        prune(&mut self.float_blank_runs, gone, &mut steps);
+        prune(&mut self.tables, gone, &mut steps);
+        prune(&mut self.placed_absolutes, |(x, _)| gone(x), &mut steps);
+        prune(&mut self.abs_static_fits, |(x, _)| gone(x), &mut steps);
+        prune(&mut self.abs_chain_marked, gone, &mut steps);
+        prune(&mut self.scroll_lock_roots, gone, &mut steps);
+        prune(&mut self.scroll_lock_exempt, gone, &mut steps);
+        prune(&mut self.anonymous_block_boxes, gone, &mut steps);
+        prune(&mut self.split_inlines, gone, &mut steps);
+        prune(&mut self.ended_animations, gone, &mut steps);
+        prune(self.minify_deferred.get_mut(), gone, &mut steps);
+        prune(self.atomic_min_requests.get_mut(), gone, &mut steps);
+        prune(&mut self.animated_recascade, gone, &mut steps);
+        prune(&mut self.outside_markers, gone, &mut steps);
+        prune(&mut self.marker_moves, |(x, _)| gone(x), &mut steps);
+        prune(&mut self.scroll_into_view_requests, gone, &mut steps);
+        prune(
+            &mut self.scroll_to_fraction_requests,
+            |(x, _, _)| gone(x),
+            &mut steps,
+        );
+        prune(
+            &mut self.pending_scroll_clamps,
+            |(x, _)| gone(x),
+            &mut steps,
+        );
+        prune(&mut self.textarea_extent_dirty, gone, &mut steps);
+        if !self.atomic_leaf_layouts.is_empty() {
+            steps += self.atomic_leaf_layouts.len() as u64;
+            self.atomic_leaf_layouts.retain(|(x, _), _| !gone(x));
+        }
+        self.free_prune_steps += steps;
         for node_id in to_remove {
-            self.nodes.remove(node_id);
+            let node = self.nodes.remove(node_id);
+            if node.style_isolated {
+                self.isolated_nodes -= 1;
+            }
+            // Its Taffy node goes with it, and `taffy_map` forgets it (#723:
+            // `set_inner_html` leaked one Taffy node per freed node until
+            // then). The root's was detached from its parent by the caller.
+            if let Some(taffy_id) = node.taffy_id {
+                self.taffy_map.remove(&taffy_id);
+                let _ = self.taffy.remove(taffy_id);
+            }
         }
     }
 
+    /// `id` and everything below it, including the anonymous block boxes a
+    /// container holds for its inline runs (`run_boxes`): they are slab nodes
+    /// of its own that no `children` list names, and outlive it otherwise.
     fn collect_descendants(&self, id: RawNodeId, out: &mut Vec<RawNodeId>) {
-        out.push(id);
-        if let Some(node) = self.nodes.get(id) {
-            let children: Vec<_> = node.children.clone();
-            for child in children {
-                self.collect_descendants(child, out);
+        let mut stack = vec![id];
+        while let Some(id) = stack.pop() {
+            let Some(node) = self.nodes.get(id) else {
+                continue;
+            };
+            out.push(id);
+            stack.extend(node.children.iter().rev().copied());
+            for &b in &node.run_boxes {
+                if self
+                    .nodes
+                    .get(b)
+                    .is_some_and(|anon| anon.parent == Some(id))
+                {
+                    stack.push(b);
+                }
             }
         }
     }
@@ -2150,7 +5625,7 @@ pub fn first_legend_child(tree: &NodeTree, parent: &Node) -> Option<RawNodeId> {
         .children
         .iter()
         .copied()
-        .find(|&c| tree.get(c).and_then(|n| n.tag()) == Some("legend"))
+        .find(|&c| tree.get_live(c).and_then(|n| n.tag()) == Some("legend"))
 }
 
 /// Whether a tag names an element HTML lets be disabled — the set `:disabled`
@@ -2166,4 +5641,209 @@ pub fn tag_is_disableable(tag: Option<&str>) -> bool {
         tag,
         Some("button" | "input" | "select" | "textarea" | "option" | "optgroup" | "fieldset")
     )
+}
+
+/// Tags HTML lets be `required` — the set `:required`/`:optional` are
+/// defined over (HTML Standard §4.10.5.3's "candidate for constraint
+/// validation" minus the kinds rinch doesn't special-case per `type=`).
+/// Narrower than [`tag_is_disableable`]: a `<button>`/`<option>`/`<optgroup>`/
+/// `<fieldset>` has no `required` attribute at all.
+pub fn tag_supports_required(tag: Option<&str>) -> bool {
+    matches!(tag, Some("input" | "select" | "textarea"))
+}
+
+/// Tags `:read-only`/`:read-write`/`:placeholder-shown` apply to in this
+/// implementation (#681): `input`, `textarea`. `select` has neither
+/// `readonly` nor `placeholder` of its own.
+///
+/// **Narrower than the full CSS definition**, deliberately, same spirit as
+/// [`tag_is_disableable`]'s own narrowing: Selectors 4 also matches
+/// `:read-only` on every element that cannot be edited at all (a `<div>`,
+/// which is never "mutable"), and factors a `<fieldset disabled>` ancestor
+/// into whether an `<input>` inside it is "mutable". Neither is implemented
+/// here — only the element's own `readonly` attribute decides — so do not
+/// read `tag_is_readonly_capable` as the full predicate.
+pub fn tag_is_readonly_capable(tag: Option<&str>) -> bool {
+    matches!(tag, Some("input" | "textarea"))
+}
+
+/// `:required` (#681): a `required` attribute on a tag that supports one.
+pub fn node_is_required(node: &Node) -> bool {
+    tag_supports_required(node.tag()) && node.attributes.contains_key("required")
+}
+
+/// `:optional` (#681): the inverse of [`node_is_required`] — a tag that
+/// supports `required` but doesn't carry it. `false` for a tag the
+/// attribute doesn't apply to at all, matching `:required`'s own gate (a
+/// `<div>` is neither required nor optional).
+pub fn node_is_optional(node: &Node) -> bool {
+    tag_supports_required(node.tag()) && !node.attributes.contains_key("required")
+}
+
+/// `:read-only` (#681): a `readonly` attribute on a tag that supports one.
+/// See [`tag_is_readonly_capable`] for the scope this deliberately leaves out.
+pub fn node_is_read_only(node: &Node) -> bool {
+    tag_is_readonly_capable(node.tag()) && node.attributes.contains_key("readonly")
+}
+
+/// `:read-write` (#681): the inverse of [`node_is_read_only`], gated the
+/// same way.
+pub fn node_is_read_write(node: &Node) -> bool {
+    tag_is_readonly_capable(node.tag()) && !node.attributes.contains_key("readonly")
+}
+
+/// `:placeholder-shown` (#681): a `placeholder` attribute present and the
+/// field's current value empty — "current" meaning the `value` attribute,
+/// which the desktop runtime mirrors every edit into before dispatching
+/// `oninput` (see `value_fn`/`live_value` in CLAUDE.md), so this also tracks
+/// a live edit, not only the initial markup.
+///
+/// An `<input>`'s value is read sanitized for its type
+/// ([`crate::form_control::input_value`], #1554), so a `value` of only line
+/// breaks shows the placeholder, as in Chrome 155.
+pub fn node_is_placeholder_shown(node: &Node) -> bool {
+    if !tag_is_readonly_capable(node.tag()) || !node.attributes.contains_key("placeholder") {
+        return false;
+    }
+    let value = if node.tag() == Some("input") {
+        crate::form_control::input_value(node)
+    } else {
+        node.attributes.get("value").map(|v| v.as_str().into())
+    };
+    value.is_none_or(|v| v.is_empty())
+}
+
+/// What a node was last painted with, besides its box ([`Node::painted`]).
+#[derive(Clone, Debug, Default)]
+pub struct PaintedState {
+    /// How far the node's **own** ink reached past its border box, in CSS px:
+    /// `[left, top, right, bottom]` — outset `box-shadow` and `outline`. Its
+    /// descendants carry their own.
+    pub ink: [f32; 4],
+    /// The node's own transform, with its origin resolved against the box it
+    /// was painted in. `None` for the identity.
+    pub transform: Option<Box<PaintedTransform>>,
+    /// Whether the node clipped its content on the x axis
+    /// ([`Node::clips_overflow_x`], and a box to clip with: not
+    /// `display: contents`). Per-axis (#535) rather than one `clips: bool`,
+    /// because `crate::paint::clip_chain_bounds` needs to know which axis a
+    /// painted ancestor bounded, not merely whether it bounded either.
+    pub clips_x: bool,
+    /// [`Self::clips_x`], for `overflow-y`.
+    pub clips_y: bool,
+    /// Its `position`, which decides which clippers above it it escapes.
+    pub position: crate::computed_style::PositionValue,
+    /// Whether it was a containing block for absolute descendants
+    /// ([`Node::establishes_abs_containing_block`]), which ends their escape.
+    pub contains_abs: bool,
+    /// Whether it was a `position: fixed` box contained by an ancestor
+    /// ([`Node::is_contained_fixed`], #1372): its `position` above reads
+    /// `absolute`, and only [`Self::contains_fixed`] ends its escape.
+    pub contained_fixed: bool,
+    /// Whether it was a containing block for fixed descendants
+    /// ([`Node::establishes_fixed_containing_block`]).
+    pub contains_fixed: bool,
+    /// Where it sat in the paint order ([`crate::stacking::PaintOrderKey`]).
+    /// A node whose answer has changed since owes the damage everything its
+    /// subtree paints, not only its own rect (#1384).
+    pub order: crate::stacking::PaintOrderKey,
+    /// Its unrounded Taffy rect `[x, y, width, height]` when painted
+    /// (`unrounded_rect`; `None` for a box with no Taffy node), written by
+    /// [`NodeTree::consume_paint_dirty`]. A scroller's range is measured from
+    /// it (#2116), so a change that leaves the rounded `layout` alone can
+    /// still move a bar: `paint::bar_watch_scrollers` compares it.
+    pub unrounded: Option<[f32; 4]>,
+    /// How far its `filter` spread its whole stacking context's ink, in CSS
+    /// px (the largest side of `paint::filter::list_outsets`; `0` for a
+    /// list that moves no pixel, #2719): a filter change damages the
+    /// subtree's extent grown by the old reach as well as the new.
+    pub filter_reach: f32,
+}
+
+/// `node`'s unrounded Taffy rect `[x, y, width, height]`, in its Taffy
+/// parent's frame — what a scroller's range is measured from (#2116).
+pub(crate) fn unrounded_rect(
+    taffy: &taffy::TaffyTree<NodeContext>,
+    node: &Node,
+) -> Option<[f32; 4]> {
+    let u = taffy.unrounded_layout(node.taffy_id?);
+    Some([u.location.x, u.location.y, u.size.width, u.size.height])
+}
+
+/// A painted transform: the value and its resolved origin, in CSS px.
+#[derive(Clone, Debug)]
+pub struct PaintedTransform {
+    pub value: crate::computed_style::TransformValue,
+    pub origin: (f32, f32),
+    /// `backface-visibility: hidden` (#997).
+    pub backface_hidden: bool,
+}
+
+impl PaintedState {
+    /// What `node` paints with now.
+    pub fn of(node: &Node) -> Self {
+        Self::of_in(node, false, |_| None)
+    }
+
+    /// [`Self::of`], with the ink an IFC root's text casts through its
+    /// inline elements' own `text-shadow`s (#1048) — `get` looks them up —
+    /// when `members` ([`NodeTree::inline_text_shadows`]).
+    pub fn of_in<'a>(
+        node: &'a Node,
+        members: bool,
+        get: impl Fn(RawNodeId) -> Option<&'a Node> + 'a,
+    ) -> Self {
+        let cs = &node.computed_style;
+        let transform = node.has_applied_transform().then(|| {
+            Box::new(PaintedTransform {
+                value: cs.transform.clone(),
+                origin: (
+                    cs.transform_origin_x.resolve(node.layout.width),
+                    cs.transform_origin_y.resolve(node.layout.height),
+                ),
+                backface_hidden: cs.backface_visibility_hidden,
+            })
+        });
+        let (clips_x, clips_y) = node.clip_axes();
+        Self {
+            ink: crate::paint::ink_outsets_in(node, members, get),
+            transform,
+            clips_x,
+            clips_y,
+            position: node.box_position(),
+            contains_abs: node.establishes_abs_containing_block(),
+            contained_fixed: node.is_contained_fixed(),
+            contains_fixed: node.establishes_fixed_containing_block(),
+            order: crate::stacking::PaintOrderKey::of(node),
+            unrounded: None,
+            filter_reach: if cs.filter.is_empty() {
+                0.0
+            } else {
+                crate::paint::filter::list_outsets(&cs.filter)
+                    .into_iter()
+                    .fold(0.0, f32::max)
+            },
+        }
+    }
+}
+
+/// [`NodeTree::snap_scroll_offset`] with the scale passed in.
+///
+/// Rounds the magnitude down to the grid — a positive offset floors, a
+/// negative one (an rtl container's `scrollLeft`, #2546) ceils — with a
+/// millionth of a device pixel of slack, so an offset already on it (whose
+/// product with `scale` lands a hair inside an integer) is not moved a pixel;
+/// the answer is never further from 0 than `v` whatever that slack does, so
+/// an offset clamped to a range that ends at 0 stays inside it. A scale that
+/// is not a positive finite number leaves `v` alone.
+pub fn snap_to_device(v: f64, scale: f64) -> f64 {
+    if !v.is_finite() || !scale.is_finite() || scale <= 0.0 {
+        return v;
+    }
+    if v < 0.0 {
+        // `+ 0.0`: an offset that snaps to 0 is `0.0`, never `-0.0`, so a
+        // `scrollLeft` read back is never negative zero.
+        return -snap_to_device(-v, scale) + 0.0;
+    }
+    ((v * scale + 1e-6).floor() / scale).min(v) + 0.0
 }

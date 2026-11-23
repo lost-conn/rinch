@@ -6,8 +6,8 @@
 //! per-context signal subscriptions and bounds registries (#134) and per-root
 //! store/context namespacing with the thread-global root-0 fallback (#136).
 //!
-//! Requires the `embed` (or `gpu`) feature. Since #140 the painters are
-//! additive, so `desktop` + `embed` co-compiles and default features can stay on:
+//! Requires the `embed` (or `gpu-renderer`) feature. Since #140 the painters are
+//! additive, so `windowing` + `embed` co-compiles and default features can stay on:
 //!     cargo test -p rinch --features embed --test multi_context
 //! The per-document theme tests (#138) additionally need the `theme` feature:
 //!     cargo test -p rinch --features embed,theme --test multi_context
@@ -23,7 +23,7 @@
 //! one test to the next, so each test cleans up what it can (contexts dropped,
 //! `clear_context()` where stores are used).
 
-#![cfg(any(feature = "gpu", feature = "embed"))]
+#![cfg(any(feature = "gpu-renderer", feature = "embed"))]
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -756,5 +756,325 @@ fn the_root_build_is_attributed_to_the_root_scope() {
             !owner.is_alive(),
             "dropping the context disposes the root scope"
         );
+    });
+}
+
+// ── pointer-capture drags across contexts (issue #293) ───────────────────────
+
+/// A press in context B that arms a drag while context A's drag is live ends
+/// A's drag through its `on_cancel`, rather than dropping it with its teardown
+/// unrun. Driven through real `update()` calls, so the dispatching-document
+/// marker is the one `RinchApp::handle_event` pushes, not a test's.
+#[test]
+fn a_drag_armed_in_one_context_cancels_another_contexts_live_drag() {
+    on_ui_thread(|| {
+        use rinch_platform::{MouseButton, PlatformEvent};
+
+        #[derive(Default)]
+        struct Log {
+            cancels: Cell<u32>,
+            ends: Cell<u32>,
+        }
+        let a_log = Rc::new(Log::default());
+        let b_log = Rc::new(Log::default());
+
+        fn arming_root(log: Rc<Log>) -> impl Fn(&mut RenderScope) -> NodeHandle + 'static {
+            move |__scope: &mut RenderScope| {
+                let log = log.clone();
+                rsx! {
+                    div {
+                        style: "width: 300px; height: 300px;",
+                        onclick: move || {
+                            let c = log.clone();
+                            let e = log.clone();
+                            rinch_core::Drag::absolute()
+                                .on_cancel(move |_, _| c.cancels.set(c.cancels.get() + 1))
+                                .on_end(move |_, _| e.ends.set(e.ends.get() + 1))
+                                .start();
+                        },
+                    }
+                }
+            }
+        }
+
+        let mut a = RinchContext::new(cfg(), arming_root(a_log.clone()));
+        let mut b = RinchContext::new(cfg(), arming_root(b_log.clone()));
+        a.update(&[]);
+        b.update(&[]);
+
+        let press = PlatformEvent::MouseDown {
+            x: 50.0,
+            y: 50.0,
+            button: MouseButton::Left,
+        };
+        let release = PlatformEvent::MouseUp {
+            x: 60.0,
+            y: 60.0,
+            button: MouseButton::Left,
+        };
+
+        a.update(std::slice::from_ref(&press));
+        assert!(
+            rinch_core::Drag::is_active(),
+            "positive control: A's press armed a drag"
+        );
+        b.update(std::slice::from_ref(&press));
+        assert_eq!(
+            a_log.cancels.get(),
+            1,
+            "B's arm ended A's drag through on_cancel"
+        );
+
+        // Only B's release may commit anything now.
+        a.update(std::slice::from_ref(&release));
+        assert_eq!(a_log.ends.get(), 0, "a superseded drag never commits");
+        b.update(std::slice::from_ref(&release));
+        assert_eq!(b_log.ends.get(), 1, "B's own drag commits on B's release");
+        assert_eq!(b_log.cancels.get(), 0);
+
+        drop(a);
+        drop(b);
+    });
+}
+
+// ── effects flush under their own document (issue #295) ─────────────────────
+
+/// An effect owned by context B, woken by a write made in context A's event
+/// handler, runs under **B**'s document — not under A's, which is the one
+/// dispatching when the thread-global effect queue drains. And B's mount runs
+/// under B's document too, which is where that effect learned its document.
+///
+/// The observable consumer is the pointer-capture drag (#139/#293): a drag the
+/// effect arms belongs to the document it records, so before #295 B's own
+/// pointer moves could not drive it and A's could.
+#[test]
+fn an_effect_woken_from_another_contexts_handler_runs_under_its_own_document() {
+    on_ui_thread(|| {
+        use rinch::reactive::Effect;
+        use rinch_platform::{MouseButton, PlatformEvent};
+        use std::cell::RefCell;
+
+        // Written from A's handler, read by B's effect. Created outside both
+        // contexts, so it belongs to neither.
+        let go = Signal::new(false);
+
+        #[derive(Default)]
+        struct Seen {
+            b_click: Cell<Option<u64>>,
+            b_mount: Cell<Option<u64>>,
+            b_effect: RefCell<Vec<Option<u64>>>,
+            b_moves: Cell<u32>,
+        }
+        let seen = Rc::new(Seen::default());
+
+        let mut a = RinchContext::new(cfg(), move |__scope: &mut RenderScope| {
+            rsx! {
+                div {
+                    style: "width: 300px; height: 300px;",
+                    onclick: move || go.set(true),
+                }
+            }
+        });
+        let s = seen.clone();
+        let mut b = RinchContext::new(cfg(), move |__scope: &mut RenderScope| {
+            s.b_mount.set(rinch_core::current_dispatching_doc());
+            let e = s.clone();
+            // Leaked into the root scope's lifetime by the scope that owns it.
+            let _effect = Effect::new(move || {
+                let armed = go.get();
+                e.b_effect
+                    .borrow_mut()
+                    .push(rinch_core::current_dispatching_doc());
+                if armed {
+                    let m = e.clone();
+                    rinch_core::Drag::absolute()
+                        .on_move(move |_, _| m.b_moves.set(m.b_moves.get() + 1))
+                        .start();
+                }
+            });
+            let c = s.clone();
+            rsx! {
+                div {
+                    style: "width: 300px; height: 300px;",
+                    onclick: move || c.b_click.set(rinch_core::current_dispatching_doc()),
+                }
+            }
+        });
+        a.update(&[]);
+        b.update(&[]);
+
+        let press = PlatformEvent::MouseDown {
+            x: 50.0,
+            y: 50.0,
+            button: MouseButton::Left,
+        };
+        let release = PlatformEvent::MouseUp {
+            x: 50.0,
+            y: 50.0,
+            button: MouseButton::Left,
+        };
+        // B's own click tells us B's document key (the oracle).
+        b.update(&[press.clone(), release.clone()]);
+        let b_doc = seen.b_click.get();
+        assert!(b_doc.is_some(), "positive control: B's click dispatched");
+
+        // A's click writes `go`; B's effect flushes inside A's dispatch.
+        a.update(std::slice::from_ref(&press));
+        assert!(
+            rinch_core::Drag::is_active(),
+            "positive control: the effect armed a drag"
+        );
+        assert_eq!(
+            *seen.b_effect.borrow(),
+            vec![b_doc, b_doc],
+            "B's effect ran under B's document at mount and when A woke it"
+        );
+        assert_eq!(
+            seen.b_mount.get(),
+            b_doc,
+            "B's mount ran under B's document"
+        );
+
+        // The drag belongs to B: A's moves do not drive it, B's do.
+        let mv = PlatformEvent::MouseMove { x: 70.0, y: 70.0 };
+        a.update(std::slice::from_ref(&mv));
+        assert_eq!(
+            seen.b_moves.get(),
+            0,
+            "A's pointer stream is not B's drag's"
+        );
+        b.update(std::slice::from_ref(&mv));
+        assert_eq!(seen.b_moves.get(), 1, "B's pointer stream drives B's drag");
+
+        rinch_core::Drag::cancel();
+        drop(a);
+        drop(b);
+    });
+}
+
+// ── REVIEW-960 probes ──
+fn rv960_key() -> rinch_platform::PlatformEvent {
+    use rinch_platform::{KeyCode, KeyRepeat, Modifiers, PlatformEvent};
+    PlatformEvent::KeyDown {
+        key: KeyCode::KeyQ,
+        logical_key: Some("q".into()),
+        text: Some("q".into()),
+        modifiers: Modifiers::default(),
+        repeat: KeyRepeat::Fresh,
+    }
+}
+
+/// Single document: a mount-time interceptor, then a re-registration from
+/// outside any dispatch (a timer / menu / run_on_main_thread callback).
+#[test]
+fn rv960_outside_reregistration_replaces_mount_interceptor() {
+    on_ui_thread(|| {
+        use std::cell::RefCell;
+        let hits: Rc<RefCell<Vec<&'static str>>> = Rc::default();
+        let h = hits.clone();
+        let mut a = RinchContext::new(cfg(), move |__scope: &mut RenderScope| {
+            let h = h.clone();
+            rinch_core::events::set_keyboard_interceptor(move |_| {
+                h.borrow_mut().push("mount");
+                false
+            });
+            rsx! { div { style: "width: 300px; height: 300px;" } }
+        });
+        a.update(&[]);
+        a.update(&[rv960_key()]);
+        let h2 = hits.clone();
+        // Outside any dispatch, e.g. a set_timeout callback.
+        rinch_core::events::set_keyboard_interceptor(move |_| {
+            h2.borrow_mut().push("outside");
+            false
+        });
+        a.update(&[rv960_key()]);
+        rinch_core::events::clear_keyboard_interceptor();
+        a.update(&[rv960_key()]);
+        let got = hits.borrow().clone();
+        rinch_core::events::clear_keyboard_interceptor();
+        rinch_core::events::clear_keyboard_interceptor();
+        drop(a);
+        assert_eq!(
+            got,
+            vec!["mount", "outside"],
+            "last registration wins; clear clears"
+        );
+    });
+}
+
+/// Issue #500: two documents that BOTH register a keyboard interceptor at
+/// *initial mount* — a component body, run once, outside any `handle_event` —
+/// must not collide last-wins in the shared `None` (ownerless) slot entry.
+///
+/// `RinchApp::mount_component` has pushed the dispatching-document marker
+/// around the component's build since issue #295
+/// (`rinch_core::push_dispatching_doc`, `app/mod.rs`), so a mount-time
+/// `set_keyboard_interceptor` call already resolves `current_dispatching_doc()`
+/// to that document rather than falling through to the ownerless entry. This
+/// test is the #500 repro made concrete: if the mount marker were ever lost,
+/// B's mount-time registration would land in the same `None` slot as A's and
+/// silently replace it, so A's own later dispatch would run B's interceptor
+/// instead of its own (or vice versa, depending on registration order).
+#[test]
+fn issue_500_two_contexts_registering_at_mount_do_not_collide() {
+    on_ui_thread(|| {
+        use std::cell::RefCell;
+        let hits: Rc<RefCell<Vec<&'static str>>> = Rc::default();
+
+        let ha = hits.clone();
+        let mut a = RinchContext::new(cfg(), move |__scope: &mut RenderScope| {
+            let ha = ha.clone();
+            // Registered directly in the component body — at mount, not from
+            // inside an effect or a handler. This is the case #500 names.
+            rinch_core::events::set_keyboard_interceptor(move |_| {
+                ha.borrow_mut().push("A");
+                false
+            });
+            rsx! { div { style: "width: 300px; height: 300px;" } }
+        });
+
+        let hb = hits.clone();
+        let mut b = RinchContext::new(cfg(), move |__scope: &mut RenderScope| {
+            let hb = hb.clone();
+            rinch_core::events::set_keyboard_interceptor(move |_| {
+                hb.borrow_mut().push("B");
+                false
+            });
+            rsx! { div { style: "width: 300px; height: 300px;" } }
+        });
+
+        // Settle both initial mounts before any key dispatch.
+        a.update(&[]);
+        b.update(&[]);
+
+        a.update(&[rv960_key()]);
+        assert_eq!(
+            hits.borrow().clone(),
+            vec!["A"],
+            "A's own mount-time interceptor must run on A's dispatch"
+        );
+
+        b.update(&[rv960_key()]);
+        assert_eq!(
+            hits.borrow().clone(),
+            vec!["A", "B"],
+            "B's own mount-time interceptor must run on B's dispatch, not A's"
+        );
+
+        // A's slot must not have been clobbered by B's later mount-time
+        // registration (the collision #500 describes: both land in the same
+        // ownerless `None` entry, last-wins).
+        a.update(&[rv960_key()]);
+        assert_eq!(
+            hits.borrow().clone(),
+            vec!["A", "B", "A"],
+            "A's interceptor must survive B's mount-time registration"
+        );
+
+        rinch_core::events::clear_keyboard_interceptor();
+        rinch_core::events::clear_keyboard_interceptor();
+        drop(a);
+        drop(b);
     });
 }

@@ -1,7 +1,7 @@
 //! Interaction state tracking: hover, focus, active state changes and style recomputation.
 
 use crate::RinchDocument;
-use crate::node::DirtyFlags;
+use crate::node::RawNodeId;
 
 impl RinchDocument {
     /// Update hover state: set the hovered node and its ancestors as hovered,
@@ -12,7 +12,11 @@ impl RinchDocument {
     /// state). The `hovered_changed` out-parameter is set when the hovered node
     /// identity changed (used by the caller to dispatch `data-onenter`
     /// regardless of whether repaint is needed).
-    pub fn update_hover(&mut self, new_hovered: Option<usize>, hovered_changed: &mut bool) -> bool {
+    pub fn update_hover(
+        &mut self,
+        new_hovered: Option<RawNodeId>,
+        hovered_changed: &mut bool,
+    ) -> bool {
         let old_hovered = self.tree.hovered_node;
         *hovered_changed = old_hovered != new_hovered;
         if !*hovered_changed {
@@ -39,6 +43,27 @@ impl RinchDocument {
             }
         }
 
+        // Nodes whose hover state changes (symmetric difference), snapshotted
+        // *before* it changes. Only nodes where Stylo's selector matching
+        // actually evaluated `:hover` — meaning some CSS rule depends on this
+        // node's hover state — are snapshotted: the `hover_sensitive` flag is
+        // set by `match_non_ts_pseudo_class`. Which elements the change then
+        // restyles (this one, its descendants for `.card:hover .title`, its
+        // later siblings for `:hover + p`) is Stylo's invalidator's answer.
+        let mut needs_repaint = false;
+        for &id in old_chain.iter().filter(|id| !new_chain.contains(id)) {
+            if self.node_is_hover_sensitive(id) {
+                self.note_state_change(id);
+                needs_repaint = true;
+            }
+        }
+        for &id in new_chain.iter().filter(|id| !old_chain.contains(id)) {
+            if self.node_is_hover_sensitive(id) {
+                self.note_state_change(id);
+                needs_repaint = true;
+            }
+        }
+
         // Clear old hover state
         for &id in &old_chain {
             if let Some(node) = self.tree.nodes.get_mut(id) {
@@ -55,31 +80,6 @@ impl RinchDocument {
 
         self.tree.hovered_node = new_hovered;
 
-        // Collect nodes whose hover state changed (symmetric difference).
-        // Only invalidate styles for nodes where Stylo's selector matching
-        // actually evaluated `:hover` — meaning some CSS rule depends on
-        // this node's hover state. The `hover_sensitive` flag is set by
-        // `match_non_ts_pseudo_class` during style resolution.
-        let mut needs_repaint = false;
-        for &id in &old_chain {
-            if new_chain.contains(&id) {
-                continue;
-            }
-            if self.node_is_hover_sensitive(id) {
-                self.invalidate_hover_node(id);
-                needs_repaint = true;
-            }
-        }
-        for &id in &new_chain {
-            if old_chain.contains(&id) {
-                continue;
-            }
-            if self.node_is_hover_sensitive(id) {
-                self.invalidate_hover_node(id);
-                needs_repaint = true;
-            }
-        }
-
         if needs_repaint {
             self.tree.styles_dirty = true;
         }
@@ -87,21 +87,68 @@ impl RinchDocument {
         needs_repaint
     }
 
-    fn node_is_hover_sensitive(&self, id: usize) -> bool {
+    /// Whether `id` names a live node whose ancestor chain reaches the
+    /// document root: in the document, not detached or freed.
+    pub fn is_in_document(&self, id: RawNodeId) -> bool {
+        self.depth_if_connected(id).is_some()
+    }
+
+    /// Re-anchor the hover state after the hovered node left the document
+    /// (#2766), before the next [`Self::update_hover`].
+    ///
+    /// A removal does not touch hover: freeing the hovered node clears
+    /// `hovered_node` and leaves its ancestors `is_hovered`, and detaching it
+    /// leaves `hovered_node` naming a node whose parent chain stops at the
+    /// detached subtree. Either way the next `update_hover` walked the old
+    /// chain from there and never reached the ancestors still in the
+    /// document, so their `:hover` stayed set however far the pointer went.
+    /// As Chrome moves its hover element to the nearest ancestor still in the
+    /// document when the hovered one is removed, `hovered_node` becomes the
+    /// first connected node of `chain` (the hovered node and its ancestors,
+    /// innermost first, as the pointer last saw them), and the nodes that
+    /// left drop `is_hovered`. Nothing restyles here: the ancestors keep
+    /// their state until `update_hover` compares it with what is under the
+    /// pointer now. A no-op while the hovered node is still connected.
+    pub fn settle_detached_hover(&mut self, chain: &[RawNodeId]) {
+        let old = self.tree.hovered_node;
+        if old.is_some_and(|id| self.is_in_document(id)) || (old.is_none() && chain.is_empty()) {
+            return;
+        }
+        let mut current = old;
+        while let Some(id) = current {
+            let Some(node) = self.tree.nodes.get_mut(id) else {
+                break;
+            };
+            node.is_hovered = false;
+            current = node.parent;
+        }
+        let survivor = chain.iter().copied().find(|&id| self.is_in_document(id));
+        for &id in chain {
+            if Some(id) == survivor {
+                break;
+            }
+            if let Some(node) = self.tree.nodes.get_mut(id) {
+                node.is_hovered = false;
+            }
+        }
+        self.tree.hovered_node = survivor;
+    }
+
+    fn node_is_hover_sensitive(&self, id: RawNodeId) -> bool {
         self.tree
             .nodes
             .get(id)
             .is_some_and(|n| n.hover_sensitive.get())
     }
 
-    fn node_is_active_sensitive(&self, id: usize) -> bool {
+    fn node_is_active_sensitive(&self, id: RawNodeId) -> bool {
         self.tree
             .nodes
             .get(id)
             .is_some_and(|n| n.active_sensitive.get())
     }
 
-    fn node_is_focus_sensitive(&self, id: usize) -> bool {
+    fn node_is_focus_sensitive(&self, id: RawNodeId) -> bool {
         // The per-node flag is set by Stylo *matching* a focus pseudo-class
         // against the node — but a rule whose rightmost compound is a bare
         // focus pseudo (the theme's `:focus-visible { outline }`) lives in
@@ -118,26 +165,25 @@ impl RinchDocument {
                 .is_some_and(|n| n.focus_sensitive.get())
     }
 
-    fn invalidate_hover_node(&mut self, id: usize) {
-        if let Some(node) = self.tree.nodes.get(id) {
-            *node.stylo_element_data.borrow_mut() = None;
-        }
-        self.tree.style_roots.push(id);
-        self.push_dirty_flags(id, DirtyFlags::STYLE | DirtyFlags::PAINT);
-        // Descendant selectors like `.parent:hover .child` require descendants
-        // to be re-resolved when the ancestor's interaction state changes.
-        self.invalidate_descendant_styles(id);
-    }
-
     /// Update focus state: set the focused node, clear previous focus,
     /// and invalidate styles only for nodes that Stylo flagged as
     /// focus-sensitive during selector matching.
     ///
     /// Returns `true` if a repaint is needed.
-    pub fn update_focus(&mut self, new_focused: Option<usize>) -> bool {
+    pub fn update_focus(&mut self, new_focused: Option<RawNodeId>) -> bool {
         let old_focused = self.tree.focused_node;
         if old_focused == new_focused {
             return false;
+        }
+
+        // Snapshot before the state moves: only nodes some CSS rule depends
+        // on for `:focus`.
+        let mut needs_repaint = false;
+        for id in [old_focused, new_focused].into_iter().flatten() {
+            if self.node_is_focus_sensitive(id) {
+                self.note_state_change(id);
+                needs_repaint = true;
+            }
         }
 
         // Clear old focus state. A blurred node can't show the keyboard focus
@@ -158,21 +204,6 @@ impl RinchDocument {
 
         self.tree.focused_node = new_focused;
 
-        // Only invalidate nodes that have CSS rules depending on :focus.
-        let mut needs_repaint = false;
-        if let Some(id) = old_focused {
-            if self.node_is_focus_sensitive(id) {
-                self.invalidate_hover_node(id);
-                needs_repaint = true;
-            }
-        }
-        if let Some(id) = new_focused {
-            if self.node_is_focus_sensitive(id) {
-                self.invalidate_hover_node(id);
-                needs_repaint = true;
-            }
-        }
-
         if needs_repaint {
             self.tree.styles_dirty = true;
         }
@@ -187,17 +218,17 @@ impl RinchDocument {
     /// CSS rule depends on this node's focus state.
     ///
     /// Returns `true` if a repaint is needed.
-    pub fn set_focus_visible(&mut self, node_id: usize, visible: bool) -> bool {
-        match self.tree.nodes.get_mut(node_id) {
-            Some(node) if node.is_focus_visible != visible => node.is_focus_visible = visible,
+    pub fn set_focus_visible(&mut self, node_id: RawNodeId, visible: bool) -> bool {
+        match self.tree.nodes.get(node_id) {
+            Some(node) if node.is_focus_visible != visible => {}
             _ => return false,
         }
-        if self.node_is_focus_sensitive(node_id) {
-            self.invalidate_hover_node(node_id);
-            self.tree.styles_dirty = true;
-            return true;
+        let sensitive = self.node_is_focus_sensitive(node_id);
+        if sensitive {
+            self.note_state_change(node_id);
         }
-        false
+        self.tree.nodes[node_id].is_focus_visible = visible;
+        sensitive
     }
 
     /// Update active (mouse-pressed) state: set the active node and its
@@ -205,7 +236,7 @@ impl RinchDocument {
     /// nodes that Stylo flagged as active-sensitive during selector matching.
     ///
     /// Returns `true` if a repaint is needed.
-    pub fn update_active(&mut self, new_active: Option<usize>) -> bool {
+    pub fn update_active(&mut self, new_active: Option<RawNodeId>) -> bool {
         let old_active = self.tree.active_node;
         if old_active == new_active {
             return false;
@@ -231,6 +262,22 @@ impl RinchDocument {
             }
         }
 
+        // Snapshot the nodes whose active state changes AND that have CSS
+        // rules depending on :active, before it changes.
+        let mut needs_repaint = false;
+        for &id in old_chain.iter().filter(|id| !new_chain.contains(id)) {
+            if self.node_is_active_sensitive(id) {
+                self.note_state_change(id);
+                needs_repaint = true;
+            }
+        }
+        for &id in new_chain.iter().filter(|id| !old_chain.contains(id)) {
+            if self.node_is_active_sensitive(id) {
+                self.note_state_change(id);
+                needs_repaint = true;
+            }
+        }
+
         // Clear old active state
         for &id in &old_chain {
             if let Some(node) = self.tree.nodes.get_mut(id) {
@@ -246,28 +293,6 @@ impl RinchDocument {
         }
 
         self.tree.active_node = new_active;
-
-        // Only invalidate nodes whose active state changed AND that have
-        // CSS rules depending on :active.
-        let mut needs_repaint = false;
-        for &id in &old_chain {
-            if old_chain.contains(&id) && new_chain.contains(&id) {
-                continue;
-            }
-            if self.node_is_active_sensitive(id) {
-                self.invalidate_hover_node(id);
-                needs_repaint = true;
-            }
-        }
-        for &id in &new_chain {
-            if old_chain.contains(&id) {
-                continue;
-            }
-            if self.node_is_active_sensitive(id) {
-                self.invalidate_hover_node(id);
-                needs_repaint = true;
-            }
-        }
 
         if needs_repaint {
             self.tree.styles_dirty = true;

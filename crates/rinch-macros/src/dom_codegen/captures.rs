@@ -30,7 +30,7 @@
 //!   closures of one construct both name it, so it is moved twice today unless
 //!   it is `Copy`.
 //! - **Captured from outside a repeatable body**
-//!   ([`DomCodegenContext::site_shadows`]) — the site sits inside a branch /
+//!   (`DomCodegenContext::site_shadows`) — the site sits inside a branch /
 //!   arm / view / effect closure that runs more than once, so constructing a
 //!   `'static` `move` closure from it moves out of an `Fn`/`FnMut` capture
 //!   today unless it is `Copy`.
@@ -347,45 +347,101 @@ impl<'ast> Visit<'ast> for Collector {
 /// Used to determine which names a closure's params or a `let` introduces, so the
 /// capture scanner can skip them.
 pub(crate) fn collect_pat_idents(pat: &syn::Pat, out: &mut HashSet<String>) {
+    let mut idents = Vec::new();
+    collect_pat_ident_tokens(pat, &mut idents);
+    out.extend(idents.iter().map(|id| id.to_string()));
+}
+
+/// The identifiers a pattern binds, as the pattern's **own tokens** — spans,
+/// and so hygiene, intact.
+///
+/// For emitting code that names a binding (issue #394's `let _ = &name;`): a
+/// name rebuilt from its string at `Span::call_site()` does not resolve to a
+/// binding that came in through a user's `macro_rules!` fragment (`for $it in
+/// …`), and fails with E0425. An or-pattern contributes every alternative's
+/// copy; callers that emit once per name dedup.
+pub(crate) fn collect_pat_ident_tokens(pat: &syn::Pat, out: &mut Vec<syn::Ident>) {
     use syn::Pat;
     match pat {
         Pat::Ident(pat_ident) => {
-            out.insert(pat_ident.ident.to_string());
+            out.push(pat_ident.ident.clone());
             if let Some((_, sub)) = &pat_ident.subpat {
-                collect_pat_idents(sub, out);
+                collect_pat_ident_tokens(sub, out);
             }
         }
         Pat::Tuple(t) => {
             for p in &t.elems {
-                collect_pat_idents(p, out);
+                collect_pat_ident_tokens(p, out);
             }
         }
         Pat::TupleStruct(t) => {
             for p in &t.elems {
-                collect_pat_idents(p, out);
+                collect_pat_ident_tokens(p, out);
             }
         }
         Pat::Struct(s) => {
             for field in &s.fields {
-                collect_pat_idents(&field.pat, out);
+                collect_pat_ident_tokens(&field.pat, out);
             }
         }
         Pat::Or(o) => {
             for p in &o.cases {
-                collect_pat_idents(p, out);
+                collect_pat_ident_tokens(p, out);
             }
         }
-        Pat::Reference(r) => collect_pat_idents(&r.pat, out),
-        Pat::Paren(p) => collect_pat_idents(&p.pat, out),
+        Pat::Reference(r) => collect_pat_ident_tokens(&r.pat, out),
+        Pat::Paren(p) => collect_pat_ident_tokens(&p.pat, out),
         Pat::Slice(s) => {
             for p in &s.elems {
-                collect_pat_idents(p, out);
+                collect_pat_ident_tokens(p, out);
             }
         }
-        Pat::Type(t) => collect_pat_idents(&t.pat, out),
+        Pat::Type(t) => collect_pat_ident_tokens(&t.pat, out),
         // No-binding patterns:
         // - Wild, Lit, Range, Rest, Path, Const, Macro, Verbatim
         _ => {}
+    }
+}
+
+/// Whether a branch's pattern binds a value its body could read (issue #2105).
+///
+/// Such a branch is rebuilt when its scrutinee's reactive reads change while it
+/// keeps matching (`show_dom_rebinding` / `match_dom_rebinding`); one that binds
+/// nothing is built once per selection, as before.
+///
+/// A bare identifier is ambiguous in a pattern: `name` binds, but `None` or an
+/// imported unit variant or constant matches by value. Like rustc's own
+/// `non_snake_case` convention, one that starts with an uppercase letter and
+/// carries no `ref`, `mut` or `@` is taken as a path, not a binding. Getting
+/// that wrong one way costs a rebuild the branch did not need; the other way
+/// (an uppercase binding) keeps today's build-once behaviour for that branch.
+/// A macro or unparsed pattern is assumed to bind.
+pub(crate) fn pattern_binds_a_value(pat: &syn::Pat) -> bool {
+    use syn::Pat;
+    match pat {
+        Pat::Ident(pat_ident) => {
+            let starts_upper = pat_ident
+                .ident
+                .to_string()
+                .chars()
+                .next()
+                .is_some_and(char::is_uppercase);
+            pat_ident.by_ref.is_some()
+                || pat_ident.mutability.is_some()
+                || pat_ident.subpat.is_some()
+                || !starts_upper
+        }
+        Pat::Tuple(t) => t.elems.iter().any(pattern_binds_a_value),
+        Pat::TupleStruct(t) => t.elems.iter().any(pattern_binds_a_value),
+        Pat::Struct(s) => s.fields.iter().any(|f| pattern_binds_a_value(&f.pat)),
+        Pat::Or(o) => o.cases.iter().any(pattern_binds_a_value),
+        Pat::Reference(r) => pattern_binds_a_value(&r.pat),
+        Pat::Paren(p) => pattern_binds_a_value(&p.pat),
+        Pat::Slice(s) => s.elems.iter().any(pattern_binds_a_value),
+        Pat::Type(t) => pattern_binds_a_value(&t.pat),
+        Pat::Macro(_) | Pat::Verbatim(_) => true,
+        // Wild, Lit, Range, Rest, Path, Const: no binding.
+        _ => false,
     }
 }
 
@@ -400,6 +456,54 @@ mod tests {
             .iter()
             .map(|i| i.to_string())
             .collect()
+    }
+
+    fn binds(src: &str) -> bool {
+        let pat = syn::parse::Parser::parse_str(syn::Pat::parse_multi_with_leading_vert, src)
+            .expect("parse pattern");
+        super::pattern_binds_a_value(&pat)
+    }
+
+    #[test]
+    fn which_patterns_bind_a_value() {
+        // Issue #2105: a pattern that binds is rebuilt on a value change.
+        for src in [
+            "Some(name)",
+            "Some(ref name)",
+            "Some(mut n)",
+            "x",
+            "_x",
+            "(a, _)",
+            "Point { x, .. }",
+            "Point { x: Some(px), .. }",
+            "Ok(v) | Err(v)",
+            "&Some(v)",
+            "[first, ..]",
+            "N @ 1..=3",
+        ] {
+            assert!(binds(src), "{src} binds a value");
+        }
+        for src in [
+            "None",
+            "Some(_)",
+            "_",
+            "0",
+            "1..=9",
+            "Mode::Edit",
+            "Mode::Edit { .. }",
+            "Some(Mode::Edit)",
+            // An uppercase bare identifier is read as a constant or unit
+            // variant: syntax alone cannot tell `Some(N)` binding `N` from
+            // matching a `const N`, and rustc's own lints treat the uppercase
+            // form as the constant. Such a branch keeps the build-once
+            // behaviour (documented with `#[once]`).
+            "Some(N)",
+            "Ok(_) | Err(_)",
+            "(None, _)",
+            "\"lit\"",
+        ] {
+            assert!(!binds(src), "{src} binds nothing");
+        }
     }
 
     #[test]

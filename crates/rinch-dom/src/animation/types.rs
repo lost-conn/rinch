@@ -1,5 +1,8 @@
 //! Animation types: AnimationSpec, ActiveAnimation, KeyframeStop.
 
+use style::stylesheets::keyframes_rule::{KeyframesAnimation, KeyframesStepValue};
+
+use super::keyframes::StopBasis;
 use crate::transition::types::{AnimatableValue, TimingFunction, TransitionProperty};
 
 // =============================================================================
@@ -62,6 +65,17 @@ pub struct KeyframeStop {
     pub values: Vec<(TransitionProperty, AnimatableValue)>,
     /// Per-keyframe timing function override.
     pub timing_function: Option<TimingFunction>,
+    /// The properties whose value in this stop is not authored but the
+    /// element's **base value** — Web Animations' neutral keyframe (#781).
+    ///
+    /// Only a 0% or 100% stop has any: a property some keyframe of the rule
+    /// animates and that stop does not set. That covers the whole stop Stylo
+    /// generates for a missing `from`/`to` (`KeyframesStepValue::ComputedValues`)
+    /// and a property an authored `from`/`to` leaves out. A property no
+    /// keyframe names is in no stop, so the animation never writes it.
+    /// `super::keyframes::refresh_implicit_values` re-reads these values from
+    /// the current base style on every cascade of the node, so they follow it.
+    pub implicit: Vec<TransitionProperty>,
 }
 
 // =============================================================================
@@ -80,20 +94,167 @@ pub struct ActiveAnimation {
     pub fill_mode: AnimationFillMode,
     pub play_state: AnimationPlayState,
     pub start_time_ms: f64,
+    /// Whether the animation is still **pending** (#768): minted by a cascade
+    /// and not yet shown by a frame. Web Animations starts a CSS animation at
+    /// the first frame that renders its element, not at the style change that
+    /// created it, so until then it samples at t = 0 whatever the clock says
+    /// ([`Self::elapsed_ms`]), and `resolve_layout` — the frame — sets
+    /// `start_time_ms` to its own time and clears this
+    /// ([`crate::node::NodeTree::start_pending_animations`]).
+    pub pending: bool,
     /// When paused, stores the elapsed time at the moment of pause.
     pub paused_elapsed_ms: Option<f64>,
-    /// Whether the fill of a **finished** `forwards`/`both` animation has been
-    /// written by a tick (#782).
+    /// Whether a tick has written the end of this **finished** animation
+    /// (#782, #783).
     ///
-    /// The tick that finishes such an animation writes its fill and marks the
-    /// node dirty — that frame changes what the box looks like — and sets this.
-    /// From then on its sample is constant, like a paused one's: later ticks
-    /// re-apply it without dirtying anything and do not count it, and
+    /// For a `forwards`/`both` animation that end is its fill: the tick that
+    /// finishes it writes the fill and marks the node dirty, and from then on
+    /// its sample is constant, like a paused one's. For a `none`/`backwards`
+    /// one it is *no* effect: the tick that finishes it asks for a restyle of
+    /// the node, so the cascaded values replace the last sample
+    /// ([`crate::node::NodeTree::ended_animations`]), and the entry is kept as
+    /// a finished marker in [`crate::node::NodeTree::finished_animations`],
+    /// which no tick walks — a later cascade finds it by name and does not mint
+    /// the still-declared animation again from t=0, which is what a browser
+    /// does (a finished CSS animation stays finished until its
+    /// `animation-name` changes or its element is rendered again).
+    ///
+    /// Either way later ticks do not dirty anything and do not count it, and
     /// [`crate::node::NodeTree::has_running_animations`] does not count it.
     /// `start_animations` clears it again when a restyle leaves the animation
-    /// no longer filling (more iterations, say), so it describes the timing the
-    /// animation has now rather than a latch set once.
-    pub fill_settled: bool,
+    /// no longer finished (more iterations, say), so it describes the timing
+    /// the animation has now rather than a latch set once. Pausing it does not
+    /// clear it ([`Self::has_ended`]): a paused finished animation is still
+    /// finished, and resuming it costs no frame.
+    pub settled: bool,
+    /// What [`Self::keyframe_stops`] were extracted from (#766): the
+    /// `@keyframes` rule's declaration blocks and the base-style inputs an
+    /// authored stop resolves against. A cascade that finds them unchanged
+    /// keeps the stops and refreshes only their implicit values; anything else
+    /// re-extracts them.
+    pub(crate) stop_inputs: StopInputs,
+    /// The node's base basis at its last cascade (#2056): its cascaded
+    /// `font-size` and `color`, which a sample replaces with the animated
+    /// ones, and which implicit colour properties have `currentcolor` as
+    /// their base value.
+    pub(crate) base: BaseInputs,
+    /// This animation's index in the node's `animation-name` list at its last
+    /// cascade, so a later cascade matches repeated names by position even
+    /// when the entries are split between the running and the finished maps
+    /// (#780).
+    pub(crate) position: usize,
+}
+
+/// The inputs a kept animation's keyframe stops were extracted from (#766).
+///
+/// The blocks are held, not just their addresses, so an address cannot be
+/// reused by a different rule while this compares against it. Stylo shares a
+/// keyframe's declaration block between the `@keyframes` rule and every
+/// cascade data rebuilt from it, so a sheet flush that leaves the rule alone
+/// leaves these equal, and a redefined, removed or newly winning rule does not.
+///
+/// Of the base-style inputs, only the ones the authored stops **read** at
+/// extraction count ([`StopDeps`]): a `to { transform: rotate(…) }` spin reads
+/// none, so a hover that moves the element's `color` or `font-size` keeps its
+/// stops, and a `from { background-color: currentcolor }` reads the colour, so
+/// the same hover re-extracts them. The implicit (base) values of a 0%/100%
+/// stop are not inputs: they are re-read on every cascade anyway
+/// ([`super::keyframes::refresh_implicit_values`]).
+#[derive(Clone)]
+pub(crate) struct StopInputs {
+    /// The rule the stops came from. Its declaration blocks are `Arc`s that
+    /// Stylo shares with the rule, compared by address ([`Self::hold_for`]),
+    /// and a sample that has to resolve the stops again reads them
+    /// ([`super::rebase_node_stops`], #2056).
+    animation: std::sync::Arc<KeyframesAnimation>,
+    /// The values the stops resolved against, and which of them they read.
+    basis: StopBasis,
+}
+
+impl StopInputs {
+    /// The inputs of stops just extracted from `animation` against `basis`.
+    pub(crate) fn new(animation: &KeyframesAnimation, basis: StopBasis) -> Self {
+        Self {
+            animation: std::sync::Arc::new(animation.clone()),
+            basis,
+        }
+    }
+
+    /// The rule the stops came from.
+    pub(crate) fn animation(&self) -> &std::sync::Arc<KeyframesAnimation> {
+        &self.animation
+    }
+
+    /// The basis the stops were last resolved against.
+    pub(crate) fn basis(&self) -> &StopBasis {
+        &self.basis
+    }
+
+    /// The stops were resolved again against `basis` (#2056).
+    pub(crate) fn set_basis(&mut self, basis: StopBasis) {
+        self.basis = basis;
+    }
+
+    /// Whether stops extracted from `animation` against `basis` would come out
+    /// as the ones these inputs produced: the same declaration blocks, and the
+    /// same value for every base-style input those blocks read.
+    pub(crate) fn hold_for(&self, animation: &KeyframesAnimation, basis: &StopBasis) -> bool {
+        self.animation.steps.len() == animation.steps.len()
+            && self
+                .animation
+                .steps
+                .iter()
+                .zip(&animation.steps)
+                .all(|(held, step)| match (&held.value, &step.value) {
+                    (
+                        KeyframesStepValue::Declarations { block: a },
+                        KeyframesStepValue::Declarations { block },
+                    ) => servo_arc::Arc::ptr_eq(a, block),
+                    (KeyframesStepValue::ComputedValues, KeyframesStepValue::ComputedValues) => {
+                        true
+                    }
+                    _ => false,
+                })
+            && self.basis.agrees_on(basis, self.basis.read())
+    }
+}
+
+impl std::fmt::Debug for StopInputs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StopInputs")
+            .field("steps", &self.animation.steps.len())
+            .field("read", &self.basis.read())
+            .finish()
+    }
+}
+
+/// The node-level inputs of a sample that the tick cannot read back from the
+/// node's `computed_style`, which holds the last sample (#2056).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BaseInputs {
+    /// The cascaded `font-size`.
+    pub(crate) font_size: f32,
+    /// The cascaded `color`.
+    pub(crate) color: Option<peniko::Color>,
+    /// The colour properties whose computed base value is `currentcolor`, so
+    /// an implicit stop of one is the element's colour at the sample.
+    pub(crate) current_color: Vec<TransitionProperty>,
+}
+
+/// Which base-style inputs a rule's authored keyframe stops read when they
+/// were extracted ([`StopInputs`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StopDeps {
+    /// An `em` length: the element's `font-size`.
+    pub(crate) em: bool,
+    /// A `font-size` `em` or percentage: the parent's `font-size`.
+    pub(crate) parent_em: bool,
+    /// A `rem` length: the root font size.
+    pub(crate) rem: bool,
+    /// A `currentcolor`: the element's `color`.
+    pub(crate) color: bool,
+    /// `color: currentcolor`: the parent's `color`.
+    pub(crate) parent_color: bool,
 }
 
 /// Result of computing animation values at a given time.
@@ -107,6 +268,16 @@ pub enum AnimationResult {
 }
 
 impl ActiveAnimation {
+    /// Time on this animation's running clock at `current_time_ms`: zero while
+    /// it is [`Self::pending`] (#768).
+    pub fn elapsed_ms(&self, current_time_ms: f64) -> f64 {
+        if self.pending {
+            0.0
+        } else {
+            current_time_ms - self.start_time_ms
+        }
+    }
+
     /// Compute interpolated values at the given time.
     pub fn values_at(&self, current_time_ms: f64) -> AnimationResult {
         if self.duration_ms <= 0.0 && self.delay_ms <= 0.0 {
@@ -117,14 +288,16 @@ impl ActiveAnimation {
         let elapsed = if let Some(paused) = self.paused_elapsed_ms {
             paused
         } else {
-            current_time_ms - self.start_time_ms
+            self.elapsed_ms(current_time_ms)
         };
 
         // Handle delay period
         if elapsed < self.delay_ms {
             return match self.fill_mode {
+                // The before phase: CSS Easing 2's before flag is set when
+                // the first iteration runs forwards.
                 AnimationFillMode::Backwards | AnimationFillMode::Both => {
-                    self.values_at_progress(self.start_progress())
+                    self.values_at_progress(self.start_progress(), !self.reversed(0))
                 }
                 _ => AnimationResult::NoValues,
             };
@@ -139,7 +312,8 @@ impl ActiveAnimation {
                 if current_iteration >= n {
                     return match self.fill_mode {
                         AnimationFillMode::Forwards | AnimationFillMode::Both => {
-                            self.values_at_progress(self.end_progress(n))
+                            let (progress, before_flag) = self.end_progress();
+                            self.values_at_progress(progress, before_flag)
                         }
                         _ => AnimationResult::Complete,
                     };
@@ -158,7 +332,7 @@ impl ActiveAnimation {
         // Apply direction
         let directed_progress = self.apply_direction(iteration_progress, current_iteration);
 
-        self.values_at_progress(directed_progress)
+        self.values_at_progress(directed_progress, false)
     }
 
     /// Whether this animation's clock is frozen (`animation-play-state: paused`).
@@ -179,29 +353,68 @@ impl ActiveAnimation {
             .any(|k| k.values.iter().any(|(p, _)| p.changes_text_measure()))
     }
 
+    /// Whether any keyframe sets part of an inline element's edge boxes
+    /// (`TransitionProperty::changes_inline_edge`, #1426).
+    pub fn changes_inline_edge(&self) -> bool {
+        self.keyframe_stops
+            .iter()
+            .any(|k| k.values.iter().any(|(p, _)| p.changes_inline_edge()))
+    }
+
+    /// Whether any keyframe of this animation sets `property`.
+    pub fn animates(&self, property: TransitionProperty) -> bool {
+        self.keyframe_stops
+            .iter()
+            .any(|k| k.values.iter().any(|(p, _)| *p == property))
+    }
+
     /// Whether this animation has completed all iterations.
+    ///
+    /// Its active duration is `duration × iterations`, and a zero duration makes
+    /// that zero whatever the count — `0s infinite` included (Web Animations
+    /// §4.6; Chrome 155 reports such an animation `finished` at its delay's
+    /// end, #786). Only an infinite animation with a positive duration never
+    /// completes.
     pub fn is_complete(&self, current_time_ms: f64) -> bool {
         if self.paused_elapsed_ms.is_some() {
             return false; // Paused animations are never "complete"
         }
-        if let IterationCount::Finite(n) = self.iteration_count {
-            let elapsed = current_time_ms - self.start_time_ms;
-            let total = self.delay_ms + self.duration_ms * n;
-            elapsed >= total
-        } else {
-            false // Infinite animations never complete
-        }
+        let active_duration = match self.iteration_count {
+            IterationCount::Finite(n) => self.duration_ms * n,
+            IterationCount::Infinite if self.duration_ms <= 0.0 => 0.0,
+            IterationCount::Infinite => return false,
+        };
+        self.elapsed_ms(current_time_ms) >= self.delay_ms + active_duration
     }
 
-    /// Whether this animation is filling (complete but fill-mode keeps it active).
-    pub fn is_filling(&self, current_time_ms: f64) -> bool {
-        if !self.is_complete(current_time_ms) {
-            return false;
-        }
+    /// Whether the active duration has passed on this animation's own clock —
+    /// [`Self::is_complete`], except that a **paused** animation is asked at
+    /// its frozen elapsed time instead of answering `false`. Pausing a
+    /// finished animation does not un-finish it.
+    pub fn has_ended(&self, current_time_ms: f64) -> bool {
+        let elapsed = self
+            .paused_elapsed_ms
+            .unwrap_or_else(|| self.elapsed_ms(current_time_ms));
+        let active_duration = match self.iteration_count {
+            IterationCount::Finite(n) => self.duration_ms * n,
+            IterationCount::Infinite if self.duration_ms <= 0.0 => 0.0,
+            IterationCount::Infinite => return false,
+        };
+        elapsed >= self.delay_ms + active_duration
+    }
+
+    /// Whether `animation-fill-mode` holds the end value once the animation
+    /// has finished (`forwards` / `both`).
+    pub fn fills_forwards(&self) -> bool {
         matches!(
             self.fill_mode,
             AnimationFillMode::Forwards | AnimationFillMode::Both
         )
+    }
+
+    /// Whether this animation is filling (complete but fill-mode keeps it active).
+    pub fn is_filling(&self, current_time_ms: f64) -> bool {
+        self.is_complete(current_time_ms) && self.fills_forwards()
     }
 
     fn start_progress(&self) -> f32 {
@@ -211,19 +424,55 @@ impl ActiveAnimation {
         }
     }
 
-    fn end_progress(&self, iterations: f64) -> f32 {
-        let last_iter = (iterations.ceil() as u64).saturating_sub(1);
-        self.apply_direction(1.0, last_iter)
+    /// The directed progress at the end of the active duration — what a
+    /// `forwards` fill holds (Web Animations §4.8.4, #785).
+    ///
+    /// The active duration is `duration × count`, so it ends in iteration
+    /// `floor(count)` at progress `fract(count)`: 2.5 iterations stop half way
+    /// through the third, and the direction is that iteration's. A whole count
+    /// above zero ends at progress 1 of its last iteration (`count - 1`), and a
+    /// count of 0 at progress 0 of iteration 0. This holds for a zero duration
+    /// too, whose overall progress is its count. An infinite count (reachable
+    /// only with a zero duration, which is finished at once, #786) ends at
+    /// progress 1 of an infinite iteration, which Chrome 155 does not count as
+    /// odd: `alternate` fills forwards, `alternate-reverse` backwards, as
+    /// iteration 0 does.
+    ///
+    /// The second value is CSS Easing 2's before flag, which Web Animations
+    /// sets in the after phase when that last iteration runs backwards (#1564:
+    /// `steps(4, start) reverse forwards` ends at its `from` value, not a
+    /// step past it).
+    fn end_progress(&self) -> (f32, bool) {
+        let (progress, iteration) = match self.iteration_count {
+            IterationCount::Finite(n) if n <= 0.0 => (0.0, 0),
+            IterationCount::Finite(n) => {
+                let whole = n.floor();
+                if n > whole {
+                    (n - whole, whole as u64)
+                } else {
+                    (1.0, whole as u64 - 1)
+                }
+            }
+            IterationCount::Infinite => (1.0, 0),
+        };
+        (
+            self.apply_direction(progress, iteration),
+            self.reversed(iteration),
+        )
     }
 
-    fn apply_direction(&self, progress: f64, iteration: u64) -> f32 {
-        let reversed = match self.direction {
+    /// Whether iteration `iteration` runs backwards.
+    fn reversed(&self, iteration: u64) -> bool {
+        match self.direction {
             AnimationDirection::Normal => false,
             AnimationDirection::Reverse => true,
             AnimationDirection::Alternate => iteration % 2 == 1,
             AnimationDirection::AlternateReverse => iteration.is_multiple_of(2),
-        };
-        if reversed {
+        }
+    }
+
+    fn apply_direction(&self, progress: f64, iteration: u64) -> f32 {
+        if self.reversed(iteration) {
             (1.0 - progress) as f32
         } else {
             progress as f32
@@ -233,23 +482,22 @@ impl ActiveAnimation {
     fn final_values(&self) -> AnimationResult {
         match self.fill_mode {
             AnimationFillMode::Forwards | AnimationFillMode::Both => {
-                let n = match self.iteration_count {
-                    IterationCount::Finite(n) => n,
-                    IterationCount::Infinite => 1.0,
-                };
-                self.values_at_progress(self.end_progress(n))
+                let (progress, before_flag) = self.end_progress();
+                self.values_at_progress(progress, before_flag)
             }
             _ => AnimationResult::Complete,
         }
     }
 
-    fn values_at_progress(&self, progress: f32) -> AnimationResult {
+    /// The values at directed progress `progress`, the interval's easing
+    /// evaluated with `before_flag` (CSS Easing 2's before flag).
+    fn values_at_progress(&self, progress: f32, before_flag: bool) -> AnimationResult {
         if self.keyframe_stops.is_empty() {
             return AnimationResult::NoValues;
         }
 
-        // Find surrounding keyframe stops
-        let (prev_idx, next_idx) = self.find_surrounding_stops(progress);
+        // Find the keyframe interval progress falls in
+        let (prev_idx, next_idx) = self.interval(progress);
 
         let prev = &self.keyframe_stops[prev_idx];
         let next = &self.keyframe_stops[next_idx];
@@ -264,14 +512,26 @@ impl ActiveAnimation {
         let local = ((progress - prev.percentage) / span).clamp(0.0, 1.0);
 
         // Apply timing function (from prev keyframe, or default)
-        let timing = prev.timing_function.unwrap_or(self.default_timing);
-        let eased = timing.apply(local);
+        let timing = prev
+            .timing_function
+            .as_ref()
+            .unwrap_or(&self.default_timing);
+        let eased = timing.apply_with_before_flag(local, before_flag);
 
         // Interpolate each property
         let mut result = Vec::new();
         for (prop, from_val) in &prev.values {
             if let Some((_, to_val)) = next.values.iter().find(|(p, _)| p == prop) {
-                if let Some(interpolated) = from_val.interpolate(to_val, eased) {
+                // An eased 0 or 1 is the keyframe's own value, as it was when
+                // an iteration's ends snapped to it: an interpolation there
+                // need not reproduce it (a `matrix3d` against `none` is
+                // decomposed and put back together), and Chrome 153 shows the
+                // keyframe.
+                if eased == 0.0 {
+                    result.push((*prop, from_val.clone()));
+                } else if eased == 1.0 {
+                    result.push((*prop, to_val.clone()));
+                } else if let Some(interpolated) = from_val.interpolate(to_val, eased) {
                     result.push((*prop, interpolated));
                 } else {
                     // Snap to target at 50%
@@ -296,30 +556,26 @@ impl ActiveAnimation {
         AnimationResult::Values(result)
     }
 
-    /// Binary search for surrounding keyframe stops.
-    fn find_surrounding_stops(&self, progress: f32) -> (usize, usize) {
+    /// The keyframe interval `progress` falls in (Web Animations, "the
+    /// effect value of a keyframe effect"): it starts at the last stop at or
+    /// before `progress` that is below 100%, so an iteration's start (0) and end
+    /// (1) are the first and last interval at distances 0 and 1 and are
+    /// **eased**, not snapped to the keyframe there — `steps(4, start)` at 0 and
+    /// `linear(0, 0.5)` at 1 sit a step or half way off it (#1564). Only a
+    /// progress of 1 with more than one stop at 100% takes the last stop alone.
+    fn interval(&self, progress: f32) -> (usize, usize) {
         let stops = &self.keyframe_stops;
-        if stops.is_empty() {
+        let last = stops.len().saturating_sub(1);
+        if last == 0 {
             return (0, 0);
         }
-        if progress <= stops[0].percentage {
-            return (0, 0);
-        }
-        if progress >= stops[stops.len() - 1].percentage {
-            let last = stops.len() - 1;
+        if progress >= 1.0 && stops.iter().filter(|s| s.percentage >= 1.0).count() > 1 {
             return (last, last);
         }
-
-        // Find the last stop with percentage <= progress
-        let mut prev_idx = 0;
-        for (i, stop) in stops.iter().enumerate() {
-            if stop.percentage <= progress {
-                prev_idx = i;
-            } else {
-                break;
-            }
-        }
-        let next_idx = (prev_idx + 1).min(stops.len() - 1);
-        (prev_idx, next_idx)
+        let start = stops
+            .iter()
+            .rposition(|s| s.percentage <= progress && s.percentage < 1.0)
+            .unwrap_or(0);
+        (start, (start + 1).min(last))
     }
 }

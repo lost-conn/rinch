@@ -20,7 +20,6 @@
 //! when Ctrl+V arrives — so nothing dispatches this there today. The hook lives in
 //! `rinch-core` so app code that registers it compiles for every target.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 /// The content a paste carried, as the platform delivered it.
@@ -44,14 +43,13 @@ pub type PasteInterceptor = Rc<dyn Fn(&PasteEventData) -> bool>;
 /// [`DocScopedSlotMap`](crate::reactive::DocScopedSlotMap).
 type InterceptorSlots = crate::reactive::DocScopedSlotMap<dyn Fn(&PasteEventData) -> bool>;
 
-thread_local! {
+crate::doc_keyed! {
     /// One interceptor slot **per document**, plus the ownerless `None` entry —
     /// keyed exactly like [`KEYBOARD_INTERCEPTOR`](super::set_keyboard_interceptor)
     /// (issues #340, #478): two documents on one thread no longer clobber each
     /// other's registration, and dispatch prefers the dispatching document's
     /// interceptor over the thread-global fallback.
-    static PASTE_INTERCEPTOR: RefCell<InterceptorSlots> =
-        const { RefCell::new(InterceptorSlots::new()) };
+    static PASTE_INTERCEPTOR: InterceptorSlots = InterceptorSlots::new();
 }
 
 /// Set the paste interceptor for the current document.
@@ -60,8 +58,8 @@ thread_local! {
 /// handler may call `rinch::clipboard::paste_text()` / `paste_html()` inside it
 /// and get the just-pasted content. Only one interceptor can be active at a time
 /// **per document**: a second call from the same document replaces the first
-/// (issue #478). Registering outside any dispatch — from `main`, a timer, or at
-/// mount, and everywhere on rinch-web, which never marks dispatch — fills the
+/// (issue #478). Registering outside any document — from `main`, a timer armed
+/// there, or page script outside any rinch-web root (#2811) — fills the
 /// thread-global fallback slot, which serves every document that has no
 /// interceptor of its own.
 ///
@@ -109,7 +107,9 @@ pub fn has_paste_interceptor() -> bool {
 /// different interceptor, for instance) without a double borrow.
 pub fn dispatch_paste_event(data: &PasteEventData) -> bool {
     match crate::reactive::read_doc_scoped_slot(&PASTE_INTERCEPTOR) {
-        Some(cb) => cb(data),
+        // One transaction per handler (`crate::reactive::batch`), untracked
+        // (#931): this is public, so it can be called from inside an effect.
+        Some(cb) => crate::reactive::batch(|| crate::reactive::untracked_handler(|| cb(data))),
         None => false,
     }
 }
@@ -117,7 +117,7 @@ pub fn dispatch_paste_event(data: &PasteEventData) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     use crate::reactive::Scope;
 

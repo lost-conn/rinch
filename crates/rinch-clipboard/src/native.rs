@@ -324,6 +324,18 @@ fn rich_probe(backend: &mut dyn Backend) -> ClipboardResult<RichPaste> {
     }
 }
 
+/// [`rich_probe`], plus the `text/plain` flavour offered beside an html answer —
+/// still **one** worker job, so the text costs no second trip (and no second
+/// worst-case stall: the owner has just answered the html read).
+fn rich_with_text_probe(backend: &mut dyn Backend) -> ClipboardResult<(RichPaste, Option<String>)> {
+    let rich = rich_probe(backend)?;
+    let text = match rich {
+        RichPaste::Html(_) => backend.get_text().ok().filter(|t| !t.is_empty()),
+        RichPaste::Image(_) | RichPaste::Text(_) => None,
+    };
+    Ok((rich, text))
+}
+
 // ── The in-memory backend (tests) ────────────────────────────────────────────
 
 /// Route every clipboard call in this process to an **in-memory** clipboard
@@ -426,6 +438,19 @@ pub fn copy_text_async(text: impl AsRef<str>) {
     }));
 }
 
+/// Copy text **without waiting**, and report the write's result: `on_done` is
+/// called with what the clipboard said, **on the clipboard worker thread** (see
+/// the module docs for hopping back to the UI). The shape a "Copied" confirmation
+/// needs on every target — on the web it is the browser's answer to
+/// `navigator.clipboard.writeText`.
+pub fn copy_text_then(
+    text: impl AsRef<str>,
+    on_done: impl FnOnce(ClipboardResult<()>) + Send + 'static,
+) {
+    let text = text.as_ref().to_string();
+    run_async(move |b| b.set_text(&text), on_done);
+}
+
 /// Paste text from the clipboard.
 ///
 /// Blocks until the clipboard owner answers — potentially seconds. Prefer
@@ -508,6 +533,18 @@ pub fn copy_html_async(html: impl AsRef<str>, alt_text: Option<&str>) {
     }));
 }
 
+/// [`copy_html`] without waiting, reporting the write's result as
+/// [`copy_text_then`] does (on the clipboard worker thread).
+pub fn copy_html_then(
+    html: impl AsRef<str>,
+    alt_text: Option<&str>,
+    on_done: impl FnOnce(ClipboardResult<()>) + Send + 'static,
+) {
+    let html = html.as_ref().to_string();
+    let alt = alt_text.map(str::to_string);
+    run_async(move |b| b.set_html(&html, alt.as_deref()), on_done);
+}
+
 /// Paste HTML from the clipboard.
 ///
 /// Returns the HTML content if the clipboard contains `text/html`.
@@ -548,6 +585,34 @@ pub fn paste_rich_timeout(timeout: Duration) -> ClipboardResult<RichPaste> {
 /// pass, one completion — never three stacked worst-case stalls.
 pub fn paste_rich_async(on_done: impl FnOnce(ClipboardResult<RichPaste>) + Send + 'static) {
     run_async(rich_probe, on_done);
+}
+
+/// [`paste_rich`], and the `text/plain` flavour when the richest answer is
+/// `text/html`: `(RichPaste::Html(html), Some(text))` for a copy that offers both
+/// (a browser's selection, an address bar's link). The second value is `None`
+/// when the first is [`RichPaste::Text`] (it *is* the text) or an image, or the
+/// clipboard offers no text beside its html. One trip to the clipboard.
+///
+/// For a consumer that decides by the text before it takes the html — the
+/// editor's paste hook, which is how an app sees that a paste is a URL.
+pub fn paste_rich_with_text() -> ClipboardResult<(RichPaste, Option<String>)> {
+    run_blocking(rich_with_text_probe, None)
+}
+
+/// [`paste_rich_with_text`], giving up after `timeout` with
+/// [`ClipboardError::TimedOut`].
+pub fn paste_rich_with_text_timeout(
+    timeout: Duration,
+) -> ClipboardResult<(RichPaste, Option<String>)> {
+    run_blocking(rich_with_text_probe, Some(timeout))
+}
+
+/// [`paste_rich_with_text`] without blocking; `on_done` runs on the clipboard
+/// worker thread. What the built-in editor's Ctrl+V uses.
+pub fn paste_rich_with_text_async(
+    on_done: impl FnOnce(ClipboardResult<(RichPaste, Option<String>)>) + Send + 'static,
+) {
+    run_async(rich_with_text_probe, on_done);
 }
 
 #[cfg(test)]
@@ -808,6 +873,48 @@ mod tests {
         assert!(
             matches!(h.blocking(rich_probe, None).unwrap(), RichPaste::Text(t) if t == "plain")
         );
+    }
+
+    /// The text beside the html comes from the same single job, and only
+    /// beside html: a text answer is its own text, an image has none.
+    #[test]
+    fn the_rich_probe_with_text_reads_the_text_beside_html_in_the_same_pass() {
+        let h = Harness::new(
+            |c| {
+                c.html = Some("<a href=\"https://x.test/\">x</a>".into());
+                c.text = Some("https://x.test/".into());
+            },
+            Duration::ZERO,
+        );
+        let (rich, text) = h.blocking(rich_with_text_probe, None).unwrap();
+        assert!(matches!(rich, RichPaste::Html(ref h) if h.contains("href")));
+        assert_eq!(text.as_deref(), Some("https://x.test/"));
+        assert_eq!(h.jobs.load(Ordering::SeqCst), 1, "one worker job");
+        assert_eq!(
+            h.read_counts(),
+            (1, 1, 0),
+            "(text, html, image): the html, then the text beside it, no image read"
+        );
+
+        let h = Harness::new(|c| c.text = Some("plain".into()), Duration::ZERO);
+        let (rich, text) = h.blocking(rich_with_text_probe, None).unwrap();
+        assert!(matches!(rich, RichPaste::Text(ref t) if t == "plain"));
+        assert_eq!(text, None, "a text answer carries its text itself");
+
+        let h = Harness::new(
+            |c| {
+                c.image = Some(ImageData::new(1, 1, vec![0u8; 4]));
+                c.text = Some("plain".into());
+            },
+            Duration::ZERO,
+        );
+        let (rich, text) = h.blocking(rich_with_text_probe, None).unwrap();
+        assert!(matches!(rich, RichPaste::Image(_)));
+        assert_eq!(text, None);
+
+        let h = Harness::new(|c| c.html = Some("<p>only</p>".into()), Duration::ZERO);
+        let (_, text) = h.blocking(rich_with_text_probe, None).unwrap();
+        assert_eq!(text, None, "html with no text beside it");
     }
 
     /// An empty clipboard reports a content-type mismatch rather than an empty

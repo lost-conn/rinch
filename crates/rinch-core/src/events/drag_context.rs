@@ -109,7 +109,9 @@ thread_local! {
 ///
 /// Call this from `ondragstart`, `ondragenter`, `DragEnter`, or `DragOver`
 /// handlers when the drop target provides its own visual feedback. The ghost
-/// remains hidden until `restore_drag_ghost()` is called or the drag ends.
+/// remains hidden until `restore_drag_ghost()` is called or the drag ends —
+/// by a drop, a release, Escape or a pointer cancel alike — and every drag
+/// starts with it visible, so a suppression never outlives its drag (#333).
 ///
 /// ```ignore
 /// // In a surface event handler:
@@ -141,7 +143,7 @@ pub fn is_drag_ghost_visible() -> bool {
 }
 
 /// Reset ghost visibility to default (visible). Called by the runtime
-/// when a drag ends.
+/// when a drag starts (before `data-ondragstart`) and whenever one ends.
 pub fn reset_drag_ghost_visibility() {
     DRAG_GHOST_VISIBLE.with(|v| v.set(true));
 }
@@ -182,5 +184,38 @@ mod tests {
         assert_eq!(drag.take(), None);
         assert!(!drag.is_active());
         drag.clear(); // lenient write — must not panic either
+    }
+}
+
+// ============================================================================
+// Element drag end
+// ============================================================================
+
+thread_local! {
+    static DRAG_END_LISTENERS: std::cell::RefCell<Vec<std::rc::Rc<dyn Fn()>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Call `f` at the end of every element drag (`draggable` + `data-ondrag*`),
+/// dropped or cancelled, after the source's `data-ondragend` (#2091), for the
+/// rest of the thread.
+///
+/// The end is the runtime's, not the source element's: an app that re-renders
+/// the dragged element mid-drag removes the node `data-ondragend` is sent to,
+/// and a component that keeps state for the drag (a sortable list) still
+/// needs to hear it. Both backends call [`notify_element_drag_ended`]; an
+/// embedder that runs the drag suite itself should too.
+pub fn on_element_drag_end(f: impl Fn() + 'static) {
+    DRAG_END_LISTENERS.with(|l| l.borrow_mut().push(std::rc::Rc::new(f)));
+}
+
+/// Tell the [`on_element_drag_end`] listeners an element drag ended. A backend
+/// entry point.
+#[doc(hidden)]
+pub fn notify_element_drag_ended() {
+    // Snapshot: a listener may register another.
+    let listeners: Vec<std::rc::Rc<dyn Fn()>> = DRAG_END_LISTENERS.with(|l| l.borrow().clone());
+    for f in listeners {
+        crate::reactive::batch(|| crate::reactive::untracked_handler(|| f()));
     }
 }

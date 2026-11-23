@@ -284,7 +284,7 @@ fn an_inline_flex_lays_its_mixed_content_out_in_a_row() {
          no anonymous block boxes — got {:?}",
         doc.tree.get(w.0).unwrap().run_boxes,
     );
-    let claimed: Vec<usize> = doc
+    let claimed: Vec<u64> = doc
         .tree
         .nodes
         .iter()
@@ -536,7 +536,16 @@ fn an_inline_block_measures_its_box_with_its_own_text_style() {
     fn width_of(extra: &str) -> (f32, f32) {
         let mut doc = RinchDocument::new();
         let body = doc.body();
-        let c = el(&mut doc, body, "div", CONTAINER);
+        // Wider than `CONTAINER`: the 32px row is ~400 wide in Chrome's face
+        // and wider in the host's, and an auto-width inline-block is capped at
+        // its containing block (#658) — it would wrap, and this is about the
+        // measurement, not the cap.
+        let c = el(
+            &mut doc,
+            body,
+            "div",
+            "width: 700px; line-height: 20px; font-size: 16px",
+        );
         let w = el(
             &mut doc,
             c,
@@ -676,20 +685,15 @@ fn an_inline_blocks_text_fits_the_box_it_was_measured_into() {
 /// `min-width: 10%` of a 400px cell is 40px, far under the ~580px this text
 /// wants, so the two spellings below are the same box by construction — a twin
 /// whose oracle is the input, like the rest of this file. Chrome 150 gives both
-/// `400x40`; rinch gives both `580x20` because an auto-width inline-block never
-/// caps at its containing block (`min(max-content, available)` — the
-/// min-content half of CSS 2.1 §10.3.5 is unimplemented, pre-existing and
-/// unchanged here, which is precisely why the twin rather than the number is
-/// asserted).
+/// `400x40`, and so does rinch since #658: an auto-width inline-block is
+/// shrink-to-fit, capped at its containing block. (Before that both were
+/// `580x20`, and the twin was all that could be asserted.)
 ///
-/// It is here because the percentage path is the only one that runs
-/// `measure_inline_blocks`' shrink-to-fit pin, and the pin has to be taken from
-/// **`unrounded_layout`**. Taffy rounds a final layout to whole pixels; pinning
-/// the rounded 580 for a 580.37px max-content line re-broke the text into two
-/// lines and left a 580-wide box holding an interior laid out for 400. Measured
-/// both ways: `(580, 20)` with the unrounded pin, `(580, 40)` with the rounded
-/// one, against a twin that is `(580, 20)` either way because it never reaches
-/// the pin at all.
+/// The unrounded pin this test used to guard (a 580.37px line pinned at the
+/// rounded 580 re-broke into two lines) is now
+/// `inline_block_shrink_to_fit_658_tests::a_fitting_box_is_pinned_at_its_unrounded_width`:
+/// a capped box is pinned at its containing block's width, which is no
+/// rounding question.
 #[test]
 fn a_percentage_min_width_that_cannot_bind_changes_nothing() {
     fn build(extra: &str) -> (f32, f32) {
@@ -720,9 +724,9 @@ fn a_percentage_min_width_that_cannot_bind_changes_nothing() {
          percentage re-measure must land where the plain one does",
     );
     assert_eq!(
-        bound.1, LINE,
-        "…on one line: the text was measured at the width the box has, not at \
-         a whole-pixel rounding of it",
+        bound,
+        (400.0, 2.0 * LINE),
+        "…capped at the 400px cell and wrapped onto two lines, as in Chrome",
     );
 }
 
@@ -730,11 +734,12 @@ fn a_percentage_min_width_that_cannot_bind_changes_nothing() {
 /// border.
 ///
 /// Chrome 150 in a `line-height: 20px` container: `0x0`, and `2x2` with
-/// `border: 1px solid black`. This is the pin on the one place the four
-/// block-container sites deliberately disagree — `apply_empty_block_line_floor`
-/// is a rinch divergence for blockified form controls and must not reach an
-/// atomic inline, or every childless `inline-block` (an `<img>` with no `src`
-/// included, since the UA sheet makes it one) becomes one line tall.
+/// `border: 1px solid black`. This was the pin on the one place the four
+/// block-container sites deliberately disagreed — the one-line floor for
+/// childless blocks, a rinch divergence for blockified form controls that must
+/// not reach an atomic inline. The floor is gone (#296), and an empty block is 0
+/// tall too; the fixture stays, since an empty inline-block is still owed a
+/// zero box.
 #[test]
 fn an_empty_inline_block_is_zero_sized() {
     for (style, want) in [
@@ -942,8 +947,7 @@ fn an_image_with_no_source_has_no_box() {
     assert_eq!(
         (lay(&doc, img).2, lay(&doc, img).3),
         (0.0, 0.0),
-        "Chrome gives a source-less <img> no box; a one-line floor would make \
-         it 19 tall",
+        "Chrome gives a source-less <img> no box",
     );
 }
 
@@ -1075,12 +1079,11 @@ fn a_container_that_stops_being_one_takes_its_text_back() {
 /// `set_inner_html` is outer-first: the host came out `14x14`, its padding and
 /// nothing else.
 ///
-/// Chrome 150: host `54x34`, inner at `(7, 10)` inside it. **rinch gives the
-/// host `54x26` and the inner `(7, 7)`, and that 8px is #624**, not this fix: a
-/// line box holding only an atomic inline gets no strut, so the line is the
-/// inner's own 12px rather than the container's declared 20, and there is no
-/// room above it to baseline-align into. The width and the inner's own box are
-/// asserted; the height is recorded here and left to #624.
+/// Chrome 156 (the bundled Inter, `16px/20px`): host `54x34`, inner at
+/// `(7, 11)` inside it — its line box is the declared 20px strut, and the 12px
+/// box baseline-aligns into it. Before parley 0.12 rinch gave the host `54x26`
+/// and the inner `(7, 7)`: a line box holding only an atomic inline had no
+/// strut (#624).
 ///
 /// **This one passed on `main` too**, so it is a regression pin rather than a
 /// kill: before the fix the inner `<i>` was not IFC content at all and the host
@@ -1090,12 +1093,23 @@ fn a_container_that_stops_being_one_takes_its_text_back() {
 #[test]
 fn a_nested_atomic_inline_is_measured_before_the_box_that_places_it() {
     let mut doc = RinchDocument::new();
+    {
+        use parley::fontique::{Blob, FontInfoOverride};
+        const FACE: &[u8] = include_bytes!("../assets/fonts/Inter-Regular.ttf");
+        doc.font_cx.collection.register_fonts(
+            Blob::new(std::sync::Arc::new(FACE)),
+            Some(FontInfoOverride {
+                family_name: Some("ProbeFace"),
+                ..Default::default()
+            }),
+        );
+    }
     let body = doc.body();
     let container = doc.create_element("div");
     doc.append_child(body, container);
     doc.set_inner_html(
         container,
-        "<div style=\"padding: 20px\">\
+        "<div style=\"padding: 20px; font: 16px/20px ProbeFace\">\
            <span id=\"host\" style=\"display: inline-block; padding: 7px\">\
              <i id=\"inner\" style=\"display: inline-block; width: 40px; height: 12px\"></i>\
            </span>\
@@ -1119,10 +1133,10 @@ fn a_nested_atomic_inline_is_measured_before_the_box_that_places_it() {
     );
     assert_eq!(
         rel(&doc, inner, host),
-        (7.0, 7.0),
-        "inside the host's padding. Chrome says (7, 10): its line box is the \
-         container's declared 20px and the 12px box baseline-aligns into it, \
-         where rinch's line box is the box's own 12px — that is #624",
+        (7.0, 11.0),
+        "inside the host's padding, baseline-aligned into the declared 20px \
+         line box (Chrome 156: (7, 11))",
     );
+    assert_eq!(lay(&doc, host).3, 34.0, "Chrome 156: the host is 54x34");
     assert_consistent(&doc, "nested atomic inlines");
 }

@@ -39,8 +39,38 @@ pub struct NodeSpec {
     /// Whether the node isolates cursor (can't escape via arrow keys)
     pub isolating: bool,
 
+    /// Whether the node *defines* its content (ProseMirror's `defining`): a
+    /// list item, a heading, a quote. When content whose outer node is
+    /// defining is pasted over a whole textblock (an empty line included), the
+    /// defining node is kept and takes the textblock's place, where a
+    /// non-defining wrapper is dropped and only its content goes in. See
+    /// [`Transform::replace_range`](crate::transform::Transform::replace_range).
+    pub defining: bool,
+
+    /// Whether the node holds code (ProseMirror's `code`): a paste into it is
+    /// plain text, line breaks kept.
+    pub code: bool,
+
     /// Node attributes with their defaults
     pub attrs: BTreeMap<String, AttrSpec>,
+
+    /// Whether the node keeps an app's `data-*` attributes beside the ones
+    /// [`attrs`](Self::attrs) declares: any valid HTML custom data attribute
+    /// name rinch does not reserve ([`is_app_data_attr`]), with a string
+    /// value, at most [`MAX_DATA_ATTRS`] of them and each value at most
+    /// [`MAX_DATA_ATTR_VALUE`] bytes ([`kept_data_attrs`]). Kept by attribute
+    /// validation, `DocNode`, HTML (as themselves on the node's void element, or
+    /// on the `<div>` a tagless block atom is written as), collaboration and the
+    /// view (which writes them on the host element). Off by default; the
+    /// starter kit's `image` and `embed` opt in. Only a **leaf** node
+    /// type may set it: [`SchemaBuilder::build`] panics for one with content.
+    ///
+    /// [`is_app_data_attr`]: crate::schema::is_app_data_attr
+    /// [`kept_data_attrs`]: crate::schema::kept_data_attrs
+    /// [`MAX_DATA_ATTRS`]: crate::schema::MAX_DATA_ATTRS
+    /// [`MAX_DATA_ATTR_VALUE`]: crate::schema::MAX_DATA_ATTR_VALUE
+    /// [`SchemaBuilder::build`]: crate::schema::SchemaBuilder::build
+    pub data_attrs: bool,
 
     /// HTML tags to parse as this node (e.g., ["p"], ["h1", "h2", "h3"...])
     pub parse_html_tags: Vec<String>,
@@ -64,7 +94,10 @@ impl NodeSpec {
             selectable: true,
             draggable: false,
             isolating: false,
+            defining: false,
+            code: false,
             attrs: BTreeMap::new(),
+            data_attrs: false,
             parse_html_tags: Vec::new(),
         }
     }
@@ -81,7 +114,10 @@ impl NodeSpec {
             selectable: false,
             draggable: false,
             isolating: false,
+            defining: false,
+            code: false,
             attrs: BTreeMap::new(),
+            data_attrs: false,
             parse_html_tags: Vec::new(),
         }
     }
@@ -98,7 +134,10 @@ impl NodeSpec {
             selectable: true,
             draggable: false,
             isolating: false,
+            defining: false,
+            code: false,
             attrs: BTreeMap::new(),
+            data_attrs: false,
             parse_html_tags: Vec::new(),
         }
     }
@@ -140,7 +179,7 @@ impl MarkSet {
 /// defaults to `Int(1)` and `task_item.checked` to `Bool(false)` — the typed
 /// model the document tree carries (amendment A11). `default == None` marks a
 /// required attribute (no default; absence is a schema-validation error at the
-/// serialization / Step boundary via [`NodeType::compute_attrs`]).
+/// serialization / Step boundary via `NodeType::compute_attrs`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttrSpec {
     /// Default value (None = required attribute)
@@ -187,7 +226,10 @@ impl NodeSpecBuilder {
                 selectable: true,
                 draggable: false,
                 isolating: false,
+                defining: false,
+                code: false,
                 attrs: BTreeMap::new(),
+                data_attrs: false,
                 parse_html_tags: Vec::new(),
             },
         }
@@ -247,9 +289,27 @@ impl NodeSpecBuilder {
         self
     }
 
+    /// Set whether the node is defining (see [`NodeSpec::defining`]).
+    pub fn defining(mut self, defining: bool) -> Self {
+        self.spec.defining = defining;
+        self
+    }
+
+    /// Set whether the node holds code (see [`NodeSpec::code`]).
+    pub fn code(mut self, code: bool) -> Self {
+        self.spec.code = code;
+        self
+    }
+
     /// Add an attribute specification.
     pub fn attr(mut self, name: impl Into<String>, attr: AttrSpec) -> Self {
         self.spec.attrs.insert(name.into(), attr);
+        self
+    }
+
+    /// Keep an app's `data-*` attributes (see [`NodeSpec::data_attrs`]).
+    pub fn data_attrs(mut self, data_attrs: bool) -> Self {
+        self.spec.data_attrs = data_attrs;
         self
     }
 

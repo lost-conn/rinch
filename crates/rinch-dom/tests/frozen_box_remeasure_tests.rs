@@ -44,6 +44,7 @@ const TYPOGRAPHY_CSS: &str = "
 
 fn typography_doc(class: &str) -> (RinchDocument, NodeId, NodeId) {
     let mut doc = RinchDocument::new();
+    doc.set_animation_clock_ms(Some(1_000_000.0)); // pinned: exact samples (#2267)
     doc.load_css(TYPOGRAPHY_CSS);
     let body = doc.body();
     let root = doc.create_element("div");
@@ -131,6 +132,288 @@ fn a_colour_only_restyle_still_skips_taffy() {
     );
 }
 
+// ------------------------------------------------- display: contents -----
+
+/// `typography_doc` with the text wrapped in a `display: contents` `<span>` —
+/// the shape `rsx!` emits for every `{|| …}` reactive text and every
+/// if/for/match/component site. Returns the wrapper as well.
+fn contents_doc(class: &str) -> (RinchDocument, NodeId, NodeId, NodeId) {
+    let mut doc = RinchDocument::new();
+    doc.set_animation_clock_ms(Some(1_000_000.0)); // pinned: exact samples (#2267)
+    doc.load_css(TYPOGRAPHY_CSS);
+    let body = doc.body();
+    let root = doc.create_element("div");
+    doc.set_attribute(root, "class", class);
+    doc.append_child(body, root);
+    let ifc = doc.create_element("div");
+    doc.set_attribute(ifc, "class", "ifc");
+    doc.append_child(root, ifc);
+    let wrapper = doc.create_element("span");
+    doc.set_attribute(wrapper, "style", "display: contents");
+    doc.append_child(ifc, wrapper);
+    let text = doc.create_text("hello world hello world");
+    doc.append_child(wrapper, text);
+    (doc, root, ifc, wrapper)
+}
+
+/// The cheap path survives a `display: contents` wrapper in the restyled
+/// subtree.
+///
+/// `sync_display_contents` stores a wrapper's Taffy style as `Display::None`,
+/// and the cascade used to rebuild it from the computed values as
+/// `Display::Flex` — so the comparison in `apply_stylo_styles_to_taffy` saw a
+/// display change on **every** re-cascade of a wrapper, set `ifc_dirty` and
+/// `layout_dirty`, and ran the whole-document structural pass plus a compute.
+/// A class change re-cascades the whole subtree (as a `:hover` does), so this
+/// colour-only change reaches the wrapper. At 2000 rows that made a hover cost
+/// 82ms where the same hover without wrappers costs 0.12ms.
+///
+/// `a_colour_only_restyle_still_skips_taffy` above could not see it: its
+/// fixture has no wrapper.
+#[test]
+fn a_colour_only_restyle_over_a_contents_wrapper_still_skips_taffy() {
+    let (mut doc, root, _ifc, _wrapper) = contents_doc("sans");
+    doc.resolve_layout(800.0, 600.0);
+    let computes = doc.tree.taffy_computes;
+    let passes = doc.tree.ifc_setup_passes;
+    assert!(
+        computes > 0 && passes > 0,
+        "positive control: the first layout must run a compute and a structural \
+         pass, or this fixture cannot tell a skipped one from a broken counter"
+    );
+
+    // Twice: the first restyle after mount and a steady-state one must both
+    // take the cheap path.
+    for class in ["red", "sans"] {
+        doc.set_attribute(root, "class", class);
+        doc.resolve_layout(800.0, 600.0);
+        assert_eq!(
+            doc.tree.ifc_setup_passes, passes,
+            "a colour-only restyle over a contents wrapper (to `.{class}`) must \
+             not re-run the structural IFC pass"
+        );
+        assert_eq!(
+            doc.tree.taffy_computes, computes,
+            "a colour-only restyle over a contents wrapper (to `.{class}`) must \
+             take the early return, not a Taffy compute"
+        );
+    }
+
+    // Positive control: the same document, a typography change — the compute
+    // must happen, so the assertions above are not passing on a dead counter.
+    doc.set_attribute(root, "class", "mono");
+    doc.resolve_layout(800.0, 600.0);
+    assert!(
+        doc.tree.taffy_computes > computes,
+        "positive control: a typography change must run a compute"
+    );
+}
+
+/// The other side of the same comparison: a **real** crossing into or out of
+/// `display: contents` still re-runs the structural pass and lays the wrapper
+/// out as what it now is.
+///
+/// The fix makes the cascade rebuild a wrapper's Taffy style as the
+/// `Display::None` style `sync_display_contents` writes, keyed on the
+/// **computed** display. Keying it on `contents_spliced` instead looks
+/// equivalent and is not: on the way *out* of `contents` that flag is still set
+/// when the cascade runs (the sync pass clears it later), so the wrapper keeps
+/// `Display::None` and never gets its box back — this fixture's `200.0` check
+/// fails on that mutant (measured: `0.0`). Also covered: both directions,
+/// twice, and `flex -> contents`, whose Taffy displays used to compare equal
+/// (#520).
+#[test]
+fn a_real_display_change_into_or_out_of_contents_still_invalidates() {
+    let (mut doc, _root, ifc, wrapper) = contents_doc("sans");
+    doc.resolve_layout(800.0, 600.0);
+    let contents_height = height(&doc, ifc);
+
+    for round in 0..2 {
+        let passes = doc.tree.ifc_setup_passes;
+        doc.set_attribute(wrapper, "style", "display: block; height: 200px");
+        doc.resolve_layout(800.0, 600.0);
+        assert!(
+            doc.tree.ifc_setup_passes > passes,
+            "round {round}: contents -> block must re-run the structural pass"
+        );
+        assert_eq!(
+            height(&doc, wrapper),
+            200.0,
+            "round {round}: the wrapper must get its own box back"
+        );
+        assert_ne!(
+            height(&doc, ifc),
+            contents_height,
+            "round {round}: counter-oracle: the container must grow around the \
+             wrapper's own box"
+        );
+
+        let passes = doc.tree.ifc_setup_passes;
+        doc.set_attribute(wrapper, "style", "display: contents; height: 200px");
+        doc.resolve_layout(800.0, 600.0);
+        assert!(
+            doc.tree.ifc_setup_passes > passes,
+            "round {round}: block -> contents must re-run the structural pass"
+        );
+        assert_eq!(
+            height(&doc, ifc),
+            contents_height,
+            "round {round}: the wrapper must be spliced again, its height ignored"
+        );
+    }
+
+    doc.set_attribute(wrapper, "style", "display: flex; height: 200px");
+    doc.resolve_layout(800.0, 600.0);
+    assert_eq!(height(&doc, wrapper), 200.0, "flex: the wrapper has a box");
+    let passes = doc.tree.ifc_setup_passes;
+    doc.set_attribute(wrapper, "style", "display: contents; height: 200px");
+    doc.resolve_layout(800.0, 600.0);
+    assert!(
+        doc.tree.ifc_setup_passes > passes,
+        "flex -> contents must re-run the structural pass"
+    );
+    assert_eq!(
+        height(&doc, ifc),
+        contents_height,
+        "flex -> contents splices"
+    );
+}
+
+/// Stylesheet for the two tick fixtures below: a `display: contents` wrapper
+/// that carries a `width` transition or a `width` animation. `width` is a
+/// layout property, so a tick marks the wrapper `LAYOUT`-dirty and it reaches
+/// the tick passes' Taffy re-sync — which is the code under test.
+const CONTENTS_TICK_CSS: &str = "
+    @keyframes pulse { from { width: 10px; } to { width: 100px; } }
+    .sans { font-family: sans-serif; font-size: 16px; line-height: 20px; }
+    .red  { font-family: sans-serif; font-size: 16px; line-height: 20px; color: rgb(255,0,0); }
+    .ifc  { width: 100px; }
+    .w    { display: contents; width: 10px; transition: width 1000ms linear; }
+    .w.wide { width: 100px; }
+    .w.anim { animation: pulse 1000ms linear infinite; }
+";
+
+/// `div.<root_class> > div.ifc > span.w.<wrapper_extra> > text`, laid out once
+/// with transitions enabled.
+fn contents_tick_doc(root_class: &str, wrapper_extra: &str) -> (RinchDocument, NodeId, NodeId) {
+    let mut doc = RinchDocument::new();
+    doc.set_animation_clock_ms(Some(1_000_000.0)); // pinned: exact samples (#2267)
+    doc.load_css(CONTENTS_TICK_CSS);
+    let body = doc.body();
+    let root = doc.create_element("div");
+    doc.set_attribute(root, "class", root_class);
+    doc.append_child(body, root);
+    let ifc = doc.create_element("div");
+    doc.set_attribute(ifc, "class", "ifc");
+    doc.append_child(root, ifc);
+    let wrapper = doc.create_element("span");
+    doc.set_attribute(wrapper, "class", &format!("w {wrapper_extra}"));
+    doc.append_child(ifc, wrapper);
+    let text = doc.create_text("hello world hello world");
+    doc.append_child(wrapper, text);
+    doc.tree.transitions_enabled = true;
+    doc.resolve_layout(800.0, 600.0);
+    (doc, root, wrapper)
+}
+
+/// The counters a tick fixture holds flat, plus the positive control that the
+/// first layout moved them at all.
+fn structural_counters(doc: &RinchDocument) -> (u64, u64) {
+    let c = (doc.tree.ifc_setup_passes, doc.tree.taffy_computes);
+    assert!(
+        c.0 > 0 && c.1 > 0,
+        "positive control: the first layout must run a structural pass and a \
+         compute, or a flat counter proves nothing"
+    );
+    c
+}
+
+/// A transition ticking on a `display: contents` wrapper leaves its Taffy style
+/// `sync_display_contents`' `Display::None`, so neither the tick nor the next
+/// colour-only restyle re-runs the structural pass.
+///
+/// `tick_transitions` rebuilds a `LAYOUT`-dirty node's Taffy style from its
+/// computed values. Without the contents substitution there it writes a
+/// `Display::Flex` style onto the wrapper — a box of its own, mid-splice — and
+/// the next re-cascade compares that with the `Display::None` it rebuilds and
+/// runs the whole-document pass. The cascade fixture above cannot see this: it
+/// never ticks.
+#[test]
+fn a_transition_ticking_on_a_contents_wrapper_keeps_the_cheap_path() {
+    let (mut doc, root, wrapper) = contents_tick_doc("sans", "");
+    doc.set_attribute(wrapper, "class", "w wide");
+    doc.resolve_layout(800.0, 600.0);
+    let _ = doc.take_dirty_nodes();
+    let before = structural_counters(&doc);
+
+    for t in doc
+        .tree
+        .active_transitions
+        .get_mut(&wrapper.0)
+        .expect("positive control: the class change started a width transition on the wrapper")
+        .values_mut()
+    {
+        // Mid-transition, so the tick interpolates rather than finishing.
+        t.start_time_ms -= 500.0;
+    }
+    doc.tick_transitions();
+    doc.resolve_layout(800.0, 600.0);
+    assert_eq!(
+        (doc.tree.ifc_setup_passes, doc.tree.taffy_computes),
+        before,
+        "a width transition ticking on a contents wrapper must not give it a \
+         Taffy box, re-run the structural pass or compute"
+    );
+
+    doc.set_attribute(root, "class", "red");
+    doc.resolve_layout(800.0, 600.0);
+    assert_eq!(
+        doc.tree.ifc_setup_passes, before.0,
+        "a colour-only restyle after the tick must not re-run the structural pass"
+    );
+    assert_eq!(
+        doc.tree.taffy_computes, before.1,
+        "a colour-only restyle after the tick must not compute"
+    );
+}
+
+/// The animation twin: `tick_animations` carries its own copy of the re-sync,
+/// and a copy with no fixture behind it is free to drift.
+#[test]
+fn an_animation_ticking_on_a_contents_wrapper_keeps_the_cheap_path() {
+    let (mut doc, root, wrapper) = contents_tick_doc("sans", "anim");
+    let _ = doc.take_dirty_nodes();
+    let before = structural_counters(&doc);
+
+    for a in doc
+        .tree
+        .active_animations
+        .get_mut(&wrapper.0)
+        .expect("positive control: the wrapper's class started a width animation")
+    {
+        a.start_time_ms -= 500.0;
+    }
+    doc.tick_animations();
+    doc.resolve_layout(800.0, 600.0);
+    assert_eq!(
+        (doc.tree.ifc_setup_passes, doc.tree.taffy_computes),
+        before,
+        "a width animation ticking on a contents wrapper must not give it a \
+         Taffy box, re-run the structural pass or compute"
+    );
+
+    doc.set_attribute(root, "class", "red");
+    doc.resolve_layout(800.0, 600.0);
+    assert_eq!(
+        doc.tree.ifc_setup_passes, before.0,
+        "a colour-only restyle after the tick must not re-run the structural pass"
+    );
+    assert_eq!(
+        doc.tree.taffy_computes, before.1,
+        "a colour-only restyle after the tick must not compute"
+    );
+}
+
 // ---------------------------------------------------------------- #661 -----
 
 const ATOMIC_CSS: &str = "
@@ -150,6 +433,7 @@ const LONG: &str = "hello world hello world hello world hello world";
 /// test; `.wrap` is the IFC root that has to line-break around it.
 fn atomic_doc(display: &str, size: &str, text: &str) -> (RinchDocument, NodeId, NodeId) {
     let mut doc = RinchDocument::new();
+    doc.set_animation_clock_ms(Some(1_000_000.0)); // pinned: exact samples (#2267)
     doc.load_css(ATOMIC_CSS);
     let body = doc.body();
     let wrap = doc.create_element("div");
@@ -274,6 +558,7 @@ fn text_that_is_a_flex_item_is_remeasured_in_its_new_font() {
     ";
     fn build(class: &str) -> (RinchDocument, NodeId) {
         let mut doc = RinchDocument::new();
+        doc.set_animation_clock_ms(Some(1_000_000.0)); // pinned: exact samples (#2267)
         doc.load_css(CSS);
         let body = doc.body();
         let d = doc.create_element("div");
@@ -333,6 +618,7 @@ fn a_font_size_transition_on_a_flex_row_remeasures_its_text() {
     ";
     fn build(class: &str) -> (RinchDocument, NodeId) {
         let mut doc = RinchDocument::new();
+        doc.set_animation_clock_ms(Some(1_000_000.0)); // pinned: exact samples (#2267)
         doc.load_css(CSS);
         let body = doc.body();
         let d = doc.create_element("div");
@@ -397,6 +683,7 @@ fn a_font_size_animation_on_a_flex_row_remeasures_its_text() {
     ";
     fn build(extra: &str) -> (RinchDocument, NodeId) {
         let mut doc = RinchDocument::new();
+        doc.set_animation_clock_ms(Some(1_000_000.0)); // pinned: exact samples (#2267)
         doc.load_css(CSS);
         let body = doc.body();
         let d = doc.create_element("div");
@@ -454,6 +741,7 @@ const NESTED_CSS: &str = "
 /// inline, sized in px so nothing here is measured from a font.
 fn block_in_atomic_inline(extra: &str) -> (RinchDocument, NodeId, NodeId) {
     let mut doc = RinchDocument::new();
+    doc.set_animation_clock_ms(Some(1_000_000.0)); // pinned: exact samples (#2267)
     doc.load_css(NESTED_CSS);
     let body = doc.body();
     let wrap = doc.create_element("div");
@@ -572,6 +860,7 @@ fn a_width_animation_inside_an_atomic_inline_regrows_it() {
     ";
     fn build(extra: &str) -> (RinchDocument, NodeId, NodeId) {
         let mut doc = RinchDocument::new();
+        doc.set_animation_clock_ms(Some(1_000_000.0)); // pinned: exact samples (#2267)
         doc.load_css(CSS);
         let body = doc.body();
         let wrap = doc.create_element("div");
@@ -640,6 +929,7 @@ fn a_measure_leaf_root_reflows_when_an_atomic_inline_inside_it_grows() {
     ";
     fn build(label: &str) -> (RinchDocument, NodeId, NodeId, NodeId) {
         let mut doc = RinchDocument::new();
+        doc.set_animation_clock_ms(Some(1_000_000.0)); // pinned: exact samples (#2267)
         doc.load_css(CSS);
         let body = doc.body();
         let wrap = doc.create_element("div");
@@ -713,6 +1003,7 @@ fn nested_atomic_inlines_both_regrow() {
     ";
     fn build(text: &str) -> (RinchDocument, NodeId, NodeId) {
         let mut doc = RinchDocument::new();
+        doc.set_animation_clock_ms(Some(1_000_000.0)); // pinned: exact samples (#2267)
         doc.load_css(CSS);
         let body = doc.body();
         let wrap = doc.create_element("div");
@@ -783,6 +1074,7 @@ fn a_percentage_atomic_inline_tracks_a_viewport_resize() {
     ";
     fn build() -> (RinchDocument, NodeId) {
         let mut doc = RinchDocument::new();
+        doc.set_animation_clock_ms(Some(1_000_000.0)); // pinned: exact samples (#2267)
         doc.load_css(CSS);
         let body = doc.body();
         let wrap = doc.create_element("div");
@@ -845,6 +1137,12 @@ fn a_percentage_atomic_inline_tracks_a_viewport_resize() {
 /// that does not dirty its own enclosing root on the way past. Measured against
 /// the mutant: height 30 either way, `text_layout` `Some` with the insert and
 /// `None` without it.
+///
+/// **Since the keep-text-layouts change the insert is belt-and-braces**:
+/// `build_ifc_layouts` now rebuilds any root whose `text_layout` is `None`,
+/// dirty or not, so dropping the insert no longer strands this root and the
+/// mutant is equivalent on its own. The fixture stays as the pin on the
+/// *outcome*: with **both** rules gone the root is left with nothing to paint.
 #[test]
 fn a_remeasured_atomic_inlines_root_keeps_its_shaped_text() {
     const CSS: &str = "
@@ -856,6 +1154,7 @@ fn a_remeasured_atomic_inlines_root_keeps_its_shaped_text() {
     // `first` holds text plus an atomic inline; `second` holds text only.
     fn build(box_class: &str, second_text: &str) -> (RinchDocument, NodeId, NodeId, NodeId) {
         let mut doc = RinchDocument::new();
+        doc.set_animation_clock_ms(Some(1_000_000.0)); // pinned: exact samples (#2267)
         doc.load_css(CSS);
         let body = doc.body();
 

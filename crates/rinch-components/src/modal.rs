@@ -19,6 +19,7 @@
 //! }
 //! ```
 
+use crate::borderless_window::SectionRenderer;
 use rinch_core::Component;
 use rinch_core::dom::{NodeHandle, RenderScope};
 use std::rc::Rc;
@@ -130,6 +131,16 @@ pub struct Modal {
     pub trap_focus: bool,
     /// Callback when modal should close.
     pub onclose: Option<rinch_core::Callback>,
+    /// A pinned footer below the body, typically the dialog's buttons.
+    ///
+    /// Rendered into `.rinch-modal__footer`, a row after the body that never
+    /// scrolls: a tall modal's body scrolls between the header and the footer,
+    /// and a very short window shrinks the body first, until only its own
+    /// padding is left (40px by default); a flex item cannot shrink below its
+    /// padding. The row ends its children with a `sm` gap and carries a top border; both
+    /// are stylesheet rules an app can override on the class. `None` (the
+    /// default) renders no footer element at all.
+    pub footer: Option<SectionRenderer>,
 }
 
 impl std::fmt::Debug for Modal {
@@ -152,6 +163,7 @@ impl std::fmt::Debug for Modal {
             .field("lock_scroll", &self.lock_scroll)
             .field("trap_focus", &self.trap_focus)
             .field("onclose", &self.onclose.as_ref().map(|_| "<callback>"))
+            .field("footer", &self.footer.as_ref().map(|_| "<section>"))
             .finish()
     }
 }
@@ -176,6 +188,7 @@ impl Default for Modal {
             lock_scroll: true,
             trap_focus: true,
             onclose: None,
+            footer: None,
         }
     }
 }
@@ -339,6 +352,8 @@ impl Component for Modal {
                 && let Some(handler_id) = close_handler_id
             {
                 overlay.set_attribute("data-rid", &handler_id.to_string());
+                // A press of any button outside dismisses, not only a left one (#1093).
+                overlay.set_attribute(rinch_core::events::BACKDROP_ATTRIBUTE, "");
             }
             root.append_child(&overlay);
         }
@@ -378,6 +393,20 @@ impl Component for Modal {
             body.append_child(child);
         }
         modal_div.append_child(&body);
+
+        // Footer: a third row of the panel's column, after the body, so it
+        // stays in view while the body scrolls and comes last in Tab order
+        // (header, body, footer). It is inside the root, so the focus trap
+        // already includes its buttons on both backends.
+        if let Some(ref render_footer) = self.footer {
+            let footer = rinch_macros::rsx! { div { class: "rinch-modal__footer" } };
+            if let Some(ref style) = content_style {
+                footer.set_attribute("style", style);
+            }
+            let content = render_footer(__scope);
+            footer.append_child(&content);
+            modal_div.append_child(&footer);
+        }
 
         root.append_child(&modal_div);
 

@@ -51,7 +51,9 @@ fn mount(build: impl FnOnce(&mut RenderScope) -> NodeHandle + 'static) -> RinchA
         d.load_css(&rinch_components::generate_component_css());
         d.recompute_all_styles_full();
     }
-    app.resolve_and_repaint(W, H);
+    // A modal open at mount parks its focus move; see [`settle`] for why it
+    // is dropped (#2731).
+    settle(&mut app);
     app
 }
 
@@ -94,7 +96,7 @@ fn shift_tab(app: &mut RinchApp) {
 }
 
 /// The node the arbiter currently holds, whichever target kind it is.
-fn focused(app: &RinchApp) -> Option<usize> {
+fn focused(app: &RinchApp) -> Option<u64> {
     match app.focus_target {
         FocusTarget::Input(id) | FocusTarget::Node(id) => Some(id),
         _ => None,
@@ -102,7 +104,7 @@ fn focused(app: &RinchApp) -> Option<usize> {
 }
 
 /// Tab `n` times, recording where the arbiter lands each time.
-fn tab_tour(app: &mut RinchApp, n: usize) -> Vec<Option<usize>> {
+fn tab_tour(app: &mut RinchApp, n: u64) -> Vec<Option<u64>> {
     (0..n)
         .map(|_| {
             tab(app);
@@ -135,12 +137,12 @@ fn text_input(scope: &mut RenderScope, id: &str) -> NodeHandle {
 /// Node ids captured at mount, by the name the fixture gave them.
 #[derive(Clone, Copy, Default)]
 struct Ids {
-    before: usize,
-    after: usize,
-    inside_first: usize,
-    inside_middle: usize,
-    inside_last: usize,
-    root: usize,
+    before: u64,
+    after: u64,
+    inside_first: u64,
+    inside_middle: u64,
+    inside_last: u64,
+    root: u64,
 }
 
 /// A page with a control either side of a `Modal`, and three controls inside
@@ -202,8 +204,30 @@ fn modal_page(open: Signal<bool>, trap_focus: bool) -> (RinchApp, Ids) {
 /// containment alone: the claim is wherever the fixture put it, and Tab's
 /// answer is not entangled with the overlay having moved focus itself.
 /// `overlay_focus_tests` is where the move and the restore are asserted.
+///
+/// Since #2731 a key applies a parked focus request before it is routed (as a
+/// browser's `showModal()` / `close()` move the focus at once), so leaving the
+/// request parked is no longer enough: the next Tab would apply it. It is
+/// dropped here instead ([`drop_parked_focus`]), which keeps the claim where
+/// the fixture put it, as before.
 fn settle(app: &mut RinchApp) {
     app.resolve_and_repaint(W, H);
+    drop_parked_focus(app);
+}
+
+/// Discard the focus work the overlays parked (see [`settle`]), answering it.
+fn drop_parked_focus(app: &RinchApp) -> Vec<rinch_core::FocusStep> {
+    rinch_core::take_pending_focus_steps(app.doc_key(), true)
+}
+
+/// Park `steps` again, in their order.
+fn repark_focus(app: &RinchApp, steps: Vec<rinch_core::FocusStep>) {
+    for step in steps {
+        match step {
+            rinch_core::FocusStep::Request(r) => rinch_core::post_focus_request(app.doc_key(), r),
+            rinch_core::FocusStep::Release(n) => rinch_core::post_release_request(app.doc_key(), n),
+        }
+    }
 }
 
 /// A full runtime turn: [`settle`] plus applying whatever focus request the
@@ -414,10 +438,15 @@ fn a_closed_but_mounted_modal_traps_nothing_and_traps_again_when_reopened() {
 
     open.set(false);
     settle(&mut app);
+    // The claim is still on `inside_last`, which lost its box with the modal.
+    // Tab resumes at that node's tree neighbour (`after`) rather than at the
+    // document's first stop — what Chrome 153 does from a focused element
+    // hidden under it (issue #435, `tab_order_tests`). Either way the trap is
+    // gone: `after` is outside it.
     let tour = tab_tour(&mut app, 2);
     assert_eq!(
         tour,
-        vec![Some(ids.before), Some(ids.after)],
+        vec![Some(ids.after), Some(ids.before)],
         "and gone again when it closes"
     );
 }
@@ -473,7 +502,7 @@ fn closing_removes_the_attribute_rather_than_writing_false() {
 /// its *other* guard, so it needs a fixture that keeps the attribute on purpose.
 #[test]
 fn an_invisible_trap_is_not_a_trap() {
-    let ids: Rc<Cell<(usize, usize)>> = Rc::new(Cell::new((0, 0)));
+    let ids: Rc<Cell<(u64, u64)>> = Rc::new(Cell::new((0, 0)));
     let out = ids.clone();
     let mut app = mount(move |scope: &mut RenderScope| {
         let page = scope.create_element("div");
@@ -516,7 +545,7 @@ fn an_invisible_trap_is_not_a_trap() {
 #[test]
 fn the_false_escape_opts_out_and_zero_does_not() {
     for (value, traps) in [("false", false), ("FALSE", false), ("0", true)] {
-        let ids: Rc<Cell<(usize, usize)>> = Rc::new(Cell::new((0, 0)));
+        let ids: Rc<Cell<(u64, u64)>> = Rc::new(Cell::new((0, 0)));
         let out = ids.clone();
         let mut app = mount(move |scope: &mut RenderScope| {
             let page = scope.create_element("div");
@@ -551,10 +580,10 @@ fn the_false_escape_opts_out_and_zero_does_not() {
 /// Node ids for the two-modal fixture.
 #[derive(Clone, Copy, Default)]
 struct Nested {
-    outer_a: usize,
-    outer_b: usize,
-    inner_a: usize,
-    inner_b: usize,
+    outer_a: u64,
+    outer_b: u64,
+    inner_a: u64,
+    inner_b: u64,
 }
 
 /// An inner `Modal` mounted inside an outer one's body, each with two controls.
@@ -651,7 +680,14 @@ fn closing_a_nested_trap_hands_containment_back_to_the_outer_one() {
     );
 
     inner.set(false);
-    settle(&mut app);
+    app.resolve_and_repaint(W, H);
+    // The release the close parked is held back across the Tabs below, as it
+    // was before #2731 made a key apply it first: a pointer press (which
+    // applies no request that needs a layout) can still leave the claim in the
+    // closed subtree with the request parked, and the refusal at the end is
+    // about that request.
+    let parked = drop_parked_focus(&app);
+    assert!(!parked.is_empty(), "positive control: the close parked one");
     // Focus is still inside the closed subtree until the runtime takes its next
     // turn — the request is parked, not applied — and containment already has
     // to be right in that window.
@@ -661,10 +697,13 @@ fn closing_a_nested_trap_hands_containment_back_to_the_outer_one() {
         "the claim is untouched until the parked request is applied"
     );
 
+    // `inner_a` is no longer a stop, so Tab resumes at its tree neighbour
+    // inside the outer trap — `outer_b`, which follows the inner modal — as
+    // Chrome 153 does from a focused element hidden under it (issue #435).
     let tour = tab_tour(&mut app, 3);
     assert_eq!(
         tour,
-        vec![Some(ids.outer_a), Some(ids.outer_b), Some(ids.outer_a)],
+        vec![Some(ids.outer_b), Some(ids.outer_a), Some(ids.outer_b)],
         "the outer modal traps again"
     );
 
@@ -674,10 +713,11 @@ fn closing_a_nested_trap_hands_containment_back_to_the_outer_one() {
     // keyboard, so it is refused rather than applied to whoever does. Where the
     // claim has *not* moved, it is applied — `overlay_focus_tests` asserts both
     // halves.
+    repark_focus(&app, parked);
     turn(&mut app);
     assert_eq!(
         focused(&app),
-        Some(ids.outer_a),
+        Some(ids.outer_b),
         "a parked release must not take the keyboard off the trap that has it"
     );
 }
@@ -704,10 +744,10 @@ fn closing_a_nested_trap_hands_containment_back_to_the_outer_one() {
 fn focus_inside_one_of_two_sibling_traps_stays_in_that_one() {
     #[derive(Clone, Copy, Default)]
     struct Pair {
-        a1: usize,
-        a2: usize,
-        b1: usize,
-        b2: usize,
+        a1: u64,
+        a2: u64,
+        b1: u64,
+        b2: u64,
     }
 
     let build = || {

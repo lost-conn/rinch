@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::events::{ClickContext, get_click_context};
+use crate::events::{ClickContext, MouseButton, get_click_context};
 
 /// How coordinates are delivered to the `on_move` callback.
 enum DragMode {
@@ -57,6 +57,9 @@ struct ActiveDrag {
     on_cancel: Option<Box<dyn FnOnce(f32, f32) + 'static>>,
     /// The ClickContext captured at drag start.
     start_context: ClickContext,
+    /// The button of the last reported press when the drag started: the only
+    /// release [`finish_drag_for_button`] ends it on.
+    armed_by: MouseButton,
     /// The last coordinates delivered to `on_move`, in the drag's mode-specific
     /// coordinate space. `None` until the first move; `cancel()` then falls
     /// back to the start position mapped through the same mode.
@@ -101,8 +104,9 @@ struct ActiveDrag {
     /// still alive"; this asks "is this event stream the one that armed me".
     /// Both documents in the bug have live owners.
     ///
-    /// `None` means the drag was armed outside any dispatch — a timer, a menu
-    /// callback, a backend with one page-wide event stream (rinch-web) — and is
+    /// `None` means the drag was armed outside any document — a timer armed
+    /// from `main` (one armed inside a document runs as that document's code,
+    /// issue #963), a menu callback — and is
     /// drivable by anybody. A drag is refused **only** when both keys are `Some`
     /// and differ; anything stricter would wedge hover, surface events and text
     /// selection in the drag's *own* document, since all three gate on
@@ -202,8 +206,68 @@ fn heal_released_drag() -> bool {
     true
 }
 
+/// End this document's live drag because the backend judges that its release
+/// was missed (issue #381), through `on_cancel` — never
+/// `on_end` — with the last coordinates `on_move` was given.
+///
+/// For a backend whose move events carry no button state (desktop), the
+/// counterpart of [`update_drag_with_button`]'s [`PrimaryButton::Up`] heal. The
+/// proof is the caller's to judge; desktop offers two:
+///
+/// - a **primary press** arriving while the drag is live — a button cannot be
+///   pressed again without being released in between, so the release went
+///   elsewhere. Called *before* the press is dispatched, so the press's own
+///   handlers never see the stranded drag, and a drag the press arms is not
+///   the one this ends. Without it the next unrelated click's release ran
+///   [`finish_drag`] and **committed** the stranded drag at that click's
+///   position.
+/// - the window **losing focus**. On Windows the release then goes to another
+///   window. On X11/Wayland the implicit pointer grab still delivers it, and a
+///   blur can come from a transient keyboard grab (a global hotkey, Alt+Tab)
+///   in the middle of a healthy drag, which is cancelled too: an accepted cost,
+///   since a cancel never commits a wrong position.
+///
+/// The press proof assumes the drag was armed by the primary button, and does
+/// not ask: a middle- or right-button drag (see [`finish_drag_for_button`]), or
+/// one armed with no button held, is also ended by the next primary press.
+///
+/// Scoped like the #189 heal: a drag belonging to another document (#139) is
+/// left alone, since another window's press says nothing about this pointer; an
+/// abandoned drag is discarded silently. Returns whether a drag was cancelled.
+pub fn heal_missed_release() -> bool {
+    discard_if_abandoned();
+    if active_drag_is_foreign() {
+        return false;
+    }
+    heal_released_drag()
+}
+
+/// How many live drags one [`Drag::start`] cancels before it gives up and
+/// drops the rest silently: the first, plus any an `on_cancel` armed in turn.
+/// A bound, not a policy — one pass is the real case; more means an
+/// `on_cancel` that re-arms a drag every time it is superseded.
+const MAX_SUPERSEDE_PASSES: usize = 8;
+
 thread_local! {
     static ACTIVE_DRAG: RefCell<Option<ActiveDrag>> = const { RefCell::new(None) };
+    /// The button of the last pointer press a backend reported through
+    /// [`note_pointer_press`] — every press, whether or not it reached a
+    /// handler. `Left` until one is reported.
+    static LAST_PRESS_BUTTON: std::cell::Cell<MouseButton> =
+        const { std::cell::Cell::new(MouseButton::Left) };
+}
+
+/// Record that a pointer button was pressed (issue #1087).
+///
+/// A [`Drag`] belongs to the button of the last press reported here when it is
+/// started, and [`finish_drag_for_button`] ends it only on that button's
+/// release. A backend whose releases say which button came up calls this for
+/// **every** press, before the press is dispatched — not only for one that hits
+/// a handler — so a drag armed outside any press (a timer, a keyboard shortcut)
+/// belongs to the button most recently pressed rather than to whichever press
+/// last reached a handler.
+pub fn note_pointer_press(button: MouseButton) {
+    LAST_PRESS_BUTTON.with(|b| b.set(button));
 }
 
 /// Builder for starting a pointer capture drag.
@@ -282,7 +346,9 @@ impl Drag {
 
     /// Set the callback invoked once if the drag is cancelled via
     /// [`Drag::cancel`] (e.g. the web backend's `pointercancel` — a
-    /// touch-scroll takeover, system gesture, or pointer-capture loss).
+    /// touch-scroll takeover, system gesture, or pointer-capture loss), healed
+    /// after a missed release (issue #189), or superseded by another
+    /// [`Drag::start`] while still live (issue #293).
     ///
     /// Receives the last coordinates delivered to `on_move`, in the same
     /// coordinate space (raw pixels for `absolute`, 0.0–1.0 for `percent`);
@@ -306,6 +372,26 @@ impl Drag {
     }
 
     /// Activate the drag. Call from a mousedown/click handler.
+    ///
+    /// **A drag already live is ended first, through its `on_cancel`** (issue
+    /// #293) — whichever document armed it. There is one drag slot, so a
+    /// new press arming a drag while another is live usually means the
+    /// earlier drag's release was never delivered (on a touch screen it can
+    /// also be a second finger, whose drag then ends the first's): a `MouseUp` swallowed in its
+    /// own document (#189), or — since the pointer is grabbed to the pressing
+    /// window while a button is held — in another document on the same thread
+    /// (a DevTools window, a second embedded `RinchContext`). That is the #189
+    /// ending: no trustworthy commit position, so `on_end` does not run and
+    /// `on_cancel` gets the last coordinates the old drag delivered. A drag
+    /// whose arming scope has been disposed is dropped silently instead, as
+    /// everywhere else — its `on_cancel` would read freed state.
+    ///
+    /// `on_cancel` runs before the new drag is armed and with no drag active,
+    /// so it may query the drag API or arm a drag of its own; a drag it arms
+    /// is superseded by this one in turn, through its own `on_cancel`, up to
+    /// `MAX_SUPERSEDE_PASSES` (8) cancels, after which the leftover is dropped
+    /// silently with a warning. It runs under the superseded drag's own owner
+    /// and document, as every `on_cancel` does (see [`Drag::cancel`]).
     pub fn start(self) {
         let on_move: Rc<dyn Fn(f32, f32)> = match self.on_move {
             Some(f) => Rc::from(f),
@@ -322,6 +408,31 @@ impl Drag {
         // the dispatching document is ambient right now and gone by the time
         // `on_move` fires (issue #139).
         let doc = crate::context::current_dispatching_doc();
+        // Every drag live at this point is superseded, after the context above
+        // was captured so no `on_cancel` can disturb it. The loop covers a
+        // drag armed from inside a superseded drag's `on_cancel`.
+        // Bounded: an `on_cancel` that re-arms a drag every time it is
+        // superseded would otherwise never let this return. What is left after
+        // the last pass is dropped silently.
+        for _ in 0..MAX_SUPERSEDE_PASSES {
+            discard_if_abandoned();
+            if !ACTIVE_DRAG.with(|drag| drag.borrow().is_some()) {
+                break;
+            }
+            tracing::debug!("a new drag supersedes a live one; cancelling it");
+            Drag::cancel();
+        }
+        let leftover = ACTIVE_DRAG.with(|drag| drag.borrow_mut().take());
+        if leftover.is_some() {
+            tracing::warn!(
+                "Drag::start: a superseded drag's on_cancel kept arming new drags; \
+                 dropping the last one after {MAX_SUPERSEDE_PASSES} cancels"
+            );
+            drop(leftover);
+        }
+        // Nothing can sit in the slot here — the loop above emptied it and
+        // nothing since has run user code — but a replace keeps the drop of
+        // anything that did outside the borrow.
         let previous = ACTIVE_DRAG.with(|drag| {
             drag.borrow_mut().replace(ActiveDrag {
                 mode: self.mode,
@@ -329,14 +440,14 @@ impl Drag {
                 on_end: self.on_end,
                 on_cancel: self.on_cancel,
                 start_context,
+                armed_by: LAST_PRESS_BUTTON.with(|b| b.get()),
                 last_pos: None,
                 forward_surface_events: self.forward_surface_events,
                 owner,
                 doc,
             })
         });
-        // Dropped outside the borrow: a superseded drag's callbacks are
-        // arbitrary user closures, and their `Drop` may query the drag state.
+        debug_assert!(previous.is_none(), "the supersede loop emptied the slot");
         drop(previous);
     }
 
@@ -372,7 +483,20 @@ impl Drag {
                     .mode
                     .map(state.start_context.mouse_x, state.start_context.mouse_y)
             });
-            on_cancel(x, y);
+            // Under the drag's own owner and document, not whatever is ambient:
+            // a superseding `start()` calls this from another component's
+            // handler (review of #942, F1), and state `on_cancel` creates — or a
+            // store it looks up — must belong to the component that armed it.
+            let _doc = state.doc.map(crate::context::push_dispatching_doc);
+            // Untracked (#931): `Drag::cancel` is public and may be called from
+            // inside an effect, which must not subscribe to what `on_cancel` reads.
+            let run = || {
+                crate::reactive::batch(|| crate::reactive::untracked_handler(|| on_cancel(x, y)))
+            };
+            match &state.owner {
+                Some(owner) => owner.run(run),
+                None => crate::reactive::unowned(run),
+            }
         }
     }
 
@@ -484,7 +608,9 @@ pub fn update_drag_with_button(mouse_x: f32, mouse_y: f32, primary: PrimaryButto
         })
     });
     if let Some((on_move, x, y, forward)) = pending {
-        on_move(x, y);
+        // One transaction per callback (`crate::reactive::batch`): a slider's
+        // `on_move` that writes a value and a label flushes once.
+        crate::reactive::batch(|| on_move(x, y));
         (true, forward)
     } else {
         (false, false)
@@ -507,8 +633,31 @@ pub fn finish_drag(mouse_x: f32, mouse_y: f32) {
     }
     let on_end = ACTIVE_DRAG.with(|drag| drag.borrow_mut().take().and_then(|s| s.on_end));
     if let Some(cb) = on_end {
-        cb(mouse_x, mouse_y);
+        crate::reactive::batch(|| cb(mouse_x, mouse_y));
     }
+}
+
+/// Finish the drag on the release of `button`, which ends it only if `button`
+/// is the one that armed it (issue #1087).
+///
+/// A gesture ends on the release of the button that started it: a right or
+/// middle release while a left-button drag is live is a chord, not the end of
+/// the drag, and must not commit it at wherever the pointer happens to be. The
+/// arming button is the one of the last press reported through
+/// [`note_pointer_press`] when [`Drag::start`] ran — the press that armed it,
+/// for a drag armed from a press's handler; the most recent press, for one
+/// armed outside any (a timer, a keyboard shortcut); `Left` if none was ever
+/// reported.
+///
+/// For a backend whose release events say which button came up (desktop). One
+/// that ends a gesture only when **every** button is up — a browser's
+/// `pointerup` — calls [`finish_drag`].
+pub fn finish_drag_for_button(mouse_x: f32, mouse_y: f32, button: MouseButton) {
+    let armed_by = ACTIVE_DRAG.with(|drag| drag.borrow().as_ref().map(|state| state.armed_by));
+    if armed_by.is_some_and(|armed_by| armed_by != button) {
+        return;
+    }
+    finish_drag(mouse_x, mouse_y);
 }
 
 #[cfg(test)]
@@ -664,6 +813,40 @@ mod tests {
 
         assert_eq!(moves.get(), 1, "no further on_move after the scope died");
         assert_eq!(ends.get(), 0, "and an abandoned drag must not commit");
+    }
+
+    /// `heal_missed_release` (issue #381) ends a live drag through `on_cancel`
+    /// at its last move, and never runs the `on_cancel` of a drag whose scope
+    /// was disposed — that belongs to the same dead component.
+    #[test]
+    fn healing_a_missed_release_cancels_a_live_drag_but_not_an_abandoned_one() {
+        use crate::reactive::Scope;
+
+        let cancels = Rc::new(RefCell::new(Vec::new()));
+        let c = cancels.clone();
+        Drag::absolute()
+            .on_cancel(move |x, y| c.borrow_mut().push((x, y)))
+            .start();
+        update_drag(37.0, 91.0);
+        assert!(heal_missed_release());
+        assert_eq!(*cancels.borrow(), vec![(37.0, 91.0)]);
+        assert!(!Drag::is_active());
+        assert!(!heal_missed_release(), "nothing left to heal");
+
+        let scope = Scope::new();
+        let c = cancels.clone();
+        scope.run(|| {
+            Drag::absolute()
+                .on_cancel(move |x, y| c.borrow_mut().push((x, y)))
+                .start();
+        });
+        scope.dispose();
+        assert!(!heal_missed_release());
+        assert_eq!(
+            cancels.borrow().len(),
+            1,
+            "an abandoned drag is dropped silently"
+        );
     }
 
     /// The other half: a drag armed outside any render keeps app lifetime, so
@@ -941,11 +1124,10 @@ mod tests {
         assert_eq!(end.get(), Some((30.0, 40.0)));
     }
 
-    /// A drag armed outside any dispatch — a timer, a menu callback, or a
-    /// backend with a single page-wide pointer stream (rinch-web, which pushes
-    /// no marker at all) — belongs to nobody and stays drivable by everybody.
-    ///
-    /// This is what keeps the fix free of rinch-web changes.
+    /// A drag armed outside any document — a timer armed from `main`, a menu
+    /// callback, or rinch-web's pointer stream after a press, which pushes no
+    /// marker (a gesture may cross roots, #2811) — belongs to nobody and stays
+    /// drivable by everybody.
     #[test]
     fn a_drag_armed_outside_any_dispatch_is_drivable_by_any_document() {
         use crate::context::push_dispatching_doc;
@@ -965,5 +1147,213 @@ mod tests {
 
         assert_eq!(moves.get(), 2);
         Drag::cancel();
+    }
+
+    // ── a new drag ends the live one through on_cancel (issue #293) ─────────
+
+    /// Document B arming a drag while document A's is live ends A's drag
+    /// through `on_cancel` — it is not dropped with its teardown unrun.
+    ///
+    /// One pointer, one drag: B's press means A's release was missed (the
+    /// pointer is grabbed to A's window while its button is held), so this is
+    /// the #189 ending — no trustworthy commit position, `on_cancel` with the
+    /// last position A actually delivered.
+    #[test]
+    fn a_drag_armed_in_another_document_cancels_the_live_one() {
+        use crate::context::push_dispatching_doc;
+
+        let a_cancel: Rc<Cell<Option<(f32, f32)>>> = Rc::new(Cell::new(None));
+        let a_end = Rc::new(Cell::new(false));
+        let b_end: Rc<Cell<Option<(f32, f32)>>> = Rc::new(Cell::new(None));
+
+        {
+            let _a = push_dispatching_doc(1);
+            let c = a_cancel.clone();
+            let e = a_end.clone();
+            Drag::absolute()
+                .on_cancel(move |x, y| c.set(Some((x, y))))
+                .on_end(move |_, _| e.set(true))
+                .start();
+            update_drag(13.0, 17.0);
+        }
+        {
+            let _b = push_dispatching_doc(2);
+            let e = b_end.clone();
+            Drag::absolute()
+                .on_end(move |x, y| e.set(Some((x, y))))
+                .start();
+        }
+
+        assert_eq!(
+            a_cancel.get(),
+            Some((13.0, 17.0)),
+            "A's teardown ran, at the last position A delivered"
+        );
+        {
+            let _a = push_dispatching_doc(1);
+            assert!(!Drag::is_active(), "A no longer has a drag");
+            finish_drag(50.0, 50.0);
+        }
+        assert!(!a_end.get(), "and a superseded drag never commits");
+        {
+            let _b = push_dispatching_doc(2);
+            assert!(Drag::is_active(), "B's drag is the live one");
+            finish_drag(7.0, 9.0);
+        }
+        assert_eq!(b_end.get(), Some((7.0, 9.0)));
+    }
+
+    /// The same rule inside one document: a second press arming a drag while
+    /// one is live (its `MouseUp` was swallowed, #189) cancels the first.
+    #[test]
+    fn a_second_drag_in_the_same_document_cancels_the_first() {
+        let cancels = Rc::new(Cell::new(0));
+        let c = cancels.clone();
+        Drag::absolute()
+            .on_cancel(move |_, _| c.set(c.get() + 1))
+            .start();
+        update_drag(3.0, 4.0);
+        Drag::absolute().start();
+        assert_eq!(cancels.get(), 1, "the superseded drag's on_cancel ran once");
+        assert!(Drag::is_active(), "and the new drag is armed");
+        Drag::cancel();
+        assert_eq!(cancels.get(), 1, "the new drag's end is not the old one's");
+    }
+
+    /// A superseded drag whose arming scope is gone is dropped silently, as
+    /// everywhere else: its `on_cancel` would read freed signals.
+    #[test]
+    fn superseding_an_abandoned_drag_does_not_run_its_cancel() {
+        use crate::reactive::{Scope, Signal};
+
+        let cancels = Rc::new(Cell::new(0));
+        let scope = Scope::new();
+        let c = cancels.clone();
+        scope.run(|| {
+            let owned = Signal::new(0);
+            Drag::absolute()
+                .on_cancel(move |_, _| {
+                    let _ = owned.get();
+                    c.set(c.get() + 1);
+                })
+                .start();
+        });
+        scope.dispose();
+
+        Drag::absolute().start();
+        assert_eq!(cancels.get(), 0);
+        Drag::cancel();
+    }
+
+    /// `on_cancel` runs with the slot empty and may arm a drag of its own;
+    /// the start that superseded it still wins, and the drag the callback
+    /// armed is itself ended through its `on_cancel`, not dropped.
+    #[test]
+    fn a_superseded_drags_cancel_may_re_enter_start() {
+        let inner_cancels = Rc::new(Cell::new(0));
+        let saw_inactive = Rc::new(Cell::new(false));
+        let ic = inner_cancels.clone();
+        let saw = saw_inactive.clone();
+        Drag::absolute()
+            .on_cancel(move |_, _| {
+                saw.set(!Drag::is_active());
+                let ic = ic.clone();
+                Drag::absolute()
+                    .on_cancel(move |_, _| ic.set(ic.get() + 1))
+                    .start();
+            })
+            .start();
+
+        let outer_end = Rc::new(Cell::new(false));
+        let oe = outer_end.clone();
+        Drag::absolute().on_end(move |_, _| oe.set(true)).start();
+
+        assert!(saw_inactive.get(), "on_cancel ran with no drag active");
+        assert_eq!(
+            inner_cancels.get(),
+            1,
+            "the re-armed drag was cancelled too"
+        );
+        finish_drag(0.0, 0.0);
+        assert!(outer_end.get(), "the superseding drag is the live one");
+    }
+
+    /// A superseded drag's `on_cancel` runs under the owner of the component
+    /// that armed *that* drag, not the one whose press superseded it (review
+    /// of #942, F1). Otherwise state it creates belongs to the superseding
+    /// component and is freed when that one unmounts.
+    #[test]
+    fn a_superseded_drags_cancel_runs_under_its_own_owner() {
+        use crate::reactive::{Scope, Signal};
+
+        let stash: Rc<Cell<Option<Signal<i32>>>> = Rc::new(Cell::new(None));
+        let st = stash.clone();
+        Drag::absolute()
+            .on_cancel(move |_, _| st.set(Some(Signal::new(7))))
+            .start();
+        let b = Scope::new();
+        b.run(|| Drag::absolute().start());
+        Drag::cancel();
+        b.dispose();
+
+        let sig = stash.take().expect("on_cancel ran");
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sig.get()));
+        assert!(
+            r.is_ok(),
+            "A's on_cancel state must not be owned by B and freed with it"
+        );
+    }
+
+    /// The same, for an owned drag: its `on_cancel` runs inside its own scope,
+    /// so what it creates is freed with *that* scope.
+    #[test]
+    fn a_superseded_owned_drags_cancel_runs_inside_its_scope() {
+        use crate::reactive::{Scope, Signal, current_owner};
+
+        let ran_in_a = Rc::new(Cell::new(false));
+        let a = Scope::new();
+        let r = ran_in_a.clone();
+        let a_owner = a.run(current_owner);
+        a.run(|| {
+            Drag::absolute()
+                .on_cancel(move |_, _| {
+                    let _ = Signal::new(0);
+                    r.set(current_owner() == a_owner);
+                })
+                .start();
+        });
+        let b = Scope::new();
+        b.run(|| Drag::absolute().start());
+        assert!(ran_in_a.get(), "on_cancel ran under the arming scope");
+        Drag::cancel();
+        b.dispose();
+        a.dispose();
+    }
+
+    /// An `on_cancel` that always arms a fresh drag cannot make `start()` loop
+    /// forever (review of #942, F2): after `MAX_SUPERSEDE_PASSES` cancels the
+    /// leftover drag is dropped silently and the new drag is armed.
+    #[test]
+    fn a_self_rearming_cancel_does_not_loop_forever() {
+        thread_local! { static N: Cell<u32> = const { Cell::new(0) }; }
+        fn arm() {
+            Drag::absolute()
+                .on_cancel(|_, _| {
+                    let n = N.with(|n| {
+                        n.set(n.get() + 1);
+                        n.get()
+                    });
+                    assert!(n <= 1000, "start() looped {n} times");
+                    arm();
+                })
+                .start();
+        }
+        arm();
+        let armed = Rc::new(Cell::new(false));
+        let a = armed.clone();
+        Drag::absolute().on_end(move |_, _| a.set(true)).start();
+        assert_eq!(N.with(Cell::get), MAX_SUPERSEDE_PASSES as u32);
+        finish_drag(0.0, 0.0);
+        assert!(armed.get(), "the superseding drag is the live one");
     }
 }

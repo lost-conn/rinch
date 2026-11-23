@@ -25,6 +25,10 @@ const OPENED_CLASS: &str = "rinch-color-input--opened";
 pub struct ColorInput {
     /// Input label.
     pub label: String,
+    /// The field's `id` (Mantine's `id`): its label's `for` names it, and the
+    /// description and error are `{id}-description` / `{id}-error`. Empty
+    /// generates a unique one per render (issue #2034).
+    pub id: String,
     /// Description text below the input.
     pub description: String,
     /// Error message (shows error styling when present).
@@ -85,18 +89,35 @@ pub struct ColorInput {
     /// with. An input that alone stays open when you click away is the odd one
     /// out, and that is the whole of the defect.
     ///
-    /// Turning it off mounts no backdrop at all, so no click outside the field
-    /// dismisses the dropdown. **Escape closes it either way** — it rides the
-    /// dismiss stack, not the backdrop — so `false` is the pointer half of the
-    /// pre-#465 behaviour and not a return to it in full. A closed dropdown
-    /// leaves the key to whatever is behind it.
+    /// Turning it off mounts no backdrop at all, so a click outside the field
+    /// reaches whatever is under it instead of being taken by the backdrop.
+    /// That click still closes the dropdown when it moves the focus out of the
+    /// field (#1572: the dropdown closes when the focus leaves the
+    /// `ColorInput`, as Mantine's closes in the input's `onBlur`); a press on a
+    /// `data-nofocus` region leaves it open. **Escape closes it either way** —
+    /// it rides the dismiss stack, not the backdrop. A closed dropdown leaves
+    /// the key to whatever is behind it.
     pub close_on_click_outside: bool,
+    /// The open picker's stacking level (issue #801), published as
+    /// `--rinch-color-input-z-index` on the root, as `DropdownMenu`'s and
+    /// `Popover`'s `z_index` are. The panel sits at this level, the dismiss
+    /// backdrop one below it and the field one above it, so one number moves
+    /// all three. `None` keeps the stylesheet's `100`: below `Modal` and
+    /// `Drawer` (200/201), `Notification` and the `Select` popup (300), so an
+    /// overlay that appears while the picker is open takes its own clicks.
+    pub z_index: Option<i32>,
+    /// Spellchecking for the colour text field (#2862): `Some(false)` turns
+    /// it off, `None` (the default) inherits the nearest ancestor's
+    /// `spellcheck`. A hex code with a digit is never checked whatever this
+    /// says (the default skip rules); a code of letters alone (`#ffaacc`) is.
+    pub spellcheck: Option<bool>,
 }
 
 impl Default for ColorInput {
     fn default() -> Self {
         Self {
             label: String::new(),
+            id: String::new(),
             description: String::new(),
             error: String::new(),
             placeholder: String::new(),
@@ -114,6 +135,8 @@ impl Default for ColorInput {
             // The one field whose default is not `Default::default()`, which is
             // why this impl is written out rather than derived.
             close_on_click_outside: true,
+            z_index: None,
+            spellcheck: None,
         }
     }
 }
@@ -186,6 +209,7 @@ impl std::fmt::Debug for ColorInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ColorInput")
             .field("label", &self.label)
+            .field("id", &self.id)
             .field("value", &self.value)
             .field("format", &self.format)
             .field("disabled", &self.disabled)
@@ -218,11 +242,19 @@ impl Component for ColorInput {
 
         let root = rinch_macros::rsx! { div {} };
         root.set_attribute("class", &root_class);
+        // z_index (#801): an inherited custom property, so the panel, the
+        // backdrop and the lifted field all derive their level from it in CSS.
+        if let Some(z) = self.z_index {
+            root.set_style("--rinch-color-input-z-index", &z.to_string());
+        }
 
         // Label
+        let ids = crate::field_ids::FieldIds::new(&self.id);
+        let mut label_node = None;
         if !self.label.is_empty() {
             let label_el = rinch_macros::rsx! { label { class: "rinch-color-input__label", {self.label.clone()} } };
             root.append_child(&label_el);
+            label_node = Some(label_el);
         }
 
         // Wrapper (position: relative for dropdown)
@@ -230,14 +262,6 @@ impl Component for ColorInput {
 
         // Input group (swatch + text input)
         let input_group = rinch_macros::rsx! { div { class: "rinch-color-input__input-group" } };
-
-        // Toggle open on click
-        {
-            let handler_id = __scope.register_handler(move || {
-                opened.update(|v| *v = !*v);
-            });
-            input_group.set_attribute("data-rid", &handler_id.to_string());
-        }
 
         // Preview swatch. Painted in the alpha-carrying spelling of the
         // display format (`swatch_spelling`): `parse_color` accepts notations
@@ -256,27 +280,27 @@ impl Component for ColorInput {
             "class",
             "rinch-color-swatch rinch-color-input__swatch-preview",
         );
+        // A press on the preview takes the click but not the keyboard (#1572):
+        // it toggles the dropdown, and moving the focus off the field would
+        // close the dropdown through the focus-leave entry below before the
+        // toggle reopened it. Opening focuses the field instead (the toggle
+        // handler), as a press on a Mantine input's section does.
+        preview_node.set_attribute("data-nofocus", "");
         input_group.append_child(&preview_node);
 
         // Text input. Its text is not written here: the display effect
         // below populates it on its registration run, in the `format`
         // spelling, exactly as it does for every later colour.
         let text_input = rinch_macros::rsx! { input { class: "rinch-color-input__input" } };
+        if let Some(on) = self.spellcheck {
+            text_input.set_attribute("spellcheck", if on { "true" } else { "false" });
+        }
         if !self.placeholder.is_empty() {
             text_input.set_attribute("placeholder", &self.placeholder);
         }
         if disallow_input {
             text_input.set_attribute("readonly", "");
         }
-
-        // The field's live text, as this component last heard it — same role
-        // as ColorPicker's record (GH #231). Every `oninput` records here,
-        // parseable or not: a parse-gated record would survive an edit it no
-        // longer describes and later veto a legitimate rewrite. The display
-        // effect prefers this record over the `value` attribute, which on web
-        // holds only what was last written programmatically. Cleared whenever
-        // the effect rewrites the field.
-        let typed: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
         // The last color the app actually holds: the mount value, then every
         // commit point — a reported typed commit, a dropdown pick, an external
@@ -286,16 +310,13 @@ impl Component for ColorInput {
         let last_committed: Rc<RefCell<String>> = Rc::new(RefCell::new(initial_color.clone()));
 
         // Handle text input changes. Per-keystroke this is internal only —
-        // record the live text, parse, and preview through `current_value`
+        // parse the typed text and preview through `current_value`
         // (swatch, dropdown picker). `self.onchange` fires from the commit
         // handler below, not here: the prop promises a committed color, not a
         // live preview per parseable keystroke (issue #226).
         if !disallow_input {
-            let typed_in = typed.clone();
             let handler_id = __scope.register_input_handler(move |value: String| {
-                let parsed = parse_color_with_notation(&value);
-                *typed_in.borrow_mut() = Some(value);
-                if let Some((parsed, notation)) = parsed {
+                if let Some((parsed, notation)) = parse_color_with_notation(&value) {
                     // Previewed at the typed notation's own alpha-carrying
                     // grid, not the display format's: the dropdown picker
                     // judges and merges an inbound value at the inbound
@@ -329,10 +350,8 @@ impl Component for ColorInput {
             // `current_value`, swatch included — to the last committed color,
             // never to the live preview: the preview was never reported, so
             // keeping it would durably display a color the app never
-            // received. Either rewrite clears the typed record, like any
-            // effect rewrite.
+            // received.
             let onchange = self.onchange.clone();
-            let typed_commit = typed.clone();
             let text_input_commit = text_input.clone();
             let last_committed_commit = last_committed.clone();
             let handler_id =
@@ -349,7 +368,6 @@ impl Component for ColorInput {
                             &formatted,
                             color_format,
                         );
-                        *typed_commit.borrow_mut() = None;
                         text_input_commit.set_attribute("value", &formatted);
                         current_value.set_if_changed(formatted.clone());
                         *last_committed_commit.borrow_mut() = formatted.clone();
@@ -365,7 +383,6 @@ impl Component for ColorInput {
                         // field shows it in the display format, like every
                         // other rewrite (GH #237).
                         let committed = last_committed_commit.borrow().clone();
-                        *typed_commit.borrow_mut() = None;
                         text_input_commit
                             .set_attribute("value", &display_spelling(&committed, color_format));
                         current_value.set_if_changed(committed);
@@ -377,8 +394,33 @@ impl Component for ColorInput {
         input_group.append_child(&text_input);
         wrapper.append_child(&input_group);
 
+        // Toggle open on click. Opening puts the keyboard on the text field
+        // when it is not already there (a press on the preview swatch, which
+        // takes no focus): the dropdown closes when focus leaves the
+        // `ColorInput` (#1572), so the focus has to be inside it to leave.
+        {
+            let field = text_input.clone();
+            let handler_id = __scope.register_handler(move || {
+                opened.update(|v| *v = !*v);
+                if opened.get() {
+                    let focused = field
+                        .active_element()
+                        .is_some_and(|a| a.node_id() == field.node_id());
+                    if !focused {
+                        field.focus();
+                    }
+                }
+            });
+            input_group.set_attribute("data-rid", &handler_id.to_string());
+        }
+
         // Dropdown containing the ColorPicker
         let dropdown = rinch_macros::rsx! { div { class: "rinch-color-input__dropdown" } };
+        // A press in the panel (a swatch, the saturation area, a slider) takes
+        // the click but not the keyboard, so the text field keeps the focus and
+        // the dropdown is not closed by focus leaving the field (#1572). This is
+        // Mantine's `onMouseDown={e => e.preventDefault()}` on its dropdown.
+        dropdown.set_attribute("data-nofocus", "");
 
         // The picker is bound to `current_value` (GH #237): it starts on the
         // same string the signal was seeded with — never the raw `value` prop,
@@ -459,6 +501,8 @@ impl Component for ColorInput {
             let backdrop = rinch_macros::rsx! { div { class: "rinch-color-input__backdrop" } };
             let handler_id = __scope.register_handler(move || opened.set(false));
             backdrop.set_attribute("data-rid", &handler_id.to_string());
+            // A press of any button outside dismisses, not only a left one (#1093).
+            backdrop.set_attribute(rinch_core::events::BACKDROP_ATTRIBUTE, "");
             wrapper.append_child(&backdrop);
         }
 
@@ -517,6 +561,25 @@ impl Component for ColorInput {
             );
         }
 
+        // Focus leaving the `ColorInput`, and the window losing the keyboard,
+        // close the dropdown (#1572), as Mantine's `onBlur` on the input does.
+        // A key entry for as long as the dropdown is open, owned by the root —
+        // the element holding both the field and the panel, so a focus move
+        // between them is not a leave. It takes no key: Escape is the dismiss
+        // entry's above, and every other key is the field's. Its
+        // `on_focus_leave` is called by `notify_focus_moved` when the focus is
+        // no longer inside the root, and by `notify_window_blurred` (#1171).
+        {
+            let is_open: crate::overlay_dismiss::ReactiveBool = Rc::new(move || opened.get());
+            crate::overlay_dismiss::arm_keys_while_open(
+                __scope,
+                &root,
+                is_open,
+                Rc::new(|_| false),
+                Rc::new(move || opened.set(false)),
+            );
+        }
+
         // Reactive: update preview/input from current_value
         {
             let preview_node = preview_node.clone();
@@ -542,9 +605,9 @@ impl Component for ColorInput {
                 // replace the text under the author's caret (GH #231). The
                 // field is rewritten only when the colour moves away from it —
                 // the dropdown picker, an external `value_fn` change. "The
-                // field's text" is the `typed` record when one exists (the
-                // live text on both backends), else the `value` attribute
-                // (which on web is honest only until the first keystroke).
+                // field's text" is its `live_value` (#238), never the `value`
+                // attribute, which on web is honest only until the first
+                // keystroke.
                 //
                 // The rewrite is in the output format's spelling, at the same
                 // grid the guard judges by (GH #237): `val` itself may be a
@@ -553,16 +616,11 @@ impl Component for ColorInput {
                 // what "the same colour" means. The guard is `denotes_same`
                 // unrolled, so the spelling it judges by is the one written.
                 let spelled = display_spelling(&val, color_format);
-                let field_text = typed
-                    .borrow()
-                    .clone()
-                    .or_else(|| text_input.get_attribute("value"));
-                let field_agrees = field_text.is_some_and(|text| {
+                let field_agrees = text_input.live_value().is_some_and(|text| {
                     let text = text.trim();
                     text == val.trim() || display_spelling(text, color_format) == spelled
                 });
                 if !field_agrees {
-                    *typed.borrow_mut() = None;
                     text_input.set_attribute("value", &spelled);
                 }
             });
@@ -599,16 +657,29 @@ impl Component for ColorInput {
         }
 
         // Description
+        let mut desc_node = None;
         if !self.description.is_empty() {
             let desc = rinch_macros::rsx! { div { class: "rinch-color-input__description", {self.description.clone()} } };
             root.append_child(&desc);
+            desc_node = Some(desc);
         }
 
         // Error
+        let mut err_node = None;
         if !self.error.is_empty() {
             let err = rinch_macros::rsx! { div { class: "rinch-color-input__error", {self.error.clone()} } };
             root.append_child(&err);
+            err_node = Some(err);
         }
+
+        // The label names the field (#2034).
+        ids.wire(
+            &text_input,
+            true,
+            label_node.as_ref(),
+            desc_node.as_ref(),
+            err_node.as_ref(),
+        );
 
         root
     }

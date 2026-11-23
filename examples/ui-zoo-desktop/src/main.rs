@@ -53,6 +53,9 @@ fn build_app(
     let left_section: SectionRenderer = Rc::new(move |__scope| {
         rsx! {
             ActionIcon {
+                // The visual-test suite finds the nav toggle by this class
+                // (crates/rinch-visual-test/tests/visual/tests.json).
+                class: "ui-zoo-nav-toggle",
                 variant: "subtle",
                 size: "lg",
                 onclick: move || drawer_opened.update(|v| *v = !*v),
@@ -138,13 +141,21 @@ fn main() {
         .separator()
         .item(MenuItem::new("Quit").on_click(close_current_window));
 
-    let _tray = TrayIconBuilder::new()
+    // The tray is a feature of the showcase, not a requirement: without one
+    // (no D-Bus session, a broken tray host) the zoo still starts (#2474).
+    let _tray = match TrayIconBuilder::new()
         .with_tooltip("UI Zoo")
         .with_icon_png(include_bytes!("../../../rinch-icon.png"))
         .expect("failed to load tray icon")
         .with_menu(tray_menu)
         .build()
-        .expect("failed to create tray icon");
+    {
+        Ok(tray) => Some(tray),
+        Err(e) => {
+            eprintln!("ui-zoo: no tray icon: {e}");
+            None
+        }
+    };
 
     // ── Native menu bar ──────────────────────────────────────────────────
 

@@ -47,6 +47,11 @@ fn mount(build: impl FnOnce(&mut RenderScope) -> NodeHandle + 'static) -> RinchA
         d.recompute_all_styles_full();
     }
     app.resolve_and_repaint(VIEWPORT.0, VIEWPORT.1);
+    // An overlay open at mount parks its focus move, which these fixtures
+    // never applied; since #2731 the first key would (before it is routed), so
+    // it is dropped to keep the focus where each fixture puts it
+    // (`trap_focus_tests::settle`).
+    let _ = rinch_core::take_pending_focus_steps(app.doc_key(), true);
     app
 }
 
@@ -107,7 +112,7 @@ fn tap(app: &mut RinchApp, x: f32, y: f32) {
 }
 
 /// The one node carrying `class`, by name rather than by append order.
-fn find_by_class(app: &RinchApp, class: &str) -> usize {
+fn find_by_class(app: &RinchApp, class: &str) -> u64 {
     let doc = app.doc.as_ref().unwrap();
     let d = doc.borrow();
     d.tree
@@ -122,7 +127,7 @@ fn find_by_class(app: &RinchApp, class: &str) -> usize {
         .unwrap_or_else(|| panic!("no node carries the class {class}"))
 }
 
-fn centre(app: &RinchApp, node_id: usize) -> (f32, f32) {
+fn centre(app: &RinchApp, node_id: u64) -> (f32, f32) {
     let doc = app.doc.as_ref().unwrap();
     let d = doc.borrow();
     let n = d.tree.get(node_id).expect("node still in the tree");
@@ -241,7 +246,7 @@ fn a_closed_but_mounted_modal_leaves_escape_to_the_app_and_answers_it_once_opene
 fn escape_closes_the_modal_while_an_input_inside_it_holds_focus() {
     let open = Signal::new(true);
     let (closes, onclose) = recorder();
-    let field: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+    let field: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
     let field_in = field.clone();
 
     let mut app = mount(move |scope: &mut RenderScope| {
@@ -357,7 +362,7 @@ struct Nested {
     outer_closes: Rc<Cell<usize>>,
     inner_closes: Rc<Cell<usize>>,
     inner_scope: Rc<RefCell<Option<RenderScope>>>,
-    inner_root: Rc<Cell<Option<usize>>>,
+    inner_root: Rc<Cell<Option<u64>>>,
 }
 
 impl Nested {
@@ -365,7 +370,7 @@ impl Nested {
         let (outer_closes, outer_cb) = recorder();
         let (inner_closes, inner_cb) = recorder();
         let inner_scope: Rc<RefCell<Option<RenderScope>>> = Rc::new(RefCell::new(None));
-        let inner_root: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+        let inner_root: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
         let scope_in = inner_scope.clone();
         let root_in = inner_root.clone();
 
@@ -489,6 +494,66 @@ fn after_the_inner_modal_unmounts_the_outer_still_answers_escape() {
     );
 }
 
+/// **Issue #803.** An overlay *written inside* another takes Escape first.
+///
+/// `Modal { Popover { … } }` renders the popover before the modal (a component
+/// renders after its children), so the popover's entry sits **below** the
+/// modal's on the stack and plain LIFO closed the whole dialog when the user
+/// pressed Escape at the popover. Both are open, so the assertions name which
+/// one closed — "an overlay closed" passes against the bug. Then the popover
+/// closes and the same key reaches the modal (the positive control), and
+/// `Drawer` is checked the same way as the outer overlay.
+#[test]
+fn a_popover_written_inside_a_modal_or_drawer_takes_escape_before_it_803() {
+    for outer_is_drawer in [false, true] {
+        let outer_open = Signal::new(true);
+        let pop_open = Signal::new(true);
+        let (outer_closes, outer_cb) = recorder();
+        let (pop_closes, pop_cb) = recorder();
+        let mut app = mount(move |scope: &mut RenderScope| {
+            let pop = Popover {
+                opened_fn: Some(reactive(pop_open)),
+                onclose: Some(pop_cb),
+                ..Default::default()
+            }
+            .render(scope, &[]);
+            if outer_is_drawer {
+                rinch_components::Drawer {
+                    opened_fn: Some(reactive(outer_open)),
+                    onclose: Some(outer_cb),
+                    ..Default::default()
+                }
+                .render(scope, &[pop])
+            } else {
+                Modal {
+                    opened_fn: Some(reactive(outer_open)),
+                    onclose: Some(outer_cb),
+                    ..Default::default()
+                }
+                .render(scope, &[pop])
+            }
+        });
+        let what = if outer_is_drawer { "Drawer" } else { "Modal" };
+
+        escape(&mut app);
+        assert_eq!(
+            pop_closes.get(),
+            1,
+            "{what}: the popover inside took Escape"
+        );
+        assert_eq!(
+            outer_closes.get(),
+            0,
+            "{what}: and the overlay around it stayed"
+        );
+
+        pop_open.set(false);
+        escape(&mut app);
+        assert_eq!(pop_closes.get(), 1);
+        assert_eq!(outer_closes.get(), 1, "{what}: the next Escape closes it");
+    }
+}
+
 // ── 3. Two documents on one thread ───────────────────────────────────────────
 
 /// #134/#139: two `RinchApp`s on one thread share every thread-local here.
@@ -540,7 +605,7 @@ fn one_documents_escape_does_not_close_another_documents_modal() {
 fn a_drag_in_progress_still_takes_escape_before_the_dismiss_stack() {
     let open = Signal::new(true);
     let (closes, onclose) = recorder();
-    let row: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+    let row: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
     let row_in = row.clone();
 
     // The handle lives *inside* the modal. An open modal's root is a
@@ -588,9 +653,9 @@ fn a_drag_in_progress_still_takes_escape_before_the_dismiss_stack() {
 // ── 4b. A native <select> inside an overlay ──────────────────────────────────
 
 /// A `Modal` holding a native `<select>`, with the select's node id.
-fn mount_select_in_modal(open: Signal<bool>) -> (RinchApp, usize, Rc<Cell<usize>>) {
+fn mount_select_in_modal(open: Signal<bool>) -> (RinchApp, u64, Rc<Cell<usize>>) {
     let (closes, onclose) = recorder();
-    let sel: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+    let sel: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
     let sel_in = sel.clone();
 
     let app = mount(move |scope: &mut RenderScope| {
@@ -698,7 +763,7 @@ fn a_select_opened_inside_a_modal_takes_the_first_escape_and_the_modal_the_secon
 /// before any of this existed.
 #[test]
 fn a_bare_select_still_closes_on_escape_with_no_overlay_involved() {
-    let sel: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+    let sel: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
     let sel_in = sel.clone();
     let mut app = mount(move |scope: &mut RenderScope| {
         let root = scope.create_element("div");
@@ -731,14 +796,14 @@ struct Pop {
     closes: Rc<Cell<usize>>,
     inside_clicks: Rc<Cell<usize>>,
     /// A node inside the popover's own dropdown, to aim a click at.
-    inside: usize,
+    inside: u64,
 }
 
 fn mount_popover(open: Signal<bool>) -> Pop {
     let (closes, onclose) = recorder();
     let inside_clicks: Rc<Cell<usize>> = Rc::new(Cell::new(0));
     let inside_in = inside_clicks.clone();
-    let inside_id: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+    let inside_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
     let inside_id_in = inside_id.clone();
 
     let app = mount(move |scope: &mut RenderScope| {
@@ -847,12 +912,11 @@ mod auto_close {
     //! `Notification::auto_close`, driven by a manual timer backend.
     //!
     //! [`rinch_core::set_timer_backend`] writes a process-global static, so
-    //! these serialize against each other with a mutex. Nothing else in this
-    //! crate's test binary arms a timeout, so the installed backend is only
-    //! ever seen by the tests below.
+    //! these serialize, with every other test that installs one, on
+    //! [`timer_backend_lock`](super::super::timer_backend_lock).
 
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::MutexGuard;
 
     thread_local! {
         static SCHEDULED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
@@ -865,11 +929,7 @@ mod auto_close {
     /// Serialize the tests that own the global timer backend, and start each
     /// one from an empty schedule.
     fn timer_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let guard = LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = super::super::timer_backend_lock();
         rinch_core::set_timer_backend(manual);
         SCHEDULED.with(|s| s.borrow_mut().clear());
         guard

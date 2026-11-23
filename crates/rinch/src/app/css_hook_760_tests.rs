@@ -121,10 +121,10 @@ fn settle(app: &mut RinchApp, nth: f32) {
     app.resolve_and_repaint(VIEWPORT.0 + nth, VIEWPORT.1);
 }
 
-fn nodes_with_class(app: &RinchApp, class: &str) -> Vec<usize> {
+fn nodes_with_class(app: &RinchApp, class: &str) -> Vec<u64> {
     let doc = app.doc.as_ref().unwrap();
     let d = doc.borrow();
-    let mut found: Vec<usize> = d
+    let mut found: Vec<u64> = d
         .tree
         .nodes
         .iter()
@@ -139,13 +139,13 @@ fn nodes_with_class(app: &RinchApp, class: &str) -> Vec<usize> {
     found
 }
 
-fn node_with_class(app: &RinchApp, class: &str) -> usize {
+fn node_with_class(app: &RinchApp, class: &str) -> u64 {
     let found = nodes_with_class(app, class);
     assert_eq!(found.len(), 1, "expected one `{class}`, found {found:?}");
     found[0]
 }
 
-fn has_class(app: &RinchApp, node: usize, class: &str) -> bool {
+fn has_class(app: &RinchApp, node: u64, class: &str) -> bool {
     let doc = app.doc.as_ref().unwrap();
     let d = doc.borrow();
     d.tree
@@ -154,7 +154,7 @@ fn has_class(app: &RinchApp, node: usize, class: &str) -> bool {
         .is_some_and(|c| c.split_whitespace().any(|one| one == class))
 }
 
-fn attr(app: &RinchApp, node: usize, name: &str) -> Option<String> {
+fn attr(app: &RinchApp, node: u64, name: &str) -> Option<String> {
     let doc = app.doc.as_ref().unwrap();
     let d = doc.borrow();
     d.tree
@@ -162,26 +162,26 @@ fn attr(app: &RinchApp, node: usize, name: &str) -> Option<String> {
         .and_then(|n| n.attributes.get(name).cloned())
 }
 
-fn display_of(app: &RinchApp, node: usize) -> DisplayValue {
+fn display_of(app: &RinchApp, node: u64) -> DisplayValue {
     let doc = app.doc.as_ref().unwrap();
     let d = doc.borrow();
     d.tree.get(node).unwrap().computed_style.display
 }
 
-fn color_of(app: &RinchApp, node: usize) -> Option<peniko::Color> {
+fn color_of(app: &RinchApp, node: u64) -> Option<peniko::Color> {
     let doc = app.doc.as_ref().unwrap();
     let d = doc.borrow();
     d.tree.get(node).unwrap().computed_style.color
 }
 
-fn background_of(app: &RinchApp, node: usize) -> Option<peniko::Color> {
+fn background_of(app: &RinchApp, node: u64) -> Option<peniko::Color> {
     let doc = app.doc.as_ref().unwrap();
     let d = doc.borrow();
     d.tree.get(node).unwrap().computed_style.background_color()
 }
 
 /// How many transitions are running on `node`.
-fn running(app: &RinchApp, node: usize) -> usize {
+fn running(app: &RinchApp, node: u64) -> usize {
     let doc = app.doc.as_ref().unwrap();
     let d = doc.borrow();
     d.tree
@@ -192,14 +192,14 @@ fn running(app: &RinchApp, node: usize) -> usize {
 }
 
 /// Whether `node` declares any `transition` at all.
-fn declares_a_transition(app: &RinchApp, node: usize) -> bool {
+fn declares_a_transition(app: &RinchApp, node: u64) -> bool {
     let doc = app.doc.as_ref().unwrap();
     let d = doc.borrow();
     !d.tree.get(node).unwrap().transition_specs.is_empty()
 }
 
 /// Fire the handler behind a node's `attr`, the way the click/hover paths do.
-fn fire(app: &RinchApp, node: usize, name: &str) {
+fn fire(app: &RinchApp, node: u64, name: &str) {
     let rid = attr(app, node, name)
         .unwrap_or_else(|| panic!("node {node} carries no `{name}`"))
         .parse::<usize>()
@@ -362,13 +362,20 @@ fn opening_a_dropdown_menu_toggles_the_opened_class_and_reveals_panel_and_backdr
         DisplayValue::Block,
         "and the same class reveals the backdrop, which used to need an effect of its own"
     );
+    // Since #1764 the panel carries its placement inline (insets and a
+    // pinned width, `floating.rs`), but never its `display`.
     for (node, what) in [(panel, "panel"), (backdrop, "backdrop")] {
-        assert_eq!(
-            attr(&app, node, "style"),
-            None,
-            "the {what}'s reveal is the cascade's, not an inline `style` rewrite"
+        let style = attr(&app, node, "style").unwrap_or_default();
+        assert!(
+            !style.contains("display") && !style.contains("visibility"),
+            "the {what}'s reveal is the cascade's, not an inline `style` rewrite: {style:?}"
         );
     }
+    assert_eq!(
+        attr(&app, backdrop, "style"),
+        None,
+        "the backdrop is not placed"
+    );
 
     opened.set(false);
     settle(&mut app, 2.0);
@@ -408,10 +415,10 @@ fn the_dropdown_panel_declares_no_transition_so_a_display_reveal_is_legitimate()
 
 struct MountedTabs {
     app: RinchApp,
-    tabs: Vec<usize>,
-    panels: Vec<usize>,
-    labels: Vec<usize>,
-    indicators: Vec<usize>,
+    tabs: Vec<u64>,
+    panels: Vec<u64>,
+    labels: Vec<u64>,
+    indicators: Vec<u64>,
 }
 
 fn tabs_app(variant: &str) -> MountedTabs {
@@ -721,7 +728,7 @@ fn the_pills_and_outline_variants_are_styled_by_the_same_hook() {
 /// No tab button carries an inline `style` at all. The active styling used to be
 /// four `set_style` calls on the button (and one more on its label span); the
 /// cascade owns all of it now.
-fn no_inline_style(app: &RinchApp, nodes: &[usize]) {
+fn no_inline_style(app: &RinchApp, nodes: &[u64]) {
     for n in nodes {
         assert_eq!(
             attr(app, *n, "style"),
@@ -753,13 +760,13 @@ fn no_inline_style(app: &RinchApp, nodes: &[usize]) {
 // instances in the same state sit on the fixed point where a leaking rule and
 // a correct one agree.
 
-fn parent_of(app: &RinchApp, node: usize) -> Option<usize> {
+fn parent_of(app: &RinchApp, node: u64) -> Option<u64> {
     let doc = app.doc.as_ref().unwrap();
     let d = doc.borrow();
     d.tree.get(node).and_then(|n| n.parent)
 }
 
-fn is_inside(app: &RinchApp, node: usize, ancestor: usize) -> bool {
+fn is_inside(app: &RinchApp, node: u64, ancestor: u64) -> bool {
     let mut cur = parent_of(app, node);
     while let Some(p) = cur {
         if p == ancestor {
@@ -771,10 +778,10 @@ fn is_inside(app: &RinchApp, node: usize, ancestor: usize) -> bool {
 }
 
 /// The one node carrying `data-probe="{marker}"`.
-fn probe(app: &RinchApp, marker: &str) -> usize {
+fn probe(app: &RinchApp, marker: &str) -> u64 {
     let doc = app.doc.as_ref().unwrap();
     let d = doc.borrow();
-    let found: Vec<usize> = d
+    let found: Vec<u64> = d
         .tree
         .nodes
         .iter()
@@ -786,8 +793,8 @@ fn probe(app: &RinchApp, marker: &str) -> usize {
 }
 
 /// The one node with `class` whose parent is `parent`.
-fn child_with_class(app: &RinchApp, parent: usize, class: &str) -> usize {
-    let found: Vec<usize> = nodes_with_class(app, class)
+fn child_with_class(app: &RinchApp, parent: u64, class: &str) -> u64 {
+    let found: Vec<u64> = nodes_with_class(app, class)
         .into_iter()
         .filter(|n| parent_of(app, *n) == Some(parent))
         .collect();
@@ -1086,7 +1093,7 @@ fn nested_default_tabs_do_not_take_the_outer_variants_active_styling() {
             is_inside(&app, inner, outer),
             "the fixture really nests them"
         );
-        let active: Vec<usize> = nodes_with_class(&app, "rinch-tabs__tab")
+        let active: Vec<u64> = nodes_with_class(&app, "rinch-tabs__tab")
             .into_iter()
             .filter(|t| attr(&app, *t, "data-active").as_deref() == Some("true"))
             .collect();
@@ -1132,7 +1139,7 @@ fn nested_horizontal_tabs_keep_an_underline_inside_vertical_tabs() {
     });
     let inner = probe(&app, "inner");
     let indicators = nodes_with_class(&app, "rinch-tabs__tab-indicator");
-    let size = |node: usize| {
+    let size = |node: u64| {
         let doc = app.doc.as_ref().unwrap();
         let d = doc.borrow();
         let l = d.tree.get(node).unwrap().layout;
@@ -1177,7 +1184,7 @@ fn nested_horizontal_tabs_keep_an_underline_inside_vertical_tabs() {
 // on the fixed point where `>` and the descendant rule agree.
 
 /// Whether `node` is attached to the document.
-fn connected(app: &RinchApp, node: usize) -> bool {
+fn connected(app: &RinchApp, node: u64) -> bool {
     let doc = app.doc.as_ref().unwrap();
     let d = doc.borrow();
     let mut cur = Some(node);
@@ -1192,8 +1199,8 @@ fn connected(app: &RinchApp, node: usize) -> bool {
 
 /// The one **attached** node with `class` — a branch that was swapped out can
 /// leave a detached one in the arena.
-fn live_node_with_class(app: &RinchApp, class: &str) -> usize {
-    let found: Vec<usize> = nodes_with_class(app, class)
+fn live_node_with_class(app: &RinchApp, class: &str) -> u64 {
+    let found: Vec<u64> = nodes_with_class(app, class)
         .into_iter()
         .filter(|n| connected(app, *n))
         .collect();
@@ -1208,7 +1215,7 @@ fn live_node_with_class(app: &RinchApp, class: &str) -> usize {
 /// Whether `node` is rendered: neither it nor any ancestor computes
 /// `display: none`. A `display` read on the panel alone is not enough — on
 /// `main` the positional inline write landed on the wrapper, not the panel.
-fn rendered(app: &RinchApp, node: usize) -> bool {
+fn rendered(app: &RinchApp, node: u64) -> bool {
     let doc = app.doc.as_ref().unwrap();
     let d = doc.borrow();
     let mut cur = Some(node);
@@ -1649,20 +1656,20 @@ fn known_limit_an_open_menu_in_a_closed_menus_target_inside_an_open_menu_stays_h
 
 // ── the gap this fix had to work around ──────────────────────────────────
 
-/// rinch creates **no** pseudo-element for `content: ''`, which is why the tab
-/// underline is an element and not the `::after` the sheet used to declare.
+/// rinch now creates a pseudo-element for `content: ''` too (#773, fixed —
+/// this used to be a *record* of the gap, not an endorsement: it asserted the
+/// opposite of what's below, and this comment said to invert it once fixed).
 ///
-/// `style_resolution/pseudo.rs` extracts the `content` text and returns early
-/// when it is empty, so a decorative `::before`/`::after` — the only kind that
-/// wants an empty `content` — never exists. Six rules in the shipped component
-/// sheet are written that way (Refs #773); the Tabs one is the only one #760
-/// moved off it.
+/// The tab underline predates the fix and is still a real element rather than
+/// the `::after` the sheet used to declare — #760 didn't need to revisit that,
+/// since the underline also needs a `transition`, which an `::after` can carry
+/// just as well now, but moving it back is out of scope for #773.
 ///
 /// Sampled against a non-empty `content`, which is the positive control: a
-/// fixture that only looked at the empty case could not tell "no pseudo-element
-/// here" from "no pseudo-elements at all".
+/// fixture that only looked at the empty case could not tell "a pseudo-element
+/// here" from "pseudo-elements are created unconditionally".
 #[test]
-fn an_empty_content_creates_no_pseudo_element_but_a_non_empty_one_does() {
+fn an_empty_content_creates_a_pseudo_element_same_as_a_non_empty_one() {
     fn pseudo_count(content: &str) -> usize {
         let css = format!(".probe::after {{ content: {content}; display: block; height: 2px; }}");
         let mut app = RinchApp::new(move |scope: &mut RenderScope| {
@@ -1690,12 +1697,50 @@ fn an_empty_content_creates_no_pseudo_element_but_a_non_empty_one_does() {
     assert_eq!(
         pseudo_count("'x'"),
         1,
-        "the control: a non-empty `content` does create one"
+        "the control: a non-empty `content` creates one"
     );
     assert_eq!(
         pseudo_count("''"),
-        0,
-        "and an empty one does not — so `.rinch-tabs__tab::after` never existed \
-         on desktop, and the underline had to become a real element"
+        1,
+        "and an empty one now does too — a purely decorative `::before`/`::after` \
+         (an arrow, a divider stroke, a dot) draws, as in Chrome"
     );
+}
+
+/// `content: none` and `content: normal` are the two spellings
+/// `ineffective_content_property()` always correctly rejected, and still do —
+/// #773 only removed the second, over-eager `text.is_empty()` check sitting
+/// right after it.
+#[test]
+fn content_none_and_normal_still_create_no_pseudo_element() {
+    fn pseudo_count(content: &str) -> usize {
+        let css = format!(".probe::after {{ content: {content}; display: block; height: 2px; }}");
+        let mut app = RinchApp::new(move |scope: &mut RenderScope| {
+            let d = scope.create_element("div");
+            d.set_attribute("class", "probe");
+            d
+        });
+        app.mount_component(VIEWPORT.0, VIEWPORT.1);
+        {
+            let doc = app.doc.as_ref().unwrap();
+            let mut d = doc.borrow_mut();
+            d.load_css(&css);
+            d.recompute_all_styles_full();
+        }
+        app.resolve_and_repaint(VIEWPORT.0, VIEWPORT.1);
+        let doc = app.doc.as_ref().unwrap();
+        let d = doc.borrow();
+        d.tree
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.is_pseudo_element)
+            .count()
+    }
+    for content in ["none", "normal"] {
+        assert_eq!(
+            pseudo_count(content),
+            0,
+            "`content: {content}` creates nothing"
+        );
+    }
 }

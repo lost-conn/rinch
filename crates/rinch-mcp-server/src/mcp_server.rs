@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::client::{DebugClient, DebugCommandKind, DebugResult};
+use crate::client::{DebugClient, DebugCommandKind, DebugResult, ScrollUnit};
 use crate::discovery;
 
 #[derive(Clone)]
@@ -26,7 +26,7 @@ pub struct ConnectParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SelectorParams {
-    /// CSS-like selector: tag name, [attr], or [attr=value]
+    /// A CSS selector (any: `.a .b`, `button.primary`, `[attr=value]`, ...); a string that is not valid CSS is read as one tag, `.class`, `[attr]` or `[attr=value]`
     pub selector: String,
 }
 
@@ -55,6 +55,12 @@ pub struct ClickParams {
     /// Mouse button: "left" (default), "right", or "middle"
     #[serde(default)]
     pub button: Option<String>,
+    /// Modifiers held for this click, e.g. ["ctrl"] (a Ctrl+click) or
+    /// ["shift"]. Same names as key_press: "ctrl"/"control", "shift",
+    /// "alt"/"option", "meta"/"cmd"/"super". Set before the press, restored
+    /// after the release. Omitted: whatever the app already holds.
+    #[serde(default)]
+    pub modifiers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -74,6 +80,11 @@ pub struct MouseDownParams {
     /// Mouse button: "left" (default), "right", or "middle"
     #[serde(default)]
     pub button: Option<String>,
+    /// Modifiers to hold from this press until the next mouse_up (which
+    /// restores the previous state), e.g. ["shift"] for a Shift-drag. Same
+    /// names as key_press. Omitted: whatever the app already holds.
+    #[serde(default)]
+    pub modifiers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -85,6 +96,11 @@ pub struct MouseUpParams {
     /// Mouse button: "left" (default), "right", or "middle"
     #[serde(default)]
     pub button: Option<String>,
+    /// Modifiers held for this release. Same names as key_press. Whether or
+    /// not given, a mouse_up after a mouse_down with modifiers restores the
+    /// state from before that press.
+    #[serde(default)]
+    pub modifiers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -93,11 +109,26 @@ pub struct ScrollParams {
     pub x: f64,
     /// Y coordinate where the scroll occurs
     pub y: f64,
-    /// Horizontal scroll delta in pixels (positive = right)
+    /// Horizontal scroll delta (positive = right), in `unit`
     #[serde(default)]
     pub delta_x: f64,
-    /// Vertical scroll delta in pixels (positive = scroll down, negative = scroll up)
+    /// Vertical scroll delta (positive = scroll down, negative = scroll up), in `unit`
     pub delta_y: f64,
+    /// `"pixel"` (default): a trackpad-style wheel that scrolls at once.
+    /// `"line"`: mouse-wheel notches (1 = one notch), which glide.
+    #[serde(default)]
+    pub unit: ScrollUnit,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DropFilesParams {
+    /// X coordinate of the drop point (logical px, as `click`)
+    pub x: f64,
+    /// Y coordinate of the drop point (logical px, as `click`)
+    pub y: f64,
+    /// File paths to drop, handed to the app verbatim (not checked to exist;
+    /// a relative path is relative to the app's working directory). At least one.
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -128,6 +159,43 @@ pub struct KeyPressParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KeyDownParams {
+    /// Key name, same names as key_press.
+    pub key: String,
+    /// Shift modifier
+    #[serde(default)]
+    pub shift: bool,
+    /// Ctrl modifier
+    #[serde(default)]
+    pub ctrl: bool,
+    /// Alt modifier
+    #[serde(default)]
+    pub alt: bool,
+    /// Modifier names as an array. Same names as key_press.
+    #[serde(default)]
+    pub modifiers: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KeyUpParams {
+    /// Key name, same names as key_press. Must match the key_down this
+    /// releases so the press and release pair up.
+    pub key: String,
+    /// Shift modifier
+    #[serde(default)]
+    pub shift: bool,
+    /// Ctrl modifier
+    #[serde(default)]
+    pub ctrl: bool,
+    /// Alt modifier
+    #[serde(default)]
+    pub alt: bool,
+    /// Modifier names as an array. Same names as key_press.
+    #[serde(default)]
+    pub modifiers: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LaunchAppParams {
     /// Cargo package name to run (e.g. "hello-rinch-dom" or "ui-zoo-desktop")
     pub package: String,
@@ -152,6 +220,30 @@ pub struct GlyphBoundsParams {
     pub byte_offset: u64,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PerfStatsParams {
+    /// Zero every counter after reading them, so the next call reports only
+    /// what happened in between.
+    #[serde(default)]
+    pub reset: bool,
+}
+
+/// The tool error for the first name in a `modifiers` array the runtime does
+/// not know, so an unknown name is rejected before anything reaches the app.
+/// The names are those of `rinch_debug::fold_modifier_names`, which the app
+/// applies.
+fn unknown_modifier_error(names: &[String]) -> Option<CallToolResult> {
+    let name = names.iter().find(|name| {
+        !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "ctrl" | "control" | "shift" | "alt" | "option" | "meta" | "cmd" | "super"
+        )
+    })?;
+    Some(CallToolResult::error(vec![Content::text(format!(
+        "Unknown modifier name: {name:?} (expected ctrl/control, shift, alt/option, meta/cmd/super)"
+    ))]))
+}
+
 #[tool_router]
 impl RinchMcpServer {
     pub fn new() -> Self {
@@ -171,11 +263,11 @@ impl RinchMcpServer {
 
         let apps = discovery::list_apps();
         if apps.is_empty() {
-            return Err("No rinch applications found. Make sure your app has rinch-debug enabled and is running.".into());
+            return Err("No rinch applications found. Make sure your app is built with rinch's `debug` feature, is running, and was started with RINCH_DEBUG=1 (the debug interface is off otherwise; launch_app sets it).".into());
         }
         if apps.len() == 1 {
             let app = &apps[0];
-            let c = DebugClient::connect(app.port)?;
+            let c = DebugClient::connect(app.port, app.token.as_deref())?;
             tracing::info!("Auto-connected to {} (PID {})", c.app_name, c.pid);
             *client = Some(c);
             return Ok(());
@@ -201,7 +293,7 @@ impl RinchMcpServer {
         let apps = discovery::list_apps();
         if apps.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
-                "No rinch applications found. Make sure your app has rinch-debug enabled and is running.",
+                "No rinch applications found. Make sure your app is built with rinch's `debug` feature, is running, and was started with RINCH_DEBUG=1 (the debug interface is off otherwise; launch_app sets it).",
             )]));
         }
         let info: Vec<serde_json::Value> = apps
@@ -212,6 +304,13 @@ impl RinchMcpServer {
                     "pid": a.pid,
                     "port": a.port,
                     "started_at": a.started_at,
+                    // #2481: an app from before it takes no token, so any
+                    // local user can drive it.
+                    "access": if a.token.is_some() {
+                        "this user only (token)"
+                    } else {
+                        "any local user (rinch from before #2481)"
+                    },
                 })
             })
             .collect();
@@ -224,7 +323,7 @@ impl RinchMcpServer {
         let apps = discovery::list_apps();
         if apps.is_empty() {
             return Ok(CallToolResult::error(vec![Content::text(
-                "No rinch applications found.",
+                "No rinch applications found. An app needs rinch's `debug` feature and RINCH_DEBUG=1 at start (launch_app sets it).",
             )]));
         }
 
@@ -253,7 +352,7 @@ impl RinchMcpServer {
             )]));
         };
 
-        match DebugClient::connect(app.port) {
+        match DebugClient::connect(app.port, app.token.as_deref()) {
             Ok(c) => {
                 let msg = format!("Connected to {} (PID {})", c.app_name, c.pid);
                 *self.client.lock().unwrap() = Some(c);
@@ -291,14 +390,14 @@ impl RinchMcpServer {
     ) -> Result<CallToolResult, McpError> {
         self.forward_json_command(DebugCommandKind::DomTree {
             max_depth: params.0.max_depth,
-            root_id: params.0.root_id.map(|id| id as usize),
+            root_id: params.0.root_id,
             verbose: params.0.verbose.unwrap_or(false),
         })
         .await
     }
 
     #[tool(
-        description = "Query DOM nodes by selector. Each result has `layout` (parent-relative box) and `absolute` (on-screen box) — pass `absolute.x`/`absolute.y` to click()/mouse_*, not `layout`."
+        description = "Query DOM nodes (`<body>` and below) by CSS selector: any selector, e.g. `.panel .body`, `button.primary`, `[data-rid]`. Each result has `layout` (parent-relative box) and `absolute` (on-screen box) — pass `absolute.x`/`absolute.y` to click()/mouse_*, not `layout`."
     )]
     async fn query_selector(
         &self,
@@ -314,10 +413,8 @@ impl RinchMcpServer {
         description = "Get detailed information about a specific DOM node by ID (computed styles, display mode, geometry). Geometry is reported as `layout` (parent-relative box, == the node's own layout) and `absolute` (on-screen box). Pass `absolute.x`/`absolute.y` to click()/mouse_* — `layout` x/y are NOT screen coordinates."
     )]
     async fn get_node(&self, params: Parameters<NodeIdParams>) -> Result<CallToolResult, McpError> {
-        self.forward_json_command(DebugCommandKind::GetNode {
-            id: params.0.id as usize,
-        })
-        .await
+        self.forward_json_command(DebugCommandKind::GetNode { id: params.0.id })
+            .await
     }
 
     #[tool(description = "Get all text content within a DOM node subtree.")]
@@ -325,35 +422,41 @@ impl RinchMcpServer {
         &self,
         params: Parameters<NodeIdParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.forward_json_command(DebugCommandKind::GetTextContent {
-            id: params.0.id as usize,
-        })
-        .await
+        self.forward_json_command(DebugCommandKind::GetTextContent { id: params.0.id })
+            .await
     }
 
     #[tool(
-        description = "Simulate a mouse click at the given screen coordinates. Use the `absolute.x`/`absolute.y` of a node from get_node/query_selector (its `layout` x/y are parent-relative, not screen coordinates)."
+        description = "Simulate a mouse click at the given screen coordinates. Use the `absolute.x`/`absolute.y` of a node from get_node/query_selector (its `layout` x/y are parent-relative, not screen coordinates). `modifiers` (e.g. [\"ctrl\"], [\"shift\"], [\"meta\"]) are held for the click and restored after it: a Ctrl/Cmd+click, Shift+click or Alt+click."
     )]
     async fn click(&self, params: Parameters<ClickParams>) -> Result<CallToolResult, McpError> {
+        if let Some(err) = unknown_modifier_error(params.0.modifiers.as_deref().unwrap_or(&[])) {
+            return Ok(err);
+        }
         self.forward_json_command(DebugCommandKind::Click {
             x: params.0.x as f32,
             y: params.0.y as f32,
             button: params.0.button,
+            modifiers: params.0.modifiers,
         })
         .await
     }
 
     #[tool(
-        description = "Simulate a right-click (context menu click) at the given coordinates. Equivalent to click with button='right'."
+        description = "Simulate a right-click (context menu click) at the given coordinates. Equivalent to click with button='right', and takes the same `modifiers`."
     )]
     async fn right_click(
         &self,
         params: Parameters<ClickParams>,
     ) -> Result<CallToolResult, McpError> {
+        if let Some(err) = unknown_modifier_error(params.0.modifiers.as_deref().unwrap_or(&[])) {
+            return Ok(err);
+        }
         self.forward_json_command(DebugCommandKind::Click {
             x: params.0.x as f32,
             y: params.0.y as f32,
             button: Some("right".to_string()),
+            modifiers: params.0.modifiers,
         })
         .await
     }
@@ -373,42 +476,68 @@ impl RinchMcpServer {
     }
 
     #[tool(
-        description = "Simulate a mouse button press (without release) at the given coordinates. Use with mouse_move and mouse_up for drag operations."
+        description = "Simulate a mouse button press (without release) at the given coordinates. Use with mouse_move and mouse_up for drag operations. `modifiers` stay held until the next mouse_up, which restores the previous state (a Shift- or Alt-drag)."
     )]
     async fn mouse_down(
         &self,
         params: Parameters<MouseDownParams>,
     ) -> Result<CallToolResult, McpError> {
+        if let Some(err) = unknown_modifier_error(params.0.modifiers.as_deref().unwrap_or(&[])) {
+            return Ok(err);
+        }
         self.forward_json_command(DebugCommandKind::MouseDown {
             x: params.0.x as f32,
             y: params.0.y as f32,
             button: params.0.button,
+            modifiers: params.0.modifiers,
         })
         .await
     }
 
     #[tool(
-        description = "Simulate a mouse button release at the given coordinates. Use after mouse_down to complete a click or drag."
+        description = "Simulate a mouse button release at the given coordinates. Use after mouse_down to complete a click or drag. Restores any modifiers the mouse_down set, after the release."
     )]
     async fn mouse_up(
         &self,
         params: Parameters<MouseUpParams>,
     ) -> Result<CallToolResult, McpError> {
+        if let Some(err) = unknown_modifier_error(params.0.modifiers.as_deref().unwrap_or(&[])) {
+            return Ok(err);
+        }
         self.forward_json_command(DebugCommandKind::MouseUp {
             x: params.0.x as f32,
             y: params.0.y as f32,
             button: params.0.button,
+            modifiers: params.0.modifiers,
         })
         .await
     }
 
-    #[tool(description = "Simulate a scroll wheel event at the given coordinates.")]
+    #[tool(
+        description = "Simulate a scroll wheel event at the given coordinates. `unit` is \"pixel\" (default; a trackpad, scrolls at once) or \"line\" (mouse-wheel notches, delta 1 = one notch). A line scroll glides to its target over about 200 ms, as a real mouse wheel does, so wait (wait_frame, or a short pause) before taking a screenshot or reading the offset; a pixel scroll has landed by the time the call returns."
+    )]
     async fn scroll(&self, params: Parameters<ScrollParams>) -> Result<CallToolResult, McpError> {
         self.forward_json_command(DebugCommandKind::Scroll {
             x: params.0.x as f32,
             y: params.0.y as f32,
             delta_x: params.0.delta_x,
             delta_y: params.0.delta_y,
+            unit: params.0.unit,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Drop files on the window at (x, y), as the OS delivers a file drop (desktop): a drag enter at the point (data-onfiledragenter, an editor's drop caret), then the drop — an editor that takes pictures claims image files, and data-onfiledrop (the paths) / data-ondropfiles (the files that exist) under the point get the rest, with the drop point in get_click_context(). Paths are passed through unchecked, so a missing file fails in the app's own read. Coordinates in logical px, as click."
+    )]
+    async fn drop_files(
+        &self,
+        params: Parameters<DropFilesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.forward_json_command(DebugCommandKind::DropFiles {
+            x: params.0.x as f32,
+            y: params.0.y as f32,
+            paths: params.0.paths,
         })
         .await
     }
@@ -437,20 +566,77 @@ impl RinchMcpServer {
         let mut shift = params.0.shift;
         let mut ctrl = params.0.ctrl;
         let mut alt = params.0.alt;
+        if let Some(err) = unknown_modifier_error(&params.0.modifiers) {
+            return Ok(err);
+        }
         for name in &params.0.modifiers {
             match name.to_ascii_lowercase().as_str() {
                 "ctrl" | "control" => ctrl = true,
                 "shift" => shift = true,
                 "alt" | "option" => alt = true,
-                "meta" | "cmd" | "super" => {}
-                _ => {
-                    return Ok(CallToolResult::error(vec![Content::text(format!(
-                        "Unknown modifier name: {name:?} (expected ctrl/control, shift, alt/option, meta/cmd/super)"
-                    ))]));
-                }
+                _ => {}
             }
         }
         self.forward_json_command(DebugCommandKind::KeyPress {
+            key: params.0.key,
+            shift,
+            ctrl,
+            alt,
+            modifiers: params.0.modifiers,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Press a key WITHOUT releasing it. Use with key_up for keys that must stay held across other commands (checking whether a game still sees it held, a chord that ends on release). key_press is a complete press+release and is what you want for an ordinary keystroke."
+    )]
+    async fn key_down(
+        &self,
+        params: Parameters<KeyDownParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut shift = params.0.shift;
+        let mut ctrl = params.0.ctrl;
+        let mut alt = params.0.alt;
+        if let Some(err) = unknown_modifier_error(&params.0.modifiers) {
+            return Ok(err);
+        }
+        for name in &params.0.modifiers {
+            match name.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => ctrl = true,
+                "shift" => shift = true,
+                "alt" | "option" => alt = true,
+                _ => {}
+            }
+        }
+        self.forward_json_command(DebugCommandKind::KeyDown {
+            key: params.0.key,
+            shift,
+            ctrl,
+            alt,
+            modifiers: params.0.modifiers,
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Release a key previously held with key_down. The key (and modifiers) should match the key_down call so the press and release pair up."
+    )]
+    async fn key_up(&self, params: Parameters<KeyUpParams>) -> Result<CallToolResult, McpError> {
+        let mut shift = params.0.shift;
+        let mut ctrl = params.0.ctrl;
+        let mut alt = params.0.alt;
+        if let Some(err) = unknown_modifier_error(&params.0.modifiers) {
+            return Ok(err);
+        }
+        for name in &params.0.modifiers {
+            match name.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => ctrl = true,
+                "shift" => shift = true,
+                "alt" | "option" => alt = true,
+                _ => {}
+            }
+        }
+        self.forward_json_command(DebugCommandKind::KeyUp {
             key: params.0.key,
             shift,
             ctrl,
@@ -465,8 +651,19 @@ impl RinchMcpServer {
         &self,
         params: Parameters<NodeIdParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.forward_json_command(DebugCommandKind::GetComputedStyles {
-            id: params.0.id as usize,
+        self.forward_json_command(DebugCommandKind::GetComputedStyles { id: params.0.id })
+            .await
+    }
+
+    #[tool(
+        description = "Get the app's performance counters: style cascades, Parley shapes, IFC setup passes, Taffy computes, full repaints by reason, dirty-region area, Vello clip and layer tiles (vello_clip_tiles, an estimate; 0 on a software frame), images painted (image_draws: one per <img> and background-image layer drawn, either painter), hit-test visits, effect runs and phase timings. Returns last_frame (the last completed redraw), current_frame, total (since the last reset), frames and prepared_frames for the main window, and windows: one entry per open window (window id, main, title, app_id, output, output_id, frames, prepared_frames, last_frame, total), the main one first; a windowless app reports only windows. Each window's effect_runs, signal_notifies and rerender_events_queued are its own document's; work under no document is under pass (passes, last_pass, total) when the app has several windows, and on the only window's frames otherwise. Pass reset: true to zero them after reading, then drive the app and call again to measure one interaction."
+    )]
+    async fn perf_stats(
+        &self,
+        params: Parameters<PerfStatsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.forward_json_command(DebugCommandKind::PerfStats {
+            reset: params.0.reset,
         })
         .await
     }
@@ -625,8 +822,13 @@ impl RinchMcpServer {
         cmd.stderr(std::process::Stdio::piped());
 
         match cmd.spawn() {
-            Ok(child) => {
+            Ok(mut child) => {
                 let pid = child.id();
+                // Read the app's stderr for as long as it runs, keeping the
+                // tail for an early-exit report. A pipe nobody reads fills at
+                // 64 KiB and then blocks the app's next log line (#2482: the
+                // desktop shell logs to stderr).
+                let stderr_tail = child.stderr.take().map(StderrTail::spawn);
 
                 // Store the child process handle
                 self.spawned_processes.lock().unwrap().insert(pid, child);
@@ -646,16 +848,11 @@ impl RinchMcpServer {
                         if let Some(child) = procs.get_mut(&pid)
                             && let Ok(Some(status)) = child.try_wait()
                         {
-                            let mut stderr_msg = String::new();
-                            if let Some(ref mut stderr) = child.stderr {
-                                use std::io::Read;
-                                let _ = stderr.read_to_string(&mut stderr_msg);
-                            }
-                            let trimmed = if stderr_msg.len() > 2000 {
-                                &stderr_msg[stderr_msg.len() - 2000..]
-                            } else {
-                                &stderr_msg
-                            };
+                            let stderr_msg = stderr_tail
+                                .as_ref()
+                                .map(|t| t.finish(std::time::Duration::from_secs(1)))
+                                .unwrap_or_default();
+                            let trimmed = tail_chars(&stderr_msg, 2000);
                             procs.remove(&pid);
                             return Ok(CallToolResult::error(vec![Content::text(format!(
                                 "{} exited with {} before connecting.\n{}",
@@ -668,7 +865,7 @@ impl RinchMcpServer {
 
                     // Try exact PID match first (direct binary execution)
                     if let Some(app) = apps.iter().find(|a| a.pid == pid)
-                        && let Ok(c) = DebugClient::connect(app.port)
+                        && let Ok(c) = DebugClient::connect(app.port, app.token.as_deref())
                     {
                         let msg = format!(
                             "Launched {} (PID {}) and connected on port {}",
@@ -682,7 +879,7 @@ impl RinchMcpServer {
                     // processes a different PID than the cargo wrapper we spawned)
                     for app in &apps {
                         if !pre_apps.contains(&app.pid)
-                            && let Ok(c) = DebugClient::connect(app.port)
+                            && let Ok(c) = DebugClient::connect(app.port, app.token.as_deref())
                         {
                             let msg = format!(
                                 "Launched {} (PID {}) and connected on port {}",
@@ -707,28 +904,28 @@ impl RinchMcpServer {
     }
 
     #[tool(
-        description = "Get the screen position of a text caret at a given byte offset in a node"
+        description = "Get the screen position (x, y) of a text caret at a given byte offset in a node, in logical (CSS) pixels like `absolute` and the input tools — multiply by the scale factor to find it in a screenshot"
     )]
     async fn get_caret_position(
         &self,
         params: Parameters<CaretPositionParams>,
     ) -> Result<CallToolResult, McpError> {
         self.forward_json_command(DebugCommandKind::GetCaretPosition {
-            node_id: params.0.node_id as usize,
+            node_id: params.0.node_id,
             byte_offset: params.0.byte_offset as usize,
         })
         .await
     }
 
     #[tool(
-        description = "Get the bounding box of a glyph cluster at a given byte offset in a node"
+        description = "Get the bounding box of the glyph cluster at a given byte offset in a node, in logical (CSS) pixels like `absolute` and the input tools — multiply by the scale factor to find it in a screenshot"
     )]
     async fn get_glyph_bounds(
         &self,
         params: Parameters<GlyphBoundsParams>,
     ) -> Result<CallToolResult, McpError> {
         self.forward_json_command(DebugCommandKind::GetGlyphBounds {
-            node_id: params.0.node_id as usize,
+            node_id: params.0.node_id,
             byte_offset: params.0.byte_offset as usize,
         })
         .await
@@ -803,5 +1000,152 @@ mod key_press_params_tests {
             serde_json::from_str(r#"{"key":"End","ctrl":true,"shift":true}"#).unwrap();
         assert!(p.ctrl && p.shift && !p.alt);
         assert!(p.modifiers.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pointer_modifiers_params_tests {
+    use super::{ClickParams, MouseDownParams, MouseUpParams, unknown_modifier_error};
+
+    #[test]
+    fn click_mouse_down_and_mouse_up_accept_a_modifiers_array() {
+        let json = r#"{"x":1,"y":2,"modifiers":["ctrl"]}"#;
+        let ctrl = Some(vec!["ctrl".to_string()]);
+        assert_eq!(
+            serde_json::from_str::<ClickParams>(json).unwrap().modifiers,
+            ctrl
+        );
+        assert_eq!(
+            serde_json::from_str::<MouseDownParams>(json)
+                .unwrap()
+                .modifiers,
+            ctrl
+        );
+        assert_eq!(
+            serde_json::from_str::<MouseUpParams>(json)
+                .unwrap()
+                .modifiers,
+            ctrl
+        );
+        let p: ClickParams = serde_json::from_str(r#"{"x":1,"y":2}"#).unwrap();
+        assert_eq!(p.modifiers, None);
+    }
+
+    #[test]
+    fn every_known_name_passes_and_an_unknown_one_is_an_error() {
+        let known: Vec<String> = [
+            "ctrl", "Control", "shift", "alt", "option", "meta", "CMD", "super",
+        ]
+        .iter()
+        .map(|n| n.to_string())
+        .collect();
+        assert!(unknown_modifier_error(&known).is_none());
+        let err = unknown_modifier_error(&["ctrl".into(), "hyper".into()])
+            .expect("an unknown name is an error");
+        assert_eq!(err.is_error, Some(true));
+        let text = format!("{:?}", err.content);
+        assert!(
+            text.contains("Unknown modifier name") && text.contains("hyper"),
+            "{text}"
+        );
+    }
+}
+
+/// Drains a child's stderr on a thread of its own, keeping the last
+/// [`StderrTail::KEEP`] bytes.
+struct StderrTail {
+    tail: std::sync::Arc<Mutex<std::collections::VecDeque<u8>>>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+impl StderrTail {
+    const KEEP: usize = 8 * 1024;
+
+    fn spawn(mut stderr: impl std::io::Read + Send + 'static) -> Self {
+        let tail = std::sync::Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let sink = tail.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match stderr.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let mut t = sink.lock().unwrap();
+                        t.extend(&buf[..n]);
+                        let over = t.len().saturating_sub(Self::KEEP);
+                        t.drain(..over);
+                    }
+                }
+            }
+            let _ = done_tx.send(());
+        });
+        Self { tail, done }
+    }
+
+    /// The tail so far, after waiting up to `wait` for the stream to end (a
+    /// process that exited may still have unread output in the pipe).
+    fn finish(&self, wait: std::time::Duration) -> String {
+        let _ = self.done.recv_timeout(wait);
+        let t = self.tail.lock().unwrap();
+        String::from_utf8_lossy(&t.iter().copied().collect::<Vec<u8>>()).into_owned()
+    }
+}
+
+/// The last `max` bytes of `s`, cut at a character boundary.
+fn tail_chars(s: &str, max: usize) -> &str {
+    let mut start = s.len().saturating_sub(max);
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
+#[cfg(test)]
+mod stderr_tail_tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// Issue #2482: a launched app that writes far more than a pipe holds
+    /// (64 KiB) to stderr runs to the end instead of blocking on a full pipe,
+    /// and the tail kept is the end of what it wrote.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_writing_more_than_a_pipe_holds_is_not_blocked() {
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "head -c 600000 /dev/zero | tr '\\0' x >&2; printf END >&2",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("sh runs");
+        let tail = StderrTail::spawn(child.stderr.take().unwrap());
+        let t0 = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if t0.elapsed() > Duration::from_secs(10) {
+                let _ = child.kill();
+                panic!("the child is blocked writing to its stderr");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(status.success());
+        let got = tail.finish(Duration::from_secs(5));
+        assert_eq!(got.len(), StderrTail::KEEP, "the tail is capped");
+        assert!(got.ends_with("xxxEND"), "{:?}", &got[got.len() - 10..]);
+    }
+
+    #[test]
+    fn tail_chars_cuts_on_a_char_boundary() {
+        assert_eq!(tail_chars("abc", 10), "abc");
+        assert_eq!(tail_chars("abcdef", 2), "ef");
+        // "é" is two bytes: a cut inside it moves past it.
+        assert_eq!(tail_chars("aé", 1), "");
+        assert_eq!(tail_chars("aéb", 2), "b");
     }
 }

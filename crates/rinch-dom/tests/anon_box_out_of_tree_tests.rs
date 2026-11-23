@@ -671,13 +671,13 @@ fn the_dom_tree_invariants_all_fail_on_a_corrupt_box() {
 
     // C — `run_boxes` must name live slab entries, the same as `children`. This
     // is what catches a cleanup that removes the boxes and forgets the list.
-    doc.tree.nodes[c.0].run_boxes.push(usize::MAX);
+    doc.tree.nodes[c.0].run_boxes.push(u64::MAX);
     let v = doc.dom_tree_violations();
     assert!(
         v.iter().any(|s| s.starts_with("C freed run box")),
         "a freed run-box entry must be reported, got {v:?}"
     );
-    doc.tree.nodes[c.0].run_boxes.retain(|&x| x != usize::MAX);
+    doc.tree.nodes[c.0].run_boxes.retain(|&x| x != u64::MAX);
 
     // B — one parent per node, counted across both lists.
     doc.tree.nodes[body.0].run_boxes.push(box_id);
@@ -848,11 +848,14 @@ fn moving_a_run_member_between_passes_is_legal_and_r_is_not_an_any_time_rule() {
         "moving a node between containers is ordinary, not corruption"
     );
     // R, asked at this moment, reports the stale run — which is why it is not
-    // asked at this moment.
+    // asked at this moment. Since the scoped structural pass the move takes the
+    // member out of its box's run at once (`clear_ifc_root_recursive`), so the
+    // box is left **memberless** rather than listing a member that is not its
+    // container's unit; either is R, and neither is an any-time fact.
     assert!(
         doc.run_bookkeeping_violations()
             .iter()
-            .any(|s| s.starts_with("R not a unit")),
+            .any(|s| s.starts_with("R not a unit") || s.starts_with("R memberless box")),
         "the mid-mutation window must be real, or this fixture pins nothing"
     );
 

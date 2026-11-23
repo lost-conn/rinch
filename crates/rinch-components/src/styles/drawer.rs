@@ -35,14 +35,61 @@ pub fn styles() -> String {
    other side (`styles/popover.rs`) — it has never touched `display` on the
    panel it animates.
 
-   The close is deliberately instant on both backends, exactly as it was. Making
-   the panel slide *out* needs the root to stay visible for the 300ms, i.e. a
-   transition on `visibility` itself — `rinch_dom::transition::TransitionProperty`
-   has no variant for it, so declaring one here would animate the close in a
-   browser and snap on desktop. One behaviour on both backends is worth more
-   than the slide-out; see issue #759. */
+   The close slides out too (#759, #413). The hidden state holds the root
+   `visible` for the panel's 300ms and only then hides it — `visibility 0s
+   linear 300ms`, a zero-length transition after a 300ms delay, which is the
+   canonical spelling: a browser keeps the old value through a transition's
+   delay, and css-values-4 interpolates `visibility` so that nothing strictly
+   inside a transition with a `visible` end is hidden. rinch-dom implements
+   both, and hands the held value down to the panel and everything else that
+   inherits it, so the close is the same on both backends.
+
+   Only the hidden state declares it. Opening is instant — the root has no
+   `visibility` transition to run — and reopening before the 300ms are up
+   cancels the pending hide (css-transitions-1 §3 item 3: the open state's
+   `transition-property` no longer matches `visibility`), so the panel simply
+   reverses.
+
+   While it slides out the root is visible, so for those 300ms it paints, takes
+   clicks and is in the Tab order, exactly as in a browser. Its focus trap and
+   its hold on the page scroll are released at the close itself. And the pause
+   below applies from the close, so a spinner inside a closing drawer stops
+   where it is and slides out still — also what a browser does with this CSS. */
 .rinch-drawer__root--hidden {
     visibility: hidden !important;
+    transition: visibility 0s linear 300ms;
+}
+
+/* Paused while closed (#912).
+
+   Being rendered has a cost the note above does not: an animation under a
+   `visibility: hidden` box runs — in rinch and in a browser alike — and an
+   `animation: … infinite` (a `Loader`, a loading `Button`, a `Skeleton`) has no
+   duration to expire, so a closed drawer holding one kept the app asking for a
+   frame on every turn, forever, for pixels nobody could see. A paused animation
+   asks for none (#763), and resumes where it stopped when the drawer opens, as
+   a browser keeps its `currentTime`.
+
+   Every descendant, not a list of known spinners: any component or app rule
+   can declare an animation. `!important` because the `animation` shorthand
+   resets `animation-play-state` to `running`, so without it the pause would
+   lose to any shorthand of equal or higher specificity declared after it —
+   `.rinch-loader__oval` ties with this selector and `.rinch-button--loading
+   .rinch-button__loader` beats it. `animation-play-state` does not inherit,
+   hence the `*`.
+
+   Not `*::before` / `*::after`, deliberately, although `animation-play-state`
+   does not inherit into a pseudo-element either: on rinch-web a spinner drawn
+   by an `::after` under a closed overlay is therefore **not** paused, and
+   since #1004 neither is one on desktop, which now runs a pseudo-element's
+   animation (#925, #1023). The selectors are not free there: rinch-dom matches `::before` /
+   `::after` for every element with no ancestor bloom filter (#935), so two
+   rules with a universal rightmost compound cost +10% of style instructions
+   on a page with no overlay in it, and +71% under a closed drawer (measured by
+   PR #929's review). The `drawer_toggle` bench in `rinch-bench` pins this
+   stylesheet's cost. */
+.rinch-drawer__root--hidden * {
+    animation-play-state: paused !important;
 }
 
 /* Drawer overlay — absolute within the fixed root */
@@ -72,6 +119,15 @@ pub fn styles() -> String {
     bottom: 0;
 }
 
+/* Open: `transform: none`, not `translateX(0)` (#1372). Any `transform` but
+   `none` — an identity included — makes the panel the containing block of
+   its `position: fixed` descendants, in a browser as in rinch, so the
+   full-window dismiss backdrop of a `Select`, `DropdownMenu`, `Popover` or
+   `ColorInput` inside an open drawer covered only the panel, and a tap on the
+   dimmed overlay closed the drawer instead of the menu. The panel keeps its
+   stacking context through its `z-index`; while it slides it is transformed,
+   and contains them, as a browser does. */
+
 /* Position: Left */
 .rinch-drawer--left {
     left: 0;
@@ -79,7 +135,7 @@ pub fn styles() -> String {
 }
 
 .rinch-drawer--left.rinch-drawer--opened {
-    transform: translateX(0);
+    transform: none;
 }
 
 /* Position: Right */
@@ -90,7 +146,7 @@ pub fn styles() -> String {
 }
 
 .rinch-drawer--right.rinch-drawer--opened {
-    transform: translateX(0);
+    transform: none;
 }
 
 /* Position: Top */
@@ -103,7 +159,7 @@ pub fn styles() -> String {
 }
 
 .rinch-drawer--top.rinch-drawer--opened {
-    transform: translateY(0);
+    transform: none;
 }
 
 /* Position: Bottom */
@@ -116,7 +172,7 @@ pub fn styles() -> String {
 }
 
 .rinch-drawer--bottom.rinch-drawer--opened {
-    transform: translateY(0);
+    transform: none;
 }
 
 /* Drawer sizes (for left/right) */

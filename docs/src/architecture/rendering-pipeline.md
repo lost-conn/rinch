@@ -98,7 +98,8 @@ invalidation in the table would have reached.
 ### Why a typography change is a layout change
 
 `font-family`, `font-weight`, `font-style`, `line-height`, `letter-spacing`,
-`word-spacing`, `text-transform`, `white-space` and `overflow-wrap` are not Taffy
+`word-spacing`, `text-transform`, `white-space`, `overflow-wrap`, `word-break`,
+`line-break` and `text-indent` are not Taffy
 properties, and neither is `font-size` for a box whose own sizes are in `px`. A
 declaration change in any of them re-wraps the text and therefore moves the box
 around it, so it sets `layout_dirty` even though no Taffy field changed
@@ -113,6 +114,18 @@ the cascade, so a `transition: font-size` frame reaches none of that gating on
 its own; both ticks invalidate the text measure of the nodes they are
 interpolating.
 
+A `color` frame needs no new layout at all, and gets none (issue #679). The
+colour of each run is a brush inside the shaped layout, so paint asks every text
+range what colour its element computes now and draws the ranges that answer
+differently from the build in the new colour (`paint::text::LiveColours`); an
+underline follows where it was `currentcolor`, and a wavy underline and an
+inline element's background are read from their element's style on every paint.
+The layout is rebuilt once, with no Taffy compute, on the frame the colour stops
+moving, so a finished fade costs what a colour-only hover costs and later frames
+recolour nothing (each paint still compares every range's colour with the one it
+was shaped in). A span on a line cut by `text-overflow: ellipsis` follows too:
+the cut keeps the lines and their text ranges and is made at paint (#1100).
+
 ### Why an atomic inline needs its own pass
 
 An `inline-block`, `inline-flex` or `inline-grid` box is **detached from its
@@ -122,11 +135,62 @@ and three passes give one a size, all through `measure_inline_blocks`: the
 `ifc_dirty` pass, which measures every atomic inline in the document; since
 issue #661, a re-measure of the boxes a change actually reached
 (`dirty_atomic_inlines`); and `resolve_percentage_inline_blocks`, which runs
-after the root compute and is what lets a percentage inline size resolve against
-a containing block that only has a width once the compute has run. A component
+after the root compute and is what lets a width that needs the containing
+block's — a percentage, `fit-content`/`stretch`, or an `auto` width, which is
+shrink-to-fit and so capped at that block (#658) — resolve against a containing
+block that only has a width once the compute has run. The inline formatting
+context around such a box is *measured* before that, and asked about widths
+the box is never laid out at; a measure lines an `auto`-width box up at what it
+contributes to the width asked about (`ifc::AtomicContributions`, #1476): its
+max-content size, its min-content size, or the shrink-to-fit of the two. That
+is what lets a container sized from its content — a flex item, a grid `auto`
+track, a shrink-to-fit absolute box, another `auto` atomic inline — come out
+narrower than the box, so the cap can bind. The min-content size is measured
+only when a line narrower than the box asks for it, after the compute that
+asked (a measure cannot start a compute), and the compute then runs again,
+followed by the pass once more: a pass that found such a request is looked at
+again after its compute (until no measure asks any more;
+`ifc::MAX_INLINE_ROUNDS` only guards against a cycle), and one that found none is
+followed by a single compute as before. A component
 that declares `display: inline-flex` —
 `Badge`, `Button` and the rest of the list in CLAUDE.md — is one of these
 whenever it sits beside text rather than inside a `Stack`.
+
+### Why an absolute box can need a second compute
+
+Taffy lays an out-of-flow box out against its **direct parent**. CSS lays a
+`position: absolute` box out against its *containing block*: the padding box of
+the nearest positioned or transformed ancestor, or the viewport when there is
+none. `crates/rinch-dom/src/out_of_flow.rs` closes the gap in two halves.
+
+The **size** is baked into the box's Taffy style before the compute, so the
+box's own children — a percentage child, wrapping content — are laid out inside
+the right box. For the viewport that is known up front. For an ancestor it is
+not: the ancestor's used size is what the compute produces. So a style site
+bakes from the ancestor's last laid-out size, and after each root compute
+`resolve_ancestor_absolutes` compares every absolute box whose containing block
+is a non-parent ancestor with the size that ancestor now has, rewrites the ones
+that differ and asks for another compute. An out-of-flow box sizes nothing
+above it, so one extra compute settles it (one more per level of nesting, with
+`calc()`'s fixpoint and its cap of 8). A box whose size does not depend on its
+containing block is never rewritten. The counter is
+`abs_containing_block_passes`.
+
+The **position** is written as a parent-relative value, so `LayoutResult` means
+the same thing for every node and paint, stacking, hit testing and the debug
+protocol need no special case: the containing block's border, plus the inset
+and margin, minus the offsets of the boxes between — plus those boxes' scroll
+offsets, because a scroller between a box and its containing block does not
+carry the box. A scroll runs no layout, so `NodeTree::mark_scrolled` writes
+those positions again.
+
+None of this touches a box Taffy already resolves — an absolute child of its
+own positioned parent, the usual badge or close button. The size check iterates
+only the boxes under a non-parent ancestor, a scroll re-places only when the
+scrolled box lies between a corrected box and its containing block, and the
+`abs_boxes_visited` counter reads 0 for a page of ordinary badges. A box under
+a non-parent ancestor costs about 0.8k instructions per layout (the size
+compare and the placement).
 
 ## Key Technologies
 
@@ -168,12 +232,109 @@ pub trait Painter {
     fn draw_image(&mut self, image: &PaintImage, transform: Affine);
     fn push_clip(&mut self, fill: Fill, transform: Affine, shape: &PaintShape);
     fn push_layer(&mut self, blend: BlendMode, opacity: f32, ...);
+    fn push_isolated_layer(&mut self, opacity: f32, ...); // never elided, even at opacity 1
     fn pop_layer(&mut self);
     // ...
 }
 ```
 
-Application code never interacts with the Painter directly — the backend is selected at compile time via Cargo features.
+**Each text run casts its own element's `text-shadow`** (#1048). The property
+is inherited, so an IFC's text casts its root's list unless an inline element on
+the way down declared another (`none` included). When every run casts the
+root's list the text is drawn exactly as one list; otherwise each distinct list
+is drawn through a mask that keeps it to the text casting it
+(`paint::text::ShadowGroup`, the #829 visibility mask's per-range rule), every
+shadow before any text, as for one list.
+
+**Chrome paints shadow-then-text per text fragment** (#1060) — one text node's
+stretch of one line — so a later fragment's shadow reaching back is drawn over
+earlier text: in `<p style="text-shadow: -29px 0 blue">A<span>B</span></p>`
+the shadow of `B` covers `A`, and with `text-shadow: 0 -60px` on a 60px line
+the second line's shadow covers the first line, one text node or not (Chrome
+155, measured). Within one fragment every shadow is under the text. This is an
+inline formatting context's rule; a flex or grid item's own text (a text leaf)
+is still painted in one pass however many lines it has. Chrome also splits a
+fragment at a bidi boundary inside one text node and paints a line's fragments
+in visual order; rinch does neither (#1675, pinned in
+`tests/review_1673_fixtures.rs`).
+
+rinch keeps the one-pass order wherever drawing in Chrome's order would change
+no pixel by more than 2 levels of 255 (`ORDER_TOLERANCE_LEVELS`), decided on
+boxes (`paint::text::TextFragment::in_paint_order`). That covers the *order*
+only: the one-pass path blurs all fragments of one shadow list as one mask,
+the per-fragment path one mask a fragment, and where two adjacent fragments'
+blurs overlap the two composites differ by up to about 10 levels whichever
+order is chosen (as on main, review 2 of #1673). A fragment's text box is the
+advance extent of its ink-bearing clusters (a space has none unless an
+underline, line-through or wavy underline is drawn across it) by its line's
+ascent and descent, moved with any `vertical-align` shift. A shadow's box is
+that box moved by its offset and grown by its *visible* reach: how far its blur
+can still change a pixel of the ink under it by more than the tolerance. A
+shadow painted over a pixel or under it differs by at most its alpha times the
+two colours' largest channel difference times the blur's coverage, so a
+40%-black `0 0 4px` blur over `rgb(40, 40, 40)` text reaches about 2.3px, less
+than a 14px space, and `Count: <span>3</span>` keeps one pass. A decorated
+fragment is compared with every colour, since its underline has a colour of its
+own. The bound is a half-plane's coverage at the text box's edge, which is
+conservative: spans in highlighter colours under the same shadow (a 40%-black
+blur over `rgb(28, 0, 207)` stays above 2 levels for about 3.95px, past a
+3.91px space) still go per fragment, where the pixels measured differ by 1–5
+levels. Only a shadow box overlapping an earlier fragment's text box — or, with
+shadows of more than one colour, its shadow box — sends the IFC down the
+per-fragment path, which draws each fragment's shadows and text through a mask
+of its own; a blurred fragment's mask covers that fragment's clusters only. A
+blurred shadow that reaches into the line above makes every line its own mask.
+Ink past a glyph's advance or below its descent (an italic overhang) is not in
+the box, so a shadow touching only that keeps the one-pass order.
+
+A span's own list is ink of the root that draws it: damage, the paint prune,
+the painted state and `layer_bounds` all count it.
+A line that `text-overflow: ellipsis` cuts keeps its text ranges, so a span
+there casts its own list too, up to the cut, and the "…" casts the block's
+(#1065, #1100). Each
+distinct list is a pass over the lines its text is on, and so is each fragment
+of the per-fragment order. Those passes share one walk of each line they draw
+(`paint::text::PaintText`, #1066): the line's positioned items are collected
+the first time a masked pass draws it and kept for the rest of that paint,
+with the byte each glyph's cluster starts at (`PaintLine::glyph_bytes`, built
+the first time a pass needs it: a mask, a `vertical-align` span and a live
+colour are all by byte). Since parley 0.12 a glyph run's glyphs come from
+`GlyphRun::glyphs`, which walks only that glyph run; only a line an ellipsis
+cuts is walked cluster by cluster, stopping at the cut. A paragraph with
+no such passes keeps nothing: each of its passes walks a line into one reused
+buffer. Parley 0.11.1's `Line::items` and `GlyphRun::glyphs` re-walked a run from its
+start for every glyph run, and a pass each used to make a paragraph of 400
+spans with different lists cost 19 ms against 2.4 ms for one shared list; it is
+2.5–3.9 ms now (release, 800x600, software painter). A pass still visits every
+glyph of the lines its text is on.
+
+**A blurred `text-shadow` is a blurred mask** (#980, `paint/text_shadow.rs`).
+Vello has no general blur, so wherever the software rasteriser is compiled in
+(every desktop and Android build) the shadow — glyphs, underline, line-through
+and wavy underline (#981) — is rasterised **once** into a coverage mask over the
+part of it that can be seen, blurred by a separable Gaussian of standard
+deviation `blur / 2` out to three of them, and handed to the painter as
+`Painter::draw_alpha_mask`: the same mask to Vello (as an image) and to
+tiny-skia (a solid fill through a pooled surface mask). Blurred masks are kept
+between paints (32 MB, least recently used out), keyed by a hash of every call
+that rasterised them in the terms that decide its pixels: each glyph by the
+pixel the software painter rounds it to, a decoration to a quarter pixel. The
+mask is always rasterised at the text's true position. A repaint of a shadow
+that is wholly on screen and unchanged, or has moved by whole pixels, or by a
+fraction that moves none of its glyphs to another pixel, rasterises nothing; a shadow the surface, a clip or the damage crops is
+rasterised again whenever the crop moves relative to it (a line scrolling
+across a scroller's edge), and so is any shadow whose text or style changed.
+`text_shadow_masks_rasterised` counts what a paint rasterised. The Vello-only
+build (`embed` without `software-renderer`) has no rasteriser and draws a
+kernel of copies in `BlendMode::Plus` layers inside one
+`push_isolated_layer`: 13 taps, a 5-tap cross or none, chosen by the shadow's
+own glyph count against `TAP_GLYPHS_PER_SHADOW`, with `TAP_GLYPH_BUDGET` as a
+per-paint crash guard. Cost: `dom::text_shadow_paint` in the Perf job, 40
+paragraphs of 14px text at 800x600 with `0 1px 4px` — `paragraphs_40` repaints
+from the cache (61M instructions in CI), `paragraphs_40_cold` rasterises every
+visible mask.
+
+Application code never interacts with the Painter directly. Cargo features decide which backends a build carries, and a `gpu` (or `gpu-renderer`) build picks one of its two when the window opens (see below).
 
 ### Vello (GPU Backend)
 
@@ -188,7 +349,7 @@ A GPU-accelerated 2D graphics library (enabled with `features = ["gpu"]`):
 
 ### tiny-skia (Software Backend)
 
-A CPU-based rasterizer (the default when `gpu` is not enabled):
+A CPU-based rasterizer, carried by every `desktop` (or `windowing`) build: the only backend without `gpu`/`gpu-renderer`, and the fallback with it:
 
 - Direct pixel rendering to an RGBA buffer
 - Presented via softbuffer (no GPU required)
@@ -200,15 +361,17 @@ A CPU-based rasterizer (the default when `gpu` is not enabled):
 
 ### Choosing a Backend
 
-Set it in your `Cargo.toml`:
+Your `Cargo.toml` decides which backends the build carries:
 
 ```toml
-# GPU mode (recommended for most apps):
+# GPU, with software as the fallback (recommended for most apps):
 rinch = { workspace = true, features = ["desktop", "gpu"] }
 
-# Software mode (default — no GPU required):
+# Software only (no GPU required, smaller build):
 rinch = { workspace = true, features = ["desktop"] }
 ```
+
+A `gpu` (or `gpu-renderer`) build then chooses when the window opens (`crates/rinch/src/shell/renderer.rs`): `App::renderer(Renderer::Auto)`, the default, tries the GPU and presents with software when it will not start; `Renderer::Gpu` panics instead; `Renderer::Software` skips the GPU. The `RINCH_RENDERER` environment variable (`auto`, `gpu`, `software`, `cpu`) overrides the app's choice. An app that configured the GPU device itself (`gpu_config` / `external_gpu`) always presents on the GPU. The details are in [Rendering Backends](../guide/windows.md#rendering-backends).
 
 ### GPU Rendering Flow
 
@@ -231,6 +394,8 @@ fn paint_software(&mut self) {
 ```
 
 The software renderer includes **dirty region caching**: when only a small part of the UI changes (e.g., cursor blink, hover feedback), only the affected rectangular region is cleared and repainted. Nodes outside the dirty region are skipped entirely during the paint traversal.
+
+Every dirty node contributes two rects: its current box, grown by how far its own outset `box-shadow`, `outline` and `text-shadow` reach (an inset shadow paints inside its padding box), and the rect it was **last painted** in. The second is summed up the box-tree chain from what each node was last painted with — `Node::prev_layout` and `Node::painted` (own ink reach, own transform), parent-relative, written only by the paint that consumes the region (`NodeTree::consume_paint_dirty`: the software frame, a full repaint and a GPU scene build alike). So the old pixels are found however many layout passes ran between two paints, when an ancestor moved rather than the node, and when a box moved *and* dropped its shadow, lost a child or changed its transform in the same frame; a removal records the painted rect of every node it takes out. A positioned box (`absolute`, `fixed` or `relative`) that moved is also grown by its whole painted subtree's reach, which carries an untouched overflowing child with it. That is what lets an editor keystroke, a caret move or a dragged absolute panel repaint a region instead of the whole window. Once the region reaches half the surface (`FULL_REPAINT_FRACTION`) it stops being measured and the frame repaints in full.
 
 The region is the union of the changed *nodes'* rects, so anything painted **outside** the node tree has to contribute its own. The drag ghost is the one such overlay: it is blitted into the framebuffer after the document paint, so `RinchApp` remembers the rect it covered and folds that into the next frame's dirty region — otherwise the frame that stops drawing the ghost would never clear where it had been, leaving it stuck on screen (issue #173). The GPU backend rebuilds the whole Vello scene every dirty frame and so has no equivalent case.
 
@@ -349,18 +514,112 @@ close direction carries `transition-delay: 150ms` as a grace period for moving
 the pointer onto the card, and scaling that with the factor would halve the
 grace period for anyone who leaves part way through the fade-in.
 
-Two things rinch does **not** implement from §3. The **transitionability**
+**Every easing function eases** (#1564), in transitions and `@keyframes`
+alike, a keyframe's own `animation-timing-function` included:
+`cubic-bezier()` and its keywords, `steps(<n>, start | end)`,
+`step-start`/`step-end` and `linear(<stops>)` with percentage positions
+(`transition::types::TimingFunction`; `steps()` and `linear()` used to run as
+plain `linear`). A step function reads CSS Easing 2's **before flag**, set in
+the before phase going forwards and the after phase going backwards, so
+`steps(4, start)` shows its `from` value through a backwards-filled delay and
+at the end of a `reverse` run. A transition fills its delay the same way (its
+easing at 0 with the flag), so `linear(0.5, 1)` sits half way through it, and
+a reversal taken there is shortened by that output. An iteration's start and end are eased too (the
+first interval at distance 0, the last at distance 1), not snapped to the
+keyframe there: `steps(4, start)` begins a step in and `linear(0, 0.5)` ends
+half way. A reversal's shortening reads the stepped output, so reversing
+`steps(4, end)` at 600ms takes half the duration. The `jump-*` step positions
+parse since stylo 0.21 (#1581; with 0.11 a declaration naming one was dropped).
+
+**A `transform` is interpolated as a function list, not matrix entry by entry**
+(#414). A computed transform keeps the list it was composed from
+(`TransformValue::functions`), and `transition::transform::interpolate_lists`
+interpolates it the way Chrome does: functions that pair by type interpolate
+their arguments (`rotate(0deg)` → `rotate(90deg)` is `rotate(45deg)` half way,
+full size), a shorter list — `none` included — is padded with identity
+functions, and from the first pair that does not match, the rest of both lists
+is composed and interpolated by Chromium's 2D decomposition (translation,
+scale, shear and the shorter way round for the angle; a singular matrix flips
+half way). Lerping the six matrix entries, which is what rinch did before,
+gives the right angle with a uniform scale of `cos(Δθ/2)`: a 90° turn shrank to
+71% at its midpoint and a 180° one to a point. Two consequences: the
+interpolated value is itself a function list, so a reversal or a retarget goes
+on pairing by function; and "did the transform change" compares the lists, so
+`rotate(0deg)` → `rotate(360deg)` is a change and spins. So is `none` →
+`rotate(0deg)`, and any pair of lists of different lengths: the padding is how
+they interpolate, not a sign they are equal. Chrome starts an invisible
+transition there, and so does rinch since #2724, so `rotate(0deg)` → `none`
+stays a stacking context until its run ends. `@keyframes` stops go through the
+same code.
+`tests/transform_interpolation_tests.rs` pins it against Chrome 153's
+`getComputedStyle` numbers.
+
+**The 3D transform functions are drawn flat** (#405). rinch paints in 2D, and
+every 3D function but `translate3d` used to compute to the identity — so
+`rotateZ(45deg)`, the same rotation as `rotate(45deg)`, did not rotate. Now a
+list holding `rotateX`/`rotateY`/`rotateZ`/`rotate3d`, `scaleZ`/`scale3d`,
+`translateZ`, `matrix3d` or `perspective()` is composed as 4×4 matrices and the
+result is projected the way Chrome draws an element with no `perspective` or
+`preserve-3d` ancestor: applied to the plane `z = 0`, divided by `w`, the
+resulting `z` dropped. So `rotateX(60deg)` squashes the box to half its height,
+and `perspective(100px) translateZ(10px)` magnifies it by 100/90. A plane at or
+behind the viewer (`w <= 0`, `perspective(10px) translateZ(20px)`) is neither
+drawn nor hit, as in Chrome — it flattens to the zero matrix `scale(0)` gives.
+So is a box whose 4×4 is **singular** (`scaleZ(0)`, `scale3d(1, 1, 0)`, a
+`matrix3d()` with a zero column), although its flattening may be invertible —
+`scaleZ(0)` flattens to the identity — and its subtree with it, a `position:
+fixed` descendant aside, as for a hidden backface below (#1051). The cut
+is where Chrome 153's is, measured: a determinant that is not a normal `f32`,
+so `scaleZ(1e-20)` is still drawn and `scaleZ(1e-38)` is not. (Chrome's
+`getBoundingClientRect()` still reports the flattened rect for such a box.)
+Only the
+**composed** matrix is flattened — `rotateX(90deg) scaleY(2) rotateX(-90deg)` is
+the identity, where flattening each function would draw a line. For
+interpolation every `rotate*` is one primitive (a common axis lerps the angle,
+two axes slerp a quaternion the shorter way), `perspective(d)` interpolates
+`1/d`, and `matrix3d()` pairs with `matrix3d()` but not with `matrix()`.
+`tests/transform_3d_tests.rs` pins all of it against Chrome 153. What is **not**
+Chrome's: the `perspective` and `transform-style` *properties* are not
+implemented at all, so a parent's `perspective` does nothing; a transform whose
+`w` depends on x or y (`perspective(200px) rotateY(30deg)`, a trapezoid in
+Chrome) is drawn with those terms dropped, since no affine draws a trapezoid. A
+mismatched remainder holding a 3D function is decomposed as Chrome decomposes
+it, as a 4×4 (translation, scale, shears, perspective, a quaternion), and only
+the interpolated result is flattened (#989).
+
+`transform-origin`'s z component is applied before the flattening — a list is
+composed as `M · T(0, 0, -z)` and flattened, and paint applies the x and y about
+the flattened matrix as before — so `rotateY(45deg)` about `50% 50% 100px`
+lands where Chrome's does. `backface-visibility: hidden` hides a box whose
+**own** transform turns its back to the viewer (the `(3, 3)` entry of the
+inverse 4×4 is negative, Chrome's test): it composes to the zero matrix, so it
+and its whole subtree are neither drawn nor hit, a `position: fixed`
+descendant included: the transformed box is its containing block (#1372). A mirror (`scaleX(-1)`) is not
+a turn, and a child under a turned parent is judged by its own transform alone,
+as in Chrome without `transform-style: preserve-3d` (#997).
+
+One thing rinch does **not** implement from §3: the **transitionability**
 precondition, which appears in item 1 and again in item 4.2: a pair of values
-that cannot be interpolated — a length against a percentage, which needs a
-`calc()` that `ComputedStyle` cannot hold — still gets an `ActiveTransition`,
-which then idles for its whole duration because `AnimatableValue::interpolate`
-answers `None` for it. The property snaps either way; cancelling instead would
-only save the idle ticks. And **item 3**, cancelling a running transition whose
-property has stopped matching `transition-property`: rinch skips the property
-and leaves the transition running, so the box snaps to the target on the restyle
-and then jumps backwards on the next tick, which resumes writing the interpolated
-value. Any restyle that changes `transition-property` mid-transition reaches it.
-Both gaps are pre-existing; item 3 is tracked as issue #693.
+that cannot be interpolated — `auto` against a length, or a sizing keyword —
+still gets an `ActiveTransition`, which then idles for its whole duration
+because `AnimatableValue::interpolate` answers `None` for it. The property snaps
+either way; cancelling instead would only save the idle ticks. A length against
+a percentage **is** interpolable, as a `calc()` whose length and percentage
+parts each go their own way (#767; `ComputedStyle` holds that `Calc` for sizes,
+margins and length-percentages alike). Whether a transition *starts* for such a
+pair is the differ's call (`transition/diff.rs`): `background-position`
+compares the computed values (`diff_lp_exact`), `padding-*` compares pixels with
+a percentage read as 0 (`diff_lp`), and `width`, `height` and `margin-*` start
+one only between two lengths (`diff_dimension`, `diff_lpa`), so a
+length-to-percentage change there applies at once.
+
+**Item 3** is implemented (issue #693): a running transition whose property has
+stopped matching `transition-property` is cancelled on the next cascade of its
+node, whether or not the property also changed on that restyle, and the
+after-change value stands. It used to be left running, so the box snapped to the
+target on the restyle and jumped backwards on the next tick. It is also what
+makes a delayed `visibility` hide safe to reopen through (see
+[Components](../guide/components.md)).
 
 ## The before-change style, and who has one
 
@@ -405,6 +664,11 @@ unlink a node from its old parent with the same lines `remove_child` uses, but
 the node is back in the document before the call returns, so it never stopped
 being rendered and a mid-flight transition goes on running — which is what a
 keyed `for` reorder depends on, since it moves rows with `insert_after`.
+A move **within one parent** is not re-cascaded either (#914): its ancestor
+chain is the one it was styled against, and the selector flags on the parent
+restyle it when a positional selector (`:nth-child`, `+`, `~`, …) can see the
+move. Nor does it drop its own shaped text — only the inline formatting context
+it was a member of, if any. A move to another parent re-cascades the subtree.
 
 **Unless the destination is itself detached** (#702). A mounted node moved into
 a parent that is not connected to `tree.root_id` has left the document while
@@ -495,8 +759,11 @@ carried `display: none` while closed and its panel carried
 the panel in a single pass, exactly the shape above. So its 300ms slide-in ran
 on desktop only until this change, and had never run on `rinch-web` at all. Its
 closed state is `visibility: hidden` now, which is where `Popover` already was —
-hidden, still **rendered**, and still out of paint, hit testing and the Tab
-order on both backends.
+hidden, still **rendered**, and — once its close has run — out of paint, hit
+testing and the Tab order on both backends. Since issue #759 the close holds the
+root `visible` for the panel's 300ms slide-out (a delayed `visibility`
+transition), so for those 300ms it still paints, takes clicks and is tabbable,
+as in a browser.
 
 The blast radius is wider than "a control restyled in an inactive tab":
 **any component that un-hides an ancestor and retargets a transitioned property
@@ -528,8 +795,8 @@ beside it: `NodeTree::transitions_enabled`, false at construction and set at the
 very end of the first `resolve_layout` ("Enable transitions after first layout
 completes", `layout_engine.rs`). `has_been_styled` alone would not do the job,
 because a tree is cascaded more than once before its first layout — appending a
-`<style>` element re-resolves the whole document there and then
-(`maybe_load_style_css`), so a component that appends its own stylesheet after
+`<style>` element to the document restyles every element its rules reach there
+and then (`flush_stylist`, #884), so a component that appends its own stylesheet after
 building its markup leaves every node already styled, and the next rule it loads
 is a *change* on an already-styled node. Without the flag that is a transition
 running on page load. `recompute_all_styles_full` forces the same flag off for
@@ -558,11 +825,11 @@ So the animation block reads no flag, and `recompute_all_styles_full` no longer
 clears the map. The re-cascade it runs is what reconciles it:
 `animation::start_animations` matches a running animation **by name**, keeps its
 clock — `start_time_ms`, `paused_elapsed_ms`, `play_state` — and drops one whose
-declaration the new sheet no longer carries. On this pass, and only this one
-(`NodeTree::refreshing_animations`, a flag of its own), a kept animation takes
-everything else afresh: the `@keyframes` rule is looked up again and the
-animation dropped if it is gone, the stops are re-extracted from the new base
-style, and the duration and delay come from the new declaration.
+declaration the new sheet no longer carries. On this pass, as on every cascade
+of an animated node (#766), a kept animation takes everything else afresh: the
+`@keyframes` rule is looked up again and the animation dropped if it is gone,
+the stops are re-extracted when the rule or a base-style input they read
+changed, and the duration and delay come from the new declaration.
 
 Preserving rather than restarting is what a browser does, measured in Chrome
 150.0.7871.100 by replacing a `<style>` element's `textContent` under a running
@@ -589,43 +856,76 @@ seeked `currentTime`, added three more rows the refresh also matches:
 | `animation-duration` 10s → 20s | same animation, `currentTime` 3000, progress 0.15 |
 | a panel shown by the theme, which also moves `font-size` 10px → 40px under a `1em → 11em` spinner | width 80px at 1000ms |
 
-The refresh is scoped to `recompute_all_styles_full` on purpose, and that is
-**not** the only pass that re-cascades the whole document. Two others drop every
-node's cached style too and do not set the flag: appending a `<style>` element
-(`maybe_load_style_css`), and a viewport change in `resolve_layout`. Measured
-after the first layout, a `<style>` appended with a redefined `@keyframes kk`
-leaves a running `kk` on its old body. Those two passes, and every targeted
-restyle — a class change, a hover — still keep a kept animation's stops and
-timing whole: an edited `@keyframes` body (issue **#766**), a changed duration or
-delay (**#780**), and a stop derived from the base style, such as the implicit
-`from` of a `to`-only rule carrying `color` (**#781**), stay stale. **#781**
-tracks the two whole-document passes. The full restyle is the pass a theme
-toggle takes, it runs rarely, and it can afford a keyframes lookup and a stop
-extraction per animated node; a targeted restyle runs per hover and should not
-pay that.
+The refresh is not scoped to this pass (issues **#766**, **#780**, **#781**).
+Every cascade of an animated node — a class change, a hover, a `<style>`
+appended (whose `@keyframes` takes `flush_stylist`'s whole-document re-cascade,
+#884), a viewport change that flips a `@media` block holding a `@keyframes` —
+keeps a running animation's clock and nothing else, as CSS
+Animations 1 §3 says and Chrome 156 does: a new `animation-duration` or
+`animation-delay` re-times it around the kept `currentTime`, a redefined or
+newly winning `@keyframes` body plays at once, and a rule that is gone cancels
+it. Repeated names match by position from the end, so `k 10s, k 20s` stays two
+animations. `ActiveAnimation::stop_inputs` holds the rule's declaration blocks
+and the base-style inputs the authored stops **read** when they were extracted
+— the element's `font-size` for an `em`, the root font size for a `rem`, the
+element's `color` for a `currentcolor`, the parent's for `color:
+currentcolor` — and the stops are re-extracted only when one of those moved.
+So a node cascaded while it animates pays a keyframes lookup, a pointer compare
+per keyframe and a re-read of its implicit values per animation, and a hover
+that changes `color` under a `transform` spin extracts nothing. Keying on every
+input instead, whether a stop read it or not, cost 500 spinning rows +3.2% on a
+body colour change and +6.1% on a colour hover (review of #2049, Callgrind);
+`rinch-bench`'s `animated_list_color` keeps this path under the Perf job. The
+root font size is `<html>`'s (#2058), and a `font-size` stop's `em` or
+percentage is the parent's.
+
+**A keyframe is computed at each sample** (#2056): `em` against the element's
+*animated* `font-size`, `currentcolor` against its *animated* `color` (an
+implicit stop whose base value is `currentcolor` included), and `rem`, a
+`font-size` `em` and `color: currentcolor` against the root's and parent's
+values as they are at the sample. `animation::rebase_node_stops` does it, in
+the cascade (end of `start_animations`) and in every tick: it compares only
+the inputs the stops read, so a stop that reads none costs nothing, and an
+`em` stop beside a `font-size` animation is resolved again on every sample
+from the rule `StopInputs` holds. A transition does not start on a property an
+animation with an effect (running, paused, filling) animates, and an animation's implicit stop is the cascaded
+value, not a transition's sample (#2059).
+
+An **implicit keyframe** — the `from` or `to` Stylo generates for a rule that
+lacks one, and any property an authored `from`/`to` leaves out — is the
+element's base value for exactly the properties the rule animates (Web
+Animations' neutral keyframe), and it is re-read from the base style on every
+cascade (`keyframes::refresh_implicit_values`), the layout properties among
+them (`width`, `height`, `padding-*`, `margin-*`, `border-*-width`,
+`font-size`, the border colours: #767), so `to { width: 200px }` on a 100px box
+gives 150px at 50%, and 150px at 75% once the base is set to 0 mid-animation.
+It used to carry a fixed list (opacity, background colour and position,
+colour, transform), so a `to`-only
+`transform` spin pinned the element's `color` at the value it had when the spin
+started, and a `to { background-color }` fade kept fading from the background
+the element no longer had.
+`crates/rinch-dom/tests/animation_restyle_refresh_tests.rs` pins those routes;
 `crates/rinch-dom/tests/full_restyle_animation_refresh_tests.rs` pins every row.
 
-**One divergence the theme path now reaches, not fixed here: a finished one-shot
-animation replays on a theme toggle.** An animation with a finite iteration
-count and no `forwards` fill is removed from `tree.active_animations` by
-`tick_animations` once it completes. The full restyle re-cascades its node,
-`start_animations` finds no entry of that name, and mints a new one from t=0.
-Chrome does not replay it, and neither did `main` before #762 — its full restyle
-cleared the map with the animation block gated off, so nothing was minted, which
-was right by accident. It is the mechanism of issue **#783** (a finished
-animation's entry is forgotten, so any later cascade of the node restarts it),
-reached through the theme path. Component CSS declares only `infinite`
-animations; the one finite iteration count rinch ships is the theme's
-`prefers-reduced-motion` rule (`animation-duration: 0.01ms;
-animation-iteration-count: 1`), whose replay would last 0.01ms.
+**A finished one-shot animation does not replay on a theme toggle** (issue
+**#783**). Until #783, an animation with a finite iteration count and no
+`forwards` fill was removed from `tree.active_animations` once it completed, so
+the full restyle — or any later cascade of the node — found no entry of that
+name and minted a new one from t=0. Chrome does not replay it. The finished
+entry is now kept as a settled marker (below, beside #782's fill), which the
+re-cascade finds by name and applies nothing for. The one finite iteration count
+rinch ships is the theme's `prefers-reduced-motion` rule (`animation-duration:
+0.01ms; animation-iteration-count: 1`), so under reduced motion every
+component animation is one of these.
 
-One consequence comes with the first-frame start, and it is pre-existing rather
-than new: an animation's clock begins at the cascade that styles the node —
-`append_child`, for a freshly appended element — not at the frame that first
-shows it. So the first frame is already a few milliseconds in, where a browser
-defers an animation's start to the first frame it is rendered in. Every
-post-mount insertion has always behaved that way; #762 only lets the first frame
-join them. Issue **#768**.
+An animation's clock starts at the first frame that renders its element, as in
+a browser (#768). The cascade that mints it — `append_child`, for a freshly
+appended element, which can run long before the frame — leaves it **pending**
+(`ActiveAnimation::pending`): it samples t = 0 whatever the clock says, and
+`resolve_layout` sets its start to the frame's time
+(`NodeTree::start_pending_animations`). Before that the clock began at the
+cascade, so the first frame was already some milliseconds in, and under load a
+short animation could finish before the frame that should have been its first.
 
 `crates/rinch-dom/tests/animation_start_gating_tests.rs` is the pin, and its
 module doc carries the measurement above plus a table of which fixture kills
@@ -703,13 +1003,14 @@ would be. An `animation: … infinite` has no duration to expire, so a rendered-
 but-invisible spinner asks for a frame forever. That is now reachable through a
 shipped component: #751 made the closed `Drawer`'s root `visibility: hidden`
 precisely so its panel could transition, so a `Loader` placed inside a **closed**
-drawer keeps the app rendering. Measured, software backend, 804x600, closed
-drawer, 20 idle frames:
+drawer kept the app rendering until #912 paused it (below). Measured before
+that, software backend, 804x600, closed drawer, 20 idle frames:
 
 | closed-state spelling | `active_animations` | idle frames asking to redraw | ms per tick+paint |
 |---|---|---|---|
 | `display: none` | 0 | 0 / 20 | 0.001 |
-| `visibility: hidden` (today) | 1 | 20 / 20 | 2.53 |
+| `visibility: hidden`, running (the `Drawer` before #912) | 1 | 20 / 20 | 2.53 |
+| `visibility: hidden`, paused (the `Drawer` since #912) | 1 | 0 / 20 | — |
 | open drawer, either spelling | 1 | 20 / 20 | 8.8 – 9.7 |
 
 This is accepted rather than overlooked. Refusing an animation to a
@@ -752,20 +1053,71 @@ on an `ifc_dirty` pass instead of returning early.
 A finished animation with `animation-fill-mode: forwards` or `both` is the same
 shape (issue **#782**): its fill is as constant as a paused sample. The tick that
 finishes it writes the fill and marks the node dirty — that frame shows the end —
-and records it in `ActiveAnimation::fill_settled`; later ticks re-apply it
+and records it in `ActiveAnimation::settled`; later ticks re-apply it
 without dirtying anything, and neither `tick_animations` nor
-`has_running_animations()` counts it.
+`has_running_animations()` counts it. A zero-duration infinite animation
+(`0s infinite forwards`) is one of these: its active duration is `0 × ∞ = 0`, so
+it finishes when its delay ends, as in Chrome (issue **#786**).
 
-`Drawer`'s closed rule does not declare the pause itself yet. An app that wants a
-closed drawer holding a `Loader` to idle can add the rule below; the three
-`Loader` variants animate `__oval`, `__bar` and `__dot` respectively, so it names
-all three:
+A finished animation **without** a forwards fill (`none`, `backwards`) has no
+effect at all once its active duration ends, so the animated properties go back
+to their cascaded values (issue **#783**). The tick cannot write those itself —
+`computed_style` holds the last sample and nothing beneath it — so the tick that
+finishes such an animation keeps the entry, settled, in
+`NodeTree::finished_animations` — a map of its own, which no tick walks, so a
+list of rows that each finished an entrance animation costs a running spinner's
+frames nothing — and pushes its node onto `NodeTree::ended_animations`; `RinchDocument::tick_animations` restyles the node
+(its originator, for a `::before`/`::after` box), and that cascade applies no
+sample for it. The way back from the last sample is not a transition start: the
+cascade drops those properties from its transition diff, because the
+before-change style is the one updated to the current time. The kept entry is
+what keeps it finished: a later class change, `animation-play-state: paused` or
+theme toggle finds it by name instead of starting the still-declared animation
+from t=0, as Chrome does. A new `animation-name`, or the element being rendered
+again after `display: none` (#747), starts a new one; a restyle that gives it
+more iterations runs it again, as with a fill (`start_animations` keeps
+`settled` only while the animation has still ended; pausing it does not count
+as un-ending it). One known gap: a real change of an animated property in the
+same frame as the end starts no transition, because the diff drops that
+property whole. Pinned by
+`crates/rinch-dom/tests/finished_animation_no_fill_783_tests.rs`.
+
+The fill is the value at the end of the active duration (`duration × count`):
+iteration `floor(count)` at progress `fract(count)`, in that iteration's
+direction, so `2.5 forwards` over `40px → 100px` holds 70px and
+`1.25 alternate forwards` 85px; a whole count holds the end of its last
+iteration and a count of 0 its start (issue **#785**,
+`tests/fractional_iteration_fill_tests.rs`, Chrome 155's values).
+
+The component library declares the pause itself (issue **#912**). `Drawer`'s
+closed rule, and the closed states of `Popover`'s and `HoverCard`'s dropdowns —
+the three overlays that close with `visibility: hidden` and take content —
+pause every animation beneath them:
 
 ```css
-.rinch-drawer__root--hidden .rinch-loader__oval,
-.rinch-drawer__root--hidden .rinch-loader__bar,
-.rinch-drawer__root--hidden .rinch-loader__dot { animation-play-state: paused; }
+.rinch-drawer__root--hidden * { animation-play-state: paused !important; }
+.rinch-popover__dropdown:not(.rinch-popover--opened .rinch-popover__dropdown) * {
+    animation-play-state: paused !important;
+}
 ```
+
+Every descendant, not a list of known spinners, because any component or app
+rule can declare an animation. Not the pseudo-elements, although
+`animation-play-state` does not inherit into them, so an `::after` spinner
+under a closed overlay still runs — on rinch-web, and since #1004 on desktop
+too, where a generated box carries its pseudo cascade and its animation starts
+(#925; it keeps its clock across a cascade of its originator since #1023), keeping
+the frame clock running. They are left out because rinch-dom matches
+`::before`/`::after` rules with no ancestor bloom filter (#935), so `*::before`/`*::after` rules cost +10% of style instructions
+on every page that loads the component CSS and +71% under a closed drawer.
+`!important` because the `animation` shorthand
+resets `animation-play-state` to `running`: without it the pause loses to any
+shorthand of equal specificity declared later (`.rinch-loader__oval`) or higher
+(`.rinch-button--loading .rinch-button__loader`). An app that really wants an
+animation to run inside a closed overlay needs an `!important` of its own. The
+`:not()` is the exact complement of the rule that makes the dropdown visible.
+A closed drawer holding a `Loader` therefore idles, and opening it resumes the
+spinner where it stopped, as a browser keeps `currentTime`.
 
 None of the three sites reads `transitions_enabled` (see "The page-load guard
 arms transitions, and only transitions" above), and for the restart walk that is

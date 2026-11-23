@@ -106,6 +106,25 @@ impl Hasher for ObserverIdHasher {
 /// count.set(1); // Prints: "Count is now: 1"
 /// count.set(2); // Prints: "Count is now: 2"
 /// ```
+///
+/// # An effect does not wake itself
+///
+/// A write that reaches the effect *while its own body is running* is dropped
+/// for that effect, not queued (issue #343). A write made with no batch open
+/// flushes at once — and every run a flush makes is in that state — so the
+/// flush reaches this effect one frame down its own stack and skips it. The
+/// write lands and every other observer runs; this effect keeps what it
+/// computed and sees the value on its next run for another reason. That
+/// includes a write made by code the body calls, most often an
+/// [`on_cleanup`](super::on_cleanup) of a scope the body disposes.
+///
+/// It is deliberate: queued instead, an effect that disposes a scope on every
+/// run whose cleanup writes a signal it reads would re-run without end.
+///
+/// A body running while a batch is **open** — [`Effect::new`] or
+/// [`Effect::run`] called inside [`batch`](super::batch), which includes every
+/// event handler — queues its writes instead, and the effect does run again
+/// for its own write when the batch flushes.
 pub struct Effect {
     id: ObserverId,
 }
@@ -117,6 +136,22 @@ pub(super) struct EffectInner {
     /// every run so `use_context`/`use_store` resolve the same namespace as at
     /// build time (issue #136). `0` = the thread-global fallback root.
     pub(super) root: u64,
+    /// The document current when this effect was created
+    /// ([`current_dispatching_doc`](crate::context::current_dispatching_doc)),
+    /// re-entered as the dispatching-document marker on every run (issue #295).
+    ///
+    /// The effect queue is thread-global: an effect owned by one document is
+    /// flushed wherever the write that woke it happened, and with two
+    /// documents on one thread (an app and its DevTools panel, two embedded
+    /// `RinchContext`s) that is routinely inside the *other* document's
+    /// `handle_event`. Everything the body does that reads the marker — arming
+    /// a `Drag`, registering a keyboard/paste/selection interceptor, asking
+    /// `Drag::is_active` — must be attributed to the document the effect
+    /// belongs to, not to whichever one was dispatching. Raw `doc_key`: `0`
+    /// (created outside any document — `main`, a timer armed there, rinch-web) re-enters
+    /// "no document", which every consumer reads as "nobody's" — never a
+    /// borrowed document.
+    pub(super) doc: u64,
     /// The scope that owned this effect when it was created, re-entered on every
     /// run so resources the body creates are attributed to the component that
     /// built it rather than to whatever happened to be rendering when the flush
@@ -144,6 +179,11 @@ pub(super) struct EffectInner {
     /// memo from its own sources, and a dirty memo nobody happens to read would
     /// then stay disconnected from them.
     pub(super) body_tracks_deps: bool,
+    /// `Some` for a memo's dirty-marker: the memo it stands for. Read by the
+    /// eager staleness walk in `Signal::notify` (which marks the memo stale the
+    /// moment a source is written) and by `flush_effects` (which skips a
+    /// marker whose memo nobody reads). `None` for an ordinary effect.
+    pub(super) memo: Option<Rc<dyn super::memo::MemoNode>>,
 }
 
 impl Effect {
@@ -154,13 +194,16 @@ impl Effect {
             ObserverId(rt.next_id())
         });
 
+        let (root, doc) = crate::context::current_reactive_frame();
         let inner = Rc::new(EffectInner {
             f: RefCell::new(Box::new(f)),
             disposed: Cell::new(false),
-            root: crate::context::current_context_root(),
+            root,
+            doc,
             owner: super::Owner::current(),
             deps: RefCell::new(Vec::new()),
             body_tracks_deps: true,
+            memo: None,
         });
 
         // Store the effect
@@ -183,13 +226,16 @@ impl Effect {
             ObserverId(rt.next_id())
         });
 
+        let (root, doc) = crate::context::current_reactive_frame();
         let inner = Rc::new(EffectInner {
             f: RefCell::new(Box::new(f)),
             disposed: Cell::new(false),
-            root: crate::context::current_context_root(),
+            root,
+            doc,
             owner: super::Owner::current(),
             deps: RefCell::new(Vec::new()),
             body_tracks_deps: true,
+            memo: None,
         });
 
         register(id, inner);
@@ -212,7 +258,7 @@ impl Effect {
 
     /// Dispose of this effect, preventing it from running again.
     ///
-    /// Also removes it from the global [`EFFECTS`] registry, allowing the
+    /// Also removes it from the global `EFFECTS` registry, allowing the
     /// `Rc<EffectInner>` — and everything its closure captures — to be
     /// reclaimed.
     pub fn dispose(&self) {
@@ -384,11 +430,8 @@ impl ObserverGuard {
 
 impl Drop for ObserverGuard {
     fn drop(&mut self) {
-        // `try_with`: TLS may already be torn down at thread exit.
-        let _ = RUNTIME.try_with(|rt| {
-            if let Ok(mut rt) = rt.try_borrow_mut() {
-                rt.observer_stack.pop();
-            }
+        let _ = super::restore::with_runtime_on_drop("the observer stack", |rt| {
+            rt.observer_stack.pop();
         });
     }
 }
@@ -407,8 +450,13 @@ pub(super) fn run_effect(id: ObserverId) {
 
         // Re-enter the context root the effect was created under, so
         // use_context/use_store resolve the same namespace as at build time
-        // (issue #136).
-        let _root_guard = crate::context::push_context_root(inner.root);
+        // (issue #136) — and the document it was created in, for the same
+        // reason and for the same kind of consumer: the queue drains under
+        // whichever document happens to be dispatching (issue #295), and a
+        // `Drag::start()` or interceptor registration made from the body must
+        // be attributed to the effect's own document. One guard for both, so
+        // the document rides the root's TLS access for free.
+        let _frame_guard = crate::context::enter_reactive_frame(inner.root, inner.doc);
 
         // Re-enter the scope that owned this effect at creation, for the same
         // reason: `flush_effects` runs from arbitrary stacks (an event handler,
@@ -430,7 +478,11 @@ pub(super) fn run_effect(id: ObserverId) {
         // Skipping is deliberate over re-queuing: re-queuing an effect that is
         // still running turns a self-triggering body into a hang, which is
         // strictly harder to debug than a stale value. The effect re-runs on the
-        // next genuine change.
+        // next genuine change. The wake is not parked anywhere for later: this
+        // run was dequeued before it got here. User-facing statement of the
+        // rule, and its batch-open exception (a write queued rather than
+        // flushed is still pending when the body returns): `Effect`'s docs and
+        // the guide, issue #343; pinned by `self_wake_tests`.
         //
         // The borrow is taken *before* the observer is pushed, and that order is
         // load-bearing: a tracking push also releases the previous run's
@@ -455,6 +507,14 @@ pub(super) fn run_effect(id: ObserverId) {
             ObserverGuard::push(id)
         };
 
+        // A memo's marker is bookkeeping, not an effect body anyone wrote: it
+        // only passes a wake on. Counting it would make `effect_runs` scale
+        // with the number of memos a write *reached* rather than the effects
+        // that actually re-ran.
+        if inner.memo.is_none() {
+            super::count_effect_run(inner.doc);
+        }
+        let _depth = super::ReactiveDepthGuard::enter();
         body();
         drop(body);
 
@@ -471,23 +531,101 @@ pub(super) fn run_effect(id: ObserverId) {
 /// effects in *reverse* registration order, and would run effects queued by a
 /// running effect ahead of ones queued before it. See the "Execution order"
 /// section of the [`reactive`](crate::reactive) module docs.
+///
+/// **The memo equality cut-off lives here.** An observer queued by a signal it
+/// reads directly is *definite* and runs. One queued only by a memo's marker is
+/// a *maybe*: it runs only if at least one memo it read has moved to a new
+/// version since it read it ([`memo_sources_changed`]), which brings those
+/// memos up to date to find out. A skipped observer keeps its place in no
+/// queue and its subscriptions untouched — it has seen nothing new. Skipping
+/// never reorders anything: the observers that do run still run in the order
+/// they were queued.
 pub(super) fn flush_effects() {
     loop {
-        let effect_id = RUNTIME.with(|rt| {
+        let next = RUNTIME.with(|rt| {
             let mut rt = rt.borrow_mut();
-            let id = rt.pending_effects.pop_front();
+            let id = rt.pending_effects.pop_front()?;
             // Remove from set when dequeuing.
-            if let Some(ref observer) = id {
-                rt.pending_effects_set.remove(observer);
-            }
-            id
+            rt.pending_effects_set.remove(&id);
+            let definite = rt.definite_effects.remove(&id);
+            Some((id, definite))
         });
 
-        match effect_id {
-            Some(id) => run_effect(id),
+        match next {
+            Some((id, true)) => run_effect(id),
+            Some((id, false)) => {
+                if maybe_needs_run(id) {
+                    run_effect(id);
+                }
+            }
             None => break,
         }
     }
+}
+
+/// Whether an observer woken only through a memo has anything new to see.
+fn maybe_needs_run(id: ObserverId) -> bool {
+    let Some(inner) = EFFECTS.with(|effects| effects.borrow().get(&id).cloned()) else {
+        return false;
+    };
+    if inner.disposed.get() {
+        return false;
+    }
+    // A memo's marker is never cut off here, only when nobody subscribes to
+    // its memo. Asking whether the *memo's* sources moved is the wrong
+    // question: a read in between (inside a batch, say) can already have
+    // recomputed the memo and re-recorded its sources, so they look unmoved
+    // while the memo's value has moved on from what its dependents last saw.
+    // Only each dependent knows which version it saw, so the marker passes the
+    // wake on and every dependent makes its own comparison.
+    if let Some(memo) = &inner.memo {
+        return memo.has_subscribers();
+    }
+    deps_changed(&inner)
+}
+
+/// Whether any memo `observer` read has moved to a new version since.
+///
+/// Used for a *maybe* observer (above) and for a memo in the `Check` state
+/// (`MemoNode::refresh`), whose dependencies are recorded on its marker under
+/// the same id. Refreshes each memo it asks about — that is the "pull".
+pub(super) fn memo_sources_changed(observer: ObserverId) -> bool {
+    let Some(inner) = EFFECTS.with(|effects| effects.borrow().get(&observer).cloned()) else {
+        return true;
+    };
+    deps_changed(&inner)
+}
+
+fn deps_changed(inner: &EffectInner) -> bool {
+    // Copied out: refreshing a memo runs user code, which must not find this
+    // observer's `deps` borrowed.
+    let memo_deps: Vec<(u32, u32, u64)> = inner
+        .deps
+        .borrow()
+        .iter()
+        .filter_map(|dep| match *dep {
+            DepKey::Memo {
+                id,
+                generation,
+                seen,
+            } => Some((id, generation, seen)),
+            DepKey::Signal { .. } => None,
+        })
+        .collect();
+    // Woken through a memo but holding no record of reading one: nothing to
+    // compare against, so run rather than guess.
+    if memo_deps.is_empty() {
+        return true;
+    }
+    memo_deps.into_iter().any(|(id, generation, seen)| {
+        let node = super::MEMO_STORE.with(|store| store.borrow().get_node(id, generation));
+        // A freed memo counts as moved. The reader was computed from its old
+        // value and nothing will ever wake it again (the memo's marker went
+        // with it), so leaving it clean would strand it on that value for good
+        // — a `try_get` reader must get its chance to see `None`. Costs one
+        // recompute, once.
+        node.is_none_or(|node| node.refresh() != seen)
+    })
 }
 
 #[cfg(test)]
@@ -1040,5 +1178,191 @@ mod unsubscribe_tests {
         );
         recycled.set(1);
         assert_eq!(runs.get(), 2, "the new occupant's subscriber still fires");
+    }
+}
+
+/// The self-wake rule (issue #343): a write an effect's own body causes to a
+/// signal it reads is **dropped** for that effect when the write is flushed
+/// while the body is still running, and **kept** when the write is only queued.
+///
+/// The guide states this rule next to the execution-order contract
+/// (`docs/src/guide/reactivity.md`, "An effect does not wake itself"); these
+/// fixtures are what that paragraph rests on.
+#[cfg(test)]
+mod self_wake_tests {
+    use super::*;
+    use crate::reactive::{Scope, Signal, batch};
+    use std::cell::Cell;
+
+    fn is_pending(id: ObserverId) -> bool {
+        RUNTIME.with(|rt| rt.borrow().pending_effects_set.contains(&id))
+    }
+
+    /// The issue's shape: an effect disposes a scope in its own body, and a
+    /// cleanup on that scope writes a signal the effect reads.
+    ///
+    /// The write lands, every *other* observer of the signal runs, and the
+    /// effect itself keeps what it computed on this pass — the wake is not left
+    /// in the queue for a later flush either. It sees the value on its next run
+    /// for an unrelated reason.
+    ///
+    /// The child scope is created on the first run only, so a variant of the
+    /// guard that re-runs the effect once its body has returned ("queue instead
+    /// of skip") fails an assertion here instead of hanging: with a new scope
+    /// per run — `for_each_dom`'s own shape — every re-run would dispose one
+    /// more and wake itself again, without end.
+    #[test]
+    fn a_cleanup_write_during_the_effects_own_body_does_not_re_run_it() {
+        let trigger = Signal::new(0);
+        let tally = Signal::new(0);
+        let runs = Rc::new(Cell::new(0));
+        let seen = Rc::new(Cell::new(-1));
+        let child: Rc<RefCell<Option<Scope>>> = Rc::new(RefCell::new(None));
+
+        let (r, s, c) = (runs.clone(), seen.clone(), child.clone());
+        let effect = Effect::new(move || {
+            trigger.get();
+            s.set(tally.get());
+            r.set(r.get() + 1);
+            // Bound first: an `if let` on the `take()` would hold the `RefMut`
+            // across the disposal and its cleanup.
+            let old = c.borrow_mut().take();
+            match old {
+                // Its cleanup writes `tally`, which this effect reads.
+                Some(old) => old.dispose(),
+                None if r.get() == 1 => {
+                    let scope = Scope::new();
+                    scope.on_cleanup(move || tally.update(|n| *n += 1));
+                    *c.borrow_mut() = Some(scope);
+                }
+                None => {}
+            }
+        });
+
+        // Positive control: registered after the effect, observing the same
+        // signal. Proves the cleanup's write does wake observers — only the
+        // effect that was running is left out.
+        let bystander_seen = Rc::new(Cell::new(-1));
+        let b = bystander_seen.clone();
+        let _bystander = Effect::new(move || b.set(tally.get()));
+
+        assert_eq!((runs.get(), seen.get()), (1, 0));
+        assert!(child.borrow().is_some());
+
+        trigger.set(1); // re-runs the effect, which disposes the scope
+
+        assert!(child.borrow().is_none(), "the cleanup ran");
+        assert_eq!(tally.get(), 1, "and its write landed");
+        assert_eq!(bystander_seen.get(), 1, "another observer was woken by it");
+        assert_eq!(runs.get(), 2, "the effect was not re-run for its own wake");
+        assert_eq!(seen.get(), 0, "so it keeps the value it read before");
+        assert!(
+            !is_pending(effect.id()),
+            "and the wake is not waiting in the queue"
+        );
+
+        // Nothing later picks the dropped wake up: an empty batch flushes
+        // whatever is queued, and nothing is.
+        batch(|| {});
+        assert_eq!(runs.get(), 2);
+
+        // The next genuine change runs it, and it reads the current value.
+        trigger.set(2);
+        assert_eq!((runs.get(), seen.get()), (3, 1));
+    }
+
+    /// The counter-case: a body running while a batch is open queues its own
+    /// wake instead of flushing it, and that wake is **not** dropped — the
+    /// effect runs again when the batch flushes.
+    ///
+    /// Reached by `Effect::new` (and [`Effect::run`]) called inside a
+    /// [`batch`], which includes every event handler. Every re-run *caused by*
+    /// a signal change happens inside a flush, where the batch flag is down, so
+    /// it is the other case.
+    #[test]
+    fn a_self_write_during_a_first_run_inside_a_batch_is_kept() {
+        let signal = Signal::new(0);
+        let runs = Rc::new(Cell::new(0));
+        let seen = Rc::new(Cell::new(-1));
+
+        let (r, s) = (runs.clone(), seen.clone());
+        let effect = batch(|| {
+            let effect = Effect::new(move || {
+                let v = signal.get();
+                s.set(v);
+                r.set(r.get() + 1);
+                if v == 0 {
+                    signal.set(1);
+                }
+            });
+            assert_eq!(runs.get(), 1, "the first run happened immediately");
+            assert!(
+                is_pending(effect.id()),
+                "the self-write was queued, not flushed"
+            );
+            effect
+        });
+
+        assert_eq!(runs.get(), 2, "the batch's flush ran the queued wake");
+        assert_eq!(seen.get(), 1, "and the effect saw its own write");
+        assert!(!is_pending(effect.id()));
+    }
+
+    /// The same self-write made outside any batch is the dropped case: the
+    /// write flushes synchronously while the body is still running.
+    #[test]
+    fn the_same_self_write_outside_a_batch_is_dropped() {
+        let signal = Signal::new(0);
+        let runs = Rc::new(Cell::new(0));
+        let seen = Rc::new(Cell::new(-1));
+
+        let (r, s) = (runs.clone(), seen.clone());
+        let effect = Effect::new(move || {
+            let v = signal.get();
+            s.set(v);
+            r.set(r.get() + 1);
+            if v == 0 {
+                signal.set(1);
+            }
+        });
+
+        assert_eq!((runs.get(), seen.get()), (1, 0));
+        assert_eq!(signal.get(), 1);
+        assert!(!is_pending(effect.id()));
+        batch(|| {});
+        assert_eq!(runs.get(), 1, "nothing picks the dropped wake up later");
+    }
+
+    /// [`Effect::run`] inside a batch is the same kept case as `Effect::new`
+    /// there: the body's self-write is queued, and the batch's flush runs the
+    /// effect again (issue #343).
+    #[test]
+    fn a_self_write_during_a_manual_run_inside_a_batch_is_kept() {
+        let signal = Signal::new(0);
+        let armed = Rc::new(Cell::new(false));
+        let runs = Rc::new(Cell::new(0));
+
+        let (a, r) = (armed.clone(), runs.clone());
+        let effect = Effect::new(move || {
+            let v = signal.get();
+            r.set(r.get() + 1);
+            if a.get() && v == 0 {
+                signal.set(1);
+            }
+        });
+        assert_eq!(runs.get(), 1);
+
+        armed.set(true);
+        batch(|| {
+            effect.run();
+            assert_eq!(runs.get(), 2);
+        });
+        assert_eq!(runs.get(), 3, "the batch's flush ran the queued self-wake");
+
+        // Control: a re-run caused by a change runs inside a flush, with the
+        // batch closed, so the same self-write there is dropped.
+        signal.set(0); // runs (4), writes 1 in its body: not run again
+        assert_eq!(runs.get(), 4);
+        assert_eq!(signal.get(), 1);
     }
 }

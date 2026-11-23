@@ -32,20 +32,17 @@
 //! declaration (`line-height: 20px`, a `40x30` box, an inset), never a glyph
 //! measurement.
 //!
-//! Three divergences from Chrome are **pre-existing and hold for the unwrapped
-//! twin too**, so they are stated in the fixture that meets them and not
-//! pocketed: an absolute that is the *first* child takes its static position
-//! after the line (Chrome: before it — the measure leaf goes in at index 0,
-//! `ifc_out_of_flow_tests`); a `position: fixed` box with auto insets goes to
-//! the viewport origin (Chrome: its static position —
-//! `read_layout_results`' fixed arm); an inline-level absolute (`<span
-//! style="position: absolute">`) takes a block's static position (Chrome: in the
-//! line — Stylo blockifies it). A fourth is the one shape with no wrapper-free
-//! twin: a `position: relative` inline is the absolute's containing block per
-//! CSS 2.1 §10.1, and rinch resolves the insets against the block container
-//! instead. Each is filed — #632 (static position after the line block), #633
-//! (`fixed` auto insets), #634 (inline-level absolute), #631 (the `relative`
-//! inline containing block); see the fixture docs.
+//! Three divergences from Chrome held for the unwrapped twin too when these
+//! fixtures were written, all in the **static position**: an absolute that is
+//! the *first* child took it after the line, one in a run of several lines
+//! after the whole run (#632); a `position: fixed` box with auto insets went
+//! to the viewport origin (#633); an inline-level absolute (`<span
+//! style="position: absolute">`) took a block's place (#634). All three are
+//! fixed, and Chrome 153's numbers for them are pinned with the bundled Inter
+//! in `static_position_tests`; what the fixtures here pin is still twin
+//! identity. The one shape with no wrapper-free twin — a `position: relative`
+//! inline, which is the absolute's containing block per CSS 2.1 §10.1 — was a
+//! fourth until #631, and is pinned in `abs_inline_containing_block_tests`.
 //!
 //! # Fixed points these fixtures step off
 //!
@@ -114,7 +111,7 @@ fn painted_at(doc: &RinchDocument, id: NodeId, container: NodeId) -> (f32, f32) 
 }
 
 /// The DOM node whose Taffy child list holds `id`'s Taffy node.
-fn taffy_parent_dom(doc: &RinchDocument, id: NodeId) -> Option<usize> {
+fn taffy_parent_dom(doc: &RinchDocument, id: NodeId) -> Option<u64> {
     let t = doc.tree.get(id.0)?.taffy_id?;
     let p = doc.tree.taffy.parent(t)?;
     doc.tree.taffy_map.get(&p).copied()
@@ -421,12 +418,10 @@ fn an_out_of_flow_child_of_an_inline_is_laid_out_where_its_twin_is() {
     }
 }
 
-/// Both ends of the run. Chrome places an absolute that is the **first** child at
-/// `y = 0` — before the line — and rinch's leaf-first canonicalization puts it
-/// after it, at `y = 20`, **for the unwrapped twin as well**
-/// (`ifc_out_of_flow_tests::an_auto_inset_absolute_child_keeps_its_below_the_line_static_position`
-/// documents the choice). Twin identity is what this pins; the divergence is
-/// pre-existing and filed as #632.
+/// Both ends of the run. An absolute that is the **first** child goes at
+/// `y = 0`, before the line (it went after it, at `y = 20`, until #632 —
+/// for the unwrapped twin as well). Twin identity is what this pins; the
+/// position is `static_position_tests`'.
 #[test]
 fn an_absolute_first_or_last_in_the_inline_lands_where_its_twin_does() {
     assert_twin("first", "span");
@@ -617,10 +612,9 @@ fn under_an_anonymous_box_root_the_icb_case_resolves_against_the_viewport() {
     assert_consistent(&wd, "icb mixed");
 }
 
-/// `position: fixed` inside the inline. Both twins go to the viewport origin
-/// (`read_layout_results`' fixed arm sends auto insets to 0); Chrome uses the
-/// static position `(0, 20)`. Pre-existing for the direct child, filed as #633; what this
-/// pins is that the fixed box is laid out at all and agrees with its twin.
+/// `position: fixed` inside the inline. Both twins take the static position
+/// `(0, 20)` (the viewport origin until #633); what this pins is that the
+/// fixed box is laid out at all and agrees with its twin.
 #[test]
 fn a_fixed_child_of_an_inline_agrees_with_its_twin() {
     let (w, _) = assert_twin("fixed", "span");
@@ -628,9 +622,9 @@ fn a_fixed_child_of_an_inline_agrees_with_its_twin() {
 }
 
 /// An **inline-level** absolute (`<span style="position: absolute">`). Stylo
-/// blockifies it, so both twins give it a block's static position below the
-/// line; Chrome keeps it in the line after `text`. Pre-existing, filed as #634; the hoist
-/// is by role, not by tag, which is what this pins.
+/// blockifies it; its static position is in the line after `text` all the
+/// same (#634 — both twins gave it a block's place below the line until
+/// then). The hoist is by role, not by tag, which is what this pins.
 #[test]
 fn an_inline_level_absolute_agrees_with_its_twin() {
     assert_twin("inline_level", "span");
@@ -652,26 +646,33 @@ fn an_absolute_in_an_inline_with_no_positioned_ancestor_resolves_against_the_icb
     );
 }
 
-/// A three-line run. Chrome's static position is after the line containing the
-/// preceding content (`y = 20`); rinch's is after the whole run (`y = 60`), for
-/// the unwrapped twin as well — the measure leaf is one Taffy child. Twin
-/// identity is pinned; the divergence is filed with the abs-first one, #632.
+/// A three-line run. The static position is after the line containing the
+/// preceding content (`y = 20`) — it was after the whole run (`y = 60`) until
+/// #632, for the unwrapped twin as well. Twin identity is pinned here.
 #[test]
 fn an_absolute_in_a_multi_line_run_agrees_with_its_twin() {
+    // Laid out in the platform's own `serif`, as before #2255: Chrome's
+    // narrower Times New Roman (a host that has it) fits the run in two
+    // lines. CI has no Times New Roman.
+    rinch_dom::fonts::set_font_defaults(
+        rinch_dom::fonts::FontDefaults::default()
+            .with_serif(None)
+            .with_sans_serif(None),
+    );
     let (w, _) = assert_twin("multiline", "span");
     assert_eq!(height_of(&w.doc, w.container), 3.0 * LINE, "three lines");
 }
 
 /// **A `position: relative` inline is the absolute's containing block** (CSS 2.1
-/// §10.1) and rinch does not model that: the insets resolve against the block
-/// container, so `top: 0; left: 0` lands at the container's `(0, 0)` where
-/// Chrome lands at the span's first fragment — `(34.7, 1)` with `lead ` before
-/// the span, `(0, 1)` without. Same class as #386 (the containing block is a
-/// positioned ancestor that is not the Taffy parent), one level worse because
-/// this ancestor has no box in Taffy at all. Filed as #631; this fixture pins that the
-/// box is laid out, reachable, painted, and states the number it gets.
+/// §10.1, issue #631): `top: 0; left: 0` lands on the span's first fragment —
+/// after `lead `, on the line — not on the block container's corner, where it
+/// landed while the insets resolved against the container (the same class as
+/// #386's case, one level worse because this ancestor has no box in Taffy at
+/// all). The numbers are text-measured, so this fixture, which declares no
+/// face, asserts only what holds in any font; Chrome 153's are pinned with the
+/// bundled Inter in `abs_inline_containing_block_tests`.
 #[test]
-fn an_absolute_in_a_relative_inline_is_laid_out_and_the_containing_block_is_stated() {
+fn an_absolute_in_a_relative_inline_resolves_against_the_inlines_fragment() {
     let mut doc = RinchDocument::new();
     let body = doc.body();
     let container = el(&mut doc, body, "div", CONTAINER);
@@ -685,13 +686,16 @@ fn an_absolute_in_a_relative_inline_is_laid_out_and_the_containing_block_is_stat
 
     assert!(reachable(&doc, abs), "laid out");
     assert_eq!(size_of(&doc, abs), (40.0, 30.0));
-    assert_eq!(
-        painted_at(&doc, abs, container),
-        (0.0, 0.0),
-        "DOCUMENTED DIVERGENCE (#631): resolved against the container; Chrome resolves \
-         against the span's first fragment (34.7, 1). When the containing-block \
-         #631 lands this assertion is the one to flip."
+    let (x, y) = painted_at(&doc, abs, container);
+    assert!(
+        (10.0..100.0).contains(&x),
+        "x = {x}: after `lead `, not at the container's corner"
     );
+    assert!(
+        y.abs() <= 3.0,
+        "y = {y}: the fragment's top, within the font's leading of the line's"
+    );
+    assert_eq!((x.fract(), y.fract()), (0.0, 0.0), "on the pixel grid");
     assert_consistent(&doc, "relative inline");
 }
 

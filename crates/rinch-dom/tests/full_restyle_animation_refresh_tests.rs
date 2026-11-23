@@ -5,9 +5,8 @@
 //! animation survives a theme change with its clock, as in a browser. Keeping
 //! the whole entry kept too much: its keyframe stops were extracted from the
 //! **old** base style against the **old** `@keyframes` rule, and its timing from
-//! the old declaration. So during a full restyle — and only then, behind the
-//! dedicated `NodeTree::refreshing_animations` flag — a kept animation keeps its
-//! **clock** (`start_time_ms`, `paused_elapsed_ms`, `play_state`) and takes
+//! the old declaration. So on a full restyle — as on every cascade of an
+//! animated node since #766 — a kept animation keeps its **clock** (`start_time_ms`, `paused_elapsed_ms`, `play_state`) and takes
 //! everything else afresh: the keyframes are looked up again (and the animation
 //! dropped if the rule is gone), the stops are re-extracted from the new base
 //! style, and `duration_ms` / `delay_ms` come from the new declaration.
@@ -29,28 +28,24 @@
 //! | a hidden panel shown by the theme, which also moves `font-size` 10px → 40px under a `1em → 11em` spinner | width **80px** at 1000ms |
 //! | a `to`-only `@keyframes`, `color: var(--fg)` changed by the theme | `color` follows the theme, clock kept |
 //!
-//! Scope: this is **`recompute_all_styles_full` only** — the pass a theme toggle
-//! takes. A targeted restyle (a class change) still keeps a running animation's
-//! stops and timing whole (#766, #780, #781 stay open for that route);
-//! refreshing there would cost a keyframes lookup and a stop extraction per
-//! animated node per cascade, which a theme toggle can afford and a hover
-//! cannot. Nor is the full restyle the only pass that re-cascades the whole
-//! document: a `<style>` append and a viewport change do too, set no flag, and
-//! keep the same staleness (#781).
+//! Scope: this file pins the theme path. The same refresh runs on every other
+//! cascade of an animated node — a class change, a `<style>` append, a `@media`
+//! flip — and `animation_restyle_refresh_tests.rs` pins those (#766, #780,
+//! #781).
 //!
-//! Not fixed here, and not pinned: **a finished one-shot animation replays on a
-//! theme toggle.** `tick_animations` drops a completed animation that has no
-//! `forwards` fill, so the full restyle finds no entry of that name and mints a
-//! new one from t=0. Chrome does not replay it; neither did `main`, whose full
-//! restyle started nothing at all. That is #783's mechanism, reached through
-//! this path.
+//! Not fixed here: **a finished one-shot animation replayed on a theme
+//! toggle.** `tick_animations` dropped a completed animation that has no
+//! `forwards` fill, so the full restyle found no entry of that name and minted
+//! a new one from t=0. Chrome does not replay it. #783 keeps the finished entry
+//! as a settled marker; `finished_animation_no_fill_783_tests::
+//! a_theme_change_does_not_replay_a_finished_animation` pins this path.
 //!
 //! # Which fixture kills which mutant
 //!
 //! Every row was run: each mutant applied to the committed source, then
 //! `RINCH_TREE_CHECK=1 cargo test -p rinch-dom -p rinch --no-fail-fast`
-//! (86 binaries, 1820 tests), then the source restored from the commit. MR7 and
-//! MR8 fail nothing, which doubles as the unmutated control's count.
+//! (86 binaries, 1820 tests), then the source restored from the commit (the
+//! table as it stood at #771).
 //!
 //! | Mutant | Killed by |
 //! |---|---|
@@ -58,20 +53,12 @@
 //! | **MR1** a kept animation whose rule is gone is kept | `a_theme_that_drops_the_keyframes_rule_stops_the_animation`, alone |
 //! | **MR2** the stops are not re-extracted | `…redefines_the_keyframes_body…`, `…starts_its_spinner_on_the_new_em_basis`, `…implicit_from_stop` |
 //! | **MR3** duration and delay are not taken from the spec | `…changes_the_duration_re_times_around_the_kept_clock`, `a_paused_animation_keeps_its_frozen_time_across_a_theme_change` (its re-timing precondition) |
-//! | **MR4** `recompute_all_styles_full` never sets the flag | the six fixtures above that need the refresh |
 //! | **MR5** the refresh resets `paused_elapsed_ms` the way a fresh entry mints it | `a_paused_animation_keeps_its_frozen_time_across_a_theme_change`, alone |
 //! | **MR6** the refresh rescales a frozen time to the new duration | `a_paused_animation_keeps_its_frozen_time_across_a_theme_change`, alone |
-//! | **MR7** the refresh runs on **every** cascade, not only the full restyle | **survives**, by construction |
-//! | **MR8** the refresh keys on `!transitions_enabled` instead of its own flag | **survives**, by construction |
 //!
-//! The two survivors are scope decisions, not behaviour a fixture can hold
-//! without pinning a bug. MR7 is *more* Chrome-correct than the code — it fixes
-//! #766, #780 and #781 on a plain restyle too — and is refused on cost: a
-//! keyframes lookup and a stop extraction per animated node per cascade. MR8
-//! differs only on cascades before the first layout, where it would also
-//! refresh, and the only thing a fixture could observe there is the plain
-//! restyle's staleness — again a bug to pin. It is refused because it asks one
-//! flag two unrelated questions, which is what #762 was.
+//! MR4, MR7 and MR8 were about the `NodeTree::refreshing_animations` flag that
+//! scoped the refresh to this pass. #766 removed it: the refresh runs on every
+//! cascade (MR7 is now the code), so a mutant of the flag has nothing to mutate.
 
 use rinch_core::dom::{DomDocument, NodeId};
 use rinch_dom::RinchDocument;
@@ -91,6 +78,7 @@ const BOX: &str = "div.x { width: 10px; height: 10px; line-height: 10px; \
 /// that would drop every cached style on its own.
 fn document(theme: &str, author: &str) -> RinchDocument {
     let mut doc = RinchDocument::new();
+    doc.set_animation_clock_ms(Some(1_000_000.0)); // pinned: exact samples (#2267)
     doc.set_viewport(VP.0, VP.1);
     doc.update_theme_variables(theme);
     doc.load_css(&format!("{BOX} {author}"));
@@ -180,14 +168,6 @@ fn px(value: &AnimatableValue) -> f32 {
     }
 }
 
-fn now_ms() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs_f64()
-        * 1000.0
-}
-
 // ── required: a `@keyframes` rule the new theme no longer carries ───────────
 
 /// **The regression #762 introduced and this round removes.** Chrome's third
@@ -250,7 +230,7 @@ fn a_theme_that_renames_the_animation_starts_a_new_one_from_zero() {
     doc.resolve_layout(VP.0, VP.1);
     let old_start = backdate(&mut doc, t, &[3000.0])[0];
 
-    let swap_started = now_ms();
+    let swap_started = doc.animation_now_ms();
     change_theme(
         &mut doc,
         ":root { --probe: 2; } body .t { animation-name: k2; }",
@@ -258,10 +238,9 @@ fn a_theme_that_renames_the_animation_starts_a_new_one_from_zero() {
 
     assert_eq!(names(&doc, t), ["k2"], "only the renamed animation runs");
     let new_start = start_times(&doc, t)[0];
-    assert!(
-        new_start >= swap_started,
-        "`k2` starts from t=0 at the swap ({new_start} < {swap_started}), not on \
-         `k`'s clock ({old_start})"
+    assert_eq!(
+        new_start, swap_started,
+        "`k2` starts from t=0 at the swap, not on `k`'s clock ({old_start})"
     );
     assert_eq!(
         rgb(&sample(

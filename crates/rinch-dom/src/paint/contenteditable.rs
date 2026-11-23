@@ -7,123 +7,169 @@ use peniko::kurbo::{Affine, Rect};
 use peniko::{Brush, Fill};
 
 use super::painter::Painter;
-use crate::computed_style::LineHeightValue;
 use crate::node::Node;
 
-use super::text::render_text_with_shadow;
+use super::text::render_painted_text_with_shadow;
 
-/// Find the line height from a Parley layout for the line containing the given y
-/// position (layout-relative). Returns Parley's reported line height for that
-/// line, which reflects the actual font metrics of the laid-out text.
-fn line_height_at_y(layout: &parley::layout::Layout<Brush>, y: f32) -> Option<f64> {
-    for line in layout.lines() {
-        let m = line.metrics();
-        let glyph_top = m.baseline - m.ascent;
-        let half_leading = (m.line_height - m.ascent - m.descent) / 2.0;
-        let line_box_top = glyph_top - half_leading;
-        let line_box_bottom = line_box_top + m.line_height;
-        if y >= line_box_top - 0.5 && y < line_box_bottom + 0.5 {
-            return Some(m.line_height as f64);
-        }
+/// The translucent wash both selection painters draw.
+const SELECTION_WASH: (u8, u8, u8, u8) = (51, 154, 240, 100);
+
+/// Paint the selection rectangles `rects` of a layout (the selection `a..b`,
+/// byte offsets, either order), whose
+/// origin is at `(text_x, text_y)` and whose units are `units` device px each:
+/// one rect per line (per visual piece on a line holding a right-to-left run,
+/// #1114), from [`crate::text_query::selection_rects_for_layout`] —
+/// the editor's rule, so each line's rect is its line box and ends where the
+/// next line's begins, the line before a hard break carries a newline's width
+/// and a soft-wrapped line runs to its trailing edge (#1106; #1008, #1010,
+/// #1024). Two neighbours used to be derived here from the glyph top and a
+/// fractional `line_height` (or `1.2 × font-size` in a `<textarea>`), so they
+/// overlapped by a pixel — a darker row across a translucent highlight — or
+/// left one unpainted. A line the selection carries on past is not extended to
+/// the content box's edge: Chrome 155 ends it at its text (a soft wrap's
+/// trailing space) or a newline's width, whether or not it is the last.
+#[allow(clippy::too_many_arguments)]
+fn paint_selection_rects(
+    painter: &mut dyn Painter,
+    transform: Affine,
+    rects: Vec<(f32, f32, f32, f32)>,
+    text_x: f64,
+    text_y: f64,
+    units: f64,
+) {
+    let (r, g, bl, al) = SELECTION_WASH;
+    let color = AlphaColor::<Srgb>::from_rgba8(r, g, bl, al);
+    for (left, top, width, height) in rects {
+        let rect = Rect::new(
+            text_x + left as f64 * units,
+            text_y + top as f64 * units,
+            text_x + (left + width) as f64 * units,
+            text_y + (top + height) as f64 * units,
+        );
+        painter.fill_color(Fill::NonZero, transform, color, &rect.into());
     }
-    // If y doesn't match any line (e.g. empty layout), try the first line.
-    layout
-        .lines()
-        .next()
-        .map(|line| line.metrics().line_height as f64)
+}
+
+/// The **read-only** text selection (`user-select: text`) IFC root (or text
+/// leaf, #1692) `node` carries — `data-text-sel`, `-start`, `-end`, and `-ranges` when the
+/// selection skips runs inside it (`"a-b,c-d"`: text that is hidden or
+/// `user-select: none`) — as byte ranges into its laid-out text, clamped to
+/// it. Empty when it carries none.
+pub(crate) fn read_only_selection(node: &Node) -> Vec<(usize, usize)> {
+    if !node.carries_text_selection() {
+        return Vec::new();
+    }
+    // An IFC root's text, or a text leaf's (#1692): its last line ends it.
+    let len = match (&node.text_layout, &node.cached_text_parley) {
+        (Some(layout), _) => layout.text_content.len(),
+        (None, Some(leaf)) => leaf.lines().last().map_or(0, |l| l.text_range().end),
+        (None, None) => return Vec::new(),
+    };
+    let num = |s: &str| s.trim().parse::<usize>().ok().map(|v| v.min(len));
+    if let Some(ranges) = node.attributes.get("data-text-sel-ranges") {
+        return ranges
+            .split(',')
+            .filter_map(|r| {
+                let (a, b) = r.split_once('-')?;
+                Some((num(a)?, num(b)?))
+            })
+            .filter(|(a, b)| a < b)
+            .collect();
+    }
+    let at = |k: &str| node.attributes.get(k).and_then(|s| num(s)).unwrap_or(0);
+    let (a, b) = (at("data-text-sel-start"), at("data-text-sel-end"));
+    if a == b {
+        Vec::new()
+    } else {
+        vec![(a.min(b), a.max(b))]
+    }
+}
+
+/// How far `node`'s read-only selection highlight reaches past its border box,
+/// in CSS px: `[left, top, right, bottom]`, never negative. Under a
+/// `line-height` smaller than the text, each line's rect is its content area
+/// (#1008), and the first and last stand out of the box above and below it, as
+/// Chrome 155 paints them; the highlight is the node's own paint, so its damage
+/// has to reach that far, or a partial frame leaves stale rows of wash (review
+/// of #1706). Zero for a node with no selection.
+pub(crate) fn read_only_selection_outsets(node: &Node) -> [f32; 4] {
+    let mut o = [0.0_f32; 4];
+    let Some(layout) = node.text_layout.as_ref() else {
+        return o;
+    };
+    // Where the highlight is painted: moved by the box's scroll (#1707).
+    let (ox, oy) = super::ifc_root_content_origin(node);
+    let (ox, oy) = (
+        ox - node.scroll_offset.0 as f32,
+        oy - node.scroll_offset.1 as f32,
+    );
+    let (w, h) = (node.layout.width, node.layout.height);
+    for (left, top, width, height) in read_only_selection(node)
+        .into_iter()
+        .flat_map(|(a, b)| crate::text_query::selection_rects_for_inline(layout, a, b))
+    {
+        o[0] = o[0].max(-(ox + left));
+        o[1] = o[1].max(-(oy + top));
+        o[2] = o[2].max(ox + left + width - w);
+        o[3] = o[3].max(oy + top + height - h);
+    }
+    o
 }
 
 /// Paint the translucent selection highlight for a **read-only** text selection
-/// (`user-select: text`) over a block's inline `layout`. `sel_start`/`sel_end`
-/// are byte offsets into the laid-out text; `text_x`/`text_y` are the content-box
-/// origin. (The editor and `<input>` render their own selections elsewhere; this
-/// is only for selecting static, non-editable text.)
-#[allow(clippy::too_many_arguments)]
+/// (`user-select: text`, [`read_only_selection`]) over IFC root `node`'s inline
+/// layout, whose content-box origin, less the box's scroll offset (where its
+/// text is drawn, #1707), is at device px `(text_x, text_y)`. The
+/// layout is in CSS px, so its rects are scaled by `scale` (they were drawn at
+/// 1/scale on a HiDPI display). (The editor and `<input>` render their own
+/// selections elsewhere; this is only for selecting static, non-editable text.)
 pub(super) fn paint_text_selection_highlight(
     node: &Node,
     painter: &mut dyn Painter,
     scale: f64,
     text_x: f64,
     text_y: f64,
-    layout: &parley::layout::Layout<Brush>,
-    text_len: usize,
-    sel_start: usize,
-    sel_end: usize,
-    content_width: f64,
     transform: Affine,
 ) {
-    if sel_start == sel_end {
+    let Some(layout) = node.text_layout.as_ref() else {
         return;
-    }
-
-    // Parley's line metrics are authoritative (the layout may belong to a child
-    // block with its own font size); fall back to computed style if needed.
-    let fallback_line_height = {
-        let font_size = node.computed_style.font_size;
-        let scaled = font_size * scale as f32;
-        let mult = match node.computed_style.line_height {
-            LineHeightValue::Relative(r) => r as f64,
-            LineHeightValue::Absolute(abs) => (abs / font_size) as f64,
-            LineHeightValue::Normal => 1.2,
-        };
-        scaled as f64 * mult
     };
-
-    let sel_start_byte = sel_start.min(text_len);
-    let sel_end_byte = sel_end.min(text_len);
-
-    let (start_x, start_y) =
-        crate::text_query::caret_position_for_offset_layout(layout, sel_start_byte);
-    let (end_x, end_y) = crate::text_query::caret_position_for_offset_layout(layout, sel_end_byte);
-
-    let sel_color = AlphaColor::<Srgb>::from_rgba8(51, 154, 240, 100);
-
-    if (start_y - end_y).abs() < 0.1 {
-        // Same line — find the matching line's actual height from Parley.
-        let actual_line_height = line_height_at_y(layout, start_y).unwrap_or(fallback_line_height);
-        let sel_rect = Rect::new(
-            text_x + start_x as f64,
-            text_y + start_y as f64,
-            text_x + end_x as f64,
-            text_y + start_y as f64 + actual_line_height,
+    for (a, b) in read_only_selection(node) {
+        // Where the text is drawn: moved by a relative inline element (#1425).
+        paint_selection_rects(
+            painter,
+            transform,
+            crate::text_query::selection_rects_for_inline(layout, a, b),
+            text_x,
+            text_y,
+            scale,
         );
-        painter.fill_color(Fill::NonZero, transform, sel_color, &sel_rect.into());
-    } else {
-        // Multi-line selection.
-        for line in layout.lines() {
-            let line_metrics = line.metrics();
-            let glyph_top = line_metrics.baseline - line_metrics.ascent;
-            let half_leading =
-                (line_metrics.line_height - line_metrics.ascent - line_metrics.descent) / 2.0;
-            let line_box_top = glyph_top - half_leading;
-            let line_box_bottom = line_box_top + line_metrics.line_height;
+    }
+}
 
-            // Skip lines entirely outside the selection.
-            if line_box_bottom <= start_y || line_box_top > end_y + 0.5 {
-                continue;
-            }
-
-            let is_start_line = start_y >= line_box_top - 0.5 && start_y < line_box_bottom;
-            let is_end_line = end_y >= line_box_top - 0.5 && end_y < line_box_bottom;
-
-            let rect_y = text_y + line_box_top as f64;
-            let (rect_start_x, rect_end_x) = if is_start_line && is_end_line {
-                (start_x as f64, end_x as f64)
-            } else if is_start_line {
-                (start_x as f64, content_width)
-            } else if is_end_line {
-                (0.0, end_x as f64)
-            } else {
-                (0.0, content_width)
-            };
-            let sel_rect = Rect::new(
-                text_x + rect_start_x,
-                rect_y,
-                text_x + rect_end_x,
-                rect_y + line_metrics.line_height as f64,
-            );
-            painter.fill_color(Fill::NonZero, transform, sel_color, &sel_rect.into());
-        }
+/// [`paint_text_selection_highlight`] for a text leaf `node` (a flex or grid
+/// container's own text, #1692), whose layout's origin is at device px
+/// `(text_x, text_y)`.
+pub(super) fn paint_text_leaf_selection_highlight(
+    node: &Node,
+    painter: &mut dyn Painter,
+    scale: f64,
+    text_x: f64,
+    text_y: f64,
+    transform: Affine,
+) {
+    let Some(layout) = node.cached_text_parley.as_deref() else {
+        return;
+    };
+    for (a, b) in read_only_selection(node) {
+        paint_selection_rects(
+            painter,
+            transform,
+            crate::text_query::selection_rects_for_layout(layout, a, b),
+            text_x,
+            text_y,
+            scale,
+        );
     }
 }
 
@@ -175,6 +221,8 @@ pub(super) fn parse_px(value: &str) -> Option<f32> {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn paint_input_value(
     node: &Node,
+    value: &str,
+    perf: &crate::perf::PerfCounters,
     painter: &mut dyn Painter,
     scale: f64,
     x: f64,
@@ -184,13 +232,10 @@ pub(super) fn paint_input_value(
     font_cx: &mut parley::FontContext,
     layout_cx: &mut parley::LayoutContext<Brush>,
     transform: Affine,
+    scroll: (f32, f32),
 ) {
-    // Get the value or placeholder
-    let value = node
-        .attributes
-        .get("value")
-        .map(|s| s.as_str())
-        .unwrap_or("");
+    // `value` is `form_control::control_value`: the `value` attribute, else a
+    // textarea's text children (#1159), which nothing else draws.
     let placeholder = node
         .attributes
         .get("placeholder")
@@ -264,14 +309,7 @@ pub(super) fn paint_input_value(
         (text, cursor_pos, selection_start)
     };
 
-    // Get font properties from computed style
     let font_size = node.computed_style.font_size;
-    let font_weight = node.computed_style.font_weight;
-    let font_family = if node.computed_style.font_family.is_empty() {
-        "sans-serif".to_string()
-    } else {
-        node.computed_style.font_family.clone()
-    };
 
     // Get text color from computed style - dimmed for placeholder
     let base_color = node
@@ -286,104 +324,99 @@ pub(super) fn paint_input_value(
         base_color
     };
 
-    // Get padding from computed style
-    let padding_left = node.computed_style.padding_left.to_px() as f64 * scale;
-    let padding_top = node.computed_style.padding_top.to_px() as f64 * scale;
-
-    // Check if this is a textarea (multi-line) or input (single-line)
     let is_textarea = node.tag() == Some("textarea");
-
-    // Build text layout
     let scaled_font_size = font_size * scale as f32;
-    // Kept glyph-for-glyph in step with `RinchApp::compute_input_cursor_from_click`
-    // (crates/rinch/src/app/click_handling.rs) — a property added here and not
-    // there moves the painted text out from under the caret. Both should move to
-    // `ComputedStyle::build_parley_layout` together (#320).
-    let mut builder = layout_cx.ranged_builder(font_cx, text, 1.0, true);
-    builder.push_default(parley::style::StyleProperty::FontSize(scaled_font_size));
-    builder.push_default(parley::style::StyleProperty::Brush(Brush::Solid(color)));
-    builder.push_default(parley::style::StyleProperty::FontFamily(
-        parley::style::FontFamily::Source(std::borrow::Cow::Owned(font_family)),
-    ));
-    if (font_weight - 400.0).abs() > 1.0 {
-        builder.push_default(parley::style::StyleProperty::FontWeight(
-            parley::style::FontWeight::new(font_weight),
-        ));
-    }
 
-    let mut text_layout = builder.build(text);
-    text_layout.break_all_lines(Some((w - padding_left * 2.0) as f32));
+    // The one builder and the one origin the hit-test, caret-rect and IME
+    // paths use (`form_control::field_text_layout` / `field_text_origin`,
+    // #827): built at the scaled font size, so its geometry is device px.
+    perf.bump(crate::perf::Counter::ShapePaint);
+    let text_layout = crate::form_control::field_text_layout(
+        node,
+        text,
+        scale as f32,
+        Some(Brush::Solid(color)),
+        font_cx,
+        layout_cx,
+    );
+    let (origin_x, origin_y) =
+        crate::form_control::field_text_origin(node, text_layout.height() / scale as f32, scroll);
+    let text_x = x + origin_x as f64 * scale;
+    let text_y = y + origin_y as f64 * scale;
 
-    // For textarea, align to top with padding; for input, center vertically
-    let text_height = text_layout.height() as f64;
-    let text_y = if is_textarea {
-        y + padding_top
+    // A text control's text, selection, caret and composition underline are
+    // clipped as Chrome's inner editor clips them, whenever they could reach
+    // past it. A single-line field: to its content box horizontally (its
+    // padding box vertically) once its line overflows the column or is
+    // scrolled (#1721). A textarea, a scroll container: to its padding box
+    // once its text is taller than the content box or scrolled (#827). Text
+    // that fits needs no clip.
+    let style = &node.computed_style;
+    let (column_left, column_width) = crate::form_control::text_column(node);
+    let column_left = column_left as f64 * scale;
+    let column_width = column_width as f64 * scale;
+    let top = style.border_top_width.to_px() as f64 * scale;
+    let bottom = style.border_bottom_width.to_px() as f64 * scale;
+    let clip = if is_textarea {
+        let left = style.border_left_width.to_px() as f64 * scale;
+        let right = style.border_right_width.to_px() as f64 * scale;
+        let pad_top = style.padding_top.to_px() as f64 * scale;
+        let pad_bottom = style.padding_bottom.to_px() as f64 * scale;
+        let content_h = h - top - bottom - pad_top - pad_bottom;
+        (scroll.1 > 0.0 || text_layout.height() as f64 > content_h).then(|| {
+            Rect::new(
+                x + left,
+                y + top,
+                (x + w - right).max(x + left),
+                (y + h - bottom).max(y + top),
+            )
+        })
     } else {
-        y + (h - text_height) / 2.0
+        (scroll.0 > 0.0
+            || text_layout.full_width() as f64 + crate::form_control::CARET_WIDTH as f64 * scale
+                > column_width)
+            .then(|| {
+                Rect::new(
+                    x + column_left,
+                    y + top,
+                    x + column_left + column_width,
+                    (y + h - bottom).max(y + top),
+                )
+            })
     };
-    let text_x = x + padding_left;
+    if let Some(clip) = clip {
+        painter.push_clip(Fill::NonZero, transform, &clip.into());
+    }
 
     // Draw selection highlight if there's a selection
     if is_focused && cursor_pos != selection_start && !is_placeholder && !text.is_empty() {
         let sel_start_byte = cursor_pos.min(selection_start).min(text.len());
         let sel_end_byte = cursor_pos.max(selection_start).min(text.len());
 
-        let (start_x, start_y) =
-            crate::text_query::caret_position_for_offset_layout(&text_layout, sel_start_byte);
-        let (end_x, end_y) =
-            crate::text_query::caret_position_for_offset_layout(&text_layout, sel_end_byte);
-
-        let sel_color = AlphaColor::<Srgb>::from_rgba8(51, 154, 240, 100); // Blue with alpha
-        let line_height = scaled_font_size as f64 * 1.2;
-
-        if (start_y - end_y).abs() < 0.1 {
-            // Same line - draw single rectangle
-            let sel_x = text_x + start_x as f64;
-            let sel_width = (end_x - start_x) as f64;
-            let sel_y = text_y + start_y as f64;
-
-            let sel_rect = Rect::new(sel_x, sel_y, sel_x + sel_width, sel_y + line_height);
-            painter.fill_color(Fill::NonZero, transform, sel_color, &sel_rect.into());
-        } else {
-            // Multi-line selection - draw rectangles for each line
-            let content_width = (w - padding_left * 2.0) as f32;
-
-            for line in text_layout.lines() {
-                let line_metrics = line.metrics();
-                let line_top = line_metrics.baseline - line_metrics.ascent;
-
-                // Skip lines outside selection range
-                if line_top + line_metrics.line_height < start_y || line_top > end_y {
-                    continue;
-                }
-
-                let rect_y = text_y + line_top as f64;
-                let (rect_start_x, rect_end_x) = if (line_top - start_y).abs() < 0.1 {
-                    // First line of selection: from start_x to end of line
-                    (start_x, content_width)
-                } else if (line_top - end_y).abs() < 0.1 {
-                    // Last line of selection: from start of line to end_x
-                    (0.0, end_x)
-                } else {
-                    // Middle line: full width
-                    (0.0, content_width)
-                };
-
-                let sel_rect = Rect::new(
-                    text_x + rect_start_x as f64,
-                    rect_y,
-                    text_x + rect_end_x as f64,
-                    rect_y + line_height,
-                );
-                painter.fill_color(Fill::NonZero, transform, sel_color, &sel_rect.into());
-            }
-        }
+        paint_selection_rects(
+            painter,
+            transform,
+            crate::text_query::selection_rects_for_layout(
+                &text_layout,
+                sel_start_byte,
+                sel_end_byte,
+            ),
+            text_x,
+            text_y,
+            // The control's layout is built at the scaled font size: already
+            // device px.
+            1.0,
+        );
     }
 
     // Render text (layout already uses scaled_font_size, so pass scale=1.0)
     if !text.is_empty() {
         let text_shadows = node.computed_style.text_shadow.as_slice();
-        render_text_with_shadow(
+        // Filled and outlined as the control says (#2719); its stroke width,
+        // CSS px, onto the layout's device px.
+        let mut text_paint = node.computed_style.text_paint;
+        text_paint.stroke_width *= scale as f32;
+        render_painted_text_with_shadow(
             painter,
             &text_layout,
             text_x,
@@ -391,16 +424,61 @@ pub(super) fn paint_input_value(
             text_shadows,
             transform,
             1.0,
+            None,
+            None,
+            None,
+            node.computed_style.font_synthesis_weight,
+            text_paint,
+        );
+    }
+
+    // The spellchecker's marks (#2862). A single-line field shows them only
+    // while it has the keyboard and a textarea always, as Chrome 158 does
+    // (measured: an `<input>`'s marks go at blur and come back at the next
+    // focus, a `<textarea>`'s stay).
+    if !is_placeholder
+        && !is_password
+        && let Some(marks) = node.spelling.as_deref()
+        && (is_textarea || is_focused || marks.show_when_blurred)
+        && marks.text == value
+    {
+        paint_spelling_marks(
+            node,
+            marks,
+            preedit_range,
+            &text_layout,
+            painter,
+            transform,
+            (text_x, text_y),
+            scale,
         );
     }
 
     // Draw cursor/caret if focused and visible
     if is_focused && cursor_visible {
         let caret_pos = cursor_pos.min(text.len());
-        let (caret_offset_x, caret_offset_y) = if text.is_empty() {
-            (0.0, 0.0)
+        // An upstream caret at a soft wrap is drawn at the end of the upper
+        // line (#941). It is the committed text's caret: a composition moves
+        // the caret to the preedit's end, which nothing set an affinity for.
+        let affinity = if composing || is_placeholder {
+            rinch_core::dom::CaretAffinity::Downstream
         } else {
-            crate::text_query::caret_position_for_offset_layout(&text_layout, caret_pos)
+            crate::form_control::caret_affinity(node)
+        };
+        let (caret_offset_x, caret_offset_y) = if text.is_empty() {
+            // At the column's start, over where a glyph would stand on the
+            // empty line (#320), as `form_control::painted_caret_rect` puts it.
+            (
+                0.0,
+                crate::form_control::field_caret_position(
+                    &text_layout,
+                    0,
+                    rinch_core::dom::CaretAffinity::Downstream,
+                )
+                .1,
+            )
+        } else {
+            crate::form_control::field_caret_position(&text_layout, caret_pos, affinity)
         };
         let caret_x = text_x + caret_offset_x as f64;
         let caret_y = text_y + caret_offset_y as f64;
@@ -422,8 +500,12 @@ pub(super) fn paint_input_value(
     if let Some((a, b)) = preedit_range {
         let a = a.min(text.len());
         let b = b.min(text.len());
-        let (start_x, start_y) =
-            crate::text_query::caret_position_for_offset_layout(&text_layout, a);
+        // Under the glyphs, where the caret stands (#320).
+        let (start_x, start_y) = crate::form_control::field_caret_position(
+            &text_layout,
+            a,
+            rinch_core::dom::CaretAffinity::Downstream,
+        );
         let (end_x, _end_y) = crate::text_query::caret_position_for_offset_layout(&text_layout, b);
         let line_height = scaled_font_size as f64 * 1.2;
         let underline_y = text_y + start_y as f64 + line_height - scale;
@@ -434,6 +516,139 @@ pub(super) fn paint_input_value(
             underline_y + scale,
         );
         painter.fill_color(Fill::NonZero, transform, base_color, &ul_rect.into());
+    }
+
+    if clip.is_some() {
+        painter.pop_layer();
+    }
+}
+
+/// The colour of a text control's spelling marks: `--rinch-spellcheck-color`
+/// on it (inherited, so set on any ancestor), else Chrome's red.
+pub(crate) fn spelling_mark_color(node: &Node) -> peniko::Color {
+    let current = node.computed_style.color.unwrap_or(peniko::Color::BLACK);
+    crate::img_placeholder::custom_property(node, "rinch-spellcheck-color")
+        .and_then(|v| crate::layout::parse_color_with_current(&v, current))
+        .unwrap_or(SPELLING_RED)
+}
+
+/// Chrome's spelling-marker red (`SK_ColorRED`).
+pub(crate) const SPELLING_RED: peniko::Color = peniko::Color::from_rgba8(255, 0, 0, 255);
+
+/// How a text control's spelling marks are drawn: `--rinch-spellcheck-style`
+/// (`wavy`, the default; `solid`; `none` draws nothing).
+pub(crate) fn spelling_mark_line(node: &Node) -> Option<super::text::MarkLine> {
+    match crate::img_placeholder::custom_property(node, "rinch-spellcheck-style") {
+        Some(v) if v.eq_ignore_ascii_case("none") => None,
+        Some(v) if v.eq_ignore_ascii_case("solid") => Some(super::text::MarkLine::Solid),
+        _ => Some(super::text::MarkLine::Wavy),
+    }
+}
+
+/// Draw `marks` (ranges of the control's value) under `layout`, which shows
+/// the value with `preedit` spliced in at `preedit.0` when composing: a mark
+/// after the composition moves past it, one the composition sits inside is
+/// not drawn.
+#[allow(clippy::too_many_arguments)]
+fn paint_spelling_marks(
+    node: &Node,
+    marks: &crate::node::SpellingMarks,
+    preedit: Option<(usize, usize)>,
+    layout: &parley::layout::Layout<Brush>,
+    painter: &mut dyn Painter,
+    transform: Affine,
+    (text_x, text_y): (f64, f64),
+    scale: f64,
+) {
+    let Some(line_kind) = spelling_mark_line(node) else {
+        return;
+    };
+    let brush = Brush::Solid(spelling_mark_color(node));
+    for range in &marks.ranges {
+        let (start, end) = match preedit {
+            Some((at, end)) if range.start >= at => (range.start + end - at, range.end + end - at),
+            Some((at, _)) if range.end > at => continue,
+            _ => (range.start, range.end),
+        };
+        super::text::paint_layout_mark(
+            painter, layout, text_x, text_y, transform, start, end, &brush, scale, line_kind,
+        );
+    }
+}
+
+impl crate::RinchDocument {
+    /// Set the misspelled words text control `node` shows (#2862): `None`
+    /// clears them. A write that changes nothing does nothing; one that does
+    /// marks the control for repaint (no restyle, no layout) and counts one
+    /// `spelling_mark_writes`.
+    pub fn set_spelling_marks(
+        &mut self,
+        node: crate::node::RawNodeId,
+        marks: Option<crate::node::SpellingMarks>,
+    ) {
+        let Some(n) = self.tree.nodes.get_mut(node) else {
+            return;
+        };
+        let marks = marks.filter(|m| !m.ranges.is_empty()).map(Box::new);
+        if n.spelling == marks {
+            return;
+        }
+        n.spelling = marks;
+        self.tree.mark_paint_dirty(node);
+        self.tree
+            .perf
+            .bump(crate::perf::Counter::SpellingMarkWrites);
+    }
+
+    /// The misspelled words text control `node` was last given, if any.
+    pub fn spelling_marks(
+        &self,
+        node: crate::node::RawNodeId,
+    ) -> Option<&crate::node::SpellingMarks> {
+        self.tree.nodes.get(node)?.spelling.as_deref()
+    }
+
+    /// Write IFC root `node`'s read-only selection highlight: `ranges` of its
+    /// laid-out text (none to clear), as the `data-text-sel*` attributes
+    /// `read_only_selection` reads, and mark it for repaint. The app's
+    /// selection calls it only for the roots whose part changed; each call is
+    /// one `read_only_selection_writes`.
+    pub fn set_read_only_selection(
+        &mut self,
+        node: crate::node::RawNodeId,
+        ranges: &[(usize, usize)],
+    ) {
+        if let Some(n) = self.tree.nodes.get_mut(node) {
+            match (ranges.first(), ranges.last()) {
+                (Some(&(start, _)), Some(&(_, end))) => {
+                    n.write_attribute("data-text-sel", "true");
+                    n.attributes
+                        .insert("data-text-sel-start".to_string(), start.to_string());
+                    n.attributes
+                        .insert("data-text-sel-end".to_string(), end.to_string());
+                    if ranges.len() > 1 {
+                        let list: Vec<String> =
+                            ranges.iter().map(|(a, b)| format!("{a}-{b}")).collect();
+                        n.attributes
+                            .insert("data-text-sel-ranges".to_string(), list.join(","));
+                    } else {
+                        n.attributes.remove("data-text-sel-ranges");
+                    }
+                }
+                _ => {
+                    n.erase_attribute("data-text-sel");
+                    n.attributes.remove("data-text-sel-start");
+                    n.attributes.remove("data-text-sel-end");
+                    n.attributes.remove("data-text-sel-ranges");
+                }
+            }
+        }
+        // The highlight is painted from these attributes on the IFC root, so
+        // the root is the damage.
+        self.tree.mark_paint_dirty(node);
+        self.tree
+            .perf
+            .bump(crate::perf::Counter::ReadOnlySelectionWrites);
     }
 }
 

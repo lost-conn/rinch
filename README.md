@@ -101,6 +101,18 @@ rinch = { git = "https://github.com/joeleaver/rinch.git", features = ["desktop",
 
 Add `"gpu"` for GPU rendering, or leave it off for software rendering (no GPU required — works in CI, containers, SSH sessions, your grandma's laptop).
 
+No `[patch]` lines are needed at all: delete any old winit, dpi or wgpu-fork ones from your `[patch.crates-io]`. Use `rinch::wgpu` and `rinch::vello` instead of your own `wgpu`/`vello` dependencies; add `wgpu = "30"` only to turn on an extra feature.
+
+The showcase and `video-call` carry real-time audio and video (rinch-rtc's
+`media`: H.264 and Opus, built from source with a C compiler and cmake),
+which needs more system packages than rinch itself. On Debian or Ubuntu:
+`libclang-dev` (bindgen, for the camera bindings) and `libasound2-dev`
+(audio); `nasm` is optional (openh264's assembly). VP8 is opt-in
+(rinch-rtc's `media-vp8`, which neither example turns on) and only that
+needs `libvpx-dev` too. Inside this repository, rinch-rtc's tests and
+`cargo clippy --workspace --all-targets` also need `libssl-dev`: its test-only
+interop peer links the system OpenSSL.
+
 ```bash
 # Run the component showcase
 cargo run --release -p ui-zoo-desktop
@@ -378,7 +390,7 @@ If you want a GUI framework that's been blessed by a foundation and has a 200-pa
 | `markdown-editor` | Rich text editor with CRDT backing |
 | `drag-and-drop-demo` | Drag and drop between lists |
 | `game-embed` | Game engine integration demo |
-| `video-call` | WebRTC video calling |
+| `video-call` | A video call between two machines on rinch-rtc (with `rtc-room-relay`) |
 | `paint-desktop` | Drawing application |
 
 [**Live web demo**](https://joeleaver.github.io/rinch/ui-zoo/) (WASM, works in all modern browsers)
@@ -411,7 +423,7 @@ rinch-debug        <- TCP IPC server for tooling
 rinch-mcp-server   <- MCP server for Claude Code integration
 ```
 
-The full layout is in `CLAUDE.md` if you want the gory details.
+The full layout is in `CLAUDE.md`, and the gory details are in `docs/internals/`.
 
 ## Standing On Shoulders
 

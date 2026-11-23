@@ -861,11 +861,12 @@ fn test_display_contents_block_parent_nested_inline() {
 
 // --- min-height on childless block containers -------------------------------
 //
-// An empty block container is inflated to one line-height so an empty `<p></p>`
-// doesn't collapse. That floor used to be written as an unconditional
-// assignment, which silently discarded the author's `min-height` for ANY
-// childless block — most visibly a `<textarea>` (its value is an attribute, not
-// a text child, so it is always childless) once blockified by a flex parent.
+// An empty block container is 0 tall (CSS 2.1 §10.6.3; Chrome 153), so an
+// author `min-height` is its height outright. rinch used to floor it at one
+// line box — a divergence written for `<input>`/`<textarea>`, which had no
+// content height of their own, and that once silently discarded the
+// author's `min-height` altogether. #297 measured the controls; #296 removed
+// the floor.
 
 #[test]
 fn test_empty_block_honors_author_min_height() {
@@ -880,28 +881,25 @@ fn test_empty_block_honors_author_min_height() {
     let layout = doc.tree.get(div.0).unwrap().layout;
     assert_eq!(
         layout.height, 200.0,
-        "an author min-height must survive the empty-block line-height floor"
+        "an author min-height is an empty block's height"
     );
 }
 
 #[test]
-fn test_empty_block_min_height_below_line_height_keeps_floor() {
+fn test_empty_block_min_height_below_line_height_is_its_height() {
     let mut doc = RinchDocument::new();
     let body = doc.body();
     let div = doc.create_element("div");
-    // 5px is far below one line — the line-height floor must still win, so an
-    // empty <p> keeps its line box.
+    // 5px is far below one line, and it is the height: an empty block has no
+    // line box to keep (Chrome 153: 5). The one-line floor this used to pin made
+    // it a line tall (#296).
     doc.set_attribute(div, "style", "min-height: 5px; width: 100px");
     doc.append_child(body, div);
 
     doc.resolve_layout(800.0, 600.0);
 
     let layout = doc.tree.get(div.0).unwrap().layout;
-    assert!(
-        layout.height > 5.0,
-        "line-height floor must still apply when min-height is smaller, got {}",
-        layout.height
-    );
+    assert_eq!(layout.height, 5.0, "Chrome 153: 5");
 }
 
 #[test]
@@ -930,7 +928,7 @@ fn test_blockified_textarea_honors_min_height() {
 
     let style = doc.create_element("style");
     let css = doc
-        .create_text(".wrap { display: flex; flex-direction: column; } .ta { min-height: 80px; }");
+        .create_text(".wrap { display: flex; flex-direction: column; } .ta { box-sizing: border-box; min-height: 80px; }");
     doc.append_child(style, css);
     doc.append_child(body, style);
 
@@ -947,42 +945,6 @@ fn test_blockified_textarea_honors_min_height() {
     assert_eq!(
         layout.height, 80.0,
         "a blockified <textarea> must honor its CSS min-height"
-    );
-}
-
-#[test]
-fn test_empty_block_line_floor_survives_a_restyle() {
-    // The floor is written onto the Taffy style by the IFC pass, which only runs
-    // on a structural change; `apply_stylo_styles_to_taffy` rebuilds that style
-    // from the computed values on *every* restyle. Applied in the IFC pass
-    // alone, the floor was discarded the first time anything re-resolved the
-    // node's style, and nothing put it back.
-    let mut doc = RinchDocument::new();
-    let body = doc.body();
-    let div = doc.create_element("div");
-    doc.set_attribute(
-        div,
-        "style",
-        "width: 100px; font-size: 10px; line-height: 20px",
-    );
-    doc.append_child(body, div);
-
-    doc.resolve_layout(800.0, 600.0);
-    assert_eq!(
-        doc.tree.get(div.0).unwrap().layout.height,
-        20.0,
-        "an empty block starts one line tall"
-    );
-
-    // A style-only change: no child added or removed, so the IFC pass does not
-    // re-run.
-    doc.set_attribute(div, "data-state", "open");
-    doc.resolve_layout(800.0, 600.0);
-
-    assert_eq!(
-        doc.tree.get(div.0).unwrap().layout.height,
-        20.0,
-        "the line-height floor must survive a restyle"
     );
 }
 
@@ -1017,8 +979,8 @@ fn test_blockified_input_keeps_its_height_when_focused() {
     doc.resolve_layout(800.0, 600.0);
     assert_eq!(
         doc.tree.get(input.0).unwrap().layout.height,
-        20.0,
-        "an unfocused input is one line tall"
+        26.0,
+        "an unfocused input is one line tall, plus the UA sheet's 1px padding and 2px border (#1194)"
     );
 
     doc.set_attribute(input, "data-focused", "true");
@@ -1027,76 +989,80 @@ fn test_blockified_input_keeps_its_height_when_focused() {
 
     assert_eq!(
         doc.tree.get(input.0).unwrap().layout.height,
-        20.0,
+        26.0,
         "a focused input must keep its height, or nothing about it is painted"
     );
 }
 
-/// A childless block whose only height is the one-line floor, laid out once so
-/// the floor is already on its Taffy style.
+/// A blockified `<input>` — childless, so its height is its form-control
+/// measure (#297) — laid out once.
 ///
 /// `apply_stylo_styles_to_taffy` is not the only pass that rebuilds a node's
 /// Taffy style from the computed values: `tick_transitions` and
 /// `tick_animations` do the same for every node with an active
 /// transition/animation or sitting in `dirty_nodes`, and they run on the event
-/// loop's idle tick *before* the next layout. Each must re-apply the floor.
+/// loop's idle tick *before* the next layout. Neither may cost the control its
+/// height. (This used to be the one-line floor for childless blocks, which the
+/// ticks had to re-apply by hand; the measure lives on the Taffy node's context,
+/// which rebuilding the style does not touch.)
 ///
 /// The two ticks get a test apiece rather than one test that calls both: both
 /// rebuild the *whole* style, so whichever runs last decides the outcome, and a
 /// combined test passes with the earlier tick's call deleted.
-fn empty_block_floored_at_one_line() -> (RinchDocument, usize) {
+fn blockified_input_one_line_tall() -> (RinchDocument, u64) {
     let mut doc = RinchDocument::new();
     let body = doc.body();
-    let div = doc.create_element("div");
+    let input = doc.create_element("input");
     doc.set_attribute(
-        div,
+        input,
         "style",
-        "width: 100px; font-size: 10px; line-height: 20px",
+        "display: block; width: 100px; font-size: 10px; line-height: 20px; padding: 0; border: 0",
     );
-    doc.append_child(body, div);
+    doc.append_child(body, input);
 
     doc.resolve_layout(800.0, 600.0);
-    assert_eq!(doc.tree.get(div.0).unwrap().layout.height, 20.0);
+    assert_eq!(doc.tree.get(input.0).unwrap().layout.height, 20.0);
 
-    (doc, div.0)
+    (doc, input.0)
 }
 
-/// The next layout after a tick must not find a floorless style.
-fn assert_floor_survived_relayout(doc: &mut RinchDocument, div: usize, what: &str) {
+/// The next layout after a tick must not find the control collapsed.
+fn assert_height_survived_relayout(doc: &mut RinchDocument, input: u64, what: &str) {
     doc.tree.layout_dirty = true;
     doc.resolve_layout(800.0, 600.0);
 
     assert_eq!(
-        doc.tree.get(div).unwrap().layout.height,
+        doc.tree.get(input).unwrap().layout.height,
         20.0,
-        "{what} must not discard the line-height floor"
+        "{what} must not collapse a blockified input"
     );
 }
 
 #[test]
-fn test_empty_block_line_floor_survives_a_transition_tick() {
+fn test_blockified_input_height_survives_a_transition_tick() {
     // A `<input class="rinch-number-input">` carries
     // `transition: border-color 150ms`, so focusing one puts it on exactly this
     // path — with no animation tick behind it to rebuild the style again.
-    let (mut doc, div) = empty_block_floored_at_one_line();
+    let (mut doc, input) = blockified_input_one_line_tall();
 
-    doc.tree.dirty_nodes.insert(div);
+    doc.tree.dirty_nodes.insert(input);
     doc.tick_transitions();
 
-    assert_floor_survived_relayout(&mut doc, div, "a transition tick");
+    assert_height_survived_relayout(&mut doc, input, "a transition tick");
 }
 
 #[test]
-fn test_empty_block_line_floor_survives_an_animation_tick() {
-    let (mut doc, div) = empty_block_floored_at_one_line();
+fn test_blockified_input_height_survives_an_animation_tick() {
+    let (mut doc, input) = blockified_input_one_line_tall();
 
-    doc.tree.dirty_nodes.insert(div);
+    doc.tree.dirty_nodes.insert(input);
     doc.tick_animations();
 
-    assert_floor_survived_relayout(&mut doc, div, "an animation tick");
+    assert_height_survived_relayout(&mut doc, input, "an animation tick");
 }
 
-/// The line floor is not the only override those two ticks used to drop: an
+/// The line floor for childless blocks (gone since #296) was not the only
+/// override those two ticks used to drop: an
 /// out-of-flow box whose containing block is not its Taffy parent has its
 /// *size* baked from that containing block, and rebuilding the style from the
 /// computed values discards the bake just as thoroughly. `tick_transitions` and
@@ -1105,8 +1071,8 @@ fn test_empty_block_line_floor_survives_an_animation_tick() {
 /// absolute of #204 rides the same helper and would have inherited the drift.
 ///
 /// One document holds both cases; the split is by tick, for the reason
-/// `empty_block_floored_at_one_line` records — whichever tick runs last decides.
-fn out_of_flow_boxes_sized_from_the_viewport() -> (RinchDocument, usize, usize) {
+/// `blockified_input_one_line_tall` records — whichever tick runs last decides.
+fn out_of_flow_boxes_sized_from_the_viewport() -> (RinchDocument, u64, u64) {
     let mut doc = RinchDocument::new();
     let body = doc.body();
 
@@ -1154,8 +1120,8 @@ fn out_of_flow_boxes_sized_from_the_viewport() -> (RinchDocument, usize, usize) 
 
 fn assert_viewport_size_survived_relayout(
     doc: &mut RinchDocument,
-    fixed_child: usize,
-    absolute_child: usize,
+    fixed_child: u64,
+    absolute_child: u64,
     what: &str,
 ) {
     doc.tree.layout_dirty = true;
@@ -1179,7 +1145,7 @@ fn assert_viewport_size_survived_relayout(
 fn test_out_of_flow_viewport_size_survives_a_transition_tick() {
     let (mut doc, fixed_child, absolute_child) = out_of_flow_boxes_sized_from_the_viewport();
 
-    let parents: Vec<usize> = [fixed_child, absolute_child]
+    let parents: Vec<u64> = [fixed_child, absolute_child]
         .iter()
         .map(|&n| doc.tree.get(n).unwrap().parent.unwrap())
         .collect();
@@ -1200,7 +1166,7 @@ fn test_out_of_flow_viewport_size_survives_a_transition_tick() {
 fn test_out_of_flow_viewport_size_survives_an_animation_tick() {
     let (mut doc, fixed_child, absolute_child) = out_of_flow_boxes_sized_from_the_viewport();
 
-    let parents: Vec<usize> = [fixed_child, absolute_child]
+    let parents: Vec<u64> = [fixed_child, absolute_child]
         .iter()
         .map(|&n| doc.tree.get(n).unwrap().parent.unwrap())
         .collect();
@@ -1219,8 +1185,9 @@ fn test_out_of_flow_viewport_size_survives_an_animation_tick() {
 
 #[test]
 fn test_empty_block_author_min_height_survives_a_restyle() {
-    // The floor is a floor on both passes: re-applying it on restyle must not
-    // start stomping an author `min-height` that is larger.
+    // Written for the one-line floor for childless blocks (removed in #296),
+    // which was re-applied on every restyle and must not have stomped a larger
+    // author `min-height`. Kept: a restyle still must not lose it.
     let mut doc = RinchDocument::new();
     let body = doc.body();
     let div = doc.create_element("div");
@@ -1244,8 +1211,8 @@ fn test_empty_block_author_min_height_survives_a_restyle() {
 
 #[test]
 fn test_explicit_height_survives_a_restyle_uninflated() {
-    // The mirror of the above: a `height: 1px` separator must not be inflated to
-    // a line by the floor's new call site either.
+    // The mirror of the above: a `height: 1px` separator must not be inflated
+    // on a restyle (the old line floor's restyle call site was the risk).
     let mut doc = RinchDocument::new();
     let body = doc.body();
     let sep = doc.create_element("div");
@@ -1268,7 +1235,7 @@ fn test_empty_block_percentage_min_height_resolves() {
     // Percentage min-height on a childless block used to be flattened to the
     // line-height floor, because Taffy 0.9 could not resolve a percentage
     // min-height against a block containing block at all. Since the 0.12
-    // upgrade it resolves, so the floor must no longer stomp it.
+    // upgrade it resolves (and the floor itself is gone since #296).
     let mut doc = RinchDocument::new();
     let body = doc.body();
     let outer = doc.create_element("div");
@@ -1302,8 +1269,8 @@ fn test_textarea_rows_sets_intrinsic_height() {
 
     let layout = doc.tree.get(ta.0).unwrap().layout;
     assert_eq!(
-        layout.height, 120.0,
-        "rows=6 at line-height 20px must give a 6-line box"
+        layout.height, 126.0,
+        "rows=6 at line-height 20px must give a 6-line box, plus the UA sheet's 2px padding and 1px border (#1194)"
     );
 }
 
@@ -1319,8 +1286,8 @@ fn test_textarea_default_rows_is_two() {
 
     let layout = doc.tree.get(ta.0).unwrap().layout;
     assert_eq!(
-        layout.height, 40.0,
-        "a <textarea> with no rows attribute defaults to 2 rows"
+        layout.height, 46.0,
+        "a <textarea> with no rows attribute defaults to 2 rows, plus the UA sheet's 2px padding and 1px border (#1194)"
     );
 }
 
@@ -1356,7 +1323,7 @@ fn test_textarea_larger_min_height_beats_rows() {
     doc.set_attribute(
         ta,
         "style",
-        "font-size: 10px; line-height: 20px; min-height: 300px",
+        "font-size: 10px; line-height: 20px; min-height: 300px; box-sizing: border-box",
     );
     doc.append_child(body, ta);
 
@@ -1378,7 +1345,7 @@ fn test_textarea_explicit_height_beats_rows() {
     doc.set_attribute(
         ta,
         "style",
-        "font-size: 10px; line-height: 20px; height: 55px",
+        "font-size: 10px; line-height: 20px; height: 55px; box-sizing: border-box",
     );
     doc.append_child(body, ta);
 
@@ -1564,19 +1531,16 @@ fn test_percentage_min_height_block_inside_flex_column() {
 }
 
 #[test]
-fn test_empty_block_line_height_floor_survives_percentage_work() {
-    // The floor must still apply when the author asked for nothing...
+fn test_empty_block_height_survives_percentage_work() {
+    // An empty block with nothing asked of it is 0 tall (Chrome 153: 0)...
     let bare = pct_doc(DEFINITE_PARENT, "width: 10px", None);
-    assert!(bare > 0.0 && bare < 30.0, "expected one line, got {bare}");
+    assert_eq!(bare, 0.0, "Chrome 153: 0");
 
-    // ...and when the author's min-height is smaller than a line.
+    // ...its min-height is its height (Chrome 153: 5)...
     let tiny = pct_doc(DEFINITE_PARENT, "min-height: 5px; width: 10px", None);
-    assert_eq!(
-        tiny, bare,
-        "a sub-line min-height must not shrink the floor"
-    );
+    assert_eq!(tiny, 5.0, "Chrome 153: 5");
 
-    // ...but an explicit height still wins outright (separators).
+    // ...and an explicit height wins outright (separators).
     let sep = pct_doc(DEFINITE_PARENT, "height: 1px; width: 10px", None);
     assert_eq!(sep, 1.0);
 }
@@ -1728,6 +1692,7 @@ fn test_fixed_block_auto_height_sums_children() {
 
 /// The same fixed box clamps to its `max-height` (and scrolls the overflow)
 /// rather than growing past the cap.
+/// `border-box`, so the 120px cap includes the padding.
 #[test]
 fn test_fixed_block_auto_height_clamps_to_max_height() {
     let mut doc = RinchDocument::new();
@@ -1736,7 +1701,7 @@ fn test_fixed_block_auto_height_clamps_to_max_height() {
     doc.set_attribute(
         panel,
         "style",
-        "position: fixed; left: 10px; top: 10px; max-height: 120px; overflow-y: auto; padding: 4px;",
+        "position: fixed; left: 10px; top: 10px; max-height: 120px; overflow-y: auto; padding: 4px; box-sizing: border-box;",
     );
     doc.append_child(body, panel);
     for _ in 0..8 {
@@ -1753,7 +1718,8 @@ fn test_fixed_block_auto_height_clamps_to_max_height() {
 }
 
 /// The percentage resolves against the containing block's *content* box, so
-/// horizontal padding on the containing block shrinks it.
+/// horizontal padding on the containing block shrinks it. (The cell is `border-box`:
+/// 700px includes the padding.)
 #[test]
 fn test_inline_block_percent_width_excludes_container_padding() {
     let mut doc = RinchDocument::new();
@@ -1762,7 +1728,7 @@ fn test_inline_block_percent_width_excludes_container_padding() {
     doc.set_attribute(
         cell,
         "style",
-        "width: 700px; height: 40px; padding: 0 20px;",
+        "width: 700px; height: 40px; padding: 0 20px; box-sizing: border-box;",
     );
     doc.append_child(body, cell);
     let ib = doc.create_element("div");
@@ -2301,13 +2267,12 @@ mod inset_fast_path {
         );
     }
 
-    /// (e) rinch's fixed override in `read_layout_results` places the border
-    /// box at `left`, ignoring the margin — a known deviation from CSS, which
-    /// puts the *margin* edge there. The twin shares the override, so this
-    /// pins consistency with it, not CSS: a `set_style` must land where a
-    /// full resolve lands, whichever formula that is.
+    /// (e) rinch's fixed placement in `read_layout_results` puts the
+    /// *margin* edge at `left`, as CSS does (#1980; it used to put the border
+    /// box there, ignoring the margin). A `set_style` must land where a full
+    /// resolve lands.
     #[test]
-    fn set_style_left_on_fixed_ignores_margin() {
+    fn set_style_left_on_fixed_adds_margin() {
         let child = "position: fixed; margin-left: 4px; left: 0; top: 0; width: 10px; height: 10px";
         let (mut doc, node) = positioned(PARENT, child);
         let overrides = [("left", "10px")];
@@ -2315,8 +2280,8 @@ mod inset_fast_path {
 
         let expected = twin(PARENT, child, &overrides);
         assert_eq!(
-            expected.x, 10.0,
-            "oracle sanity: the fixed override is viewport-relative and drops the margin"
+            expected.x, 14.0,
+            "oracle sanity: the fixed placement is viewport-relative and adds the margin"
         );
         assert_eq!(layout_of(&doc, node), expected);
     }
@@ -2437,6 +2402,208 @@ mod inset_fast_path {
             "`left: 25px` was written after `inset: 0`, so it wins"
         );
     }
+
+    // ── #277: a stylesheet `!important` inset beats the inline write ────────
+
+    /// `positioned`, with `css` in a `<style>` element and `class` on the
+    /// child, laid out once.
+    fn positioned_with_sheet(css: &str, class: &str) -> (RinchDocument, NodeId) {
+        let mut doc = RinchDocument::new();
+        let body = doc.body();
+        let sheet = doc.create_element("style");
+        let text = doc.create_text(css);
+        doc.append_child(sheet, text);
+        doc.append_child(body, sheet);
+        let parent = doc.create_element("div");
+        doc.set_attribute(parent, "style", PARENT);
+        doc.append_child(body, parent);
+        let child = doc.create_element("div");
+        doc.set_attribute(child, "class", class);
+        doc.set_attribute(child, "style", CHILD);
+        doc.append_child(parent, child);
+        doc.resolve_layout(800.0, 600.0);
+        (doc, child)
+    }
+
+    /// An unrelated restyle of the child: a full cascade of its whole block,
+    /// at a different viewport so layout is not skipped.
+    fn restyle_unrelated(doc: &mut RinchDocument, child: NodeId) {
+        doc.set_style(child, "background-color", "rgb(1, 2, 3)");
+        doc.resolve_layout(801.0, 600.0);
+    }
+
+    /// The cascade puts an author `!important` declaration above a normal
+    /// inline one, so `left: 200px` written inline must leave the child at
+    /// the stylesheet's 50px — at once, not only after the next unrelated
+    /// restyle (which used to snap it back from 205 to 55).
+    #[test]
+    fn a_stylesheet_important_left_beats_an_inline_left_write() {
+        let (mut doc, child) = positioned_with_sheet(".pin { left: 50px !important; }", "pin");
+        assert_eq!(layout_of(&doc, child).x, 55.0, "baseline: the rule wins");
+
+        doc.set_style(child, "left", "200px");
+        doc.resolve_layout(800.0, 600.0);
+        assert_eq!(
+            layout_of(&doc, child).x,
+            55.0,
+            "the inline write must not beat the stylesheet's !important left"
+        );
+        assert!(matches!(
+            doc.tree.get(child.0).unwrap().computed_style.left,
+            LengthPercentageAutoValue::Length(v) if v == 50.0
+        ));
+
+        restyle_unrelated(&mut doc, child);
+        assert_eq!(layout_of(&doc, child).x, 55.0, "and it stays there");
+    }
+
+    /// The `inset` shorthand with `!important` expands to four important
+    /// longhands; `top` must decline as `left` does.
+    #[test]
+    fn a_stylesheet_important_inset_shorthand_beats_an_inline_top_write() {
+        let (mut doc, child) =
+            positioned_with_sheet(".pin { inset: 30px auto auto 40px !important; }", "pin");
+        assert_eq!(
+            (layout_of(&doc, child).x, layout_of(&doc, child).y),
+            (45.0, 37.0)
+        );
+
+        doc.set_style(child, "top", "150px");
+        doc.resolve_layout(800.0, 600.0);
+        assert_eq!(layout_of(&doc, child).y, 37.0);
+    }
+
+    /// Off the fixed point: an important rule on a *different* side leaves
+    /// this side's write on the fast path, and it lands. Kills a guard that
+    /// declines whenever any important rule matched at all — and, because the
+    /// same rule also declares a *normal* `left` (Stylo points a rule's normal
+    /// and important rule nodes at one block), a guard that asks the block
+    /// whether it declares `left` without asking whether that declaration is
+    /// the important one.
+    #[test]
+    fn an_important_rule_on_another_side_keeps_the_fast_path() {
+        let (mut doc, child) =
+            positioned_with_sheet(".pin { left: 50px; top: 30px !important; }", "pin");
+        let overrides = [("left", "120px")];
+        set_and_resolve(&mut doc, child, &overrides, Path::Fast);
+        assert_eq!(
+            (layout_of(&doc, child).x, layout_of(&doc, child).y),
+            (125.0, 37.0)
+        );
+
+        restyle_unrelated(&mut doc, child);
+        assert_eq!(
+            (layout_of(&doc, child).x, layout_of(&doc, child).y),
+            (125.0, 37.0)
+        );
+    }
+
+    /// A normal (not important) stylesheet inset loses to the inline one, so
+    /// the write keeps the fast path. Kills a guard that declines on any
+    /// stylesheet declaration of the side, important or not.
+    #[test]
+    fn a_normal_stylesheet_left_keeps_the_fast_path() {
+        let (mut doc, child) = positioned_with_sheet(".pin { left: 50px; }", "pin");
+        // The inline `left: 0` already wins over the rule.
+        assert_eq!(layout_of(&doc, child).x, 5.0);
+        set_and_resolve(&mut doc, child, &[("left", "120px")], Path::Fast);
+        assert_eq!(layout_of(&doc, child).x, 125.0);
+    }
+
+    /// An inline `!important` beats an author `!important` (the style
+    /// attribute is more specific within one origin and importance). The fast
+    /// path may decline here — it is conservative — but the result must be
+    /// the cascade's.
+    #[test]
+    fn an_inline_important_left_beats_a_stylesheet_important_left() {
+        let (mut doc, child) = positioned_with_sheet(".pin { left: 50px !important; }", "pin");
+        doc.set_style(child, "left", "200px !important");
+        doc.resolve_layout(800.0, 600.0);
+        assert_eq!(layout_of(&doc, child).x, 205.0);
+        restyle_unrelated(&mut doc, child);
+        assert_eq!(layout_of(&doc, child).x, 205.0);
+    }
+
+    /// A *logical* important inset is its own longhand (`inset-inline-start`),
+    /// which the cascade maps to a physical side only later; the guard must
+    /// still decline. It does so for any important logical inset, whatever
+    /// the writing mode (review of #927, F1).
+    #[test]
+    fn a_stylesheet_important_logical_inset_beats_an_inline_left_write() {
+        for rule in [
+            ".pin { inset-inline-start: 50px !important; }",
+            ".pin { inset-inline: 50px auto !important; }",
+        ] {
+            let (mut doc, child) = positioned_with_sheet(rule, "pin");
+            assert_eq!(layout_of(&doc, child).x, 55.0, "{rule}: baseline");
+            doc.set_style(child, "left", "200px");
+            doc.resolve_layout(800.0, 600.0);
+            assert_eq!(layout_of(&doc, child).x, 55.0, "{rule}: after the write");
+            restyle_unrelated(&mut doc, child);
+            assert_eq!(layout_of(&doc, child).x, 55.0, "{rule}: settled");
+        }
+    }
+
+    /// The guard walks the whole matched-rule chain, not only its leaf: an
+    /// inline `!important` on another property puts the style attribute's
+    /// important node above the author's important `left`. Kills a walk that
+    /// reads only the leaf rule node (review of #927, K5).
+    #[test]
+    fn an_inline_important_elsewhere_does_not_hide_an_author_important_left() {
+        let (mut doc, child) = positioned_with_sheet(".pin { left: 50px !important; }", "pin");
+        doc.set_style(child, "width", "12px !important");
+        doc.resolve_layout(800.0, 600.0);
+        assert_eq!(layout_of(&doc, child).x, 55.0);
+        doc.set_style(child, "left", "200px");
+        doc.resolve_layout(800.0, 600.0);
+        assert_eq!(layout_of(&doc, child).x, 55.0);
+        restyle_unrelated(&mut doc, child);
+        assert_eq!(layout_of(&doc, child).x, 55.0);
+    }
+
+    /// Every requested side is checked, not only the first: the important
+    /// side here is `top`, a later `INSET_SIDES` slot than `left`. Kills a
+    /// check of the first requested side only (review of #927, K6).
+    #[test]
+    fn a_batch_whose_second_side_is_important_declines() {
+        let (mut doc, child) = positioned_with_sheet(".pin { top: 30px !important; }", "pin");
+        doc.set_styles(child, &[("left", "200px"), ("top", "150px")]);
+        doc.resolve_layout(800.0, 600.0);
+        assert_eq!(layout_of(&doc, child).y, 37.0);
+        restyle_unrelated(&mut doc, child);
+        assert_eq!(layout_of(&doc, child).y, 37.0);
+    }
+
+    // ── #280: the fast path and `transition` ─────────────────────────────────
+
+    /// A `transition` naming an inset must leave the fast path agreeing with
+    /// the cascade. Today `TransitionProperty` has no inset variant, so the
+    /// cascade moves the box at once and so must the fast path; the day one
+    /// is added, `TransitionProperty::covers_inset` makes the fast path
+    /// decline for such a node and this fixture keeps asking the two to agree.
+    #[test]
+    fn an_inset_transition_moves_the_box_as_the_cascade_does() {
+        for transition in ["left 1s linear", "all 1s linear", "inset 1s linear"] {
+            let child_style = format!("{CHILD}; transition: {transition}");
+            let (mut doc, child) = positioned(PARENT, &child_style);
+            doc.set_style(child, "left", "120px");
+            // No inset is animatable today, so nothing about the transition
+            // may cost the fast path (a `transition: all` is common).
+            assert_path(&doc, child, Path::Fast);
+            doc.resolve_layout(800.0, 600.0);
+            // The cascade twin: the same write through a value only the
+            // cascade takes (`calc`), on a fresh tree.
+            let (mut twin_doc, twin_child) = positioned(PARENT, &child_style);
+            twin_doc.set_style(twin_child, "left", "calc(100px + 20px)");
+            assert_path(&twin_doc, twin_child, Path::Stylo);
+            twin_doc.resolve_layout(800.0, 600.0);
+            assert_eq!(
+                layout_of(&doc, child),
+                layout_of(&twin_doc, twin_child),
+                "`transition: {transition}`: fast path and cascade disagree"
+            );
+        }
+    }
 }
 
 /// An inline-block nested inside an inline element still belongs to the block's
@@ -2502,12 +2669,23 @@ fn test_inline_block_inside_an_inline_element_is_measured() {
 #[test]
 fn test_inline_block_inside_an_inline_block_is_not_joined_to_the_outer_ifc() {
     let mut doc = RinchDocument::new();
+    {
+        use parley::fontique::{Blob, FontInfoOverride};
+        const FACE: &[u8] = include_bytes!("../assets/fonts/Inter-Regular.ttf");
+        doc.font_cx.collection.register_fonts(
+            Blob::new(std::sync::Arc::new(FACE)),
+            Some(FontInfoOverride {
+                family_name: Some("ProbeFace"),
+                ..Default::default()
+            }),
+        );
+    }
     let body = doc.body();
     let container = doc.create_element("div");
     doc.append_child(body, container);
     doc.set_inner_html(
         container,
-        "<div style=\"padding: 20px\">\
+        "<div style=\"padding: 20px; font: 16px/20px ProbeFace\">\
            <span id=\"host\" style=\"display: inline-block; padding: 7px\">\
              <i id=\"inner\" style=\"display: inline-block; width: 40px; height: 12px\"></i>\
            </span>\
@@ -2545,11 +2723,11 @@ fn test_inline_block_inside_an_inline_block_is_not_joined_to_the_outer_ifc() {
     assert_eq!((l.width, l.height), (40.0, 12.0));
     // Its `layout.x/y` is IFC-relative now rather than parent-relative, so the
     // question has to be asked of the position paint and hit testing use.
-    // Chrome 150 puts it at `(7, 10)` inside the host: the host's line box is
-    // the container's declared 20px `line-height` and the 12px box
-    // baseline-aligns into it. rinch gives `(7, 7)` because a line box holding
-    // only an atomic inline gets no strut — **#624**, unchanged by #592 and
-    // pinned from the other side in
+    // The host's line box is the container's declared 20px `line-height` and
+    // the 12px box baseline-aligns into it: Chrome 156, the bundled Inter,
+    // puts it at `(7, 11)`. Before parley 0.12 rinch gave `(7, 7)`: a line
+    // box holding only an atomic inline had no strut (#624). Pinned from the
+    // other side in
     // `inline_block_block_container_tests::a_nested_atomic_inline_is_measured_before_the_box_that_places_it`.
     let (hx, hy, _) =
         rinch_dom::paint::compute_absolute_position_and_transform(&doc.tree, host, 1.0);
@@ -2557,8 +2735,8 @@ fn test_inline_block_inside_an_inline_block_is_not_joined_to_the_outer_ifc() {
         rinch_dom::paint::compute_absolute_position_and_transform(&doc.tree, inner, 1.0);
     assert_eq!(
         ((ix - hx) as f32, (iy - hy) as f32),
-        (7.0, 7.0),
-        "it is painted inside its parent's padding"
+        (7.0, 11.0),
+        "it is painted inside its parent's padding, on its line's baseline"
     );
 }
 
@@ -2795,12 +2973,13 @@ mod absolute_containing_block {
         assert_eq!(on_screen(&doc, abs), (15.0, 27.0));
     }
 
-    /// An intervening *positioned* ancestor that is not the direct parent is
-    /// still resolved against the direct parent — the half of #204 this change
-    /// deliberately leaves alone (#386), pinned so the follow-up has a starting
-    /// point.
+    /// A *positioned* ancestor that is not the direct parent is the containing
+    /// block (#386, the other half of #204): the box fills the 400x300
+    /// grandparent, not the 300x200 parent. Until #386 this test pinned the
+    /// parent-resolved 300x200 as a known gap;
+    /// `abs_containing_block_tests` holds the rest.
     #[test]
-    fn a_positioned_grandparent_is_not_yet_honoured() {
+    fn a_positioned_grandparent_is_the_containing_block() {
         let mut doc = RinchDocument::new();
         let body = doc.body();
         let outer = doc.create_element("div");
@@ -2819,11 +2998,7 @@ mod absolute_containing_block {
         doc.resolve_layout(800.0, 600.0);
 
         let l = doc.tree.get(abs.0).unwrap().layout;
-        assert_eq!(
-            (l.width, l.height),
-            (300.0, 200.0),
-            "known gap: this should be 400x300 (the positioned grandparent)"
-        );
+        assert_eq!((l.width, l.height), (400.0, 300.0));
     }
 
     /// An ICB-absolute in a `display: none` subtree is left alone — its Taffy

@@ -25,6 +25,7 @@ use rinch_platform::{
 use crate::app::{RinchApp, TextContextMenuPresentation, TextEditAction, TextEditState};
 use crate::shell::android_frame;
 use crate::shell::android_ime::{ImeAction, ImeComposition};
+use crate::shell::android_key::{KeyPhase, KeyTranslator, MapChar, RawKey};
 use crate::shell::touch_gesture::{EventClock, TouchAction, TouchGesture};
 
 // ── Cross-thread dispatch ────────────────────────────────────────────────────
@@ -100,6 +101,8 @@ pub(crate) fn run_component<F>(
     // `rinch_dom::fonts`).
     let mut app = RinchApp::new(component);
     app.register_app_fonts(fonts);
+    // The window's size, scale and focus reach `rinch::window` (#1770).
+    app.set_publishes_window_state(true);
     run_loop(android_app, app);
 }
 
@@ -147,8 +150,12 @@ fn run_loop(android_app: AndroidApp, mut app: RinchApp) {
             .with_tag("rinch"),
     );
 
-    rinch_core::register_main_thread();
+    // Dispatcher first, as on desktop: a worker send between the two would
+    // otherwise find a main thread registered and no dispatcher, and panic.
     rinch_core::set_cross_thread_dispatcher(dispatch_to_main_thread);
+    rinch_core::register_main_thread();
+    // No window role beyond an ordinary window on Android (#2659).
+    crate::window_roles::publish(crate::window::WindowRoles::NONE);
     rinch_core::set_on_signal_change(|| {
         REDRAW_PENDING.store(true, Ordering::Release);
     });
@@ -185,7 +192,9 @@ fn run_loop(android_app: AndroidApp, mut app: RinchApp) {
     // for the same reason: both are per-gesture state that has to survive
     // between turns of the loop. See `touch_gesture::EventClock`.
     let mut event_clock = EventClock::new();
-    let mut combining_accent: Option<char> = None;
+    // Hardware-key state that outlives one event: the pending dead key and
+    // how each held key's press was spelled. See `android_key`.
+    let mut keys = KeyTranslator::new();
     // The platform's floating text-selection toolbar, as the loop believes it
     // to be (issue #813). See `ToolbarMirror` for why a belief and a count.
     let mut text_toolbar = ToolbarMirror::new();
@@ -201,7 +210,7 @@ fn run_loop(android_app: AndroidApp, mut app: RinchApp) {
     // The IME's composing region, and the field it belongs to. See
     // `shell::android_ime` for why the region is mirrored on this side at all.
     let mut composition = ImeComposition::new();
-    let mut composing_field: Option<usize> = None;
+    let mut composing_field: Option<u64> = None;
     let mut backgrounded = false;
     // A window-focus change seen inside `poll_events`, dispatched after it
     // returns (`app` is not reachable from the callback). `None` = no change
@@ -218,6 +227,10 @@ fn run_loop(android_app: AndroidApp, mut app: RinchApp) {
     // When the current iteration's *work* began. Reset just after the poll
     // returns, so the sleep is never counted against the frame it preceded.
     let mut frame_start = Instant::now();
+    // When to look again for Vello's counters of a frame the GPU has not
+    // finished (#2071). A third clock with no producer to ring the waker.
+    #[cfg_attr(not(feature = "android-gpu"), allow(unused_mut))]
+    let mut vello_check_in: Option<Duration> = None;
     // Whether the previous iteration put pixels on the glass. This is the
     // whole of the loop's pacing state — see `android_frame::poll_timeout` for
     // why it is the right predicate and why it is deliberately the *narrow*
@@ -252,8 +265,11 @@ fn run_loop(android_app: AndroidApp, mut app: RinchApp) {
             // unobserved unless the loop comes back for it (issue #813; see
             // `TouchGesture::long_press_due`). See `android_frame::poll_timeout`.
             earliest_due(
-                rinch_core::reactive::next_poll_due(),
-                gesture.long_press_due(Instant::now()),
+                earliest_due(
+                    rinch_core::reactive::next_poll_due(),
+                    gesture.long_press_due(Instant::now()),
+                ),
+                vello_check_in,
             ),
         );
         android_app.poll_events(timeout, |event| match event {
@@ -319,6 +335,12 @@ fn run_loop(android_app: AndroidApp, mut app: RinchApp) {
                         // sees the right `resolution` media features; on a
                         // re-`InitWindow` with a changed density it restyles
                         // the live document (no-op when unchanged).
+                        //
+                        // The native window's own size
+                        // (`window_physical_size`) first: the scale is
+                        // published with it, in one batch, on a re-`InitWindow`
+                        // as at the mount.
+                        app.set_surface_size(physical_size);
                         app.set_device_pixel_ratio(scale_factor);
                         if !mounted {
                             let (lw, lh) = rinch_platform::to_logical((w, h), scale_factor);
@@ -365,6 +387,8 @@ fn run_loop(android_app: AndroidApp, mut app: RinchApp) {
                         physical_size = (w, h);
 
                         let (lw, lh) = rinch_platform::to_logical((w, h), scale_factor);
+                        // Published with the `Resized` (`window_physical_size`).
+                        app.set_surface_size(physical_size);
 
                         // The `Resized` payload is the *logical* viewport layout
                         // is resolved at; `handle_event`'s `window_size` is the
@@ -520,7 +544,7 @@ fn run_loop(android_app: AndroidApp, mut app: RinchApp) {
             &mut event_clock,
             scale_factor,
             Instant::now(),
-            &mut combining_accent,
+            &mut keys,
         );
         let mut toolbar_requested = false;
         for event in &input_events {
@@ -762,6 +786,12 @@ fn run_loop(android_app: AndroidApp, mut app: RinchApp) {
         // Drain cross-thread callbacks
         rinch_core::drain_main_callbacks();
         rinch_core::reactive::drain_polls();
+        // Then the work other threads sent the app itself — a plain `<input>`
+        // paste's completion (issue #328). Android's clipboard answers inline,
+        // so a toolbar Paste handled above lands here, in the same iteration.
+        if app.run_deferred_work() > 0 {
+            REDRAW_PENDING.store(true, Ordering::Release);
+        }
 
         // The frame clock. Every time-driven thing `RinchApp` owns — CSS
         // transitions, CSS animations, the dirty state the input handlers
@@ -814,13 +844,43 @@ fn run_loop(android_app: AndroidApp, mut app: RinchApp) {
             #[cfg(feature = "android-gpu")]
             if let (Some(ctx), Some(s)) = (&mut gpu, &mut surface) {
                 let scene = app.build_scene(scale_factor, logical_size);
+                let present_start = std::time::Instant::now();
                 presented = s.present_scene(&mut ctx.renderer, scene);
+                app.perf_add(
+                    rinch_dom::perf::Counter::TimePresentNs,
+                    present_start.elapsed().as_nanos() as u64,
+                );
             }
 
             #[cfg(not(feature = "android-gpu"))]
             if let Some(ref mut s) = surface {
                 let (pixels, w, h) = app.build_pixels(scale_factor, logical_size, false);
+                let present_start = std::time::Instant::now();
                 presented = s.present_pixels(pixels, w, h);
+                app.perf_add(
+                    rinch_dom::perf::Counter::TimePresentNs,
+                    present_start.elapsed().as_nanos() as u64,
+                );
+            }
+
+            // One owed frame is one performance frame (`rinch_dom::perf`),
+            // as one redraw is on the desktop; this is also what prints the
+            // `RINCH_PERF` line on Android.
+            app.end_perf_frame();
+        }
+
+        // A frame that overflowed Vello's buffers went out undrawn, and nothing
+        // else would draw it again on a screen at rest (#2071). This path
+        // renders the whole scene every time, so a redraw is all it takes.
+        #[cfg(feature = "android-gpu")]
+        if let (Some(ctx), Some(s)) = (&mut gpu, &surface) {
+            vello_check_in = None;
+            match ctx.renderer.check_frames(&s.device) {
+                vello::FrameCheck::Settled => {}
+                vello::FrameCheck::Pending => {
+                    vello_check_in = Some(VELLO_CHECK_INTERVAL);
+                }
+                vello::FrameCheck::Lost => REDRAW_PENDING.store(true, Ordering::Release),
             }
         }
 
@@ -856,6 +916,11 @@ fn run_loop(android_app: AndroidApp, mut app: RinchApp) {
     }
 }
 
+/// How soon the loop looks again for Vello's counters of a frame the GPU has
+/// not finished (#2071).
+#[cfg(feature = "android-gpu")]
+const VELLO_CHECK_INTERVAL: Duration = Duration::from_millis(8);
+
 // ── IME ──────────────────────────────────────────────────────────────────────
 
 /// Apply one [`ImeAction`] from the composition translator.
@@ -890,6 +955,13 @@ fn apply_ime_action(
         app.focused_input_value.chars().count()
     } else {
         0
+    };
+    // A single-line field folds a committed text's line breaks as a whole
+    // (issue #824) before it is split into one key per character below: one
+    // character at a time, an inner `\n` would look trailing and vanish.
+    let action = match action {
+        ImeAction::Insert(text) => ImeAction::Insert(app.insertable_text(text)),
+        other => other,
     };
     let mut dispatch = |event: PlatformEvent, running: &mut bool| {
         let actions = app.handle_event(event, window_size, scale_factor);
@@ -975,7 +1047,7 @@ fn collect_input_events(
     event_clock: &mut EventClock,
     scale_factor: f64,
     now: Instant,
-    combining_accent: &mut Option<char>,
+    keys: &mut KeyTranslator,
 ) -> Vec<PlatformEvent> {
     let mut events = Vec::new();
 
@@ -1017,64 +1089,41 @@ fn collect_input_events(
                             meta: false,
                         };
 
-                        if key.action() == KeyAction::Down {
-                            let text = android_app
-                                .device_key_character_map(key.device_id())
-                                .ok()
-                                .and_then(|map| match map.get(key.key_code(), key.meta_state()) {
-                                    Ok(KeyMapChar::Unicode(ch)) => {
-                                        if let Some(accent) = combining_accent.take() {
-                                            match map.get_dead_char(accent, ch) {
-                                                Ok(Some(combined)) => Some(combined.to_string()),
-                                                _ => Some(ch.to_string()),
-                                            }
-                                        } else {
-                                            Some(ch.to_string())
-                                        }
-                                    }
-                                    Ok(KeyMapChar::CombiningAccent(accent)) => {
-                                        *combining_accent = Some(accent);
-                                        None
-                                    }
-                                    _ => None,
-                                });
-
-                            // The key-character-map char doubles as the logical
-                            // key value: it is the layout-produced, case-accurate
-                            // (`meta_state` includes Shift) character — exactly
-                            // what `KeyboardEvent.key` spells for a printable
-                            // key. Android hands us no DOM-style *name* for the
-                            // rest (Enter, arrows, CapsLock), so those stay
-                            // `None` and resolve through the physical `key`.
-                            // Android reports auto-repeat as a repeat count on
-                            // the same `ACTION_DOWN`, so the runtime never has
-                            // to infer it from a release — which matters twice
-                            // over here, since this backend translates no
-                            // `KeyAction::Up` at all (issue #479) and the
-                            // Enter/Space latch would otherwise be cleared only
-                            // by a window blur (issue #463).
-                            let repeat = if key.repeat_count() > 0 {
-                                KeyRepeat::Repeat
-                            } else {
-                                KeyRepeat::Fresh
+                        // Only what needs the device is done here: read the
+                        // event and ask the key character map. What the event
+                        // becomes is `android_key`'s, which host tests compile
+                        // (issue #479).
+                        let phase = match key.action() {
+                            KeyAction::Down => Some(KeyPhase::Down {
+                                repeat_count: key.repeat_count(),
+                            }),
+                            KeyAction::Up => Some(KeyPhase::Up),
+                            _ => None,
+                        };
+                        if let Some(phase) = phase {
+                            let map = android_app.device_key_character_map(key.device_id()).ok();
+                            let ch = match map
+                                .as_ref()
+                                .map(|map| map.get(key.key_code(), key.meta_state()))
+                            {
+                                Some(Ok(KeyMapChar::Unicode(ch))) => MapChar::Unicode(ch),
+                                Some(Ok(KeyMapChar::CombiningAccent(accent))) => {
+                                    MapChar::CombiningAccent(accent)
+                                }
+                                _ => MapChar::None,
                             };
-                            if let Some(key_code) = map_android_keycode(key.key_code()) {
-                                events.push(PlatformEvent::KeyDown {
-                                    key: key_code,
-                                    logical_key: text.clone(),
-                                    text,
-                                    modifiers,
-                                    repeat,
-                                });
-                            } else if let Some(text) = text {
-                                events.push(PlatformEvent::KeyDown {
-                                    key: KeyCode::Other,
-                                    logical_key: Some(text.clone()),
-                                    text: Some(text),
-                                    modifiers,
-                                    repeat,
-                                });
-                            }
+                            let raw = RawKey {
+                                id: (key.device_id(), key.key_code().into()),
+                                phase,
+                                key: map_android_keycode(key.key_code()),
+                                ch,
+                                modifiers,
+                            };
+                            let event = keys.translate(raw, |accent, ch| {
+                                map.as_ref()
+                                    .and_then(|map| map.get_dead_char(accent, ch).ok().flatten())
+                            });
+                            events.extend(event);
                         }
                     }
                     _ => {}
@@ -1522,11 +1571,12 @@ impl GpuContext {
     /// because `probe` is a local that drops before `attach` creates the other
     /// one. Do not hoist it into the returned struct.
     fn new(window: &ndk::native_window::NativeWindow) -> Option<Self> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             flags: wgpu::InstanceFlags::empty(),
             backend_options: wgpu::BackendOptions::from_env_or_default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
         });
 
         let probe = match instance.create_surface(AndroidWindow {
@@ -1544,6 +1594,7 @@ impl GpuContext {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&probe),
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             })) {
                 Ok(a) => a,
                 Err(e) => {
@@ -1552,11 +1603,13 @@ impl GpuContext {
                 }
             };
 
-        let experimental = wgpu::Features::EXPERIMENTAL_RAY_QUERY
-            | wgpu::Features::EXPERIMENTAL_MESH_SHADER
-            | wgpu::Features::EXPERIMENTAL_RAY_HIT_VERTEX_RETURN
-            | wgpu::Features::EXPERIMENTAL_MESH_SHADER_MULTIVIEW
-            | wgpu::Features::EXPERIMENTAL_PASSTHROUGH_SHADERS;
+        // Every adapter feature but the experimental ones (which need
+        // `experimental_features` opted in) and passthrough shaders (an
+        // experimental feature until wgpu 28 renamed it; still excluded as
+        // before). wgpu 30 adds experimental features the old hand-written
+        // list did not name, so take wgpu's own mask (#1955).
+        let experimental =
+            wgpu::Features::all_experimental_mask() | wgpu::Features::PASSTHROUGH_SHADERS;
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("rinch-android-gpu"),
@@ -1584,17 +1637,11 @@ impl GpuContext {
         // 31ms a frame on the library list and 56ms on a screen with a
         // rasterised PDF page; with the flag corrected the same frames took
         // **2.3ms and 5.0ms**. Nothing else about the path changed.
-        let renderer = vello::Renderer::new(
-            &device,
-            vello::RendererOptions {
-                antialiasing_support: vello::AaSupport::area_only(),
-                use_cpu: false,
-                num_init_threads: None,
-                pipeline_cache: None,
-            },
-        )
-        .map_err(|e| log::error!("GPU: vello renderer failed: {e}"))
-        .ok()?;
+        // Through `gpu_init` like the desktop's (#2468): at most four
+        // shader-compile threads, `RINCH_GPU_INIT_THREADS` to choose.
+        let renderer = crate::gpu_init::new_renderer(&device, vello::AaSupport::area_only())
+            .map_err(|e| log::error!("GPU: vello renderer failed: {e}"))
+            .ok()?;
 
         let info = adapter.get_info();
         log::info!(
@@ -1773,7 +1820,7 @@ impl GpuContext {
 /// texture with `format_features.allowed_usages =
 /// TextureUsages::RENDER_ATTACHMENT` and a `flags` set containing only the
 /// two multisample bits, hard-coded, whatever the surface advertised. So no
-/// swapchain image is bindable as a storage texture in wgpu 27 and vello can
+/// swapchain image is bindable as a storage texture in wgpu 27 (nor 30) and vello can
 /// never write one, on any driver. That is a wgpu change, not a rinch one,
 /// and it is worth something like a millisecond and a half of a 17.4ms frame
 /// if it ever lands — which is not the difference between 58fps and 120, but
@@ -1907,6 +1954,7 @@ impl GpuSurface {
             desired_maximum_frame_latency: 2,
             alpha_mode,
             view_formats: vec![],
+            color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&ctx.device, &config);
 
@@ -1999,8 +2047,9 @@ impl GpuSurface {
     fn acquire(&mut self) -> Option<wgpu::SurfaceTexture> {
         for attempt in 0..2 {
             match self.surface.get_current_texture() {
-                Ok(frame) => return Some(frame),
-                Err(e @ (wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost))
+                wgpu::CurrentSurfaceTexture::Success(frame)
+                | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => return Some(frame),
+                e @ (wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost)
                     if attempt == 0 =>
                 {
                     // Read rather than claim: this line sits in front of the
@@ -2013,7 +2062,7 @@ impl GpuSurface {
                     }
                     self.reconfigure();
                 }
-                Err(e) => {
+                e => {
                     if self.faults.failed() {
                         log::error!(
                             "GPU: acquire failed: {e:?}. The frame is owed, so the loop \
@@ -2098,7 +2147,7 @@ impl GpuSurface {
         self.blitter
             .copy(&self.device, &mut encoder, &self.target_view, &view);
         self.queue.submit(std::iter::once(encoder.finish()));
-        frame.present();
+        self.queue.present(frame);
         self.faults.presented();
         true
     }
@@ -2168,15 +2217,20 @@ impl raw_window_handle::HasDisplayHandle for AndroidWindow {
 
 // ── GPU diagnostic tests ────────────────────────────────────────────────
 
+// A bring-up diagnostic, run by hand: uncomment the `gpu_diagnostic::run_tests()`
+// call in `run_loop` to log whether this device's Vulkan driver can do what
+// Vello needs (compute, storage textures, a render). Nothing calls it otherwise,
+// so it is dead code by design rather than by accident (#372).
 #[cfg(feature = "android-gpu")]
+#[allow(dead_code)]
 mod gpu_diagnostic {
     pub fn run_tests() {
         log::info!("=== GPU DIAGNOSTIC TESTS ===");
 
         // 1. Create device
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
         let adapter =
@@ -2184,6 +2238,7 @@ mod gpu_diagnostic {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: None,
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             })) {
                 Ok(a) => a,
                 Err(e) => {
@@ -2196,11 +2251,13 @@ mod gpu_diagnostic {
         log::info!("TEST: Adapter: {} ({:?})", info.name, info.backend);
         log::info!("TEST: Driver: {}", info.driver_info);
 
-        let experimental = wgpu::Features::EXPERIMENTAL_RAY_QUERY
-            | wgpu::Features::EXPERIMENTAL_MESH_SHADER
-            | wgpu::Features::EXPERIMENTAL_RAY_HIT_VERTEX_RETURN
-            | wgpu::Features::EXPERIMENTAL_MESH_SHADER_MULTIVIEW
-            | wgpu::Features::EXPERIMENTAL_PASSTHROUGH_SHADERS;
+        // Every adapter feature but the experimental ones (which need
+        // `experimental_features` opted in) and passthrough shaders (an
+        // experimental feature until wgpu 28 renamed it; still excluded as
+        // before). wgpu 30 adds experimental features the old hand-written
+        // list did not name, so take wgpu's own mask (#1955).
+        let experimental =
+            wgpu::Features::all_experimental_mask() | wgpu::Features::PASSTHROUGH_SHADERS;
         let features = adapter.features() - experimental;
 
         let (device, queue) =
@@ -2281,8 +2338,8 @@ mod gpu_diagnostic {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -2322,7 +2379,7 @@ mod gpu_diagnostic {
             submission_index: None,
             timeout: None,
         });
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("the buffer is mapped");
         let vals: &[u32] = bytemuck::cast_slice(&data);
         if vals[0] == 42 && vals[1] == 43 {
             log::info!(
@@ -2390,8 +2447,8 @@ mod gpu_diagnostic {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -2421,7 +2478,7 @@ mod gpu_diagnostic {
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
+            pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
         }
         queue.submit(std::iter::once(encoder.finish()));
         let _ = device.poll(wgpu::PollType::Wait {

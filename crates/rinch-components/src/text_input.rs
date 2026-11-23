@@ -53,6 +53,10 @@ impl std::str::FromStr for TextInputSize {
 pub struct TextInput {
     /// Input label.
     pub label: String,
+    /// The field's `id` (Mantine's `id`): its label's `for` names it, and the
+    /// description and error are `{id}-description` / `{id}-error`. Empty
+    /// generates a unique one per render (issue #2034).
+    pub id: String,
     /// Placeholder text.
     pub placeholder: String,
     /// Description text below the input.
@@ -82,12 +86,18 @@ pub struct TextInput {
     pub onchange: Option<InputCallback>,
     /// Callback when Enter is pressed (form submission).
     pub onsubmit: Option<Callback>,
+    /// Spellchecking for this field (#2862): `Some(false)` turns it off,
+    /// `Some(true)` turns it on inside a subtree that turned it off, `None`
+    /// (the default) inherits the nearest ancestor's `spellcheck`, which is
+    /// on unless something above says otherwise.
+    pub spellcheck: Option<bool>,
 }
 
 impl std::fmt::Debug for TextInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TextInput")
             .field("label", &self.label)
+            .field("id", &self.id)
             .field("placeholder", &self.placeholder)
             .field("description", &self.description)
             .field("error", &self.error)
@@ -100,6 +110,7 @@ impl std::fmt::Debug for TextInput {
             .field("value_fn", &self.value_fn.as_ref().map(|_| "<reactive>"))
             .field("oninput", &self.oninput.as_ref().map(|_| "<callback>"))
             .field("onchange", &self.onchange.as_ref().map(|_| "<callback>"))
+            .field("spellcheck", &self.spellcheck)
             .field("onsubmit", &self.onsubmit.as_ref().map(|_| "<callback>"))
             .finish()
     }
@@ -138,6 +149,8 @@ impl Component for TextInput {
         container.set_attribute("class", &self.class_string());
 
         // Label element
+        let ids = crate::field_ids::FieldIds::new(&self.id);
+        let mut label_node = None;
         if !self.label.is_empty() {
             let label_text = &self.label;
             let label =
@@ -150,6 +163,7 @@ impl Component for TextInput {
             }
 
             container.append_child(&label);
+            label_node = Some(label);
         }
 
         // Input element
@@ -159,6 +173,9 @@ impl Component for TextInput {
             &self.input_type
         };
         let input = rinch_macros::rsx! { input { class: "rinch-text-input__input" } };
+        if let Some(on) = self.spellcheck {
+            input.set_attribute("spellcheck", if on { "true" } else { "false" });
+        }
         input.set_attribute("type", input_type);
 
         if !self.placeholder.is_empty() {
@@ -167,17 +184,9 @@ impl Component for TextInput {
 
         // Reactive value binding
         if let Some(ref value_fn) = self.value_fn {
-            // Set initial value
-            let initial_value = value_fn();
-            input.set_attribute("value", &initial_value);
-
-            // Create Effect for reactive updates
-            let value_fn = value_fn.clone();
-            let input_clone = input.clone();
-            __scope.create_effect(move || {
-                let current_value = value_fn();
-                input_clone.set_attribute("value", &current_value);
-            });
+            // Written now and on every change — minus the echo of the user's
+            // own keystroke, which the field already shows (#238).
+            crate::value_binding::bind_value_fn(__scope, &input, value_fn);
         } else if !self.value.is_empty() {
             input.set_attribute("value", &self.value);
         }
@@ -222,19 +231,32 @@ impl Component for TextInput {
         container.append_child(&input);
 
         // Description element
+        let mut desc_node = None;
         if !self.description.is_empty() {
             let desc = &self.description;
             let desc_div =
                 rinch_macros::rsx! { div { class: "rinch-text-input__description", {desc} } };
             container.append_child(&desc_div);
+            desc_node = Some(desc_div);
         }
 
         // Error element
+        let mut err_node = None;
         if !self.error.is_empty() {
             let err = &self.error;
             let err_div = rinch_macros::rsx! { div { class: "rinch-text-input__error", {err} } };
             container.append_child(&err_div);
+            err_node = Some(err_div);
         }
+
+        // The label names the field (#2034).
+        ids.wire(
+            &input,
+            true,
+            label_node.as_ref(),
+            desc_node.as_ref(),
+            err_node.as_ref(),
+        );
 
         container
     }

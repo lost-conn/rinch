@@ -16,7 +16,7 @@
 //! [`settle`] is therefore a real `UserEvent::ReRender` turn — resolve, *then*
 //! apply — which is exactly the turn a signal write triggers in a running app
 //! (`set_on_signal_change` → `RinchNativeEvent::ReRender`,
-//! `shell/rinch_runtime.rs`). A fixture that only called `resolve_and_repaint`
+//! `shell/rinch_runtime/entry.rs`). A fixture that only called `resolve_and_repaint`
 //! would leave every request parked and assert nothing.
 //!
 //! **Every geometry here is declared, never measured** — every control carries
@@ -62,7 +62,7 @@ fn settle(app: &mut RinchApp) {
 }
 
 /// The node the arbiter currently holds, whichever target kind it is.
-fn focused(app: &RinchApp) -> Option<usize> {
+fn focused(app: &RinchApp) -> Option<u64> {
     match app.focus_target {
         FocusTarget::Input(id) | FocusTarget::Node(id) => Some(id),
         _ => None,
@@ -80,10 +80,10 @@ fn button(scope: &mut RenderScope, id: &str) -> NodeHandle {
 /// Node ids captured at mount, by the name the fixture gave them.
 #[derive(Clone, Copy, Default)]
 struct Ids {
-    opener: usize,
-    elsewhere: usize,
-    inside_first: usize,
-    inside_last: usize,
+    opener: u64,
+    elsewhere: u64,
+    inside_first: u64,
+    inside_last: u64,
 }
 
 /// A page with an opener button, a `Modal` holding two controls, and a second
@@ -356,7 +356,7 @@ fn closing_does_not_release_a_claim_outside_the_overlay() {
 fn unmounting_an_open_modal_restores_the_opener() {
     let inner_scope: Rc<RefCell<Option<RenderScope>>> = Rc::new(RefCell::new(None));
     let ids: Rc<Cell<Ids>> = Rc::new(Cell::new(Ids::default()));
-    let modal_root: Rc<Cell<usize>> = Rc::new(Cell::new(0));
+    let modal_root: Rc<Cell<u64>> = Rc::new(Cell::new(0));
     let open = Signal::new(false);
 
     let scope_out = inner_scope.clone();
@@ -485,9 +485,9 @@ fn a_parked_restore_is_refused_if_focus_moved_since() {
 fn a_nested_overlay_restores_into_the_one_that_contains_it() {
     #[derive(Clone, Copy, Default)]
     struct Nested {
-        opener: usize,
-        outer_a: usize,
-        inner_a: usize,
+        opener: u64,
+        outer_a: u64,
+        inner_a: u64,
     }
 
     let ids: Rc<Cell<Nested>> = Rc::new(Cell::new(Nested::default()));
@@ -569,7 +569,7 @@ fn a_nested_overlay_restores_into_the_one_that_contains_it() {
 #[test]
 fn a_popover_takes_focus_only_for_an_autofocus_child() {
     for autofocus in [false, true] {
-        let ids: Rc<Cell<(usize, usize)>> = Rc::new(Cell::new((0, 0)));
+        let ids: Rc<Cell<(u64, u64)>> = Rc::new(Cell::new((0, 0)));
         let out = ids.clone();
         let open = Signal::new(false);
         let mut app = mount(move |scope: &mut RenderScope| {
@@ -610,7 +610,7 @@ fn a_popover_takes_focus_only_for_an_autofocus_child() {
 // ── 5. how overlays are actually opened ─────────────────────────────────────
 
 /// The centre of a node's painted box, in the logical space `click()` speaks.
-fn centre(app: &RinchApp, id: usize) -> (f32, f32) {
+fn centre(app: &RinchApp, id: u64) -> (f32, f32) {
     let d = app.doc.as_ref().unwrap().borrow();
     let (x, y, w, h) = crate::app::hit_testing::painted_element_box(&d.tree, id);
     (x + w / 2.0, y + h / 2.0)
@@ -618,7 +618,7 @@ fn centre(app: &RinchApp, id: usize) -> (f32, f32) {
 
 /// A real left press and release on a node, so the `data-rid` dispatch runs on
 /// the path a pointer takes.
-fn click_node(app: &mut RinchApp, id: usize) {
+fn click_node(app: &mut RinchApp, id: u64) {
     let (x, y) = centre(app, id);
     for ev in [
         PlatformEvent::MouseDown {
@@ -911,9 +911,9 @@ fn a_restore_the_arbiter_refuses_releases_the_claim() {
 fn closing_the_outer_overlay_first_still_restores_the_page() {
     #[derive(Clone, Copy, Default)]
     struct Nested {
-        opener: usize,
-        outer_a: usize,
-        inner_a: usize,
+        opener: u64,
+        outer_a: u64,
+        inner_a: u64,
     }
 
     let ids: Rc<Cell<Nested>> = Rc::new(Cell::new(Nested::default()));
@@ -1001,8 +1001,8 @@ fn closing_the_outer_overlay_first_still_restores_the_page() {
 fn an_opener_inside_an_already_closed_overlay_is_not_restored() {
     #[derive(Clone, Copy, Default)]
     struct Nested {
-        outer_a: usize,
-        inner_a: usize,
+        outer_a: u64,
+        inner_a: u64,
     }
 
     let ids: Rc<Cell<Nested>> = Rc::new(Cell::new(Nested::default()));
@@ -1078,4 +1078,203 @@ fn an_opener_inside_an_already_closed_overlay_is_not_restored() {
          than handed into a closed dialog",
         ids.outer_a
     );
+}
+
+// ── 7. an editor inside, or as the opener (#1126) ───────────────────────────
+
+/// A page with an opener button and a `trap_focus` `Modal` holding an editor
+/// (`editor_inside`), or with the editor on the page and a button in the modal.
+#[cfg(feature = "windowing")]
+fn editor_modal_page(
+    open: Signal<bool>,
+    editor_inside: bool,
+) -> (RinchApp, crate::editor::EditorHandle, u64, u64, u64) {
+    let handle = crate::editor::create_editor();
+    assert!(handle.load_html("<p>modal</p>"));
+    let ids: Rc<Cell<(u64, u64, u64)>> = Rc::default();
+    let (out, ed_in) = (ids.clone(), handle.clone());
+    let app = mount(move |scope: &mut RenderScope| {
+        let page = scope.create_element("div");
+        let opener = button(scope, "opener");
+        page.append_child(&opener);
+        let ed = ed_in.mount(scope);
+        ed.set_attribute(
+            "style",
+            "width: 300px; height: 60px; font-size: 16px; line-height: 24px",
+        );
+        let inside = button(scope, "inside");
+        let children = if editor_inside {
+            vec![ed.clone()]
+        } else {
+            page.append_child(&ed);
+            vec![inside.clone()]
+        };
+        let modal = Modal {
+            opened_fn: Some(Rc::new(move || open.get())),
+            trap_focus: true,
+            with_close_button: false,
+            ..Default::default()
+        }
+        .render(scope, &children);
+        page.append_child(&modal);
+        out.set((opener.node_id().0, ed.node_id().0, inside.node_id().0));
+        page
+    });
+    let (opener, ed, inside) = ids.get();
+    (app, handle, opener, ed, inside)
+}
+
+/// The web's #1126 case on desktop: the keyboard on an editor inside a
+/// `trap_focus` modal goes back to the opener when the modal closes, and the
+/// editor lets it go. Desktop's arbiter names the editor's container as the
+/// claim (`claim_node_or_dom_focus`), so this held before the web was fixed;
+/// the twin is `rinch-web/tests/overlay_editor_focus_1126.rs`.
+#[test]
+#[cfg(feature = "windowing")]
+fn closing_a_modal_hands_the_keyboard_from_its_editor_to_the_opener() {
+    let open = Signal::new(false);
+    let (mut app, handle, opener, ed, _) = editor_modal_page(open, true);
+    app.focus_element(opener);
+    open.set(true);
+    settle(&mut app);
+    handle.focus();
+    settle(&mut app);
+    assert_eq!(
+        app.focus_target,
+        FocusTarget::Editor(ed),
+        "precondition: the editor holds the keyboard"
+    );
+    open.set(false);
+    settle(&mut app);
+    assert_eq!(
+        focused(&app),
+        Some(opener),
+        "the opener got the keyboard back"
+    );
+}
+
+/// A modal opened while an editor held the keyboard gives it back to that
+/// editor when it closes — what the web does since #1126.
+#[test]
+#[cfg(feature = "windowing")]
+fn closing_a_modal_opened_from_an_editor_gives_the_editor_the_keyboard() {
+    let open = Signal::new(false);
+    let (mut app, handle, _, ed, inside) = editor_modal_page(open, false);
+    handle.focus();
+    settle(&mut app);
+    assert_eq!(app.focus_target, FocusTarget::Editor(ed), "precondition");
+    open.set(true);
+    settle(&mut app);
+    assert_eq!(focused(&app), Some(inside), "the modal took the keyboard");
+    open.set(false);
+    settle(&mut app);
+    assert_eq!(
+        app.focus_target,
+        FocusTarget::Editor(ed),
+        "the editor got the keyboard back"
+    );
+}
+
+// ── 8. review of #1734 ───────────────────────────────────────────────────────
+
+/// Two editors: A on the page holds the keyboard, a modal (button + editor B)
+/// opens, B takes the keyboard, the modal closes: A gets it back.
+#[test]
+#[cfg(feature = "windowing")]
+fn an_editor_inside_releases_and_the_editor_opener_gets_the_keyboard() {
+    let open = Signal::new(false);
+    let a = crate::editor::create_editor();
+    assert!(a.load_html("<p>outer</p>"));
+    let b = crate::editor::create_editor();
+    assert!(b.load_html("<p>inner</p>"));
+    let ids: Rc<Cell<(u64, u64)>> = Rc::default();
+    let (out, a2, b2) = (ids.clone(), a.clone(), b.clone());
+    let mut app = mount(move |scope: &mut RenderScope| {
+        let page = scope.create_element("div");
+        let ea = a2.mount(scope);
+        ea.set_attribute(
+            "style",
+            "width: 300px; height: 60px; font-size: 16px; line-height: 24px",
+        );
+        page.append_child(&ea);
+        let inside = button(scope, "inside");
+        let eb = b2.mount(scope);
+        eb.set_attribute(
+            "style",
+            "width: 300px; height: 60px; font-size: 16px; line-height: 24px",
+        );
+        let modal = Modal {
+            opened_fn: Some(Rc::new(move || open.get())),
+            trap_focus: true,
+            with_close_button: false,
+            ..Default::default()
+        }
+        .render(scope, &[inside, eb.clone()]);
+        page.append_child(&modal);
+        out.set((ea.node_id().0, eb.node_id().0));
+        page
+    });
+    let (ea, eb) = ids.get();
+    a.focus();
+    settle(&mut app);
+    assert_eq!(app.focus_target, FocusTarget::Editor(ea));
+    open.set(true);
+    settle(&mut app);
+    b.focus();
+    settle(&mut app);
+    assert_eq!(app.focus_target, FocusTarget::Editor(eb), "precondition");
+    open.set(false);
+    settle(&mut app);
+    assert_eq!(
+        app.focus_target,
+        FocusTarget::Editor(ea),
+        "outer editor restored"
+    );
+}
+
+/// A focused editor unmounted by a branch is not where the focus is: the
+/// mirror must not name its detached container (review of #1734, F1).
+#[test]
+#[cfg(feature = "windowing")]
+fn an_unmounted_editor_is_not_where_the_focus_is() {
+    let shown = Signal::new(true);
+    let h = crate::editor::create_editor();
+    assert!(h.load_html("<p>x</p>"));
+    let ids: Rc<Cell<u64>> = Rc::default();
+    let (out, h2) = (ids.clone(), h.clone());
+    let mut app = mount(move |scope: &mut RenderScope| {
+        let page = scope.create_element("div");
+        let h3 = h2.clone();
+        let out2 = out.clone();
+        rinch_core::show_dom(
+            scope,
+            &page,
+            move || shown.get(),
+            move |s: &mut RenderScope| {
+                let e = h3.mount(s);
+                e.set_attribute(
+                    "style",
+                    "width: 300px; height: 60px; font-size: 16px; line-height: 24px",
+                );
+                out2.set(e.node_id().0);
+                e
+            },
+            None::<fn(&mut RenderScope) -> NodeHandle>,
+        );
+        page
+    });
+    h.focus();
+    settle(&mut app);
+    let ed = ids.get();
+    assert_eq!(app.focus_target, FocusTarget::Editor(ed));
+    shown.set(false);
+    settle(&mut app);
+    let ae = app
+        .doc
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .active_element()
+        .map(|n| n.0);
+    assert_eq!(ae, None, "a removed editor is not where the focus is");
 }

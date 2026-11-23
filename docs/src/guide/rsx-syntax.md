@@ -71,13 +71,24 @@ rsx! {
 }
 ```
 
+Any attribute takes a reactive closure, and only that attribute is rewritten
+when the signals it reads change. So a raw form control is bound with the
+attribute itself — `input { value: {|| text.get()} }`,
+`input { r#type: "checkbox", checked: {|| done.get()} }` — not with the
+`value_fn:` / `checked_fn:` props of the `TextInput` and `Checkbox`
+components. A `*_fn` name on an HTML element is a compile error that says so
+(issue #1591; it used to be written as a `value_fn` attribute that nothing
+reads). The components' `value_fn` also skips writing back the value the field
+already shows (the #238 echo guard); a raw `value:` writes on every change of
+the signals it reads.
+
 ### Boolean attributes
 
 A handful of HTML attributes carry no useful string: their **presence** is their
 value. `disabled`, `checked`, `readonly`, `required`, `multiple`, `hidden`,
 `selected`, `open`, `autofocus` and the rest of the HTML boolean set are all of
-this kind, and so are rinch's own `data-disabled`, `data-nofocus` and
-`data-trap-focus`.
+this kind, and so are rinch's own `data-disabled`, `data-nofocus`,
+`data-trap-focus`, `data-backdrop` and `data-scroll-lock-exempt`.
 
 Write them as a `bool` — static or reactive — and `rsx!` renders the right
 *shape* rather than the string:
@@ -119,12 +130,13 @@ bare `""` that components write stays on.
 That rule is the **writer's**, and for the HTML set it is nobody's reader: no
 reader of `disabled`, `checked`, `readonly` and their kind has a falsey string on
 either backend, because a browser has none (issue #612). rinch's own
-`data-disabled`, `data-nofocus` and `data-trap-focus` — listed as boolean
+`data-disabled`, `data-nofocus`, `data-trap-focus`, `data-backdrop` and
+`data-scroll-lock-exempt` — listed as boolean
 attributes above — are the exception, and the only one: their readers do honour a
-literal `"false"`, on desktop through `rinch_core::dom::data_attr_is_on` and on
-the web through selectors like
+literal `"false"`, on desktop through `rinch_core::dom::data_attr_is_on` and,
+for the ones the web reads at all, through selectors like
 `[data-nofocus]:not([data-nofocus="false" i])`. That escape is narrower
-than the writer's rule, too: `"0"` is **on** for those three.
+than the writer's rule, too: `"0"` is **on** for those five.
 
 **Writing one by hand.** `set_attribute` is the *literal* primitive on both
 backends: it writes the string you give it, so `set_attribute("checked",
@@ -143,20 +155,30 @@ That was a real divergence until issue #622: the web backend mapped truthiness
 onto presence for `checked` and `selected` alone, so the same call unchecked a box
 in the browser and checked it on the desktop backend.
 
-On the web, `checked` and `<option selected>` also drive the control's live
-property, not only the attribute — a browser stops mirroring the attribute into
-the property once the user has toggled the control, and rinch has no such flag, so
-a programmatic write keeps winning. It follows the attribute's presence, matching
-what the desktop backend's `:checked` reads.
+On the web, `checked`, `<option selected>` and a media element's `muted` also
+drive the control's live property, not only the attribute — a browser stops
+mirroring `checked`/`selected`'s attribute into the property once the user has
+toggled the control (and never mirrors `muted`'s dynamically at all; HTML reads
+it once, at load, to seed `defaultMuted`), and rinch has no such flag, so a
+programmatic write keeps winning. `checked`/`selected` follow the attribute's
+presence, matching what the desktop backend's `:checked` reads; `muted` is
+rinch's own invention — deliberately more dynamic than plain HTML — because
+nothing else lets a reactive `muted: {|| m.get()}` binding mute or unmute a
+`<video>`/`<audio>` element at all (issue #754). The name is folded
+ASCII-lowercase before any of this is decided, so `CHECKED`/`MUTED` written in
+any case still mirror (issue #758) — desktop already folds the attribute name
+this way (#738); on the web the browser folds the written attribute itself, so
+only rinch's own Rust-side matching needed the fold.
 
-Those two are also the reason a falsey write of them is never skipped. Turning a
-boolean attribute off is otherwise a no-op when the attribute is already gone,
+These three are also the reason a falsey write of them is never skipped. Turning
+a boolean attribute off is otherwise a no-op when the attribute is already gone,
 and `write_attribute` skips it to save a restyle — but on the web a user's
-toggle leaves the *property* on with the attribute absent, so the skip was
-exactly the write that would have corrected it, and a box the user clicked
-stayed checked against a binding that said `false` (issue #687). `checked` and
-`selected` now always reach the backend, which is the only layer that can see
-the property.
+toggle (or, for `muted`, a `<video controls>`'s own mute button) leaves the
+*property* on with the attribute absent, so the skip was exactly the write that
+would have corrected it, and a box the user clicked stayed checked against a
+binding that said `false` (issue #687, and #754 for `muted`). `checked`,
+`selected` and `muted` now always reach the backend, which is the only layer
+that can see the property.
 
 Component props are unaffected — a component's `disabled: bool` is an ordinary
 typed field, and the component decides how to render it.
@@ -182,7 +204,7 @@ rsx! {
             }
         },
         onmouseup: || println!("released"),
-        onmousemove: || { /* fires on every move over this element */ },
+        onmousemove: || { /* fires on each (coalesced) move over this element */ },
         onmouseenter: || println!("hover in"),
         onmouseleave: || println!("hover out"),
         oncontextmenu: || println!("right-click menu"),
@@ -195,16 +217,265 @@ Supported HTML-element event attributes:
 
 | Attribute | Fires | Closure |
 |---|---|---|
-| `onclick` | Primary press (dispatched on pointerdown), or Enter/Space on the focused element — see [Keyboard activation](#keyboard-activation) | `Fn()` |
+| `onclick` | Primary press (dispatched on pointerdown — on the web, a touch or pen press that could start a scroll, on a scrolling page or inside a scroller, dispatches on release instead and a scroll drops it; `touch-action: none` keeps it on the press), or Enter/Space on the focused element — see [Keyboard activation](#keyboard-activation). A right or middle press does not run it, on either backend (both did until issue #1093); use `oncontextmenu`, or `onmousedown` with `get_click_context().button`. An overlay backdrop marked `data-backdrop` (`rinch_core::events::BACKDROP_ATTRIBUTE`) is the exception and runs for every button, so a press of any button outside an overlay dismisses it | `Fn()` |
 | `onmousedown` / `onmouseup` | Pointer press / release (any button) | `Fn()` |
-| `onmousemove` | Pointer moves over the element | `Fn()` |
-| `onmouseenter` / `onmouseleave` | Pointer enters / leaves the element | `Fn()` |
+| `onmousemove` | Pointer moves over the element — at most once per event-loop batch on desktop, at the newest position (see [Pointer moves are coalesced](#pointer-moves-are-coalesced)) | `Fn()` |
+| `onmouseenter` / `onmouseleave` | Pointer enters / leaves the element, as the DOM's `mouseenter` / `mouseleave` on desktop and the web: moving into the element's descendants or between its children fires neither, one move leaves the elements it left innermost first and then enters the new ones outermost first, and the mouse leaving the window leaves everything it was over. A layout, a scroll or a removal that moves another element under a mouse at rest leaves and enters as a move there would (and moves `:hover` and the cursor), as in Chrome; a removed element is not told it was left. On desktop an inline element in a paragraph's text (a link, a span) is entered over its text and its padding | `Fn()` |
 | `oncontextmenu` | Right-click, or a 500ms long press on Android (suppresses the native menu when handled) | `Fn()` |
 | `oninput` | `<input>`/`<textarea>` value change, per keystroke | `Fn(String)` |
 | `onchange` | Commit boundary: the gesture ends (blur after a modification, Enter, a `<select>` pick) — fires with the final value | `Fn(String)` |
-| `onscroll` | Scroll container scrolls, on either axis | `Fn(ScrollEvent)` — `ev.scroll_top` and `ev.scroll_left` |
-| `ondragstart` … `ondrop`, `ondragend` | Element drag-and-drop | `Fn()` |
-| `onfiledrop`, `onfiledragenter`/`onfiledragleave` | OS → app file drop | `Fn(Vec<PathBuf>)` / `Fn()` |
+| `onscroll` | Scroll container scrolls, on either axis | `Fn(ScrollEvent)` — `ev.scroll_top` and `ev.scroll_left`. In a `direction: rtl` container `scroll_left` is the browser's: 0 at the start (the right end shown) and negative toward the left, on both backends |
+| `ondragstart` … `ondrop`, `ondragend` | Element drag-and-drop. A cancelled drag (Escape; on desktop also a left press or a window blur while it is live, which prove its release went missing) fires `ondragend` (and `ondragleave` on the target, if it is over one), never `ondrop`. A drag whose pointer rests within 32px of the top or bottom of a scroll container under it scrolls that container (not one a `lock_scroll` overlay locks out), and the drop target scrolled under the still pointer hears `ondragenter` / `ondragover` | `Fn()` |
+| `onfiledrop`, `onfiledragenter`/`onfiledragleave` | OS → app file drop (desktop only: the browser build dispatches none of the three). `onfiledrop` reads the drop point and its own element's box through `get_click_context()` (`mouse_x`/`mouse_y`, `element_*`), in the same frame as a click's, so dropped files can be placed where they were dropped; it did not until issue #1650 | `Fn(Vec<PathBuf>)` / `Fn()` |
+| `ondropfiles` | OS → app file drop on the desktop **and** the web (issue #1771): the files as `LocalFile`s (name, size, path where there is one, bytes read on demand). See [Files From the User](./platform.md#files-from-the-user-web-and-desktop) | `Fn(Vec<LocalFile>)` |
+| `onsubmit` | Enter in an `<input>` or `<textarea>` (Shift+Enter in a `<textarea>` inserts a line break instead), read from the control and then up its ancestors — see [Enter in a `<textarea>`](#enter-in-a-textarea) | `Fn()` |
+| `onkeydown` / `onkeyup` | A key pressed / released while the element, or a text control or focusable element inside it, holds the keyboard — see [Keys on an element](#keys-on-an-element) | `Fn(&KeyEventData) -> bool` — `true` consumes the key |
+| `onwheel` | A mouse wheel, trackpad scroll or trackpad pinch over the element or inside it — see [The wheel on an element](#the-wheel-on-an-element) | `Fn(&WheelEvent) -> bool` — `true` consumes the wheel, and nothing scrolls |
+| `onfocus` / `onblur` | The element gains / loses the focus — see [Focus on an element](#focus-on-an-element). They do not bubble: a `div` around a field hears neither | `Fn()` |
+| `onfocusin` / `onfocusout` | The element or one inside it gains / loses the focus: `onfocus` / `onblur` that bubble | `Fn()` |
+
+That list is closed. Any other `on*` name on an HTML element — `ondblclick`,
+`onkeypress`, a typo such as `onclik` — is a compile error that lists the
+supported events and suggests the nearest one. (Until issue #1590 such a name
+was silently wired as a **click** handler.) A component's `on*` props are its
+own fields and are not affected.
+
+### Keys on an element
+
+`onkeydown` and `onkeyup` (issue #1678) take a `KeyEventData` (`key` spelled
+as `KeyboardEvent.key`, `code`, the four modifiers, `kind`) and answer whether
+they **consumed** the key. `true` is a browser listener's `preventDefault()`
+plus `stopPropagation()`: the field does not insert the key, Enter runs no
+`onsubmit` and activates nothing, Tab moves no focus, and nothing after the
+element hears it. A chat composer, Enter to send and Shift+Enter for a new
+line:
+
+```rust
+textarea {
+    value: {|| draft.get()},
+    oninput: move |v: String| draft.set(v),
+    onkeydown: move |k| {
+        if k.key == "Enter" && !k.shift {
+            send(draft.get());
+            draft.set(String::new());
+            true // no line break
+        } else {
+            false
+        }
+    },
+}
+```
+
+A key goes, on desktop and the web alike: a menu shortcut; the rich-text
+editor's or a node view's `on_key`; **the focused element's `onkeydown`, then
+its ancestors', nearest first, until one consumes it**; the document-level
+keyboard interceptor; an open popup's key entry and, for Escape, the dismiss
+stack; then the element's own handling. So a `[[` picker in a field inside a
+`Modal` takes Escape and the modal stays open. `onkeyup` is offered the same
+way; a consuming one stops its ancestors, and the interceptor hears every
+release whatever the element answered (a release has no default to prevent).
+
+The walk starts at the element holding the keyboard: a text control, or a
+focusable element (`tabindex`, a button, a link, a closed `<select>`). Keys the
+rich-text editor holds go to `EditorHandle::on_key`, a focused render
+surface's to `set_key_handler`, and an open native `<select>` list keeps its
+keys on desktop. A key an input method is composing with is not offered (a
+browser marks it `isComposing` or reports it as the `Process` key; desktop,
+while the field shows a preedit). One known gap: Safari sends the Enter that
+confirms a composition after the composition ends, unmarked (`keyCode` 229
+only), and it is offered — an Android soft keyboard's plain Enter can carry
+229 too, so refusing it would break Enter there. And
+with an input method on, plain characters may arrive as composition text with
+no key event at all — use `oninput` for text. A handler that moves the focus
+and does not consume the key sends it on to the newly focused field, as Chrome
+does. A raw `<input>` or `<textarea>` with only a key handler (no `oninput`)
+is still a text field on desktop, as in a browser — and so is one with no
+handler at all (issue #2585): `input { id: "q" }` focuses, takes typed text,
+selects, undoes and composes on both backends, and its text is read with
+`live_value()`. Its `readonly` and `disabled` are honoured, and the non-text
+types (`checkbox`, `radio`, `range`, `color`, `file`, the buttons) do not
+become text fields by this rule.
+
+A composer's popup needs two more things, both on `NodeHandle`:
+`selection_range()` reads the selection back as `(start, end, direction)` in
+UTF-16 code units, the unit `set_selection_range` takes; `caret_rect()` (at the
+selection's head) and `caret_rect_at(offset)` (at a UTF-16 offset — the start
+of a `[[`, so the popup stays put as the query is typed) answer where the caret
+is drawn, in logical window px on desktop and client px on the web, the space
+`EditorHandle::caret_rect` answers in. See [Reading the selection and the
+caret](./focus.md#reading-the-selection-and-the-caret).
+
+### Focus on an element
+
+`onfocus` and `onblur` (issue #2731) fire when the element gains and loses the
+focus — a click, Tab, `NodeHandle::focus()`, an overlay moving the focus in,
+`autofocus` — and `onfocusin` / `onfocusout` are the same two that bubble, so a
+form can hear its fields. The rules are Chrome's, on desktop and the web:
+
+- Moving the focus fires `onblur` on the old element, then `onfocusout` on it
+  and its ancestors, then `onfocus` on the new one, then `onfocusin` on it and
+  its ancestors.
+- An element's `onfocus` fires only while its **window has the keyboard**. The
+  window losing it fires `onblur` on the focused element (which keeps the
+  focus), and getting it back fires `onfocus` again. So one handler means "a
+  key typed now reaches this element":
+
+```rust
+let ready = Signal::new(false);
+rsx! {
+    input {
+        onfocus: move || ready.set(true),
+        onblur: move || ready.set(false),
+    }
+}
+```
+
+- A focus moved while the window is in the background fires nothing then; the
+  element that has the focus when the window comes back hears `onfocus`.
+- A focused element that leaves the document hears `onblur` on desktop, if
+  its handlers are still alive, as Chrome fires it; on the web it hears what
+  the browser fires.
+
+On desktop the events fire where the focus actually moves: after the event
+that moved it, and for `NodeHandle::focus()` where the runtime applies the
+request (before the next key; Chrome fires them inside `focus()`). A desktop
+window is unfocused until the system gives it the keyboard, so a window shown
+at start hears its field's `onfocus` at that moment. On the web the browser
+fires them; one difference is the rich-text editor: on the web its keyboard is a
+hidden text area under `<body>`, so its container hears none of the four there,
+where on desktop it hears them as any focused element does.
+
+### The wheel on an element
+
+`onwheel` hears a wheel turn, a two-finger trackpad scroll and a trackpad
+pinch over the element, before any scroll container moves. It answers whether
+it **consumed** the wheel: `true` is the browser's `preventDefault()` — no
+ancestor's `onwheel` is offered it and no container scrolls. `false` lets it go
+on as if the handler were not there. The element under the pointer is asked
+first, then its ancestors, nearest first, until one consumes it.
+
+The [`WheelEvent`] has the DOM's sign and unit on both backends: `delta_x` and
+`delta_y` in logical pixels, positive when the content would move left / up (a
+wheel turned towards you scrolls down: a positive `delta_y`). A notched wheel
+is 40 px a line, a page the window's height. `x` and `y` are the pointer in
+the frame of `get_click_context().mouse_x`, and `modifiers` holds Shift, Ctrl,
+Alt and Meta.
+
+A **pinch** arrives as a wheel with `modifiers.ctrl` set, the way browsers
+report one (desktop turns a macOS or Wayland pinch gesture into the same
+thing), and `zoom_factor()` reads Ctrl+wheel and pinch alike as a scale (100 px
+of `delta_y` is a factor of *e*; above 1 zooms in). A canvas that zooms around
+the pointer on Ctrl/Cmd+wheel and pinch, and pans on a plain wheel:
+
+```rust
+div {
+    style: "overflow: hidden; width: 600px; height: 400px",
+    onwheel: move |w: &WheelEvent| {
+        if w.modifiers.ctrl || w.modifiers.meta {
+            zoom_around(w.zoom_factor(), w.x, w.y);
+        } else {
+            pan_by(-w.delta_x, -w.delta_y);
+        }
+        true // the page does not scroll, nor zoom for a pinch
+    },
+}
+```
+
+A render surface under the pointer takes the wheel first (its own
+`SurfaceEvent::MouseWheel`, or a `Pinch`), and no `onwheel` hears it. A touch
+pan on a touchscreen is not a wheel in a browser; on desktop and Android
+rinch's touch recogniser scrolls through the same path, so an `onwheel` there
+hears a touch pan too.
+
+[`WheelEvent`]: https://docs.rs/rinch/latest/rinch/prelude/struct.WheelEvent.html
+
+### Smooth wheel scrolling
+
+On desktop a mouse wheel's notch **glides**: the scroller moves its 40 px a
+line over a fifth of a second, easing in and out, as Chrome scrolls, rather
+than jumping there in one frame. A notch that arrives mid-glide adds to where
+the glide is headed and carries on at the speed it has, so a fast spin of the
+wheel is one continuous movement. The curve is Chromium's own: CSS
+`ease-in-out`, 200 ms for a notch of up to 120 px, falling to 100 ms for 480 px
+or more.
+
+- A **trackpad** or a **high-resolution wheel** reports pixels, and scrolls
+  directly, as in a browser. So does the debug server's `scroll`.
+- The notch picks its scroller when it arrives, by the same rule as before: the
+  nearest under the pointer that can still move that way, so a list at its end
+  hands the notch to the scroller around it. A notch into a scroller whose
+  glide is already headed for its end goes nowhere, as a browser latches it.
+- `onwheel` hears the notch once, when it arrives, with its whole distance.
+  `onscroll` fires on every frame the glide moves the scroller, as in Chrome.
+- A frame of a glide is a scroll offset change and a repaint of the scroller,
+  never a layout.
+- Anything else that scrolls the scroller mid-glide wins, and the glide stops
+  there: a `set_scroll_top`/`set_scroll_left`, a press on its scrollbar, the
+  editor revealing its caret as you type, a trackpad. So does a `lock_scroll`
+  dialog opening over it.
+
+It is a choice an app can turn off: `App::new(app).smooth_wheel_scroll(false)`
+makes every notch scroll its whole distance at once, and
+`RinchApp::set_smooth_wheel_scroll` changes it while the app runs (an embedded
+`RinchContext`: through `app_mut()`; send `PlatformEvent::MouseWheelLines` for a
+line wheel and it glides there too). rinch does not read the OS's
+reduced-motion setting on the desktop yet
+([#2209](https://github.com/joeleaver/rinch/issues/2209)); an app that reads it
+can pass the answer to `smooth_wheel_scroll`. On the web the browser scrolls,
+with its own smoothing and its own settings, and none of this applies.
+
+### Pointer moves are coalesced
+
+On desktop, winit can report several pointer moves between two frames — a
+1000 Hz mouse does. The shell keeps only the newest one and hands it to the app
+before the next other event (so a press is judged where the pointer last was)
+or at the end of the batch. Hover, `onmousemove`, `data-ondragover` /
+`data-ondragmove` and a `Drag::absolute()` / `Drag::percent()` `on_move` all
+see one move per batch, at the latest position. This is the browser's model:
+it dispatches `pointermove` at most once per frame. A component drag's layout
+runs once per frame too, not once per move.
+
+### One pointer-capture drag at a time
+
+`Drag::start()` ends any drag that is already live before arming its own, and
+it ends it through that drag's `on_cancel` — never its `on_end`. Usually a
+press arming a drag while another is live means the earlier drag's release was
+lost (a context menu or a window-manager grab swallowed it, or it went to
+another rinch document on the same thread — a DevTools window, a second
+embedded `RinchContext`), so there is no trustworthy position to commit. On a
+touch screen it can also be a second finger: rinch-web dispatches a second
+finger's press, and a drag it arms cancels the first finger's while that finger
+is still down — there is one drag at a time, not one per finger. Keep teardown
+in `on_cancel` and it runs on every ending but a commit — and an unmount of
+the component that armed the drag, which drops it without calling back.
+
+A drag whose release never arrives is ended the same way, through
+`on_cancel` at the last position `on_move` saw. On rinch-web that happens on
+the first move that reports the button up. Desktop cannot see the button on a
+move, so it ends the drag on the next event that proves the release was
+missed: a **left press** (handled before the press reaches any handler, so
+nothing it dispatches sees the old drag) or the window **losing focus**. Until
+one of those arrives, the stranded drag keeps following the pointer. The same
+press or blur also ends a stranded element drag (cancelled: `ondragend`, no
+`ondrop`), a scrollbar-thumb drag and a text-selection drag.
+
+Three consequences on desktop. A window blur mid-drag cancels the drag even
+when its release would still have arrived (on X11 and Wayland a global hotkey
+or a held Alt+Tab can blur the window during a healthy drag). A drag armed by
+the middle or right button is cancelled by a left press made while it is held.
+And a drag armed with no button down — from a shortcut or a timer, then placed
+with a click — is cancelled by that click, as the web cancels it on its first
+move. Arm a `Drag` from a press (`onclick` or `onmousedown`) and none of this
+reaches a normal gesture.
+
+A drag ends on the release of the button that started it. On desktop a right
+or middle release while the left button still holds a drag is a chord, not the
+end of it: a left-armed `Drag` keeps following the pointer and commits on the
+left release, and the same holds for an element drag (it is not dropped), a
+scrollbar-thumb drag and a text-selection drag. A drag armed by a right press
+ends on the right release, and a drag armed outside any press (a timer) belongs
+to whichever button was pressed last. The web gets this from the browser, whose
+`pointerup` fires only once every button is up.
 
 `onscroll` fires once per container that moved, whichever axis moved it, and
 its [`ScrollEvent`] payload carries **both** offsets — so a horizontal-only
@@ -224,6 +495,13 @@ div {
 ```
 
 [`ScrollEvent`]: https://docs.rs/rinch/latest/rinch/prelude/struct.ScrollEvent.html
+
+On desktop a scroll offset is kept on the **device pixel grid** (issue #1543),
+so scrolled text moves by whole device pixels and does not re-space as it
+scrolls: at a display scale of 125% the offsets are multiples of 0.8px. The
+`ScrollEvent` offsets and `scroll_top()` report that snapped value, so
+`set_scroll_top(10.33)` at 125% reads back 9.6. Do not compare an offset you
+wrote with one you read back for equality.
 
 `oninput` and `onchange` follow HTML semantics and are **not** aliases (they
 were before issue #226): `oninput` fires on every keystroke with the live
@@ -295,9 +573,20 @@ repeat). On web, two routes cover the two kinds of element:
   it does not activate the clickable around them.
 
 Neither route double-fires with the mouse: a pointer press dispatches from
-`pointerdown`, and the trailing `click` of that same gesture — including the
-extra click a `<label>` fires at its control — is suppressed, even if a key
-was pressed while the button was held. Clicks with no pointer gesture behind
+`pointerdown`, and the trailing `click` of that same gesture is suppressed,
+even if a key was pressed while the button was held. So is the extra click a
+`<label>` fires at its control when it reaches a handler the press already ran;
+one that reaches a different handler runs it, once (see [Labels](#labels)
+below). A press that dispatched nothing has
+nothing to duplicate, so its clicks are not suppressed: a `<label for="x">`
+**outside** every handler, whose `<input id="x">` sits inside a clickable
+wrapper, activates that wrapper once by mouse as it does by keyboard (issue
+#272; desktop runs the same label activation itself, #866 — see
+[Labels](#labels) below). The same rule lets a click through when something else
+swallowed the press: a third-party widget (a map, a chart) inside a clickable
+card that stops its own `pointerdown` from propagating now activates the card
+on release, as a browser's own `click` would — stop `click` too if the widget
+must not. Clicks with no pointer gesture behind
 them — assistive technology (whose clicks are *trusted*, with no pointer or
 key event of their own on Firefox/WebKit), `element.click()` — are honoured
 once, and a click a handler raises itself (`hidden_input.click()`) does not
@@ -313,6 +602,39 @@ browser — so a clicked `tabindex` element owns Enter/Space straight away,
 without having to be reached by Tab first. A component that wants the keys for
 itself (a code editor, a keyboard-driven grid) registers for them; see
 [Keyboard Focus](./focus.md).
+
+### Labels
+
+A press on a `<label>` activates the control it labels, on both backends, as a
+browser does: the control is **focused** and then **clicked**. The control is
+the element the label's `for` names (`label { "for": "email", "Email" }`, then
+`input { id: "email" }`), or, with no `for`, the first labelable element inside
+the label (`button`, `input` other than `hidden`, `meter`, `output`,
+`progress`, `select`, `textarea`). A `for` naming nothing labelable labels
+nothing — it does not fall back to a descendant. Focusing a text field puts the
+caret where `focus()` would; a `<select>` is focused closed. "Clicked" means
+the nearest `onclick` above the control runs, after the label's own, so
+`label { "for": "c" }` beside `div { onclick: …, input { r#type: "checkbox",
+id: "c" } }` runs that `onclick` once per press — and so does a label with an
+`onclick` of its own: the label's runs, then the control's (issue #2033).
+On desktop the activation runs on the **press**, as every desktop `onclick`
+does, where a browser waits for the click (press and release on the label): a
+press that is dragged off the label, or that starts a text selection in a
+`user-select: text` label, still activates the control on desktop. Only the
+nearest `onclick` above the control runs; a browser's forwarded click bubbles
+through all of the control's ancestors.
+
+Not activated: a press on interactive content inside the label (a `button`,
+a link, the control itself — that press is the element's own), a right or
+middle press, and a disabled control (its own `disabled`, or a
+`<fieldset disabled>` around it). A handler the press already ran is not run
+again by the label's click: `Checkbox`, `Radio` and `Switch` put their
+`onchange` on the `<label>` that wraps their `<input>`, and one press toggles
+them once. A browser runs such a handler twice; rinch-web suppresses the
+second as the gesture's duplicate (#272, #2033) and desktop never raises it
+(#866).
+`TextInput`'s and `Textarea`'s labels are not yet associated with their field,
+so a press on them focuses nothing on either backend (#2034).
 
 ### Enter in a `<textarea>`
 
@@ -330,6 +652,19 @@ So a notes field takes line breaks with no ceremony, a chat composer sends on
 Enter and takes a break on Shift+Enter, and a single-line `<input>` is
 unchanged — a line break is not representable in its value.
 
+A value wider than a single-line `<input>` stays on one line, as in a browser
+(#1721): it is clipped to the field's content box and scrolled horizontally to
+keep the caret in view. Moving the caret or typing past an edge scrolls by the
+least that shows it, focusing a field whose caret is out of view centres it,
+and losing focus scrolls back to the start (Chrome 155's behaviour). Clicks,
+the selection highlight, the caret, `NodeHandle::caret_rect` and the IME
+candidate box all follow the scroll. A `<textarea>` wraps at its content
+width and scrolls vertically (#827): its text is clipped to the field, a caret
+moved or typed past the top or bottom scrolls by the least that shows it, the
+mouse wheel and the overlay scrollbar scroll it when its text is taller than
+the box, and it keeps its scroll position when it loses focus, as in a
+browser.
+
 `onsubmit` is read the way `onchange` is: from the control, then up its
 ancestors, so an `onsubmit` on the wrapper around a field submits that field.
 One backend difference to know about: on web, **Shift+Enter in an `<input>`
@@ -342,11 +677,137 @@ keyboard is told per focused field which kind it is serving, so a `<textarea>`
 gets a keyboard whose Enter types a newline instead of an action key that ends
 the input session.
 
+### Moving between lines
+
+ArrowUp and ArrowDown move the caret one **visual** line in a `<textarea>` — a
+line the text soft-wrapped onto counts, as in a browser — aiming at the column
+the first of a run of vertical moves started from, so a short line in between
+does not pull the caret left for good. On desktop this reads the same text
+layout a click is hit-tested against, so the caret lands where a click at that
+height would put it. ArrowUp on the first line goes to the start of the text and
+ArrowDown on the last line to its end; in a single-line `<input>` that is all
+they do (Chrome's behaviour on Linux and Windows). Shift extends the selection.
+Without Shift a selection collapses, moving from its start (up) or its end
+(down). An `<input type="number">` is not moved: a browser steps its value
+there, which desktop does not do.
+
+Where a soft-wrapped line is shorter than the column aimed at, the caret goes
+to the line's wrap point — after its last character, and after the space the
+line broke at — and is drawn at the end of that line, as in a browser. The end
+of one visual line and the start of the next are the same text offset, so the
+caret carries an *affinity* saying which of the two it is drawn at; the next
+ArrowUp, ArrowDown, Home or End moves from the line it is drawn on, and any
+other caret change (typing, a click, a horizontal arrow) puts it back at the
+start of the lower line. Up to #941 desktop had no affinity and stopped one
+character short instead, which in text with no spaces (CJK) left the caret a
+column short.
+
+Home and End in a `<textarea>` go to the start and end of the caret's
+**visual** line, soft-wrapped lines included; Ctrl+Home and Ctrl+End go to the
+start and end of the whole text. Shift extends the selection. These are the
+Windows and Linux keys; macOS has its own, below.
+Without Shift a selection collapses and moves from its head — the end the
+caret is at — rather than from its start or end as ArrowUp and ArrowDown do,
+which is what Chrome does. In a single-line `<input>` Home and End go to the
+ends of the value. A Home or End moves the caret off the column a run of
+vertical moves was aiming at, so the next ArrowUp or ArrowDown aims from where
+the caret now is; one that leaves the caret where it was keeps that column, as
+in Chrome.
+
+End on a soft-wrapped line goes to its wrap point, with the caret drawn at the
+end of the line, as in a browser: when the wrap is at a space the caret is
+after that space, so a character typed there goes after it — `abcd abcd Xabcd`,
+as Chrome types it.
+
+On macOS the desktop keys are the platform's (Cocoa's, which Chrome and Safari
+follow in their text controls), not Windows' with Cmd for Ctrl (issue #951):
+
+| Keys | Windows / Linux | macOS |
+|------|-----------------|-------|
+| Word left / right | Ctrl+Left / Ctrl+Right | Option+Left / Option+Right |
+| Visual line's start / end | Home / End | Cmd+Left / Cmd+Right |
+| Start / end of the text | Ctrl+Home / Ctrl+End | Cmd+Up / Cmd+Down |
+| Delete a word backward / forward | Ctrl+Backspace / Ctrl+Delete | Option+Backspace / Option+Delete |
+
+A word is the rich-text editor's word (issue #1619): a run of punctuation is a
+word apart from the letters beside it, so `foo-bar|` + Ctrl+Backspace leaves
+`foo-` and Ctrl+Right from `|path/to/file` stops at `path|`, while `3.14`,
+`1,000`, `don't` and `snake_case` are one word each. In a `<textarea>` a line
+break is one stop: Ctrl+Right at a line's end moves just past it. Ctrl+Left
+does not leave the caret's line (from an indented line it stops at the line's
+start, as in Chrome) unless the caret is exactly at the line's start, where it
+moves just before the break, to the previous line's end (Chrome's textarea
+leaves the caret there). A word delete still never crosses a line break: beside one it
+deletes just the break.
+
+Shift extends with each of them. On macOS Home and End leave the caret where it
+is (they scroll the field there, and desktop does not scroll a field's text),
+and Shift+Home / Shift+End extend the selection to the start / end of the text.
+The rich-text editor's caret keys follow the same table on desktop. Not done on
+macOS: Ctrl+Left / Ctrl+Right (Cocoa's line moves) move one character, Option+Up /
+Option+Down (paragraph moves) move one line, Cmd+Backspace (delete to the line's
+start) deletes one character, and the Emacs keys (Ctrl+A / E / K / F / B / N / P)
+are not bound.
+
+A word delete in a `<textarea>` never crosses a line break: right after one it
+deletes just the break, as Chrome does. Words are split at whitespace only, so
+`foo-bar` is one word where a browser stops at the hyphen (#1619). In a password
+field a word is the whole value: a word delete removes everything before (or
+after) the caret and a word move goes to its start or end, so neither shows
+where its spaces are.
+
 ### Sizing a `<textarea>`
 
-A `<textarea>` holds its value in an attribute rather than as child text, so it
-has no content to size against. Its height comes from `rows`, which reserves
-that many lines plus padding and border — 2 rows when unset, matching HTML:
+A `<textarea>` holds its value in its `value` attribute, and has no content to
+size against. Text written as its child — `textarea { "hi" }`, or a parsed
+`<textarea>hi</textarea>` — is its *default* value, as in HTML: the field shows
+and edits it, and follows it when it changes (a reactive
+`textarea { {|| draft.get()} }`) — until the user edits the field or something
+sets its `value`. That is HTML's dirty value flag, which focusing and blurring
+do not set (#1186); from then on a child change updates only the default value
+(`defaultValue` on the web), and the field keeps what the user typed. The rule
+is the same on the desktop and on rinch-web, `value` writes included (#1222):
+a write equal to the shown text sets the flag too, as a script `.value` write
+does in Chrome, and removing the `value` attribute is a write of `""` — the
+field empties and stays dirty, since no script write clears the flag again.
+(A browser's form reset does; the desktop has no form reset.) A child change while the field is focused and
+unedited keeps the caret at its offset, clamped to the new text, as in Chrome.
+
+**A text child is not a controlled value.** Until #1206, rinch-web wrote a
+textarea's `value` from its children on every change (#100), so
+`textarea { {|| draft.get()} }` with `draft.set(String::new())` after a submit
+cleared the field there even after the user had typed — and did not on the
+desktop. It no longer does on either backend. For a field the app keeps in step
+with a signal, bind the value itself — a `value_fn` on the `Textarea`
+component, or a reactive `value:` on the raw element — which reaches the field
+whether or not the user has typed:
+
+```rust
+let draft = Signal::new(String::new());
+rsx! {
+    div {
+        Textarea {
+            value_fn: move || draft.get(),
+            oninput: move |v: String| draft.set(v),
+        }
+        // or, on the raw element:
+        // textarea { value: {|| draft.get()}, oninput: move |v: String| draft.set(v) }
+        button { onclick: move || { send(draft.get()); draft.set(String::new()); }, "Send" }
+    }
+}
+```
+
+It sizes the field no more than a value does. An `<input>`'s
+children are not shown at all, and neither is an **element** child of a
+`<textarea>` — a `div` built into one through rsx or `append_child` has no
+box, draws nothing and does not size the field (#1178), as in a browser. A control with no `width` is as wide as its
+`cols` (a textarea, default 20) or `size` (a text `<input>`, default 20)
+average characters of its font, as in a browser, and a textarea reserves a
+scrollbar's width beside them (#1177). A
+textarea's height comes from `rows`, which reserves that many lines plus
+padding and border — 2 rows when unset, matching HTML.
+`rows` is read as HTML reads it: the leading digits (`"3abc"` is 3, `"2.5"` is
+2), and 2 when there are none or they come to zero:
 
 ```rust
 rsx! {
@@ -355,9 +816,12 @@ rsx! {
 }
 ```
 
-`min-height` and an explicit `height` both work as usual: `height` overrides the
-`rows` height outright, and `min-height` acts as a floor, so the taller of the
-two wins. The `Textarea` component exposes the same thing as `min_rows`.
+`min-height`, `max-height` and an explicit `height` all work as usual: `height`
+overrides the `rows` height outright, `min-height` acts as a floor so the taller
+of the two wins, and `max-height` caps it. The `rows` height is the textarea's
+*content* height, as in a browser, so a `min-height: 0` textarea in a flex
+column can shrink below it. An `<input>` is sized the same way from one line.
+The `Textarea` component exposes the same thing as `min_rows`.
 
 ## Components
 
@@ -376,6 +840,161 @@ rsx! {
 ```
 
 Note: Shell-level constructs like windows, menus, and themes are configured at the runtime level via props, not in RSX.
+
+### Attributes on a component
+
+A component's props are the fields of its struct, so `Group { gap: "xs" }` sets
+a field. A **hyphenated** name can never be a Rust field, so `rsx!` treats one
+written on a component as an attribute for the component's **root DOM
+element**, applied after `Component::render` — the same route the universal
+`style:` and `class:` props take:
+
+```rust
+rsx! {
+    // The whole toolbar takes clicks without taking the keyboard; no wrapper div.
+    Group { gap: "xs", data-nofocus: "", aria-label: "Formatting",
+        Button { onclick: move || ed.command("toggleBold"), "B" }
+    }
+}
+```
+
+That covers `data-*`, `aria-*` and any other hyphenated name (issue #433). The
+rules are the HTML element's rules:
+
+- A **boolean attribute** — the HTML set and rinch's own `data-disabled`,
+  `data-nofocus`, `data-trap-focus`, `data-backdrop` and
+  `data-scroll-lock-exempt` — is written as a
+  presence for a truthy value and **removed** for a falsey one
+  ([Boolean attributes](#boolean-attributes)). Any other attribute is written as
+  the string.
+- A **reactive** value, `data-state: {|| state.get()}`, is an effect on the root
+  that rewrites the attribute when its signals change, and re-renders nothing —
+  on a component that re-renders for a reactive struct prop too (issue #1190):
+  the effect belongs to the current render, so a change to the attribute's
+  signals updates the root in place and the component keeps its local state.
+  When the component re-renders for its struct prop, every attribute is written
+  again on the new root, and a reactive one gets a fresh effect there. The same
+  holds for `style:`, `class:` and the style shorthands.
+- **The caller writes last.** An attribute the component also writes on its own
+  root takes the caller's value at mount, and a falsey boolean removes the
+  component's. After that the last write wins: a component effect that later
+  writes the same attribute overwrites the caller's value, and a reactive
+  attribute overwrites it back only when its own signals change. That includes
+  rinch's own wiring attributes: a caller's `data-rid` on a component replaces
+  the id of the component's own click handler, so it stops firing. Don't.
+
+A bare unhyphenated name — `title`, `id`, `role` — is a struct field on a
+component, and a component that does not declare one does not compile. That is
+deliberate: `Alert`, `Modal`, `Drawer`, `Notification`, `FloatingPanel` and
+`BorderlessWindow` declare a `title` that means a heading, and `rsx!` cannot
+tell the two meanings apart. **Quote the name** to mean the HTML attribute
+(issue #1653):
+
+```rust
+rsx! {
+    Button { "title": "Delete the row", "id": "delete", onclick: …, "Delete" }
+    // The heading prop and the tooltip, side by side:
+    Alert { title: "Heads up", "title": "Shown on hover", "Body" }
+    // Reactive, and surgical: only the attribute is rewritten.
+    Badge { "title": {move || format!("{} unread", n.get())}, "New" }
+}
+```
+
+A quoted name is always the attribute of that name, whatever the component
+declares, and it follows every rule above (boolean attributes, reactive values
+that re-render nothing, the caller writing last). It takes any attribute name —
+`"title"`, `"id"`, `"role"`, `"lang"`, `"dir"`, `"tabindex"`, and hyphenated
+ones (`"data-2x"`, which a bare spelling cannot even tokenize).
+`ActionIcon` and `CloseButton` also take a bare `title` prop of their own (see
+the [component reference](component-props.md#actionicon)).
+
+On an **HTML element** a quoted name is the same attribute as the bare one,
+except that it is never anything else: `div { "p": "x" }` is an attribute named
+`p`, where `p:` is the padding shorthand, and `"value_fn"` is an attribute where
+`value_fn:` is refused. These are compile errors, on any element:
+
+- a name that is not an attribute name (`""`, `"two words"`, `"1st"`, a non-ASCII
+  letter): it must start with an ASCII letter, `_` or `:`, then ASCII letters,
+  digits, `-`, `_`, `.` or `:`;
+- `"style"`, `"class"`, `"key"` and `"ref"`, which `rsx!` gives its own meaning
+  (merged styles and classes, the `for` key, the node ref): write them unquoted;
+- `"on…"`, an event handler content attribute — a string of script, which rinch
+  never runs: write the handler unquoted, `onclick: move || …`.
+
+### Keeping a handle to an element: `ref:`
+
+`ref: target` hands you the `NodeHandle` of the element it is written on, so you
+can reach an inner element later (to focus it, measure it, read its live value)
+without searching for it again from a root you saved (issue #1779). `target` is
+a `Signal<Option<NodeHandle>>` you create:
+
+```rust
+#[component]
+fn search_bar() -> NodeHandle {
+    let field: Signal<Option<NodeHandle>> = Signal::new(None);
+    let popup_at = Signal::new((0.0_f32, 0.0_f32));
+    rsx! {
+        div {
+            input { ref: field, placeholder: "Search" }
+            button {
+                onclick: move || {
+                    if let Some(rect) = field.get().and_then(|f| f.bounding_rect()) {
+                        popup_at.set((rect.x, rect.y + rect.height));
+                    }
+                },
+                "Suggest"
+            }
+        }
+    }
+}
+```
+
+- The signal is set to `Some(handle)` when the element is built (after its
+  attributes and children, just before it is attached to its parent), and back
+  to `None` when the element goes: the `if` branch it is in is hidden, its `for`
+  row is removed, the component that built it unmounts or re-renders. A clear
+  only happens while the signal still holds that element, so a branch shown in
+  its place, or a component's next render, keeps the new one.
+- It is an ordinary signal: an effect or `{|| …}` closure that reads it runs
+  again when the element arrives or goes. The set happens **during the build**:
+  outside a batch (a mount, an effect re-rendering a branch) a reader runs right
+  then, while the element is not yet attached to its parent, so
+  `bounding_rect()` answers `None` there. Read the handle from an event handler,
+  or once the tree is mounted.
+- One signal shared by several elements (`ref:` inside a `for`) holds the last
+  one built, and is cleared when **that** element goes — even if another element
+  that named it is still mounted. Give each element its own signal when you
+  need each one.
+- On a component, `ref:` is the component's **root** element, like `style:` and
+  `class:`. On a component that re-renders it follows each new root.
+- `ref` is a Rust keyword; `ref:` and `r#ref:` both work. `r#ref:` used to
+  write an HTML attribute named `ref` (or set a component field named `ref`);
+  it now means this binding.
+
+### Where an element is now: `bounding_rect()`
+
+`NodeHandle::bounding_rect()` answers, synchronously, the box an element is
+painted in: viewport-relative logical pixels, the frame of a click's
+`ClickContext` (`element_x` …) and of `bounds_signal()`, so a transform on the
+element or an ancestor moves and scales it, and a scroll moves it. On the web it
+is `getBoundingClientRect()`. An inline element (`<span>`, `<a>`, `<strong>`)
+answers the box around its fragments on its lines — a wrapped one, the union of
+all of them, without the white space hung at a line's end. On desktop it is the box as of the **last layout**:
+a style the same handler just wrote shows from the next frame, where a browser
+lays out to answer. An element under `display: none` (or one that is
+`display: contents`) answers a zero rect; a text node, or an element not in the
+document, answers `None`. `get_layout_bounds()` is a different question — the
+box relative to its parent, as laid out — and `bounds_signal()` is the reactive
+one, refreshed after each desktop layout and, in a browser, in the frame after
+anything that can move the element.
+
+`NodeHandle::viewport_size()` answers the viewport's size in the same frame —
+the box a `position: fixed; inset: 0` element fills — for code that keeps
+something on screen (desktop: the last layout's; web:
+`documentElement.clientWidth/clientHeight`; `None` before a first layout).
+`NodeHandle::layout_pending()` says whether what `bounding_rect()` answers is
+already out of date: `true` on desktop after a write the next layout has not
+seen, always `false` in a browser.
 
 ## Fragments
 
@@ -621,12 +1240,128 @@ hidden. That is guaranteed on **both** backends — issue #719 was a period duri
 which `rinch-web` lost the subtree on the first hide, silently, while desktop
 kept it.
 
-**Yield the handle as the branch's whole body.** The subtree is kept because the
-branch closure was *handed* it rather than building it, and that is asked of the
-branch's top-level result only. Wrapping it in markup the branch builds —
-`if open.get() { div { {panel.clone()} } }` — puts it inside something the branch
-owns, and it is thrown away with the wrapper (issue #732). Put the wrapper
-outside the `if`.
+**The subtree is kept wherever it sits in the branch's markup**, including
+nested inside something the branch builds itself —
+`if open.get() { div { {panel.clone()} } }` — which used to throw it away with
+the wrapper (issue #732). The wrapper `div` is the branch's own and is rebuilt
+on every show and discarded on every hide as usual; `panel` is detached rather
+than discarded along with it, and the next show puts the same `panel` back
+inside a fresh wrapper.
+
+What counts as "built by the branch" is anything minted through the branch's
+`RenderScope` or through a scope created on its behalf — a `for`'s rows, a
+nested `if`, a component, a `List` patching a late row — and anything minted
+by raw document access under such a node (an `Editor`'s blocks, raw HTML). If
+your own code builds nodes through a separate `RenderScope` that belong to the
+branch and go with it (an observer patching rows, a timer adding to the
+branch's markup), create it with
+`RenderScope::with_parent(doc, node, Some(scope.id()))`, naming the branch's
+scope. Content that must **outlive** the branch — a cache you show again later
+— must not name it: build it with `RenderScope::new`, or outside the branch,
+and it is only ever detached. A `RenderScope::new` placed inside a branch's
+markup belongs to no branch, so a hide only detaches its nodes; if nothing
+shows them again they are never reclaimed.
+
+#### A cache filled from inside a `for`
+
+An `if` can be handed a panel that was built before it. A `for` row usually
+cannot: the row's subtree depends on the item, so a cache of rows is filled
+*inside* the row's body, the first time each key is seen. Everything built
+through the scope the body is given belongs to the row — its nodes are discarded
+when the key leaves the list, and its effects, signals and event handlers are
+disposed — so a row cached that way is gone the next time its key appears
+(issue #733). On `rinch-web` nothing is shown for it; on desktop the nodes come
+back and their reactive bindings do not.
+
+Build a cached row with **`scope.build_cached(..)`** instead, and keep the
+`Cached` it returns:
+
+```rust
+type TabCache = Rc<RefCell<HashMap<u32, Cached>>>;
+
+/// Hand back the cached tab, or build it once and keep the entry.
+fn cached_tab(scope: &mut RenderScope, cache: &TabCache, id: u32) -> NodeHandle {
+    if let Some(hit) = cache.borrow().get(&id) {
+        return hit.node();
+    }
+    let entry = scope.build_cached(|__scope| rsx! {
+        article { {expensive_tab(__scope, id)} }
+    });
+    let tab = entry.node();
+    cache.borrow_mut().insert(id, entry);
+    tab
+}
+
+#[component]
+fn tab_strip(open_tabs: Signal<Vec<u32>>) -> NodeHandle {
+    // When the strip unmounts the cache drops, and every entry with it.
+    let cache = TabCache::default();
+    rsx! {
+        div {
+            for id in open_tabs.get() {
+                {cached_tab(__scope, &cache, id)}
+            }
+        }
+    }
+}
+```
+
+(This block is compiled and run as
+`crates/rinch-macros/tests/rsx_for_cache_scope_733.rs`.)
+
+- `scope.build_cached(|__scope| …)` builds through a new scope on the same
+  document that belongs to no row and no branch, so nothing the list does
+  discards what it builds. That scope also owns every `Signal::new`,
+  `Memo::new`, store and event handler created inside, so they outlive the row
+  too.
+- **A `Cached` is one value that owns the node and everything built with it,
+  and dropping it is the eviction** (issue #1454): its effects stop, its
+  signals and handlers are freed, its `on_cleanup`s run while the node is still
+  live, and then the node is discarded — taken out of the page if it is shown.
+  Evicting one entry is `cache.borrow_mut().remove(&id)`; when the component
+  that owns the cache unmounts, the map drops and every entry goes with it. A
+  key that never comes back holds its row until then. `entry.scope()` hands
+  you the entry's scope to add something to it later (an effect, a cleanup)
+  that lives and dies with the entry.
+- **A cached row is not rebuilt when its item changes.** The body is called
+  again for a changed item under the same key and hands the same node back, so
+  anything in it that should follow the item has to be reactive.
+
+The same works in an `if` or `match` body whose cache is filled lazily.
+
+`build_cached` is `scope.cache_scope()` (that new scope) plus
+`keep.build(|__scope| …)` (run the closure with it as the owner), with the
+two results kept together. The pair is still there for code that needs it, and
+then the node and the scope are two values you release yourself: dispose the
+scope and discard the node to evict. Building through the cache scope's `&mut`
+without `build` gives a row whose `Signal::new`s and `onclick`s belonged to
+the row that was rendering, and were freed with it — silently. A node left
+detached when its scope drops is discarded with it (issue #1508), so dropping
+the scope alone and keeping the node for later gives you a dead node.
+
+**What tells you when a cached row was built the wrong way.** When any
+`NodeHandle` insertion verb — `append_child`, `insert_before`, `insert_after`,
+`replace_with`; every `for`, `if`, `match` and component helper puts its
+content in with them — is handed a node that was already discarded, rinch
+counts it and emits a `tracing` warning, once per node and for at most 32 nodes
+per document (issue #1456). That covers a discarded node nested in fresh
+markup — `for t in tabs.get() { div { class: "tab", {cached} } }`, where the
+`div` comes back empty — as well as the body's root. Two limits:
+
+- **It is a `tracing` event, and nothing shows it unless a subscriber is
+  installed.** The desktop shell installs one; `rinch-web` installs none (issue
+  #1455), so a browser app sees it only with a console subscriber of its own
+  (the `tracing-wasm` crate is one), and `cargo test` prints it only if the
+  test installs one (`tracing_subscriber::fmt().with_test_writer()`). What a
+  test can assert on without one is the counter,
+  `rinch_core::dom::__retired_insertions()` — `(insertions seen, nodes warned
+  about)` on the current thread.
+- **Every backend reclaims discarded nodes**: desktop (since #723),
+  `rinch-web`, and the `MockDomDocument` your component tests run on. On each
+  the row is gone.
+
+So the absence of a warning proves nothing: test a cached list on the mock or
+in a browser, not only on desktop, and assert that the row is there.
 
 Two more things to know. The branch's `RenderScope` is disposed on every hide,
 so effects *created inside the branch closure* stop; put the reactive wiring in
@@ -654,6 +1389,97 @@ rsx! {
     }
 }
 ```
+
+`current_user.set(Some("Bob".into()))` redraws the greeting. A branch whose
+pattern **binds a name** follows that value: whenever a reactive value the
+scrutinee reads changes and the pattern still matches, the branch is disposed
+and built again, so `name` is the new value. A branch that binds nothing —
+`Some(_)`, `None`, a plain `if` — is built once each time it is shown, since
+nothing in it can be stale. The same rule applies to [`match`
+arms](#how-match-works-internally). (Before issue #2105 a binding branch was
+rebuilt only when the pattern started or stopped matching, so `Some("Alice")`
+→ `Some("Bob")` kept showing Alice.)
+
+What to know about the rebuild:
+
+- **It is a rebuild, not an update.** The branch's own state goes with it:
+  focus inside it, its scroll position, the rows of a keyed `for` inside it.
+  A branch whose own controls write the value it bound — a form whose inputs
+  edit the record it shows, a panel of sliders over the material it shows —
+  would be rebuilt on every keystroke or tick, and its control would lose
+  focus. Mark such a branch [`#[once]`](#once-build-a-branch-once-per-selection).
+
+- **There is no equality check.** The branch cannot compare old and new values
+  (they need be neither `PartialEq` nor `'static`), so it rebuilds whenever
+  the scrutinee re-runs, which is whenever a signal it read was written —
+  `Signal::set` with an equal value included. To skip equal values, put the
+  value behind a `Memo`, whose equality cut-off stops the re-run, or write with
+  `Signal::set_if_changed`:
+
+  ```rust
+  let user_name = Memo::new(move || session.get().map(|s| s.user_name));
+  rsx! {
+      if let Some(name) = user_name.get() {   // rebuilt only when the name changes
+          p { "Welcome, " {name} "!" }
+      }
+  }
+  ```
+
+  The same goes for a scrutinee that reads more than the value it binds:
+  `if let Some(row) = rows.get().get(i).cloned()` rebuilds on any change to
+  `rows`; a `Memo` over the row narrows it to changes of that row.
+
+- **Telling a binding from a constant.** `name` binds; `None`, `Mode::Edit`,
+  `0`, `_` do not. A bare identifier that starts with an uppercase letter is
+  read as a constant or unit variant, as Rust's naming convention has it — the
+  macro sees only syntax and cannot tell `Some(N)` binding `N` from `Some(N)`
+  matching a `const N`. So an uppercase binding is never rebuilt, exactly as if
+  the branch carried `#[once]`. Name bindings in snake_case.
+- **Nested branches on one signal** are built once per write: the outer
+  branch's rebuild replaces the inner one, which does not also rebuild itself.
+
+#### `#[once]`: build a branch once per selection
+
+`#[once]` before an `if` or a `match` keeps the behaviour rsx had before issue
+#2105: each branch is built when it is selected and keeps the value it bound
+then, however that value changes while it stays selected. Switching branches
+(`Some` → `None`, one arm to another) still rebuilds.
+
+```rust
+let draft = Signal::new(Some(Contact::default()));
+
+rsx! {
+    #[once]
+    if let Some(contact) = draft.get() {
+        // The field writes `draft` on every keystroke; without `#[once]` each
+        // keystroke would rebuild the branch and the field would lose focus.
+        TextInput {
+            label: "Name",
+            value_fn: move || draft.get().map(|c| c.name).unwrap_or_default(),
+            oninput: move |v: String| draft.update(|d| if let Some(d) = d { d.name = v }),
+        }
+        p { "Contact #" {contact.id.to_string()} }   // read once: the id does not change
+    }
+}
+```
+
+- On an `if`, `#[once]` covers the whole `else if` chain.
+- On a `match`, it covers every arm. It can also go on **one arm**, which is
+  useful when only one arm holds a form:
+
+  ```rust
+  match mode.get() {
+      #[once]
+      Mode::Editing(draft) => { EditForm { draft } },   // its inputs write `mode`
+      Mode::Viewing(item) => { ItemView { item } },     // follows `item`
+  }
+  ```
+
+- Inside a `#[once]` branch, read anything that changes through a reactive
+  closure (`{|| …}`, `value_fn`), not through the binding: the binding is the
+  value at the time the branch was built.
+- `#[once]` is the only attribute rsx accepts there; on an element, or with
+  another name, it is a compile error.
 
 #### How `if` works internally
 
@@ -774,7 +1600,7 @@ rsx! {
 
 #### Keys
 
-Use `key:` on the first child element or component to enable efficient keyed reconciliation. When the list changes, items with the same key are preserved (not re-rendered), and only new/removed items trigger DOM operations:
+Use `key:` on the first child element or component to enable efficient keyed reconciliation. When the list changes, a row whose key and item are both unchanged is kept, a reordered row is moved, and only new and removed items build or drop rows. A row whose key is unchanged but whose item changed (by `PartialEq`) is **rendered again** with the new item, which drops its per-row state and anything it owns, such as a `Window`'s window. To keep such a row, make the item only what decides the row (its id) and read the rest reactively inside it (`for id in output_ids()` with `output(id)` inside, for a window per monitor):
 
 ```rust
 for item in items.get() {
@@ -850,6 +1676,13 @@ for todo in todos.get() {
     }
 }
 ```
+
+A binding counts as used if **either** the `key:` expression or the body reads it, so an item
+used only as a key (`for id in ids { span { key: id, "row" } }`) does not warn `unused variable`,
+and neither does an `if let` or `match` binding its branch reads. A binding nothing reads still
+warns, at your pattern. (For a `for` loop the check is by name, so a binding that both the key
+and the body merely *spell* — as a path segment or a struct-literal field name, say — can go
+unreported.)
 
 **Note:** The item type must implement `Clone + PartialEq + 'static` for `for` loops to work. This enables efficient data comparison for selective re-rendering.
 
@@ -931,7 +1764,9 @@ rsx! {
 
 #### Match with pattern bindings
 
-Patterns that bind variables work — each arm re-evaluates the scrutinee to extract the bound values:
+Patterns that bind variables work — each arm re-evaluates the scrutinee to extract the bound values,
+and an arm that binds is rebuilt when the value changes while the arm still matches, so
+`Ok("Hello")` → `Ok("Bye")` redraws (see [`if let`](#if-let) for what a rebuild costs):
 
 ```rust
 let result = Signal::new(Ok::<String, String>("Hello".into()));
@@ -959,9 +1794,63 @@ match score.get() {
 }
 ```
 
+#### Several nodes in one arm
+
+An arm body in braces can hold several nodes, as an `if` or `for` body can —
+they are rendered together as the arm:
+
+```rust
+match tab.get() {
+    0 => { h2 { "Home" } p { "Welcome back." } },
+    1 => { let n = count.get(); b { {n.to_string()} } " items" },
+    2 => { Badge { "new" } Badge { "beta" } },
+    _ => { overview_section(__scope) },   // one expression, as always
+}
+```
+
+What the braces hold is decided by how they **start**:
+
+- `let` always starts rsx nodes.
+- An element or component (`div {`, `Card {`), a string literal, `if`/`for`/
+  `match`, or an interpolation `{ … }` starts rsx nodes **when more nodes follow
+  it**: `{ {label} span { "!" } }`, `{ if open.get() { "▾" } span { "Menu" } }`.
+- An element, component or string literal on its own is that one node.
+- Anything else is a single Rust expression, as it always was: a call, a
+  variable, a closure, and a method called on a literal or on a struct
+  (`{ "a".to_string() }`, `{ if a { "x" } else { "y" } .len() }`). So
+  `{ overview_section(__scope) }`, `{ panel.clone() }` and
+  `{|| count.get().to_string()}` are unchanged. Lone control flow in braces is
+  the transparent brace described under
+  [Braces around control flow](#braces-around-control-flow).
+
+(Until issue #395 only a body starting with `let` could hold more than one node.)
+A mistake inside a multi-node arm is reported by the rsx parser, at the
+mistake, like one in any other rsx body — including one inside a leading
+`if`/`for`/`match` when another node follows it. (Finding that following node
+after a head that failed to parse is a token-level heuristic: a condition that
+itself holds braces, such as `if let Foo { a } = x`, can defeat it and leave you
+with the single-node error instead.) A lone braced `if`/`for`/`match` whose
+bodies are not rsx still gets the "renders once" error described under
+[Braces around control flow](#braces-around-control-flow).
+
+One consequence: `{ Point { x: 1 } }` in an arm is a component named `Point`,
+exactly as `Point { x: 1 }` unbraced is, not a Rust struct literal. A struct
+literal that cannot be an element — shorthand fields (`{ Foo { a } }`), a `..`
+base (`{ Foo { ..Default::default() } }`), or one with a method called on it
+(`{ Point { x: 1 }.into_node(__scope) }`) — stays an expression, and so does a
+path such as `geom::Point { x: 1 }`, which is not an element name.
+
 #### How `match` works internally
 
 The `match` block desugars to `match_dom()`, which generalizes `show_dom()` to N branches. A discriminant closure returns the index of the active branch (0, 1, 2, ...). When the discriminant changes, the old branch is disposed and the new branch is rendered.
+
+An arm whose pattern binds a name (`Some(n) => …`, `Msg::Text(body) => …`) is
+also rebuilt when the discriminant re-runs and picks the same arm again, so it
+always shows the current value; that desugars to `match_dom_rebinding()`, and
+an `if let` that binds desugars to `show_dom_rebinding()`. Arms that bind
+nothing (`0 =>`, `Tab::About =>`, `None =>`, `_ =>`) are built once per
+selection. The [`if let`](#if-let) section above lists what a rebuild costs and
+how a `Memo` scrutinee avoids rebuilding for an equal value.
 
 ### Programmatic Conditional Rendering (show_dom)
 

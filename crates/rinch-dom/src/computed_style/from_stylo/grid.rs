@@ -2,6 +2,7 @@
 
 use style::computed_values::grid_auto_flow::T as GridAutoFlow;
 use style::values::computed::{GridLine, GridTemplateComponent};
+use style::values::computed::{GridTemplateAreas, ImplicitGridTracks};
 use style::values::generics::grid::{RepeatCount, TrackBreadth, TrackListValue, TrackSize};
 use style::values::specified::GenericGridTemplateComponent;
 
@@ -94,6 +95,75 @@ pub(super) fn grid_template_tracks_from_stylo(
     }
 }
 
+/// The `[names]` of a track list (#2704) as Taffy reads them: one set per
+/// line between the list's top-level components, `values.len() + 1` sets,
+/// where a `repeat()` counts as one component and keeps its own names in
+/// [`grid_template_tracks_from_stylo`]'s `line_names`.
+///
+/// Taffy walks a `repeat()`'s names only while it walks these sets (it takes
+/// the next component after each set), so the list is empty only when no
+/// line is named anywhere, the top level and every `repeat()` alike.
+pub(super) fn grid_template_line_names_from_stylo(
+    input: &GridTemplateComponent,
+) -> Vec<Vec<String>> {
+    let GenericGridTemplateComponent::TrackList(list) = input else {
+        return Vec::new();
+    };
+    let named_in_repeat = list.values.iter().any(|value| match value {
+        TrackListValue::TrackRepeat(repeat) => repeat.line_names.iter().any(|set| !set.is_empty()),
+        TrackListValue::TrackSize(_) => false,
+    });
+    if !named_in_repeat && list.line_names.iter().all(|set| set.is_empty()) {
+        return Vec::new();
+    }
+    (0..=list.values.len())
+        .map(|line| {
+            list.line_names
+                .get(line)
+                .map(|set| set.iter().map(|ident| ident.0.to_string()).collect())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// `grid-template-areas` (#2704) as Taffy's areas. Stylo numbers an area's
+/// rows and columns by their lines from 1, end exclusive, as Taffy does; the
+/// template's size (its strings, and the columns in each) is the explicit
+/// grid's size where the track lists are shorter.
+pub(super) fn grid_template_areas_from_stylo(
+    input: &GridTemplateAreas,
+) -> Option<taffy::GridTemplateAreas<String>> {
+    let GridTemplateAreas::Areas(areas) = input else {
+        return None;
+    };
+    let areas = &areas.0;
+    let clamp = |n: u32| u16::try_from(n).unwrap_or(u16::MAX);
+    Some(taffy::GridTemplateAreas {
+        areas: areas
+            .areas
+            .iter()
+            .map(|area| taffy::GridTemplateArea {
+                name: area.name.to_string(),
+                row_start: clamp(area.rows.start),
+                row_end: clamp(area.rows.end),
+                column_start: clamp(area.columns.start),
+                column_end: clamp(area.columns.end),
+            })
+            .collect(),
+        row_count: clamp(areas.strings.len() as u32),
+        column_count: clamp(areas.width),
+    })
+}
+
+/// `grid-auto-columns` / `grid-auto-rows` (#2716) as Taffy's auto track
+/// list: each value converted as a track list's single size. Stylo keeps the
+/// initial `auto` as an empty list, which Taffy reads as `auto` too.
+pub(super) fn grid_auto_tracks_from_stylo(
+    input: &ImplicitGridTracks,
+) -> Vec<taffy::TrackSizingFunction> {
+    input.0.iter().map(track_size_from_stylo).collect()
+}
+
 fn track_repeat_from_stylo(input: RepeatCount<i32>) -> taffy::RepetitionCount {
     match input {
         RepeatCount::Number(val) => taffy::RepetitionCount::Count(val.try_into().unwrap_or(1)),
@@ -135,7 +205,7 @@ fn min_track_from_stylo(
         TrackBreadth::Breadth(lp) => {
             taffy::MinTrackSizingFunction::from(length_percentage_from_stylo_lp(lp))
         }
-        TrackBreadth::Fr(_) => taffy::MinTrackSizingFunction::auto(),
+        TrackBreadth::Flex(_) => taffy::MinTrackSizingFunction::auto(),
         TrackBreadth::Auto => taffy::MinTrackSizingFunction::auto(),
         TrackBreadth::MinContent => taffy::MinTrackSizingFunction::min_content(),
         TrackBreadth::MaxContent => taffy::MinTrackSizingFunction::max_content(),
@@ -149,7 +219,7 @@ fn max_track_from_stylo(
         TrackBreadth::Breadth(lp) => {
             taffy::MaxTrackSizingFunction::from(length_percentage_from_stylo_lp(lp))
         }
-        TrackBreadth::Fr(val) => taffy::MaxTrackSizingFunction::fr(*val),
+        TrackBreadth::Flex(val) => taffy::MaxTrackSizingFunction::fr(val.0),
         TrackBreadth::Auto => taffy::MaxTrackSizingFunction::auto(),
         TrackBreadth::MinContent => taffy::MaxTrackSizingFunction::min_content(),
         TrackBreadth::MaxContent => taffy::MaxTrackSizingFunction::max_content(),
@@ -164,8 +234,8 @@ fn max_track_from_stylo(
 /// like the rest of the #278 family, because its output is a bare Taffy value
 /// stored inside `grid_template_*`/`grid_auto_*` on the Taffy style — there is
 /// no `ComputedStyle` slot to carry the pair to `resolve_layout_calcs`, and
-/// Taffy's own calc pointer resolves to `0.0` under `TaffyTree` (taffy-0.12.2,
-/// `src/tree/taffy_tree.rs:391`). Until grid tracks grow a side channel, a
+/// Taffy's own calc pointer resolves to `0.0` under `TaffyTree` (taffy-0.14.0,
+/// `src/tree/taffy_tree.rs:387`). Until grid tracks grow a side channel, a
 /// mixed calc keeps its percentage component — `calc(50% - 10px)` sizes the
 /// track at `50%`, off by the length part, where it used to collapse to `0`.
 fn length_percentage_from_stylo_lp(

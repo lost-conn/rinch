@@ -60,32 +60,18 @@ pub use player::{PlaybackState, VideoPlayer, VideoPlayerBackend};
 pub use viewport::VideoViewport;
 
 use std::cell::{Cell, RefCell};
-use std::sync::{Mutex, OnceLock};
-
-/// Callback type for creating a frame sink for a video player.
-/// Called with the viewport_id; returns a FrameSink that delivers frames
-/// to the rendering pipeline (e.g., via RenderSurface).
-type FrameSinkFactory = Box<dyn Fn(&str) -> player::FrameSink + Send>;
-
-/// Global factory for creating frame sinks.
-/// Set by the rinch shell on startup.
-static FRAME_SINK_FACTORY: OnceLock<Mutex<FrameSinkFactory>> = OnceLock::new();
 
 /// Register a factory that creates frame sinks for video players.
 ///
-/// Called once by the rinch shell during initialization. The factory
-/// receives a viewport_id and returns a `FrameSink` that delivers
-/// decoded frames to the compositor (typically via `SurfaceWriter`).
-pub fn set_frame_sink_factory(f: impl Fn(&str) -> player::FrameSink + Send + 'static) {
-    let _ = FRAME_SINK_FACTORY.set(Mutex::new(Box::new(f)));
+/// The factory now lives in rinch-core (`rinch_core::video_sink`, shared
+/// with rinch-rtc's remote video); this forwards to it. The first call wins.
+pub fn set_frame_sink_factory(f: impl Fn(&str) -> player::FrameSink + Send + Sync + 'static) {
+    rinch_core::video_sink::set_video_sink_factory(f);
 }
 
 /// Create a frame sink for the given viewport, if a factory is registered.
 pub(crate) fn create_frame_sink(viewport_id: &str) -> Option<player::FrameSink> {
-    FRAME_SINK_FACTORY
-        .get()
-        .and_then(|f| f.lock().ok())
-        .map(|f| f(viewport_id))
+    rinch_core::video_sink::create_video_sink(viewport_id)
 }
 
 thread_local! {
@@ -134,11 +120,16 @@ pub(crate) fn decrement_video_loaded() {
 
 /// Register a player as active (called on play).
 pub(crate) fn register_active_player(player: VideoPlayer) {
-    // Set up the frame sink if a factory is available and sink isn't already set.
+    // Set up the frame sink if a factory is available and the player does not
+    // have one yet. Once per player, not once per `play()`: the sink owns a
+    // render surface, so every resume used to register one more (issue #363).
     #[cfg(not(target_arch = "wasm32"))]
     {
-        if let Some(sink) = create_frame_sink(&player.viewport_id()) {
-            player.set_frame_sink(sink);
+        if !player.frame_sink_installed.get() {
+            if let Some(sink) = create_frame_sink(&player.viewport_id()) {
+                player.set_frame_sink(sink);
+                player.frame_sink_installed.set(true);
+            }
         }
     }
 

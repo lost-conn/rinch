@@ -1,24 +1,75 @@
 //! Shell module - window management and event loop.
 
-#[cfg(feature = "gpu")]
+#[cfg(feature = "windowing")]
+pub mod activation;
+// xdg-activation token requests awaiting the compositor (#2501).
+#[cfg(feature = "windowing")]
+pub(crate) mod activation_tokens;
+#[cfg(feature = "gpu-renderer")]
 pub(crate) mod compositor;
-#[cfg(feature = "gpu")]
+// `GameViewport` base layers' frame and their fallback (#1866).
+#[cfg(feature = "gpu-renderer")]
+pub(crate) mod base_fallback;
+#[cfg(feature = "gpu-renderer")]
 pub mod desktop;
 pub mod devtools_css;
 pub mod devtools_panel;
 pub mod devtools_store;
-#[cfg(feature = "gpu")]
+// GPU presents paced by Wayland frame callbacks (#2669).
+#[cfg(feature = "gpu-renderer")]
+pub(crate) mod frame_pacing;
+#[cfg(feature = "gpu-renderer")]
 pub(crate) mod frame_upload;
+// The shared GPU device and its replacement after a loss (#1788).
+#[cfg(feature = "gpu-renderer")]
+pub(crate) mod gpu_device;
 pub mod html_parser;
+// A window sized by its content: the shell's decisions (#2552).
+#[cfg(feature = "windowing")]
+pub(crate) mod content_sizing;
+#[cfg(feature = "windowing")]
+pub(crate) mod layer_shell;
 pub mod memory_profile;
-#[cfg(feature = "desktop")]
+#[cfg(feature = "windowing")]
+pub(crate) mod os_file_drag;
+#[cfg(feature = "windowing")]
+pub(crate) mod popup_positioner;
+// The connected monitors, for placing windows and for `rinch::outputs` (#2414).
+#[cfg(feature = "windowing")]
+pub(crate) mod outputs;
+#[cfg(feature = "windowing")]
+pub(crate) mod overlay_window;
+// The main window's pointer lock and raw motion (#2092).
+#[cfg(feature = "windowing")]
+pub(crate) mod pointer_lock;
+#[cfg(feature = "windowing")]
+pub mod renderer;
+#[cfg(feature = "windowing")]
 pub mod rinch_runtime;
+// How the event loop ended other than normally (#2531).
+#[cfg(feature = "windowing")]
+pub(crate) mod run_error;
 pub mod screenshot;
-#[cfg(feature = "desktop")]
+#[cfg(feature = "windowing")]
 pub mod softbuffer_renderer;
-pub mod types;
-#[cfg(feature = "desktop")]
+// The split-layer compositor (#1865), used by `split_frame`. Crate-level
+// modules since the embed overlay composites with them too (#1866).
+#[cfg(feature = "gpu-renderer")]
+pub(crate) use crate::split_compositor;
+#[cfg(all(test, feature = "gpu-renderer"))]
+mod split_compositor_1865_tests;
+#[cfg(feature = "gpu-renderer")]
+pub(crate) use crate::split_frame;
+#[cfg(all(test, feature = "gpu-renderer"))]
+mod split_pages_1865_oracle;
+#[cfg(all(test, feature = "gpu-renderer"))]
+mod split_pages_1865_tests;
+#[cfg(all(test, feature = "gpu-renderer"))]
+mod split_slices_1865_tests;
+#[cfg(feature = "windowing")]
 pub mod window;
+#[cfg(feature = "windowing")]
+pub(crate) mod window_geometry;
 
 #[cfg(all(feature = "android", target_os = "android"))]
 pub mod android_runtime;
@@ -37,6 +88,12 @@ pub(crate) mod android_frame;
 #[cfg(any(all(feature = "android", target_os = "android"), test))]
 pub(crate) mod android_ime;
 
+// The Android hardware-key translator. What a key event becomes — a press, a
+// release, how each is spelled, what a dead key leaves pending — is decided
+// over plain data, so it is compiled for the host test build too (issue #479).
+#[cfg(any(all(feature = "android", target_os = "android"), test))]
+pub(crate) mod android_key;
+
 // The Android touch recogniser. `android_runtime` compiles only for
 // `target_os = "android"`, but the translation from finger to pointer events is
 // pure and is the part that has to be pinned down by tests, so it is compiled
@@ -45,18 +102,17 @@ pub(crate) mod android_ime;
 pub(crate) mod touch_gesture;
 
 pub use devtools_store::DevToolsStore;
-#[cfg(feature = "desktop")]
+#[cfg(feature = "windowing")]
 pub use rinch_runtime::inject_platform_event;
-#[cfg(feature = "desktop")]
+#[cfg(feature = "windowing")]
 #[allow(deprecated)]
 pub use rinch_runtime::{run_on_main_thread, run_rinch, run_rinch_with_window_props};
-#[cfg(feature = "desktop")]
-pub use types::RinchEvent;
-pub use types::{ElementLayout, HoveredElementInfo};
+#[cfg(feature = "windowing")]
+pub use run_error::RunError;
 
-#[cfg(feature = "desktop")]
+#[cfg(feature = "windowing")]
 use rinch_core::dom::{NodeHandle, RenderScope};
-#[cfg(feature = "desktop")]
+#[cfg(feature = "windowing")]
 use rinch_core::element::ThemeProviderProps;
 
 // ── Entry points ─────────────────────────────────────────────────────────────
@@ -88,7 +144,7 @@ use rinch_core::element::ThemeProviderProps;
 ///     App::new(app).title("My App").size(800, 600).run();
 /// }
 /// ```
-#[cfg(feature = "desktop")]
+#[cfg(feature = "windowing")]
 #[deprecated(
     since = "0.3.0",
     note = "use `App::new(component).title(title).size(width, height).run()`"
@@ -107,7 +163,7 @@ where
 ///
 /// This sets up theme CSS variables before running the application, making them
 /// available throughout the component tree.
-#[cfg(feature = "desktop")]
+#[cfg(feature = "windowing")]
 #[deprecated(
     since = "0.3.0",
     note = "use `App::new(component).title(title).size(width, height).theme(theme).run()`"
@@ -128,7 +184,7 @@ pub fn run_with_theme<F>(
         .run();
 }
 
-#[cfg(feature = "desktop")]
+#[cfg(feature = "windowing")]
 use rinch_core::element::WindowProps;
 
 /// Run a rinch application with a native menu bar.
@@ -152,7 +208,7 @@ use rinch_core::element::WindowProps;
 ///     .menu(vec![("File", file_menu)])
 ///     .run();
 /// ```
-#[cfg(feature = "desktop")]
+#[cfg(feature = "windowing")]
 #[deprecated(
     since = "0.3.0",
     note = "use `App::new(component).title(title).size(width, height).menu(menus).run()`"
@@ -174,7 +230,7 @@ pub fn run_with_menu<F>(
 }
 
 /// Run a rinch application with full window configuration and theme.
-#[cfg(feature = "desktop")]
+#[cfg(feature = "windowing")]
 #[deprecated(
     since = "0.3.0",
     note = "use `App::new(component).window_props(props).run()`, adding `.theme(theme)` if there is one"
@@ -189,7 +245,7 @@ where
 }
 
 /// Run a rinch application with full window configuration, theme, and optional native menu.
-#[cfg(feature = "desktop")]
+#[cfg(feature = "windowing")]
 #[deprecated(
     since = "0.3.0",
     note = "use `App::new(component).window_props(props).menu(menus).run()`, adding `.theme(theme)` if there is one"
@@ -222,7 +278,7 @@ pub fn run_with_window_props_and_menu<F>(
 ///
 /// rinch still owns the instance, picks a surface-compatible adapter, and
 /// creates the device, so window presentation is always correct. After startup,
-/// obtain the shared device via [`gpu_handle`](crate::gpu_handle).
+/// obtain the shared device via `gpu_handle`.
 ///
 /// # Example
 ///
@@ -236,10 +292,11 @@ pub fn run_with_window_props_and_menu<F>(
 ///     .gpu_config(RinchGpuConfig {
 ///         required_features: wgpu::Features::FLOAT32_FILTERABLE,
 ///         required_limits: limits,
+///         ..Default::default()
 ///     })
 ///     .run();
 /// ```
-#[cfg(feature = "gpu")]
+#[cfg(feature = "gpu-renderer")]
 #[deprecated(
     since = "0.3.0",
     note = "use `App::new(component).window_props(props).gpu_config(gpu).run()`"
@@ -266,7 +323,7 @@ pub fn run_with_gpu_config<F>(
 /// rinch creates only the window surface (from the provided `instance`),
 /// validates that the adapter can present to it, and composites directly onto
 /// the provided device — no `request_device`, no CPU readback. The provided
-/// device is published through [`gpu_handle`](crate::gpu_handle).
+/// device is published through `gpu_handle`.
 ///
 /// Prefer this when the embedder must keep its exact device descriptor; prefer
 /// [`App::gpu_config`](crate::App::gpu_config) when it only needs to raise
@@ -278,7 +335,7 @@ pub fn run_with_gpu_config<F>(
 /// Panics if the supplied adapter cannot present to rinch's window surface. The
 /// adapter/device must be created from an adapter that supports the target
 /// window (on multi-GPU systems, create the adapter with a compatible surface).
-#[cfg(feature = "gpu")]
+#[cfg(feature = "gpu-renderer")]
 #[deprecated(
     since = "0.3.0",
     note = "use `App::new(component).window_props(props).external_gpu(gpu).run()`"

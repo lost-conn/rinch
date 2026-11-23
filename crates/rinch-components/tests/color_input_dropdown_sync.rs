@@ -36,12 +36,15 @@ use rinch_components::color_input::ColorInput;
 use rinch_components::color_utils::parse_color;
 use rinch_core::dom::traits::DomDocument;
 use rinch_core::dom::{NodeHandle, RenderScope, mock::MockDomDocument};
-use rinch_core::events::{
-    ClickContext, EventHandlerId, dispatch_event, dispatch_input_event, set_click_context,
-    update_drag,
-};
+use rinch_core::events::{EventHandlerId, dispatch_event, dispatch_input_event, update_drag};
 use rinch_core::reactive::Effect;
 use rinch_core::{Component, InputCallback, Signal};
+
+mod common;
+use common::{
+    Echo, click_at, find_by_class, handler, hue_of, percent_of, record_store, thumb_style,
+    type_desktop,
+};
 
 /// Red at full saturation and value — the picker's own fallback, and the
 /// mount colour every scenario starts from unless it says otherwise.
@@ -56,17 +59,6 @@ const REMOTE: &str = "#8844dd";
 const LOW_CHROMA: &str = "hsl(200, 3%, 49%)";
 const LOW_CHROMA_MOVED: &str = "hsl(205, 3%, 49%)";
 const LOW_CHROMA_HEX: &str = "#797e81";
-
-/// Whether the consumer writes each emission back to the bound store — the
-/// controlled-input shape.
-#[derive(Clone, Copy, PartialEq)]
-enum Echo {
-    Back,
-    /// The controlled idiom that *reads* the store inside the handler:
-    /// `if value != store.get() { store.set(value) }`.
-    IfChanged,
-    Never,
-}
 
 struct Input {
     // Kept alive for the test's duration: the document owns the nodes the
@@ -138,10 +130,8 @@ impl Input {
             value_fn: store.map(|store| -> Rc<dyn Fn() -> String> { Rc::new(move || store.get()) }),
             onchange: Some(InputCallback::new(move |value: String| {
                 seen.borrow_mut().push(value.clone());
-                match (echo, store) {
-                    (Echo::Back, Some(store)) => store.set(value),
-                    (Echo::IfChanged, Some(store)) if value != store.get() => store.set(value),
-                    _ => {}
+                if let Some(store) = store {
+                    echo.write_back(store, value);
                 }
             })),
             swatches: vec!["#22aa55".into()],
@@ -195,22 +185,16 @@ impl Input {
     }
 
     fn handler(&self, class: &str, attr: &str) -> EventHandlerId {
-        let node = find_by_class(&self.root, class).expect("element exists");
-        EventHandlerId(
-            node.get_attribute(attr)
-                .expect("element carries a handler id")
-                .parse()
-                .expect("handler id is numeric"),
-        )
+        handler(&self.root, class, attr)
     }
 
     /// One keystroke, desktop-shaped: the runtime mirrors the field's text
     /// into the `value` attribute, then dispatches `oninput` with it.
     fn type_text(&self, text: &str) {
-        self.field().set_attribute("value", text);
-        dispatch_input_event(
+        type_desktop(
+            &self.field(),
             self.handler("rinch-color-input__input", "data-oninput"),
-            text.to_string(),
+            text,
         );
     }
 
@@ -233,10 +217,7 @@ impl Input {
     /// The style attribute of a thumb in the dropdown picker — where the
     /// picker says a degree of freedom currently sits.
     fn thumb_style(&self, class: &str) -> String {
-        find_by_class(&self.root, class)
-            .expect("thumb exists")
-            .get_attribute("style")
-            .expect("thumb is positioned")
+        thumb_style(&self.root, class)
     }
 
     /// The hue thumb's position, in percent of the slider (h / 360 · 100).
@@ -277,56 +258,6 @@ impl Input {
             (1.0 - hsv.v) * 100.0
         );
     }
-}
-
-/// Record every value `store` ever holds — what a peer on the other end of a
-/// controlled binding would receive — returning the log and the effect that
-/// keeps it.
-fn record_store(store: Signal<String>) -> (Rc<RefCell<Vec<String>>>, Effect) {
-    let published: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-    let recorded = published.clone();
-    let recorder = Effect::new(move || {
-        let value = store.get();
-        recorded.borrow_mut().push(value);
-    });
-    (published, recorder)
-}
-
-fn find_by_class(node: &NodeHandle, class: &str) -> Option<NodeHandle> {
-    let matches = node
-        .get_attribute("class")
-        .is_some_and(|attr| attr.split_whitespace().any(|c| c == class));
-    if matches {
-        return Some(node.clone());
-    }
-    node.children().iter().find_map(|c| find_by_class(c, class))
-}
-
-/// A click at (`px`, `py`) of a 200×200 element at the origin.
-fn click_at(px: f32, py: f32) {
-    set_click_context(ClickContext {
-        mouse_x: px * 200.0,
-        mouse_y: py * 200.0,
-        element_x: 0.0,
-        element_y: 0.0,
-        element_width: 200.0,
-        element_height: 200.0,
-        ..Default::default()
-    });
-}
-
-fn hue_of(color: &str) -> f64 {
-    parse_color(color).expect("a formatted colour parses").h
-}
-
-/// The `key`-prefixed percentage in a thumb's style string, e.g.
-/// `percent_of(&style, "left: ")`. Click-derived positions carry f32→f64
-/// noise, so callers compare within a tolerance.
-fn percent_of(style: &str, key: &str) -> f64 {
-    let start = style.find(key).expect("style carries the key") + key.len();
-    let rest = &style[start..];
-    let end = rest.find('%').expect("a % terminates the value");
-    rest[..end].trim().parse().expect("the value is numeric")
 }
 
 /// Typing a whole colour moves the dropdown picker to it.
@@ -477,6 +408,48 @@ fn a_saturation_drag_is_not_reverted_by_its_own_echo() {
         expected,
         "the store saw the seed and one write per frame — nothing else"
     );
+}
+
+/// A controlled `onchange` that writes back a *transformed* colour leaves no
+/// deferred-apply marker armed in the dropdown picker (#283).
+///
+/// The snap's apply runs down the picker's coordinating effect's own stack,
+/// where the flush cannot re-run that effect, so a marker armed for it was
+/// never taken — and swallowed the next author act that landed on the
+/// snapped colour: the swatch click below reported nothing, and the wrapper's
+/// `current_value` write that repopulates the emptied field never happened.
+#[test]
+fn a_snapping_handler_does_not_swallow_a_click_on_the_snapped_swatch() {
+    const SNAPPED: &str = "#22aa55";
+    let input = Input::bound(START, "", Echo::Snap(SNAPPED));
+
+    input.press_saturation(0.5, 0.5); // s = 0.5, v = 0.5 — not the snap
+    assert_eq!(input.emissions().len(), 1, "the drag reports once");
+    assert_eq!(input.store().get(), SNAPPED, "and the app snapped it");
+    input.assert_picker_at(SNAPPED, "the picker follows the snapped colour");
+
+    // The author empties the field, then clicks the swatch the app snaps to.
+    input.type_text("");
+    let swatch = find_by_class(&input.root, "rinch-color-picker__swatches")
+        .expect("swatches grid")
+        .children()
+        .first()
+        .expect("one swatch")
+        .clone();
+    dispatch_event(EventHandlerId(
+        swatch
+            .get_attribute("data-rid")
+            .expect("swatch is clickable")
+            .parse()
+            .expect("handler id is numeric"),
+    ));
+
+    assert_eq!(
+        input.emissions(),
+        vec![input.emissions()[0].clone(), SNAPPED.to_string()],
+        "the swatch click is an author act and reports once"
+    );
+    assert_eq!(input.field_text(), SNAPPED, "and it repopulates the field");
 }
 
 /// The #261 review note: under `format: "hex"` a store speaking hsl moves the

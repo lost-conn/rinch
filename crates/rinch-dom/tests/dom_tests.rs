@@ -405,15 +405,14 @@ fn set_styles_batch_keeps_its_own_order() {
     );
 }
 
-/// A property declared twice in one authored attribute collapses the way CSSOM
-/// collapses it: the last value, at the **last** declaration's position — so
-/// the `color` here moves past the `gap` that sat between its two
-/// declarations. It said "at the first position" until #670; see
-/// `a_repeated_property_collapses_at_its_last_position` below for the Chrome
-/// measurement and `collapsing_at_the_last_position_is_what_the_cascade_
-/// resolves` for why the position is behaviour rather than spelling.
+/// A property this call is *not* writing is collapsed as a browser's CSSOM
+/// collapsed it when the attribute was parsed (#1353): Chrome reads back
+/// `gap: 8px; color: green;` after `setProperty('gap', '8px')` on this
+/// attribute. Which declaration survives is Stylo's post-validity answer, not
+/// a syntactic guess (#722; `inline_style_cssom_block_tests` has the invalid
+/// and important shapes).
 #[test]
-fn parsing_an_attribute_collapses_a_repeated_property_in_place() {
+fn an_untouched_duplicate_collapses_on_a_write_to_another_property() {
     let mut doc = RinchDocument::new();
     let div = doc.create_element("div");
     doc.set_attribute(div, "style", "color: red; gap: 4px; color: green");
@@ -421,6 +420,26 @@ fn parsing_an_attribute_collapses_a_repeated_property_in_place() {
     assert_eq!(
         doc.get_attribute(div, "style").unwrap(),
         "gap: 8px; color: green"
+    );
+}
+
+/// The property a call *does* write still collapses every existing
+/// occurrence of it to the one new value — the write supplies an
+/// unambiguous answer, so there is no validity question left for Stylo to
+/// settle. It said "at the first position" until #670: the surviving slot is
+/// the **last** occurrence's, so the written property moves past whatever
+/// sat between its old occurrences — see
+/// `collapsing_at_the_last_position_is_what_the_cascade_resolves` below for
+/// why the position is behaviour rather than spelling.
+#[test]
+fn parsing_an_attribute_collapses_a_repeated_property_in_place() {
+    let mut doc = RinchDocument::new();
+    let div = doc.create_element("div");
+    doc.set_attribute(div, "style", "color: red; gap: 4px; color: green");
+    doc.set_style(div, "color", "blue");
+    assert_eq!(
+        doc.get_attribute(div, "style").unwrap(),
+        "gap: 4px; color: blue"
     );
 }
 
@@ -733,6 +752,12 @@ fn a_background_url_still_paints_after_an_unrelated_set_style() {
 /// A property declared twice collapses to its **last** position, which is what
 /// Chrome 150 does: `margin: 1px; color: red; gap: 2px; color: blue` serialises
 /// as `margin: 1px; gap: 2px; color: blue`.
+///
+/// The write is to `color` itself, not an unrelated property (issue #722):
+/// since #722, a write only collapses the property it is actually supplying a
+/// new value for — an untouched duplicate is left for Stylo, not collapsed
+/// here — so pinning the *position* half of this needs the write and the
+/// duplicate to be the same property.
 #[test]
 fn a_repeated_property_collapses_at_its_last_position() {
     let mut doc = RinchDocument::new();
@@ -742,10 +767,10 @@ fn a_repeated_property_collapses_at_its_last_position() {
         "style",
         "margin: 1px; color: red; gap: 2px; color: blue",
     );
-    doc.set_style(div, "padding", "12px");
+    doc.set_style(div, "color", "green");
     assert_eq!(
         doc.get_attribute(div, "style").unwrap(),
-        "margin: 1px; gap: 2px; color: blue; padding: 12px"
+        "margin: 1px; gap: 2px; color: green"
     );
 }
 
@@ -836,9 +861,9 @@ fn an_important_priority_survives_the_next_set_style() {
     }
 }
 
-/// The inline `user-select` override — Stylo's servo build does not carry the
-/// property, so `style_resolution` reads it off the attribute itself — reads
-/// through the same parser as everything else (#670).
+/// An inline `user-select` reads through the same parser as everything else
+/// (#670). `style_resolution` read it off the attribute itself until #2231;
+/// it now comes from Stylo's cascade, and this stays as the regression pin.
 ///
 /// A bare `split(';')` fabricates a "declaration" out of the inside of a
 /// quoted value: `content: "a; user-select: none; b"` gives it the part
@@ -950,4 +975,85 @@ fn an_unterminated_comment_marker_in_a_url_does_not_eat_the_rest() {
         doc.get_attribute(div, "style").unwrap(),
         "background-image: url(http://example.test/a/*b.png); color: red; padding: 12px"
     );
+}
+
+#[test]
+fn review_722_margin_shorthand_longhand_duplicate_survives_unrelated_write() {
+    let mut doc = RinchDocument::new();
+    let div = doc.create_element("div");
+    let body = doc.body();
+    doc.append_child(body, div);
+    doc.set_attribute(
+        div,
+        "style",
+        "margin: 1px; margin-left: bad; margin-left: 4px",
+    );
+    doc.set_style(div, "padding", "2px");
+    doc.resolve_layout(800.0, 600.0);
+    eprintln!("ATTR = {:?}", doc.get_attribute(div, "style"));
+    let ml = &doc.tree.get(div.0).unwrap().computed_style.margin_left;
+    eprintln!("margin_left = {:?}", ml);
+}
+
+#[test]
+fn review_722_important_combos_both_orders() {
+    let mut doc = RinchDocument::new();
+    let body = doc.body();
+    let a = doc.create_element("div");
+    doc.append_child(body, a);
+    doc.set_attribute(a, "style", "color: red !important; color: blue");
+    doc.set_style(a, "gap", "1px");
+    doc.resolve_layout(800.0, 600.0);
+    eprintln!(
+        "ORDER1 (important first) = {:?}",
+        doc.get_attribute(a, "style")
+    );
+    eprintln!(
+        "ORDER1 color = {:?}",
+        doc.tree.get(a.0).unwrap().computed_style.color
+    );
+
+    let b = doc.create_element("div");
+    doc.append_child(body, b);
+    doc.set_attribute(b, "style", "color: red; color: blue !important");
+    doc.set_style(b, "gap", "1px");
+    doc.resolve_layout(800.0, 600.0);
+    eprintln!(
+        "ORDER2 (important second) = {:?}",
+        doc.get_attribute(b, "style")
+    );
+    eprintln!(
+        "ORDER2 color = {:?}",
+        doc.tree.get(b.0).unwrap().computed_style.color
+    );
+}
+
+#[test]
+fn review_722_case_folded_duplicates() {
+    let mut doc = RinchDocument::new();
+    let n = doc.create_element("div");
+    doc.set_attribute(n, "style", "COLOR: red; color: green");
+    doc.set_style(n, "gap", "1px");
+    eprintln!("CASE_FOLD = {:?}", doc.get_attribute(n, "style"));
+}
+
+#[test]
+fn review_722_custom_properties_case_distinct() {
+    let mut doc = RinchDocument::new();
+    let n = doc.create_element("div");
+    doc.set_attribute(n, "style", "--a: 1; --A: 2");
+    doc.set_style(n, "gap", "1px");
+    eprintln!("CUSTOM_CASE = {:?}", doc.get_attribute(n, "style"));
+}
+
+#[test]
+fn review_722_attribute_growth_under_repeated_writes() {
+    let mut doc = RinchDocument::new();
+    let n = doc.create_element("div");
+    doc.set_attribute(n, "style", "color: red; color: green");
+    for i in 0..50 {
+        doc.set_style(n, "gap", &format!("{}px", i));
+    }
+    let attr = doc.get_attribute(n, "style").unwrap();
+    eprintln!("GROWTH len={} attr={:?}", attr.len(), attr);
 }

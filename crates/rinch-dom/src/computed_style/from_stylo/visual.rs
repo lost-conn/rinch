@@ -29,6 +29,37 @@ pub(super) fn object_fit_from_stylo(
     }
 }
 
+/// `image-rendering` (#2098). Stylo's servo build has three keywords.
+pub(super) fn image_rendering_from_stylo(
+    v: &style::properties::longhands::image_rendering::computed_value::T,
+) -> ImageRenderingValue {
+    use style::properties::longhands::image_rendering::computed_value::T as R;
+    match *v {
+        R::Auto => ImageRenderingValue::Auto,
+        R::CrispEdges => ImageRenderingValue::CrispEdges,
+        R::Pixelated => ImageRenderingValue::Pixelated,
+    }
+}
+
+pub(super) fn aspect_ratio_from_stylo(
+    ar: &style::values::computed::position::AspectRatio,
+) -> AspectRatioValue {
+    use style::values::generics::position::PreferredRatio;
+    let ratio = match &ar.ratio {
+        PreferredRatio::None => None,
+        PreferredRatio::Ratio(r) => {
+            let (w, h) = ((r.0).0, (r.1).0);
+            let v = w / h;
+            // A degenerate ratio behaves as `auto` (css-sizing-4 §2).
+            (w > 0.0 && h > 0.0 && v.is_finite() && v > 0.0).then_some(v)
+        }
+    };
+    AspectRatioValue {
+        auto: ar.auto,
+        ratio,
+    }
+}
+
 pub(super) fn cursor_from_stylo(cursor: &style::values::specified::ui::CursorKind) -> CursorValue {
     use style::values::specified::ui::CursorKind;
     match *cursor {
@@ -73,6 +104,29 @@ pub(super) fn pointer_events_from_stylo(
     }
 }
 
+/// `user-select` (#2231). Stylo's servo build parses all five keywords (and
+/// `-moz-none` as `none`), with the `-webkit-` and `-moz-` spellings as
+/// aliases of the one longhand.
+///
+/// `contain` is read as `auto`. Chrome 156 does not support it
+/// (`CSS.supports("user-select", "contain")` is false), so it drops the
+/// declaration, and a lone `user-select: contain` computes as if nothing were
+/// declared. Stylo has already accepted the declaration by the time it gets
+/// here, so where Chrome would let an earlier or less specific declaration win
+/// (`user-select: none; user-select: contain` is `none` there) rinch computes
+/// `auto`.
+pub(super) fn user_select_from_stylo(
+    us: style::values::specified::ui::UserSelect,
+) -> UserSelectValue {
+    use style::values::specified::ui::UserSelect;
+    match us {
+        UserSelect::Text => UserSelectValue::Text,
+        UserSelect::None => UserSelectValue::None,
+        UserSelect::Auto | UserSelect::Contain => UserSelectValue::Auto,
+        UserSelect::All => UserSelectValue::All,
+    }
+}
+
 pub(super) fn z_index_from_stylo(z: &style::values::computed::ZIndex) -> Option<i32> {
     use style::values::generics::position::ZIndex;
     match z {
@@ -81,103 +135,103 @@ pub(super) fn z_index_from_stylo(z: &style::values::computed::ZIndex) -> Option<
     }
 }
 
+/// A computed `transform`, composed about a `transform-origin` whose z is
+/// `origin_z` CSS px (#997; the x and y are applied at paint).
 pub(super) fn transform_from_stylo(
     transform: &style::values::computed::Transform,
+    origin_z: f64,
 ) -> TransformValue {
+    use crate::transition::{Affine, TransformOp, compose_about_origin_z};
     use style::values::generics::transform::GenericTransformOperation;
 
     if transform.0.is_empty() {
         return TransformValue::default();
     }
 
-    // Compose all operations into a single 2D affine matrix [a, b, c, d, e, f]
-    let mut m = [1.0_f64, 0.0, 0.0, 1.0, 0.0, 0.0]; // identity
-
     // The percentage part of a translate cannot be resolved here — the
-    // element's border box is not known until Taffy has run — so it is
-    // accumulated separately and folded in at paint time. What is accumulated
-    // is the *linear form* in (width, height): see `accumulate_pct` and the
-    // `TransformValue` type doc (#212).
-    let mut pct_w = [0.0_f64; 2];
-    let mut pct_h = [0.0_f64; 2];
-
-    for op in &*transform.0 {
-        let op_matrix = match op {
-            GenericTransformOperation::Matrix(mat) => [
+    // element's border box is not known until Taffy has run — so a
+    // `Translate` function carries it beside its pixel part, and composing the
+    // list accumulates its *linear form* in (width, height), each translate in
+    // the frame the functions before it establish (#212; see `Affine::then`).
+    let split = |lp: Option<&style::values::computed::LengthPercentage>| {
+        lp.map_or((0.0, 0.0), length_or_pct_split)
+    };
+    let translate = |x: Option<&style::values::computed::LengthPercentage>,
+                     y: Option<&style::values::computed::LengthPercentage>,
+                     z: f64| {
+        let (px, pct_x) = split(x);
+        let (py, pct_y) = split(y);
+        TransformOp::Translate {
+            px: [px, py],
+            pct: [pct_x, pct_y],
+            z,
+        }
+    };
+    let functions: Vec<TransformOp> = transform
+        .0
+        .iter()
+        .map(|op| match op {
+            GenericTransformOperation::Matrix(mat) => TransformOp::Matrix(Affine::from_matrix([
                 mat.a as f64,
                 mat.b as f64,
                 mat.c as f64,
                 mat.d as f64,
                 mat.e as f64,
                 mat.f as f64,
-            ],
-            GenericTransformOperation::Rotate(angle) => {
-                let rad = angle.radians64();
-                let cos = rad.cos();
-                let sin = rad.sin();
-                [cos, sin, -sin, cos, 0.0, 0.0]
+            ])),
+            GenericTransformOperation::Matrix3D(m) => TransformOp::matrix3d(
+                [
+                    m.m11, m.m12, m.m13, m.m14, m.m21, m.m22, m.m23, m.m24, m.m31, m.m32, m.m33,
+                    m.m34, m.m41, m.m42, m.m43, m.m44,
+                ]
+                .map(f64::from),
+            ),
+            GenericTransformOperation::Rotate(angle)
+            | GenericTransformOperation::RotateZ(angle) => TransformOp::Rotate(angle.radians64()),
+            GenericTransformOperation::RotateX(angle) => {
+                TransformOp::rotate3d(1.0, 0.0, 0.0, angle.radians64())
+            }
+            GenericTransformOperation::RotateY(angle) => {
+                TransformOp::rotate3d(0.0, 1.0, 0.0, angle.radians64())
+            }
+            GenericTransformOperation::Rotate3D(x, y, z, angle) => {
+                TransformOp::rotate3d(*x as f64, *y as f64, *z as f64, angle.radians64())
             }
             GenericTransformOperation::Scale(sx, sy) => {
-                [*sx as f64, 0.0, 0.0, *sy as f64, 0.0, 0.0]
+                TransformOp::Scale(*sx as f64, *sy as f64, 1.0)
             }
-            GenericTransformOperation::ScaleX(sx) => [*sx as f64, 0.0, 0.0, 1.0, 0.0, 0.0],
-            GenericTransformOperation::ScaleY(sy) => [1.0, 0.0, 0.0, *sy as f64, 0.0, 0.0],
-            GenericTransformOperation::TranslateX(tx) => {
-                let (px, pct) = length_or_pct_split(tx);
-                accumulate_pct(&m, pct, 0.0, &mut pct_w, &mut pct_h);
-                [1.0, 0.0, 0.0, 1.0, px, 0.0]
+            GenericTransformOperation::ScaleX(sx) => TransformOp::Scale(*sx as f64, 1.0, 1.0),
+            GenericTransformOperation::ScaleY(sy) => TransformOp::Scale(1.0, *sy as f64, 1.0),
+            GenericTransformOperation::ScaleZ(sz) => TransformOp::Scale(1.0, 1.0, *sz as f64),
+            GenericTransformOperation::Scale3D(sx, sy, sz) => {
+                TransformOp::Scale(*sx as f64, *sy as f64, *sz as f64)
             }
-            GenericTransformOperation::TranslateY(ty) => {
-                let (py, pct) = length_or_pct_split(ty);
-                accumulate_pct(&m, 0.0, pct, &mut pct_w, &mut pct_h);
-                [1.0, 0.0, 0.0, 1.0, 0.0, py]
+            GenericTransformOperation::TranslateX(tx) => translate(Some(tx), None, 0.0),
+            GenericTransformOperation::TranslateY(ty) => translate(None, Some(ty), 0.0),
+            GenericTransformOperation::Translate(tx, ty) => translate(Some(tx), Some(ty), 0.0),
+            // `translate3d()` carries two `LengthPercentage`s, and goes
+            // through the same percentage split as `translate()` (#212).
+            GenericTransformOperation::Translate3D(tx, ty, tz) => {
+                translate(Some(tx), Some(ty), tz.px() as f64)
             }
-            GenericTransformOperation::Translate(tx, ty) => {
-                let (tx_px, tx_pct) = length_or_pct_split(tx);
-                let (ty_px, ty_pct) = length_or_pct_split(ty);
-                accumulate_pct(&m, tx_pct, ty_pct, &mut pct_w, &mut pct_h);
-                [1.0, 0.0, 0.0, 1.0, tx_px, ty_px]
-            }
-            // `translate3d()` is the 2D translate with a z the flattening
-            // drops. It is handled here rather than falling into the catch-all
-            // below *because* it carries two `LengthPercentage`s: routed to
-            // the `_ => identity` arm it would silently lose the whole
-            // translation, and added later without this accumulation it would
-            // reintroduce #212. The other 3D operations stay unimplemented
-            // (#405).
-            GenericTransformOperation::Translate3D(tx, ty, _tz) => {
-                let (tx_px, tx_pct) = length_or_pct_split(tx);
-                let (ty_px, ty_pct) = length_or_pct_split(ty);
-                accumulate_pct(&m, tx_pct, ty_pct, &mut pct_w, &mut pct_h);
-                [1.0, 0.0, 0.0, 1.0, tx_px, ty_px]
-            }
-            GenericTransformOperation::SkewX(angle) => {
-                let tan = angle.radians64().tan();
-                [1.0, 0.0, tan, 1.0, 0.0, 0.0]
-            }
-            GenericTransformOperation::SkewY(angle) => {
-                let tan = angle.radians64().tan();
-                [1.0, tan, 0.0, 1.0, 0.0, 0.0]
-            }
+            GenericTransformOperation::TranslateZ(tz) => translate(None, None, tz.px() as f64),
+            GenericTransformOperation::SkewX(angle) => TransformOp::SkewX(angle.radians64()),
+            GenericTransformOperation::SkewY(angle) => TransformOp::SkewY(angle.radians64()),
             GenericTransformOperation::Skew(ax, ay) => {
-                let tan_x = ax.radians64().tan();
-                let tan_y = ay.radians64().tan();
-                [1.0, tan_y, tan_x, 1.0, 0.0, 0.0]
+                TransformOp::Skew(ax.radians64(), ay.radians64())
             }
-            // 3D transforms -- flatten to 2D identity (skip)
-            _ => [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-        };
+            GenericTransformOperation::Perspective(p) => {
+                TransformOp::perspective(p.infinity_or(|l| l.px()) as f64)
+            }
+            // `InterpolateMatrix` / `AccumulateMatrix` are stylo's own
+            // animation intermediates; rinch interpolates function lists
+            // itself (#414) and never computes one.
+            _ => TransformOp::Matrix(Affine::IDENTITY),
+        })
+        .collect();
 
-        // Matrix multiply: m = m * op_matrix
-        let a = m[0] * op_matrix[0] + m[2] * op_matrix[1];
-        let b = m[1] * op_matrix[0] + m[3] * op_matrix[1];
-        let c = m[0] * op_matrix[2] + m[2] * op_matrix[3];
-        let d = m[1] * op_matrix[2] + m[3] * op_matrix[3];
-        let e = m[0] * op_matrix[4] + m[2] * op_matrix[5] + m[4];
-        let f = m[1] * op_matrix[4] + m[3] * op_matrix[5] + m[5];
-        m = [a, b, c, d, e, f];
-    }
-
+    let (composed, back_facing) = compose_about_origin_z(&functions, origin_z);
+    let (m, pct_w, pct_h) = (composed.matrix, composed.pct_w, composed.pct_h);
     let has_pct = pct_w.iter().chain(&pct_h).any(|c| c.abs() > 1e-9);
 
     let is_identity = !has_pct
@@ -191,37 +245,13 @@ pub(super) fn transform_from_stylo(
     TransformValue {
         matrix: m,
         is_identity,
+        // The empty list returned `TransformValue::default()` above.
+        is_none: false,
         pct_translate_w: pct_w,
         pct_translate_h: pct_h,
+        functions,
+        back_facing,
     }
-}
-
-/// Fold one percentage translate into the running coefficients, in the frame
-/// the functions before it establish.
-///
-/// `m` must be the matrix as it stands *before* this operation is composed in.
-/// A translate leaves the linear part alone, so `m[0..4]` is the `L` this
-/// offset is expressed in; reading it after the multiply happens to give the
-/// same value today and would be wrong the moment anyone reorders the loop.
-///
-/// `px`/`py` are fractions (0.5 = 50%). The contribution to the final `(e, f)`
-/// is `L·(px·W, py·H)`, which is linear in `W` and `H` — hence four
-/// coefficients rather than a function list (#212).
-///
-/// Shared with the keyframe extractor so an authored `translate(50%, 0)` stop
-/// accumulates by exactly the same rule the cascade uses — the two must agree
-/// or a transform would jump the moment an animation starts.
-pub(crate) fn accumulate_pct(
-    m: &[f64; 6],
-    px: f64,
-    py: f64,
-    pct_w: &mut [f64; 2],
-    pct_h: &mut [f64; 2],
-) {
-    pct_w[0] += px * m[0];
-    pct_w[1] += px * m[1];
-    pct_h[0] += py * m[2];
-    pct_h[1] += py * m[3];
 }
 
 /// Split a LengthPercentage into (px_value, percentage_fraction).
@@ -290,60 +320,318 @@ pub(super) fn box_shadow_from_stylo(
         .collect()
 }
 
+/// One `background-image` entry as rinch paints it: a linear, radial or
+/// conic gradient, or a `url()`. `None` for `none`, a gradient with no stops
+/// and an empty url.
+fn background_image_from_stylo(
+    image: &style::values::computed::image::Image,
+    text_color: &style::color::AbsoluteColor,
+) -> Option<BackgroundValue> {
+    use style::values::computed::image::Image;
+    use style::values::generics::image::{GenericGradient, GradientFlags};
+    match image {
+        Image::Gradient(boxed_gradient) => match &**boxed_gradient {
+            GenericGradient::Linear {
+                direction,
+                items,
+                flags,
+                ..
+            } => {
+                let stops = gradient_stops_from_stylo(items, text_color);
+                (!stops.is_empty()).then(|| BackgroundValue::LinearGradient {
+                    angle_degrees: gradient_direction_to_angle(direction),
+                    stops,
+                    repeating: flags.contains(GradientFlags::REPEATING),
+                })
+            }
+            GenericGradient::Radial {
+                shape,
+                position,
+                items,
+                flags,
+                ..
+            } => {
+                let stops = gradient_stops_from_stylo(items, text_color);
+                (!stops.is_empty()).then(|| BackgroundValue::RadialGradient {
+                    stops,
+                    shape: radial_shape_from_stylo(shape),
+                    position_x: super::box_model::lp_value_from_stylo(&position.horizontal),
+                    position_y: super::box_model::lp_value_from_stylo(&position.vertical),
+                    repeating: flags.contains(GradientFlags::REPEATING),
+                })
+            }
+            GenericGradient::Conic {
+                angle,
+                position,
+                items,
+                flags,
+                ..
+            } => {
+                let stops = conic_stops_from_stylo(items, text_color);
+                (!stops.is_empty()).then(|| BackgroundValue::ConicGradient {
+                    from_degrees: angle.degrees(),
+                    stops,
+                    position_x: super::box_model::lp_value_from_stylo(&position.horizontal),
+                    position_y: super::box_model::lp_value_from_stylo(&position.vertical),
+                    repeating: flags.contains(GradientFlags::REPEATING),
+                })
+            }
+        },
+        Image::Url(url_value) => {
+            let url_str = match url_value {
+                style::values::computed::url::ComputedUrl::Valid(url) => url.as_str().to_string(),
+                style::values::computed::url::ComputedUrl::Invalid(s) => s.to_string(),
+            };
+            (!url_str.is_empty()).then_some(BackgroundValue::Image { url: url_str })
+        }
+        _ => None,
+    }
+}
+
+/// `mask-image`'s layers (#1798, #2099), each with its entries of
+/// `mask-size`, `mask-position`, `mask-repeat` and `mask-origin`, a shorter
+/// list repeating to the image count as the background lists do; see
+/// `ComputedStyle::mask_image`. A layer with nothing to paint (`none`) is
+/// left out.
+pub(super) fn mask_image_from_stylo(
+    svg: &style::properties::style_structs::SVG,
+    text_color: &style::color::AbsoluteColor,
+) -> Vec<BackgroundLayer> {
+    svg.mask_image
+        .0
+        .iter()
+        .enumerate()
+        .filter_map(|(i, image)| {
+            let image = background_image_from_stylo(image, text_color)?;
+            let (repeat_x, repeat_y) = background_repeat_from_stylo(&svg.mask_repeat.0, i);
+            Some(BackgroundLayer {
+                image,
+                geometry: BackgroundLayerGeometry {
+                    size: background_size_from_stylo(&svg.mask_size.0, i),
+                    position_x: background_position_from_stylo(&svg.mask_position_x.0, i),
+                    position_y: background_position_from_stylo(&svg.mask_position_y.0, i),
+                    repeat_x,
+                    repeat_y,
+                    origin: mask_origin_from_stylo(svg, i),
+                },
+                blend: BlendModeValue::Normal,
+            })
+        })
+        .collect()
+}
+
+/// Layer `i`'s `mask-origin` (#2099; initial `border-box`, where
+/// `background-origin`'s is `padding-box`).
+fn mask_origin_from_stylo(
+    svg: &style::properties::style_structs::SVG,
+    i: usize,
+) -> BackgroundOriginValue {
+    use style::properties::longhands::mask_origin::single_value::computed_value::T;
+    match nth(&svg.mask_origin.0, i) {
+        Some(T::PaddingBox) => BackgroundOriginValue::PaddingBox,
+        Some(T::ContentBox) => BackgroundOriginValue::ContentBox,
+        _ => BackgroundOriginValue::BorderBox,
+    }
+}
+
+/// The first background layer's image, else the `background-color`.
 pub(super) fn background_from_stylo(
     bg: &style::properties::style_structs::Background,
     text_color: &style::color::AbsoluteColor,
 ) -> BackgroundValue {
-    use style::values::computed::image::Image;
-    use style::values::generics::image::GenericGradient;
-
-    // Check for gradient or image URL in background-image first
-    if !bg.background_image.0.is_empty() {
-        match &bg.background_image.0[0] {
-            Image::Gradient(boxed_gradient) => {
-                let gradient = &**boxed_gradient;
-                match gradient {
-                    GenericGradient::Linear {
-                        direction, items, ..
-                    } => {
-                        let angle = gradient_direction_to_angle(direction);
-                        let stops = gradient_stops_from_stylo(items, text_color);
-                        if !stops.is_empty() {
-                            return BackgroundValue::LinearGradient {
-                                angle_degrees: angle,
-                                stops,
-                            };
-                        }
-                    }
-                    GenericGradient::Radial { items, .. } => {
-                        let stops = gradient_stops_from_stylo(items, text_color);
-                        if !stops.is_empty() {
-                            return BackgroundValue::RadialGradient { stops };
-                        }
-                    }
-                    _ => {} // conic gradients not supported yet
-                }
-            }
-            Image::Url(url_value) => {
-                let url_str = match url_value {
-                    style::values::computed::url::ComputedUrl::Valid(url) => {
-                        url.as_str().to_string()
-                    }
-                    style::values::computed::url::ComputedUrl::Invalid(s) => s.to_string(),
-                };
-                if !url_str.is_empty() {
-                    return BackgroundValue::Image { url: url_str };
-                }
-            }
-            _ => {}
-        }
+    if let Some(image) = bg
+        .background_image
+        .0
+        .first()
+        .and_then(|i| background_image_from_stylo(i, text_color))
+    {
+        return image;
     }
-
-    // Fall back to background-color
-    let color = color_from_computed(&bg.background_color, text_color);
-    match color {
+    match color_from_computed(&bg.background_color, text_color) {
         Some(c) => BackgroundValue::Color(c),
         None => BackgroundValue::None,
+    }
+}
+
+/// The `background-color` painted under the first image layer, when there is
+/// one `background_from_stylo` turned into an image (#468). `None` whenever
+/// `background` is already the colour, and for a transparent colour, which
+/// would fill nothing.
+pub(super) fn background_underlay_from_stylo(
+    bg: &style::properties::style_structs::Background,
+    text_color: &style::color::AbsoluteColor,
+) -> Option<peniko::Color> {
+    use style::values::computed::image::Image;
+    // Cheap exit for the common case — no image — before rebuilding anything.
+    if !matches!(
+        bg.background_image.0.first(),
+        Some(Image::Gradient(_) | Image::Url(_))
+    ) {
+        return None;
+    }
+    match background_from_stylo(bg, text_color) {
+        BackgroundValue::None | BackgroundValue::Color(_) => None,
+        _ => {
+            color_from_computed(&bg.background_color, text_color).filter(|c| c.components[3] > 0.0)
+        }
+    }
+}
+
+/// The background layers after the first (#1142), top to bottom, each with
+/// the entries of the other lists at its index. A list shorter than the
+/// image list repeats (css-backgrounds-3 §2.2: index `i` takes entry
+/// `i mod len`). Layers with nothing to paint are left out, so a single
+/// image — or none — allocates nothing.
+pub(super) fn background_layers_from_stylo(
+    bg: &style::properties::style_structs::Background,
+    text_color: &style::color::AbsoluteColor,
+) -> Vec<BackgroundLayer> {
+    let images = &bg.background_image.0;
+    if images.len() < 2 {
+        return Vec::new();
+    }
+    images
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter_map(|(i, image)| {
+            Some(BackgroundLayer {
+                image: background_image_from_stylo(image, text_color)?,
+                geometry: background_geometry_from_stylo(bg, i),
+                blend: background_blend_from_stylo(bg, i),
+            })
+        })
+        .collect()
+}
+
+/// Layer `i`'s geometry, each list indexed modulo its length.
+pub(super) fn background_geometry_from_stylo(
+    bg: &style::properties::style_structs::Background,
+    i: usize,
+) -> BackgroundLayerGeometry {
+    let (repeat_x, repeat_y) = background_repeat_from_stylo(&bg.background_repeat.0, i);
+    BackgroundLayerGeometry {
+        size: background_size_from_stylo(&bg.background_size.0, i),
+        position_x: background_position_from_stylo(&bg.background_position_x.0, i),
+        position_y: background_position_from_stylo(&bg.background_position_y.0, i),
+        repeat_x,
+        repeat_y,
+        origin: background_origin_from_stylo(bg, i),
+    }
+}
+
+/// Layer `i`'s `background-blend-mode` (#2221), indexed by the layer's place
+/// in the `background-image` list (a layer left out for having nothing to
+/// paint keeps its index), the list repeating.
+pub(super) fn background_blend_from_stylo(
+    bg: &style::properties::style_structs::Background,
+    i: usize,
+) -> BlendModeValue {
+    use style::properties::longhands::background_blend_mode::single_value::computed_value::T;
+    match nth(&bg.background_blend_mode.0, i) {
+        None | Some(T::Normal) => BlendModeValue::Normal,
+        Some(T::Multiply) => BlendModeValue::Multiply,
+        Some(T::Screen) => BlendModeValue::Screen,
+        Some(T::Overlay) => BlendModeValue::Overlay,
+        Some(T::Darken) => BlendModeValue::Darken,
+        Some(T::Lighten) => BlendModeValue::Lighten,
+        Some(T::ColorDodge) => BlendModeValue::ColorDodge,
+        Some(T::ColorBurn) => BlendModeValue::ColorBurn,
+        Some(T::HardLight) => BlendModeValue::HardLight,
+        Some(T::SoftLight) => BlendModeValue::SoftLight,
+        Some(T::Difference) => BlendModeValue::Difference,
+        Some(T::Exclusion) => BlendModeValue::Exclusion,
+        Some(T::Hue) => BlendModeValue::Hue,
+        Some(T::Saturation) => BlendModeValue::Saturation,
+        Some(T::Color) => BlendModeValue::Color,
+        Some(T::Luminosity) => BlendModeValue::Luminosity,
+    }
+}
+
+/// Entry `i` of a background list, repeated to any index (§2.2).
+fn nth<T>(list: &[T], i: usize) -> Option<&T> {
+    (!list.is_empty()).then(|| &list[i % list.len()])
+}
+
+/// Layer `i`'s `background-size` (#468). A `NonNegativeLengthPercentage`
+/// that is a genuine mixed `calc()` keeps its affine pair.
+fn background_size_from_stylo(
+    list: &[style::values::computed::background::BackgroundSize],
+    i: usize,
+) -> BackgroundSizeValue {
+    use style::values::generics::background::BackgroundSize;
+    use style::values::generics::length::LengthPercentageOrAuto;
+    let axis = |v: &LengthPercentageOrAuto<
+        style::values::computed::NonNegativeLengthPercentage,
+    >| {
+        match v {
+            LengthPercentageOrAuto::Auto => LengthPercentageAutoValue::Auto,
+            LengthPercentageOrAuto::LengthPercentage(lp) => {
+                match super::calc::split_length_percentage(&lp.0) {
+                    (px, 0.0) => LengthPercentageAutoValue::Length(px),
+                    (0.0, pct) => LengthPercentageAutoValue::Percent(pct),
+                    (px, pct) => LengthPercentageAutoValue::Calc { px, pct },
+                }
+            }
+        }
+    };
+    match nth(list, i) {
+        Some(BackgroundSize::ExplicitSize { width, height }) => BackgroundSizeValue::Explicit {
+            width: axis(width),
+            height: axis(height),
+        },
+        Some(BackgroundSize::Cover) => BackgroundSizeValue::Cover,
+        Some(BackgroundSize::Contain) => BackgroundSizeValue::Contain,
+        None => BackgroundSizeValue::default(),
+    }
+}
+
+/// Layer `i`'s `background-position-x` or `-y` (#468). A zero length is
+/// `Zero`, the unitless value that interpolates against a percentage as well
+/// as a length, so an animation from `0 0` to `-200% 0` does not snap.
+fn background_position_from_stylo(
+    list: &[style::values::computed::LengthPercentage],
+    i: usize,
+) -> LengthPercentageValue {
+    let Some(lp) = nth(list, i) else {
+        return LengthPercentageValue::Zero;
+    };
+    match super::calc::split_length_percentage(lp) {
+        (0.0, 0.0) => LengthPercentageValue::Zero,
+        (px, 0.0) => LengthPercentageValue::Length(px),
+        (0.0, pct) => LengthPercentageValue::Percent(pct),
+        (px, pct) => LengthPercentageValue::Calc { px, pct },
+    }
+}
+
+/// Layer `i`'s `background-repeat`, per axis (#468).
+fn background_repeat_from_stylo(
+    list: &[style::values::computed::BackgroundRepeat],
+    i: usize,
+) -> (BackgroundRepeatValue, BackgroundRepeatValue) {
+    use style::values::specified::background::BackgroundRepeatKeyword as K;
+    let one = |k: K| match k {
+        K::Repeat => BackgroundRepeatValue::Repeat,
+        K::Space => BackgroundRepeatValue::Space,
+        K::Round => BackgroundRepeatValue::Round,
+        K::NoRepeat => BackgroundRepeatValue::NoRepeat,
+    };
+    match nth(list, i) {
+        Some(r) => (one(r.0), one(r.1)),
+        None => (BackgroundRepeatValue::Repeat, BackgroundRepeatValue::Repeat),
+    }
+}
+
+/// Layer `i`'s `background-origin` (#468).
+fn background_origin_from_stylo(
+    bg: &style::properties::style_structs::Background,
+    i: usize,
+) -> BackgroundOriginValue {
+    use style::properties::longhands::background_origin::single_value::computed_value::T;
+    match nth(&bg.background_origin.0, i) {
+        Some(T::BorderBox) => BackgroundOriginValue::BorderBox,
+        Some(T::ContentBox) => BackgroundOriginValue::ContentBox,
+        _ => BackgroundOriginValue::PaddingBox,
     }
 }
 
@@ -369,6 +657,35 @@ fn gradient_direction_to_angle(direction: &style::values::computed::image::LineD
     }
 }
 
+/// A radial gradient's ending shape (#1798). `contain`/`cover` are the
+/// legacy aliases of `closest-side`/`farthest-corner`.
+fn radial_shape_from_stylo(shape: &style::values::computed::image::EndingShape) -> RadialShape {
+    use style::values::generics::image::{
+        GenericCircle, GenericEllipse, GenericEndingShape, ShapeExtent,
+    };
+    let extent = |e: &ShapeExtent| match e {
+        ShapeExtent::ClosestSide | ShapeExtent::Contain => RadialExtent::ClosestSide,
+        ShapeExtent::FarthestSide => RadialExtent::FarthestSide,
+        ShapeExtent::ClosestCorner => RadialExtent::ClosestCorner,
+        ShapeExtent::FarthestCorner | ShapeExtent::Cover => RadialExtent::FarthestCorner,
+    };
+    match shape {
+        GenericEndingShape::Circle(GenericCircle::Radius(r)) => RadialShape::Circle(r.0.px()),
+        GenericEndingShape::Circle(GenericCircle::Extent(e)) => RadialShape::Extent {
+            circle: true,
+            extent: extent(e),
+        },
+        GenericEndingShape::Ellipse(GenericEllipse::Radii(rx, ry)) => RadialShape::Ellipse(
+            super::box_model::lp_value_from_stylo(&rx.0),
+            super::box_model::lp_value_from_stylo(&ry.0),
+        ),
+        GenericEndingShape::Ellipse(GenericEllipse::Extent(e)) => RadialShape::Extent {
+            circle: false,
+            extent: extent(e),
+        },
+    }
+}
+
 fn gradient_stops_from_stylo(
     items: &[style::values::generics::image::GenericGradientItem<
         style::values::computed::color::Color,
@@ -379,36 +696,89 @@ fn gradient_stops_from_stylo(
     use style::values::generics::image::GenericGradientItem;
 
     let mut stops = Vec::new();
-    let total = items.len();
-
-    for (i, item) in items.iter().enumerate() {
+    for item in items.iter() {
         match item {
-            GenericGradientItem::SimpleColorStop(color) => {
-                let c = color_from_computed(color, text_color);
-                // Auto-distribute position
-                let offset = if total <= 1 {
-                    0.0
-                } else {
-                    i as f32 / (total - 1) as f32
-                };
-                stops.push(GradientStop { offset, color: c });
-            }
-            GenericGradientItem::ComplexColorStop { color, position } => {
-                let c = color_from_computed(color, text_color);
-                let offset = if let Some(pct) = position.to_percentage() {
-                    pct.0
-                } else if let Some(len) = position.to_length() {
-                    // Length stops need container size to resolve -- approximate
-                    len.px() / 100.0
-                } else {
-                    // Mixed calc: same px/100 approximation as the plain-length
-                    // arm for the length part, plus the exact percentage part.
-                    // Used to fall through to the auto-distributed index.
-                    let (px, pct) = super::calc::split_length_percentage(position);
-                    pct + px / 100.0
-                };
-                stops.push(GradientStop { offset, color: c });
-            }
+            GenericGradientItem::SimpleColorStop(color) => stops.push(GradientStop {
+                position: None,
+                color: color_from_computed(color, text_color),
+            }),
+            GenericGradientItem::ComplexColorStop { color, position } => stops.push(GradientStop {
+                position: Some(super::box_model::lp_value_from_stylo(position)),
+                color: color_from_computed(color, text_color),
+            }),
+            // Interpolation hints are not drawn (the colour midpoint stays
+            // halfway between its stops).
+            _ => {}
+        }
+    }
+    stops
+}
+
+/// A `filter` / `backdrop-filter` list as rinch paints it (#2719): every
+/// function in order. A `url()` reference (no servo build parses one) is
+/// left out.
+pub(super) fn filter_list_from_stylo(
+    filter: &[style::values::computed::effects::Filter],
+    text_color: &style::color::AbsoluteColor,
+) -> Vec<FilterOp> {
+    use style::values::generics::effects::GenericFilter as F;
+    filter
+        .iter()
+        .filter_map(|f| {
+            Some(match f {
+                F::Blur(l) => FilterOp::Blur(l.0.px()),
+                F::Brightness(v) => FilterOp::Brightness(v.0),
+                F::Contrast(v) => FilterOp::Contrast(v.0),
+                F::Grayscale(v) => FilterOp::Grayscale(v.0),
+                F::HueRotate(a) => FilterOp::HueRotate(a.degrees()),
+                F::Invert(v) => FilterOp::Invert(v.0),
+                F::Opacity(v) => FilterOp::Opacity(v.0),
+                F::Saturate(v) => FilterOp::Saturate(v.0),
+                F::Sepia(v) => FilterOp::Sepia(v.0),
+                F::DropShadow(s) => FilterOp::DropShadow {
+                    offset_x: s.horizontal.px(),
+                    offset_y: s.vertical.px(),
+                    std_dev: s.blur.0.px(),
+                    color: color_from_computed(&s.color, text_color),
+                },
+                #[allow(unreachable_patterns)]
+                _ => return None,
+            })
+        })
+        .collect()
+}
+
+/// A conic gradient's stops (#2719), each angle carried as a share of a full
+/// turn (`90deg` and `25%` are both `Percent(0.25)`), so paint places them
+/// with the linear and radial gradients' stop fix-up.
+fn conic_stops_from_stylo(
+    items: &[style::values::generics::image::GenericGradientItem<
+        style::values::computed::color::Color,
+        style::values::computed::AngleOrPercentage,
+    >],
+    text_color: &style::color::AbsoluteColor,
+) -> Vec<GradientStop> {
+    use style::values::computed::AngleOrPercentage;
+    use style::values::generics::image::GenericGradientItem;
+
+    let turn = |p: &AngleOrPercentage| {
+        LengthPercentageValue::Percent(match p {
+            AngleOrPercentage::Percentage(pct) => pct.0,
+            AngleOrPercentage::Angle(a) => a.degrees() / 360.0,
+        })
+    };
+    let mut stops = Vec::new();
+    for item in items.iter() {
+        match item {
+            GenericGradientItem::SimpleColorStop(color) => stops.push(GradientStop {
+                position: None,
+                color: color_from_computed(color, text_color),
+            }),
+            GenericGradientItem::ComplexColorStop { color, position } => stops.push(GradientStop {
+                position: Some(turn(position)),
+                color: color_from_computed(color, text_color),
+            }),
+            // Interpolation hints are not drawn, as for the other gradients.
             _ => {}
         }
     }

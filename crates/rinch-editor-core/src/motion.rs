@@ -11,6 +11,13 @@ use crate::model::Node;
 use crate::pos::Pos;
 use crate::selection::Selection;
 
+#[cfg(feature = "cost-counters")]
+#[doc(hidden)]
+pub use rinch_words::segmented_units;
+/// The word segmentation itself lives in `rinch-words`, which the desktop text
+/// fields share (#1619).
+pub use rinch_words::{Unit, word_segments};
+
 /// A model-resolvable caret motion (the horizontal / document / model-line motions).
 /// Vertical motion is intentionally absent — it depends on laid-out geometry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,7 +60,8 @@ pub fn resolve_cursor_motion(
 ) -> Option<Selection> {
     let new_head: Pos = match motion {
         CursorMotion::CharLeft => {
-            let near = Selection::near(doc, Pos(head.0.saturating_sub(1)), -1);
+            let to = grapheme_step(doc, head, false).unwrap_or(head.0.saturating_sub(1));
+            let near = Selection::near(doc, Pos(to), -1);
             // A char move onto a selectable block atom (hr/image) becomes a node
             // selection when collapsing (not when extending a text range).
             if !extend && matches!(near, Selection::Node(_)) {
@@ -62,7 +70,8 @@ pub fn resolve_cursor_motion(
             near.head()
         }
         CursorMotion::CharRight => {
-            let near = Selection::near(doc, Pos((head.0 + 1).min(doc.content_size())), 1);
+            let to = grapheme_step(doc, head, true).unwrap_or(head.0 + 1);
+            let near = Selection::near(doc, Pos(to.min(doc.content_size())), 1);
             if !extend && matches!(near, Selection::Node(_)) {
                 return Some(near);
             }
@@ -82,6 +91,67 @@ pub fn resolve_cursor_motion(
     })
 }
 
+/// The position one grapheme cluster before (`forward = false`) or after
+/// `head` inside its textblock (#1684): an emoji ZWJ sequence, a flag, a
+/// keycap or a base with its marks is one step, as in Chrome. `None` when
+/// `head` is not in a textblock or is at the edge it would step across, where
+/// the motion leaves the block one position at a time.
+pub fn grapheme_step(doc: &Node, head: Pos, forward: bool) -> Option<usize> {
+    let r = doc.resolve(head).ok()?;
+    let block = r.parent();
+    if !block.is_textblock() {
+        return None;
+    }
+    let off = r.parent_offset();
+    if (forward && off >= block.content().size()) || (!forward && off == 0) {
+        return None;
+    }
+    let text = grapheme_text(block);
+    let i = if forward {
+        rinch_words::next_grapheme_boundary_chars(&text, off)
+    } else {
+        rinch_words::prev_grapheme_boundary_chars(&text, off)
+    };
+    Some(head.0 - off + i)
+}
+
+/// Where a Backspace at `head` starts deleting inside its textblock (#1684):
+/// an emoji sequence goes whole, any other cluster one code point at a time
+/// ([`rinch_words::backspace_start`], Chrome 155's rule). `None` outside a
+/// textblock or at its start.
+pub fn backspace_start(doc: &Node, head: Pos) -> Option<usize> {
+    let r = doc.resolve(head).ok()?;
+    let block = r.parent();
+    let off = r.parent_offset();
+    if !block.is_textblock() || off == 0 {
+        return None;
+    }
+    let text = grapheme_text(block);
+    Some(head.0 - off + rinch_words::backspace_start_chars(&text, off))
+}
+
+/// A textblock's content as one string for grapheme segmentation, one char per
+/// position: a hard break is `'\n'` (a cluster never crosses it) and any other
+/// leaf U+FFFC.
+fn grapheme_text(block: &Node) -> String {
+    let mut s = String::with_capacity(block.content().size());
+    for i in 0..block.child_count() {
+        let child = block.child(i);
+        match child.text() {
+            Some(t) => s.push_str(t),
+            None => {
+                let c = if child.type_name() == "hard_break" {
+                    '\n'
+                } else {
+                    '\u{FFFC}'
+                };
+                s.extend(std::iter::repeat_n(c, child.node_size()));
+            }
+        }
+    }
+    s
+}
+
 /// The model position at the start (`forward=false`) or end (`forward=true`) of the
 /// textblock `head` is in. (Visual-line Home/End for wrapped lines is a platform
 /// refinement; this is block start/end.) `None` if `head` is not in a textblock.
@@ -98,33 +168,25 @@ pub fn line_boundary(doc: &Node, head: Pos, forward: bool) -> Option<Pos> {
     }))
 }
 
-/// The model position at the previous/next word boundary within `head`'s textblock
-/// (a simple whitespace/word-character scan; cross-block word motion is a later
-/// refinement). `None` if `head` is not in a textblock.
+/// The model position at the previous/next word boundary within `head`'s
+/// textblock (cross-block word motion is a later refinement). `None` if `head`
+/// is not in a textblock.
+///
+/// Backward (Ctrl+Left): past any whitespace before `head`, then to the start of
+/// the [word segment](word_segments) before it. Forward (Ctrl+Right): past any
+/// whitespace after `head`, then to the end of the segment after it — the end
+/// of the next word, as on Linux and macOS. An inline atom is a segment of its
+/// own, so the motion stops on either side of it (#938), and a run of
+/// punctuation is one apart from the letters beside it (#939). The word deletes
+/// remove exactly this range (`commands::word_delete_range`).
 pub fn word_boundary(doc: &Node, head: Pos, forward: bool) -> Option<Pos> {
     let r = doc.resolve(head).ok()?;
     if !r.parent().is_textblock() {
         return None;
     }
-    let chars: Vec<char> = block_text(r.parent()).chars().collect();
+    let units = block_units(r.parent());
     let content_start = head.0 - r.parent_offset();
-    let mut i = r.parent_offset();
-    if forward {
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        while i < chars.len() && !chars[i].is_whitespace() {
-            i += 1;
-        }
-    } else {
-        i = i.saturating_sub(1);
-        while i > 0 && chars[i].is_whitespace() {
-            i -= 1;
-        }
-        while i > 0 && !chars[i - 1].is_whitespace() {
-            i -= 1;
-        }
-    }
+    let i = rinch_words::word_boundary(&units, r.parent_offset(), forward);
     Some(Pos(content_start + i))
 }
 
@@ -142,10 +204,34 @@ pub fn block_text(block: &Node) -> String {
     s
 }
 
-/// The model word range `(start, end)` around `pos` — the contiguous run of
-/// like-classed characters (word vs. whitespace) under a double-click, classified
-/// by the character to the right of the gap (or the last character at block end).
-/// Collapsed `(pos, pos)` outside a textblock or in an empty block.
+/// The positions of a textblock's content, one [`Unit`] per position.
+pub fn block_units(block: &Node) -> Vec<Unit> {
+    let mut units = Vec::with_capacity(block.content().size());
+    for i in 0..block.child_count() {
+        let child = block.child(i);
+        match child.text() {
+            Some(t) => units.extend(t.chars().map(Unit::Char)),
+            None => {
+                let unit = if child.type_name() == "hard_break" {
+                    Unit::Break
+                } else {
+                    Unit::Atom
+                };
+                units.extend(std::iter::repeat_n(unit, child.node_size()));
+            }
+        }
+    }
+    units
+}
+
+/// The model word range `(start, end)` around `pos` — the [word
+/// segment](word_segments) under a double-click (a run of whitespace, a word,
+/// images, a hard break), chosen by the unit to the right of the gap, or the
+/// one to its left at block end and at a word's trailing edge (right unit
+/// whitespace, left not). On a punctuation run it is that one char (with its
+/// marks), as in Chrome 155 (`foo|...bar` selects one `.`, `foo|——bar` one
+/// `—`); a run of emoji stays whole (`😀😀`). Collapsed `(pos, pos)` outside a
+/// textblock or in an empty block.
 pub fn word_range_at(doc: &Node, pos: Pos) -> (Pos, Pos) {
     let Ok(r) = doc.resolve(pos) else {
         return (pos, pos);
@@ -153,27 +239,9 @@ pub fn word_range_at(doc: &Node, pos: Pos) -> (Pos, Pos) {
     if !r.parent().is_textblock() {
         return (pos, pos);
     }
-    let chars: Vec<char> = block_text(r.parent()).chars().collect();
-    if chars.is_empty() {
-        return (pos, pos);
-    }
+    let units = block_units(r.parent());
     let content_start = pos.0 - r.parent_offset();
-    let off = r.parent_offset().min(chars.len());
-    let is_word_char = |c: char| !c.is_whitespace();
-    // Classify by the char right of the gap, but prefer the word at a word's
-    // trailing edge (right char whitespace, left char a word char).
-    let classify_right = off < chars.len()
-        && (is_word_char(chars[off]) || off == 0 || !is_word_char(chars[off - 1]));
-    let class_idx = if classify_right { off } else { off - 1 };
-    let target = is_word_char(chars[class_idx]);
-    let mut start = off;
-    while start > 0 && is_word_char(chars[start - 1]) == target {
-        start -= 1;
-    }
-    let mut end = off;
-    while end < chars.len() && is_word_char(chars[end]) == target {
-        end += 1;
-    }
+    let (start, end) = rinch_words::word_range(&units, r.parent_offset());
     (Pos(content_start + start), Pos(content_start + end))
 }
 

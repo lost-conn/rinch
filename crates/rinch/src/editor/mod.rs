@@ -1,15 +1,15 @@
-//! Desktop wiring for the rich-text editor (part of the `desktop` feature).
+//! Desktop wiring for the rich-text editor (part of the `windowing` feature).
 //!
-//! The renderer-agnostic editor — [`RinchDomEditorView`], [`EditorHandle`], the
-//! [`Editor`] component, the mounted-editor registry, and the caret-blink clock —
+//! The renderer-agnostic editor — `RinchDomEditorView`, `EditorHandle`, the
+//! `Editor` component, the mounted-editor registry, and the caret-blink clock —
 //! lives in the shared [`rinch_editor_view`] crate (reused by the web editor in
 //! `rinch-web`). This module re-exports it and adds the **desktop-only** pieces that
 //! reach past the [`DomDocument`](rinch_core::dom::DomDocument) seam into the
 //! `rinch-dom` renderer or a native platform adapter:
 //!
-//! - block [`virtualization`] (Parley `estimated_height` over the concrete layout tree),
-//! - AccessKit [`a11y`] (the AT-SPI adapter; the derivation itself is portable), and
-//! - the thread-safe collaboration inbound entry point [`post_remote_delta`].
+//! - block `virtualization` (Parley `estimated_height` over the concrete layout tree),
+//! - AccessKit `a11y` (the AT-SPI adapter; the derivation itself is portable), and
+//! - the thread-safe collaboration inbound entry point `post_remote_delta`.
 
 #[cfg(feature = "a11y")]
 pub(crate) mod a11y;
@@ -27,7 +27,7 @@ pub(crate) use virtualization::{
 /// where [`collab_receive_for`] integrates it and re-projects the editor; the runtime
 /// is woken so the change paints promptly.
 #[cfg(feature = "collaboration")]
-pub fn post_remote_delta(container_id: usize, delta: Vec<u8>) {
+pub fn post_remote_delta(container_id: u64, delta: Vec<u8>) {
     crate::shell::run_on_main_thread(move || {
         rinch_editor_view::collab_receive_for(container_id, &delta);
     });

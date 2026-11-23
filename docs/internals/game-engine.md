@@ -1,0 +1,758 @@
+# Game engine integration (RenderSurface, embed)
+
+Read this page when your task touches: RenderSurface, GPU device sharing, the embed API, RinchContext.
+
+Moved verbatim from `CLAUDE.md` on 2026-10-22 (the index there points here). New mechanism notes for this area go on this page, not in `CLAUDE.md`. A code comment that cites a `CLAUDE.md` section by name means a section now on one of these pages: `grep -rn '<name>' docs/internals/`.
+
+## Game Engine Integration
+
+Two complementary patterns for integrating with game engines and custom renderers:
+
+### RenderSurface (Recommended)
+
+Rinch owns the window. Your renderer submits frames into a `RenderSurface` component. Rinch handles layout, compositing, and event routing.
+
+**Key types** (all re-exported in prelude):
+
+| Type | Purpose |
+|------|---------|
+| `RenderSurfaceHandle` | Main handle — `writer()`, `gpu_registrar()`, `set_event_handler()`, `set_key_handler()`, `set_pointer_events()`, `set_render_callback()`, `set_continuous()`, `request_frame()`, `layout_rect()` |
+| `RenderSurface` | Component — `RenderSurface { surface: Some(handle) }` |
+| `SurfaceWriter` | Thread-safe CPU pixel submission (`Send + Sync + Clone`) |
+| `GpuTextureRegistrar` | Thread-safe GPU texture registration (`Send + Sync + Clone`) |
+| `SurfaceEvent` | Input events dispatched to surface handler (with `set_pointer_events(true)`: `PointerDown/Move/Up/Cancel` carrying a `SurfacePointer { id, kind, pressure, primary }`, and `Pinch`, instead of `MouseDown/Move/Up`) |
+| `create_render_surface()` | Factory function |
+
+**Usage:**
+```rust
+let surface = create_render_surface();
+surface.set_event_handler(|event| { /* handle mouse/keyboard */ });
+
+let writer = surface.writer();
+std::thread::spawn(move || {
+    writer.submit_frame(&pixels, w, h); // CPU pixels
+});
+
+// Or for GPU textures:
+let registrar = surface.gpu_registrar();
+registrar.set_texture_source(wgpu_texture, wgpu_view, w, h);
+registrar.notify_frame_ready();
+
+rsx! { RenderSurface { surface: Some(surface), style: "flex: 1;" } }
+```
+
+**A press on a surface keeps the pointer** (#1502), on desktop and the web: its moves
+and releases go to that surface wherever they are, until the release of the button that
+started it (a chord's release ends nothing, #1087). Desktop keeps one capture per pointer
+(`RinchApp::surface_captures`, so two fingers each hold one) and routes only the
+surface's events: DOM hover and the cursor still follow the pointer. A capture whose
+release went missing is ended through the missed-release heal (`release_press_gestures` →
+`release_surface_captures`): a window blur and a platform `PointerCancel` end every
+capture, a left press only the pressing pointer's (another finger's press proves nothing,
+and two fingers holding a surface is a pinch); the surface hears `PointerCancel` or, without
+pointer events, a `MouseUp` at the cursor. A surface that is unregistered or leaves the
+document drops its capture silently (`prune_surface_captures`). Ctrl+wheel on a surface with
+pointer events is a `Pinch`; desktop negates winit's `delta_y` so the direction matches the
+browser's `deltaY` (`wheel_zoom_scale` takes the DOM sign). Pointer ids: desktop mouse `1`,
+tablet tool `2`, fingers above `1 << 32`; the web passes `pointerId` through; Android and
+embed report every pointer as the mouse. Pins: `app/surface_pointer_tests.rs`,
+`shell/rinch_runtime/winit_input.rs` `pointer_source_tests`, `rinch-web/tests/render_surface_pointer_events.rs`.
+
+**Pointer lock on a surface** (#2092). `RenderSurfaceHandle::request_pointer_lock`
+is the window's lock held by the surface's element (`element`, set by
+`RenderSurface::render` — the desktop `<div>`, the web `<canvas>` — and cleared
+at its cleanup), with the surface id recorded so `dispatch_pointer_motion` sends
+it `SurfaceEvent::PointerMotion` while the lock is granted;
+`unregister_render_surface` releases it. An embed host installs a
+`PointerLockHost` and forwards `PlatformEvent::PointerMotion`; mechanism and
+pins: `app-and-windows.md`, "Pointer lock and raw motion (#2092)".
+
+**Bound elements** (#2219). A surface whose element the app builds (a named
+surface's `data-viewport` element, an app canvas) gets one with
+`RenderSurfaceHandle::bind_element`. The handle's `element` field is an
+`Rc<SurfaceElement>` shared by the clones: `mounted` is the component's element,
+and its `Drop` (the last clone gone) forgets the binding and calls
+`pointer_lock::surface_dropped` (a `try_with` release, safe in TLS teardown).
+Note the registry holds a clone of every registered surface, so a named or
+mounted surface's handle "drops" only after `unregister_render_surface`, which
+releases anyway. Bindings live in the thread-local `BINDINGS` (surface id,
+element, a serial, a `Weak` of the event handler), not in the handle, so a
+scoped binding's `on_cleanup` captures only `(id, serial)` and undoes only its
+own binding, never a later one. `element()` is the binding, else `mounted`. A scoped re-bind of the same element whose binding is already `owned` returns early, so a handler or effect that binds on every run does not pile cleanups on its owner (a handler or effect runs with its component as owner, so its binding is scoped too).
+A binding change ends the surface's lock when `pointer_lock::held_element(id)`
+is some other element than the new one (and the other surface's, when the
+element is taken from it); `LockOnRebind::Move` calls `pointer_lock::request`
+on the new element instead, and releases only if that is refused. A lock's
+motion goes through `dispatch_locked_surface_event`: the registry like any
+surface event, else the binding's handler, so a handle that was never mounted
+still hears it. The element leaving the document is the existing element-lock
+path (`pointer_lock::prune` on desktop; the browser on the web). Pins:
+`app/surface_bind_element_2219_tests.rs`, `rinch-web/tests/surface_bind_element_2219.rs`.
+
+**A focused surface only swallows the keys it claims (issue #482).** `set_event_handler`
+still receives every `KeyDown`/`KeyUp` while the surface is focused — that delivery is
+unaffected. `set_key_handler(|key: &SurfaceKeyData| -> bool)` answers a separate, additive
+question asked *after*: should this key stop at the surface, or continue past it? Leave it
+unset (the default) and the surface claims nothing, so a host's own `window`-level
+keybindings (and, on the web, the browser's own shortcuts — reload, find, …) keep working
+the moment a canvas takes focus, and on desktop so do DevTools (F12), inspect mode (Alt+I)
+and Tab. Return `true` only for a key the surface genuinely uses (WASD steering a
+character, Space to jump):
+
+```rust
+surface.set_key_handler(|key| matches!(key.code.as_str(), "KeyW" | "KeyA" | "KeyS" | "KeyD" | "Space"));
+```
+
+Before this existed, a focused surface swallowed **every** key unconditionally — on the web
+via `preventDefault()`/`stopPropagation()` on every `keydown`, on desktop by never falling
+through to the same DevTools/inspect/Tab handling an unfocused canvas always had. The
+document-level keyboard interceptor (`rinch_core::events::set_keyboard_interceptor`) is
+unaffected either way: it already saw every key before a focused surface did, on both
+backends, and still does — a host that wants an app-global chord to win regardless of
+surface focus should register it there rather than through `set_key_handler`.
+
+**On `rinch-web`, an unclaimed key also keeps the browser's own default action** — no
+longer `preventDefault()`ed just because the surface is focused, matching how an unfocused
+`<canvas>` already behaves. Space, PageUp/Down and the arrow keys can scroll the page, and
+Tab leaves the canvas for the next tab stop. A web game that steers with any of those must
+claim them through `set_key_handler`, or the page scrolls under it.
+
+**Render-callback pacing and position (#1768).** `RenderSurfaceHandle::continuous` is an
+`Option<bool>`: `None` (never set) keeps each backend's original pacing — desktop runs the
+callback in every paint, the web's rAF loop every frame — and `Some(true)` / `Some(false)` are
+"every frame" / "on demand" on both. The rule is two pure functions, `draws_this_frame` and
+`wants_next_frame`, used by both drivers: desktop's `invoke_render_callbacks_where` (and through
+it an embedded context's `scene()`) and the web's `start_raf_loop`. `frame_requested` is taken
+(`replace(false)`) just before the callback, so a `request_frame()` made inside it is seen
+afterwards: desktop then calls `request_repaint()` once the `IN_RENDER_CALLBACK` guard is down
+(inside it the call is suppressed), the web keeps its loop going. A request is not taken while
+the surface has no size. `set_and_notify_size` requests a frame for an on-demand surface on every
+size change, and `schedule_canvas_init` on every web mount (a new canvas is blank). An embedded
+context reports a wanted frame through `render_surface::surfaces_want_frame` in `needs_update`
+and as `update`'s `RequestRedraw` — only for a surface with a non-zero size, or a continuous
+surface under `display: none` made the host spin at 100% with no callback run (review of
+#1790). No size, no frame, everywhere: the web loop also stops at size 0 and
+`set_and_notify_size` restarts it at the next size. The desktop paint runs **every** registered
+surface's callback, and a surface whose node left the document while its component lived on (a
+captured handle hidden by an `if`) kept its last size, so `RinchApp::update_render_surface_layouts`
+(`forget_absent: true` on the desktop window only — the registry is per thread, and an embedded
+context sharing it would zero another context's surfaces; it runs only its own ids) zeroes the
+size of every registered inline surface not in the document, with no resize callback;
+`all_surface_layout_rects` also skips a surface node inside a detached subtree. On the web `wake_for_frame` uses `try_borrow` on the callback
+cell: inside the callback it is borrowed, and the running loop picks the request up. Position:
+an inline `RenderSurface` got only its size before (`update_layout_size_by_id`), so
+`layout_rect()` said `(0, 0)` on desktop, in embed and on the web alike; the desktop paints and
+`RinchContext::prepare_render_surfaces` now call `update_layout_rect_by_id` with the painted
+box, and on wasm `layout_rect()` reads the canvas's `getBoundingClientRect` when called. Pins:
+`render_surface::pacing_tests_1768`, `app/render_surface_pacing_1768_tests.rs`,
+`tests/embed_render_surface_pacing_1768.rs`,
+`rinch-web/tests/render_surface_pacing_1768.rs` (Chrome 155; also passes in Firefox via
+Playwright).
+
+**A GPU texture layer composites in an opaque window too (#1774).** With composite layers
+present, `WgpuRenderer` renders the Vello UI over a transparent base (`desktop::ui_base_color`)
+and the compositor clears the window base under the layers, blits them, then blends the UI on
+top. That base used to go transparent only for CPU-pixel layers (`composite_layers`), so a
+window whose only layer was a zero-copy GPU texture (`gpu_layers`, a `GpuTextureRegistrar`
+surface named by `data-viewport`) rendered its UI over opaque white, which covered the layer;
+a transparent window's base is transparent anyway, so it worked there. Pin:
+`shell::compositor::gpu_alpha_tests::gpu_alpha_a_gpu_layer_shows_in_an_opaque_window_1774`
+(`#[ignore]`d, needs a GPU: `cargo test -p rinch --features gpu --lib -- --ignored gpu_alpha`).
+
+**The GPU render callback (#1768 part 3, desktop): frames drawn in the scene.**
+`set_gpu_render_callback` stores a `FnMut(&GpuSurfaceFrame)`. How a surface is drawn is decided in
+**one place**, `render_surface::surface_route` → `SurfaceRoute` (`Pixels` | `GpuImage(device)`):
+the GPU route needs a GPU callback, a device (`gpu_frame_device`: `renderer::gpu_presenting` and
+`gpu_handle()`), and a host that can draw a registered image (`invoke_render_callbacks` from the
+desktop window passes `true`; an embedded context's `invoke_render_callbacks_for` passes
+`false`, since its host renders the scene with a renderer of its own, and an image registered
+with another renderer panics in Vello). A future split-layer fast path (the UI rendered below
+and above the surface, the compositor applying clip, radius, opacity and transform) is meant to
+be another variant there, behind the same callbacks. `draw_gpu_frame` draws into the surface's
+own `gpu_target` (`Rgba8Unorm`, `RENDER_ATTACHMENT | TEXTURE_BINDING | COPY_SRC | COPY_DST`,
+`Rgba8UnormSrgb` view), never the app's `texture_source` (review of #1861, D3), reallocating
+it when the size moves, and sets `gpu_frame_fresh`. `paint_gpu` then takes
+`collect_gpu_surface_frames(&ids)` for its window's surfaces (#2416),
+has `WgpuRenderer::sync_surface_images` register each target
+with the window's Vello renderer (`register_texture`, kept while the texture is the same one,
+dropped otherwise; declared `AlphaPremultiplied`), marks the fresh surfaces' nodes paint-dirty
+(their boxes are the frame's damage, so a GPU partial frame #1718 re-renders them), and hands
+the images to paint (`rinch_dom::paint::set_surface_gpu_images`). Paint draws them where a CPU
+frame is drawn — the `data-render-surface` node's content, `object-fit: contain`, through
+`Painter::draw_gpu_image` (a no-op by default; `VelloPainter` fills with the image brush and the
+half-pixel brush transform of #1027; `ClipTrackingPainter` forwards it — a wrapper that does not
+draws nothing) — so every clip, layer, opacity group and transform around the node applies.
+Nothing is a hole or a `data-viewport` any more; the surface is sized like a CPU surface (its
+layout box times the transform's axis scales, see review 2 below), which also ended the two-sizes-a-paint under a transform of the layer version
+(review D1). **Atlas:** Vello packs every image of a scene into one atlas of at most 8192²
+(`VELLO_ATLAS_SIDE`), re-created each frame, and silently drops an image it cannot place.
+`gpu_target_size` clamps a target to `min(max_texture_dimension_2d, 8192)` a side and
+`gpu_atlas_scale` shrinks all GPU frames of a paint alike when together they pass half the
+atlas (`GPU_FRAME_ATLAS_BUDGET`); each warns once. **Video** left the GPU compositor in the same
+change: `surface_takes_compositor_path(is_inline, is_video, gpu)` is false for video, so on the
+GPU window `collect_viewport_frames_by_name` hands its CPU frames to paint
+(`RinchApp::install_gpu_viewport_frames`, with the `GameViewport` hole set) and they are drawn
+inline, as on software — black bars and all. The retention of the last layers while a video
+was loaded went with it. `GameViewport` and `GpuTextureRegistrar` textures stay compositor
+layers. Cost (spike, integrated Radeon 890M, wall time): a 640×360 surface 3–7 ms a frame in
+the scene against 1–3 as a layer, full-window 1080p 12 against 2, 4K 15 against 3; 4K video
+25 against 6. Pins (`#[ignore]`d, real GPU: `--ignored gpu_`): `gpu_render_callback_frames_are_drawn_as_elements`
+(non-clipping ancestor background beneath, rounded clip, ancestor opacity, a later translucent
+element above, z-index order, ancestor transform, overflow clip),
+`…_frames_scroll_with_their_scroller`, `…_frames_go_to_the_scene`, `…_under_a_transform_has_one_size`,
+`…_target_is_clamped_to_the_device_limit`, `…_frames_share_the_atlas`,
+`…_never_draws_into_an_app_texture`, `…_frames_are_rounded_by_their_own_radius`,
+`…_atlas_share_holds_for_idle_surfaces`, `…_unset_pacing_is_on_demand`,
+`a_later_window_presents_with_the_shared_device`, `gpu_video_frames_are_drawn_as_elements`; and
+`without_a_gpu_compositor_the_gpu_callback_falls_back_to_the_render_callback` everywhere.
+**Review 2 of #1861.** *One device:* `WgpuRenderer::try_new_transparent` used to request a
+new instance, adapter and device for every window, and a window re-created by hide/show (a tray
+app, a layer-shell output loss) got a second device while `gpu_handle()` kept the first — GPU
+frames were drawn on one and registered with a renderer on the other. Now the first window's
+instance is kept beside `GPU_HANDLE` (`RINCH_INSTANCE`) and `shared_gpu_stack` hands every later
+window that stack (as `App::external_gpu` always did); a shared adapter that cannot present to
+the new window is an `Err`, i.e. the software fallback under `Renderer::Auto`. Checked live: a
+hide/show in a nested KWin makes two renderers and one instance, and the surface draws after.
+*Atlas:* a target whose size differs from the one it has (a new layout size, or the share
+moving) is drawn again, idle or not, so the share holds for every surface and a shrunk one
+recovers. *Size:* `all_surface_layout_rects` reports the layout size times the transform's axis
+scales (not the painted bounding box, which letterboxed a rotated frame). *Radius:* the surface
+arm in paint clips its frame to its own `border-radius`, GPU and CPU. *Pacing:* an unset GPU
+surface is on demand (`invoke_render_callbacks_where`). The registration is
+`desktop::SurfaceImages`, which the GPU tests drive too.
+
+**Review 3 of #1861: the frame is the element's content.** The `data-render-surface` arm that
+painted a frame over the whole border box (background square, border never painted) is gone:
+the generic element arm paints the surface's background, shadow, border and outline as for any
+element, and then `paint_surface_frame` draws the frame — GPU image or CPU pixels — into the
+**content box** (`paint::content_box_insets`: border plus padding; a percentage padding counts
+as zero there), `contain`-fitted, clipped to the inner radius (`BorderRadii::inner` by those
+insets). The target size follows (`all_surface_layout_rects`: content box × the transform's axis
+scales), so `layout_size()`, `layout_rect()`'s size and the resize callback report the content
+box now, where they reported the border box. Pins: `gpu_render_callback_frames_sit_in_the_content_box`
+(rounded background, square and rounded border, padding; GPU and CPU),
+`gpu_render_callback_target_is_the_content_box`.
+
+**Device loss (#1788).** The shared device lives in `shell/gpu_device.rs`'s `GpuSlot` (`GPU`):
+the published `(Instance, GpuHandle)` behind an `RwLock`, a **generation** moved on by every
+`publish` (a window's renderer starting with no device published) and every `retire`, a `due`
+flag and an `announce` flag. `gpu_handle()` returns a clone (three `Arc`s) of what is published —
+it returned `Option<&'static GpuHandle>` from a `OnceLock` before, which could never change — and
+`GpuHandle::generation()` / `gpu_generation()` say which device it is. *Detection:*
+`WgpuRenderer::try_new_for` watches the device it published with `set_device_lost_callback`
+(`GpuSlot::watch`), capturing its generation; the callback (any thread) marks the slot due and
+wakes the loop through `GLOBAL_PROXY`, and a callback from a device already retired is ignored.
+A driver's loss calls it at once (wgpu-core's `Device::lose`); `Device::destroy` marks the device
+invalid at once but calls it (with `Destroyed`) only at a poll that finds the queue empty.
+*Between the loss and the replacement* every call on the device fails. wgpu drops the
+`ErrorType::DeviceLost` errors, but not a validation error on a resource the loss made invalid
+(mapping a buffer created on the dead device), and its default handler panics on those; and
+`DeviceExt::create_buffer_init` `expect`s a mapping a lost device does not give. Found by
+destroying the device under `examples/gpu-device-config` in `frames` mode, which panicked both
+ways before these: `watch` also installs an `on_uncaptured_error` handler that drops errors from a
+device known lost (logging the first) and panics on any other, as wgpu's default does, after
+first polling the device with a wait so a destroyed one has reported itself; the split
+compositor's uniforms are written through `split_compositor::uniform_buffer`, which leaves the
+buffer unwritten where `create_buffer_init` panicked; `settle_gpu_device` polls the published
+device (without waiting) before deciding; `WgpuRenderer::paint_frame` presents nothing once the
+device is known lost after Vello's render; and `present` polls when it cannot acquire a frame. An
+app that sets its own `on_uncaptured_error` on rinch's device replaces the handler. *Replacement:* `RinchRuntime::settle_gpu_device`
+(`shell/rinch_runtime/device_loss.rs`), called at the top of `proxy_wake_up` and before every
+`RedrawRequested` paint, drops every window's renderer and parked renderer, retires the device,
+calls `render_surface::forget_gpu_device` (every surface's `gpu_target` and `texture_source`:
+drawing either on the new device would be a device-mismatch validation error, which panics),
+then builds each window that presented on the GPU again exactly as at startup
+(`ShellWindow::start_gpu_renderer`; DevTools with `WgpuRenderer::try_new`) — the first makes and
+publishes the next device from a **new instance and adapter** (the GPU may have gone), later
+ones share it. Every window that had a frame on the old device (a shown GPU window, or a hidden
+one keeping a renderer) is then marked dirty and redrawn the way a frame Vello lost is (#2071,
+`ShellWindow::redraw_lost_frame`): a shown window requests a redraw, a hidden window the app
+prepared (#2633) is prepared again on the new device, any other hidden one builds its renderer
+at its show; a software window lost nothing and does nothing. The frames still out to Vello went
+with their renderers, so the per-window lost-frame look (`look_at_frames`, #2781, which also asks
+parked renderers) has nothing on the old device left to wait for. The device publish is
+`desktop.rs`'s `publish_gpu_stack`, shared by `try_new_for` and by `attach_window` publishing a
+prepared window's own device at its show (#2633), so a device first published there is watched
+too. A window whose GPU will not start
+falls back or panics by the startup rules (`on_gpu_failure`). Then the `on_gpu_device_replaced`
+listeners (main thread) get `gpu_handle()`, or `None` (software fallback, or every window hidden:
+the next show publishes a device and announces it then). A surface with a GPU callback needs no
+request: a missing target is a resize, so the next paint allocates one on the new device and
+draws, with `GpuSurfaceFrame::generation` the device's. *External devices:* never watched (wgpu
+keeps one device-lost callback per device, and rinch's would replace the app's); the app calls
+`replace_external_gpu(ExternalGpu)`, which `shared_gpu_stack` then prefers over the configured
+stack (`GpuSlot::external_source`), and the same replacement runs. The embed API's host owns its
+device and its `RinchOverlayRenderer`; nothing there changed. Pins:
+`shell/gpu_device_1788_tests.rs` (on slots of their own: a real loss through `Device::destroy`
+is due once, a retired device's loss is ignored, a retire then a publish is announced with the
+new device, an external replacement is due and presented with; listeners), and
+`render_surface_device_loss_1788_tests.rs` (a surface's target and registered texture are
+dropped, and the next paint draws a frame unasked), and
+`gpu_device_errors_on_a_lost_device_do_not_panic_1788`. The runtime glue needs windows and has
+no test; it was checked live (Wayland, a Radeon 890M) by destroying the device from another
+thread under `gpu-device-config`'s `frames` mode: the listener heard generation 3 and the surface
+went on drawing at generation 3. An idle window (nothing drawing) notices a loss at its next
+redraw, when `settle_gpu_device`'s poll reports it.
+
+*Review fixes (#1788).* **Stale resources by generation:** `TextureSource` and `GpuTarget` carry the
+generation of the device they were made on (`TextureSource::generation`, `GpuTarget::generation`),
+and `render_surface::made_on_current_device` says whether that is the current one (`0`, a texture
+an external-device app registered before rinch published, counts as the first device). Every use
+goes through it: `live_texture_source` (each `texture_source` reader, `has_texture_source`, the
+shell's `paint.rs` layer loop) drops a stale texture under the lock; `invoke_window_render_callbacks`
+treats a stale target as a resize and `draw_gpu_frame` makes a new one; `collect_gpu_surface_frames`
+skips one. So a surface unmounted during the replacement (not in `SURFACE_REGISTRY`, which
+`forget_gpu_device` walks) and a texture a render thread registers after `forget_gpu_device` are
+dropped where they would be used. `GpuTextureRegistrar::set_texture_source_on(generation, …)` takes
+the generation of the handle the thread made the texture with and refuses a stale one;
+`set_texture_source` stamps `gpu_generation()` at the call. **Retry:** `replace_gpu_device` only
+drops and retires; `device_loss.rs`'s `GpuRebuild` holds the shown GPU windows, and
+`run_gpu_rebuild` (from `settle_gpu_device`, which `AboutToWait` now also calls; its `next` is the
+loop's sixth timed wake) tries each with `ShellWindow::try_start_gpu_renderer` (the startup path
+without `on_gpu_failure`) at 0, 100, 300, 700 ms … (doubling, at most 1 s apart) until 5 s
+(`GPU_REBUILD_LIMIT`), then once more by the startup rule (`start_gpu_renderer`: panic or software
+fallback). A waiting window paints nothing (`awaits_gpu` in the redraw arm). The listeners hear
+the device only once the rebuild is over, and `redraw_lost_frame` runs then for every lost-frame
+window still open (#2891: a window closed during the rebuild is skipped, through
+`RinchRuntime::open_w`; `w` panicked on it). A hidden window prepared on the GPU is in the rebuild
+too (#2891), so it is prepared again on the renderer the rebuild built it, or, when the GPU did
+not come back in time, by the startup rule at the rebuild's end; a window shown during the rebuild
+that already has its renderer is settled rather than built a second one. The shown windows are
+tried first (`GpuRebuild::run_shown_first`, #2896), and a hidden one is not tried while a shown
+one still waits: built first, a hidden window's `try_new_offscreen` finds no device published and
+makes a private one, which its show then refuses once a shown window has published another. A second loss
+during a rebuild folds the earlier rebuild's windows into the new one. **A window shown or made during the recovery** (`device_loss::gpu_recovering`: under 5 s since
+the retirement, `note_retired`): `ShellWindow::start_gpu_renderer` goes through
+`start_renderer_with`, which tries without the startup rule and, if the GPU will not start yet,
+sets `ShellWindow::awaits_gpu`; DevTools opened then does the same. `settle_gpu_device`'s
+`adopt_waiting_windows` hands such windows to the rebuild (starting one, its limit counted from
+the retirement, when the earlier one was over). A waiting window asks for no redraws
+(`AppAction::RequestRedraw` is dropped: nothing presents, so nothing would pace them) and a debug
+screenshot of it is an error, not a software paint. `set_texture_source_on` answers whether it
+registered the texture. **A window prepared during the recovery** (#2824,
+`prepare_current_window`): `ShellWindow::prepare_gpu` builds its offscreen renderer through
+`start_offscreen_with`, which also tries without the startup rule there (it used to take it: an
+`Auto` app's preparation painted with software, a `Renderer::Gpu`/`gpu_config`/`external_gpu`
+app's painted nothing, and neither was prepared again when the device came back) and, when the GPU
+will not start yet, sets `awaits_gpu` and prepares nothing. The rebuild adopts it;
+`rebuild_window` for a window with no OS window (`ShellWindow::rebuild_hidden_with`) builds a
+prepared window's offscreen renderer at the size and scale it was prepared at, with the renderer
+choice it was prepared with (`ShellWindow::prepared_with`), and parks it, retrying with the
+others; at the limit it settles with nothing. The rebuild's end prepares every hidden prepared
+window again (`redraw_lost_frame`), on that parked renderer though no shown window published a
+device, else by the startup rule. Any other hidden window is settled at once, as before. Pins:
+`device_loss.rs`'s `a_window_prepared_during_the_recovery_waits_and_is_rebuilt_on_the_new_device`
+(both `Auto` and `Gpu`, the first two device requests failing) and
+`outside_a_recovery_the_preparation_takes_the_startup_rule`, `a_window_closed_during_the_rebuild_is_skipped`,
+and on test-gpu
+`gpu_device_loss_a_prepared_hidden_window_is_prepared_again_on_its_rebuilt_renderer_2891`
+(every window hidden, so only the parked renderer can carry the preparation). **External devices:**
+`note_external_gpu_lost()` marks the published generation lost (not due: the replacement is the
+app's), so `paint_frame` stops presenting; `poll_published` no longer polls an app's device. Pins:
+`render_surface_device_loss_1788_tests.rs` (the replacement done on the test device itself: retired,
+forgotten, published again, generation +2; an unmounted surface remounts with a fresh target; a
+late stale registration is refused, and one slipped in is dropped at use), `device_loss.rs`'s tests
+(an injected first failure retries and succeeds; a device that never comes ends with the startup
+rule at 5 s).
+
+**The GPU render callback on the web (#1768 part 4).** Behind `rinch`'s off-by-default
+`web-gpu` feature (`dep:wgpu` with its default features, of which only `webgpu` builds on
+wasm32, and `wasm-bindgen-futures`). `build.rs` emits two cfg aliases: `web_gpu`
+(`wasm32-unknown-unknown` with the feature; the feature does nothing on other targets) and
+`surface_gpu` (`gpu` or `web_gpu`), which gates what both halves share: `GpuSurfaceFrame`,
+`set_gpu_render_callback`, `gpu_frames_available`, the handle's `gpu_render_callback` and
+`scale_to_fit`. `RinchGpuConfig`, `ExternalGpu`, `device_features` and `device_limits` moved from
+`shell::desktop` to `gpu_device.rs` (re-exported from `shell::desktop` unchanged, and from
+`rinch::web_gpu`). The decisions (Joe, 2026-10-22, on the issue): WebGPU only, no WebGL (D1,
+D2); rinch owns the device by default with the desktop's config and external-device options
+(D3, `optional_limits` included: `web_gpu::acquire` asks for `device_limits` against the WebGPU
+adapter's limits, as the desktop does); on-demand pacing as on
+desktop, the CPU callback's rAF loop unchanged (D6).
+- **One device per page**, `web_gpu.rs`'s thread-local `STATE`: `Phase` `Idle` → `Pending`
+  (rinch's request in a `spawn_local` task) → `Ready(ExternalGpu)` | `Unavailable`, and a
+  `generation` (1 for the first device, +1 for each new one; frames carry it).
+  `device_for_frame` starts the request the first time a mounted surface with a GPU callback
+  and a size runs a frame. `set_gpu_config` is refused (`WebGpuAlreadyStarted`) once the
+  phase left `Idle`; `set_external_gpu` may be called at any time and replaces the device (a
+  new generation); an adapter that is not `Backend::BrowserWebGpu` is refused
+  (`Unavailable`).
+- **No canvas is claimed before a device exists.** The adapter is requested with
+  `compatible_surface: None` (on WebGPU any adapter presents to any canvas), and a canvas's
+  `wgpu::Surface` is made at its first GPU frame. A browser without an adapter therefore
+  leaves the canvas free for `web_blit_surface`'s 2D context. While `Pending`, neither
+  callback runs (a fallback frame would claim the canvas for 2D first); when the phase
+  settles, `render_surface::wake_gpu_surfaces` requests a frame of every surface with a GPU
+  callback and starts its loop.
+- **The frame** (`web_gpu::draw_frame`, from `run_web_frame`, the rAF loop's body): the
+  surface's `web_gpu_canvas` (`CanvasGpu::Ready { surface, config, generation }`, or
+  `Refused` when `create_surface` fails because another context owns the canvas — warned
+  once, retried only after a remount) is made or re-made for a new generation; the browser's
+  preferred format (`caps.formats[0]`) with its `…Srgb` view, `PreMultiplied` alpha (the
+  desktop draws frames premultiplied too; WebGPU canvases take `opaque` and `premultiplied`.
+  wgpu 30.0.1, the version `Cargo.lock` pins, lists only `Opaque` in the web caps, and 30.0.2
+  lists `PreMultiplied` as well; `configure` maps it in both, so rinch sets it without
+  consulting the caps), `Fifo`, and the desktop target's usages (`RENDER_ATTACHMENT |
+  TEXTURE_BINDING | COPY_SRC | COPY_DST`; wgpu's web caps report `RENDER_ATTACHMENT` only,
+  statically, but WebGPU canvases accept the others). The target is `layout_size()` through
+  `scale_to_fit` at `max_texture_dimension_2d`. It is reconfigured when the config's size or
+  the canvas's own `width`/`height` differ from the target: wgpu sizes the canvas in
+  `configure`, and the ResizeObserver sets it to the layout size, past the target when the
+  limit scaled it — and wgpu's `SurfaceTexture` reports the config's size, not the canvas's.
+  `Outdated`/`Lost` reconfigure once; other statuses skip the frame. The callback gets the
+  current texture and a default view, then `queue.present`.
+- **Pacing.** In `run_web_frame` a GPU-routed surface's unset pacing is on demand
+  (`continuous.unwrap_or(false)`), as on desktop; a target or generation that changed draws
+  regardless (`web_gpu::target_changed`). `draws_on_demand` (an unset surface with a GPU
+  callback counts) decides whether `set_and_notify_size` and `schedule_canvas_init` request
+  a frame, and `frame_callbacks` (either callback; `None` while one runs, its cell borrowed)
+  whether they and `wake_for_frame` start the loop.
+- **Device loss** (`watch_for_loss`, a device-lost callback holding only the generation, as
+  it must be `Send`): a loss of the current rinch-made device goes back to `Pending` and
+  requests a new one; `DeviceLostReason::Destroyed` (an explicit `destroy()`) goes to
+  `Unavailable`, as does a failed re-request (Chrome blocks WebGPU after repeated GPU-process
+  crashes). An app-supplied device is not watched: the app hands over its replacement.
+- Pins: `rinch-web/tests/render_surface_gpu_1768.rs` (`--features web-gpu`): with an adapter,
+  the first frame's size is the canvas's device-pixel size on generation 1 and the fallback
+  does not run; unset pacing is on demand, a request and a resize each draw one frame,
+  continuous draws every frame; without one (headless CI), `gpu_frames_available` stays
+  false, the render callback draws, and the canvas still takes a 2D context. Under
+  SwiftShader WebGPU, `a_destroyed_device_hands_the_canvas_to_the_fallback` pins the renewal
+  below.
+- **A canvas after the device is gone** (`render_surface::renew_gpu_canvas`, from
+  `run_web_frame` on `DeviceFor::Unavailable`): a canvas keeps the first kind of context made
+  on it, so one that drew GPU frames (`web_gpu_canvas` is `Ready`) would refuse the fallback's
+  2D context and every `submit_frame` would be dropped. The surface's node gets a fresh
+  backing element through `DomDocument::renew_element` (`WebDocument`: a shallow
+  `cloneNode`, same id and attributes, put in its place, the node id moved to it in both
+  node maps); then `teardown_web_surface` and `schedule_canvas_init` set it up as on a
+  mount, and the render callback draws on it from the next frame. CI's
+  `clippy-wasm` builds `rinch-web --features web-gpu`. The renewal itself is
+  `render_surface::renew_canvas` (GPU-free; the test hook
+  `RenderSurfaceHandle::__renew_canvas` calls it), and it carries two things over (#2813):
+  `WebDocument::renew_element` moves a bounds watch to the new element
+  (`bounds::renew`: unobserve the old, observe the new, schedule a refresh), so a
+  `bounds_signal()` taken before keeps updating; and the presses the old canvas held
+  (`HeldPresses` in `WebSurfaceCleanup`, kept by the pointerdown/move/up/cancel listeners)
+  end from a microtask after the renewal through `dispatch_surface_pointer_cancel` at the
+  last delivered position — the old canvas took the pointer capture and listeners with it,
+  so the release would reach nothing, or the new canvas as a release with no press. The
+  capture is not moved to the new canvas: a `setPointerCapture` outside a real press cannot
+  be tested, and a cancel is the documented ending of a press whose release never arrives.
+  Pins: `rinch-web/tests/render_surface_renewal_2813.rs`, and
+  `bounds_signal_1781.rs` (`the_signal_follows_a_renewed_element`).
+- **CI and WebGPU** (#2813): `test-wasm` has no adapter, so the adapter halves of
+  `render_surface_gpu_1768` and `render_surface_gpu_lost_1768` return early there. Headless
+  Chromium with `--enable-unsafe-webgpu --enable-features=Vulkan
+  --use-webgpu-adapter=swiftshader` gives an adapter, but SwiftShader loses every device a few
+  frames after creation (plain JavaScript too), so the adapter half of
+  `render_surface_gpu_1768` fails there; no CI job runs WebGPU until a reliable adapter (a
+  GPU runner) exists. The renewal's GPU-free half is covered without one (above). The
+  "request a new device" loss path is untested: SwiftShader's loss and `destroy()` both
+  report `Destroyed`.
+
+**Split-layer fast path (#1865, in progress).** Design record:
+`docs/design/split-layer-gpu-surfaces.md`. PR 1 adds the compositor,
+`shell/split_compositor.rs` (`SplitCompositor`, not yet wired into the present
+path): below around the regions, then per surface `above_out ∘ mix(below,
+above_in ∘ (surface · own ∘ below), ancestors)` in one pass with no blend
+state, every blend in the shader in f32, the surface sampled with Vello's own
+image arithmetic, so a split matches in-scene bit for bit except in the D10
+classes. The ancestors' clip coverage is applied once, to the surface and
+what is painted over it inside those clips (`above_in`, rendered without
+them), as the scene does; applying it to each separately conflated on a
+rounded card's ring (#1887 review).
+The oracle is `shell/split_compositor_1865_tests.rs` (per-pixel allowances
+computed from each case's own renders; `0` everywhere no class names), the
+Vello facts it stands on are pinned in `shell/split_slices_1865_tests.rs`
+(a registered texture no scene draws is never read; a whole-pixel clip has
+binary coverage; the below slice is in-scene but one level near R; an
+inverse clip must be non-zero with the hole wound backwards, since even-odd
+nested in a clip drops coverage on lavapipe). Both are `#[ignore]`d GPU tests
+named `gpu_split_*`; `split_composite_cost_probe` is the cost measurement.
+
+**The split path in the desktop window (#1865 PR 3).** `paint_gpu` enables
+splitting (`RinchApp::set_split_enabled`) unless a `GameViewport` layer is
+under the UI; `build_gpu_frame_split` paints with `VelloPainter::begin_slicing`
+and hands back a `shell::split_frame::SplitChange` (the surfaces whose kept
+slices it replaces, and the new slices); `WgpuRenderer::apply_split` renders
+the new slices into region textures (`SplitFrame`, each slice rendered where
+the window draws it into a scratch target, region kept) and `present`
+composites (`SplitFrame::composite`) when anything is split. A fresh frame of
+a split surface is not damage (`RinchApp::mark_fresh_surfaces`): the window
+composites without repainting. Damage meeting a kept region has the region
+added, so the region's slices are replaced whole. **A surface the frame may
+split that it does not keep** (splitting back on, a suspension run out, its
+D7a blocker repainted, a cap retry) has its region added the same way, from
+where a sliced paint last found it (#2511): `app/split_seen.rs`'s
+`SeenSurfaces`, fed after each sliced pass with the slices and the painter's
+overlap refusals (`VelloPainter::blocked_splits`), and read after the kept
+regions' growth and the S4 watch, which it leaves as they were. A surface
+blocked by a kept one is offered only when the frame's own damage, before
+any region is added, holds all of the blocker's region: a blocker that moves,
+resizes or goes damages its box where it was painted, and a change painted
+over it (a HUD over a viewport) damages only its own rect, so the blocked
+surface, which would be blocked again, does not repaint its region on every
+such frame. A blocker partly clipped by an ancestor has its old box damaged
+only inside the clip, so its move leaves the blocked surface to the safety
+net. Before it,
+such a slice came out short and the safety net painted the frame a second
+time. The safety net stays, for a region no record predicted (a stale one).
+A tainted slice repaints the frame in-scene and suspends splitting for 120
+frames. Debug builds log each
+surface's placement change (`tracing::debug!`). **Video (PR 4):**
+`split_frame::prepare_split_viewports` names the video viewports paint may
+split (`set_viewport_split_ids`) and drops a split video's new frame from the
+viewport damage, unless its size is not the slice's (a size change is caught
+there, where the frame arrives; `stale_ids` covers `RenderSurface` textures).
+Paint's video arm offers the frame to `split_surface` after its black
+backdrop. After the frame's change is applied,
+`SplitFrame::upload_split_frames` uploads the frames of the videos the window
+keeps split, and only those (one texture per surface id, straight alpha;
+counter `split_frame_uploads`). **Memory cap (PR 5, D6):** a window's split
+memory (the scratch target at the size its kept slices need, each slice's
+masks and above slices; not the window's own textures, a `RenderSurface`'s,
+or the uploaded video frames, which in the scene sit in Vello's atlas:
+`split_frame::COUNT_UPLOADS`) may be `SPLIT_MEMORY_CAP_WINDOWS` (4) times
+the window's texture bytes (`split_frame::split_bytes`, `over_cap`). After
+paint, `RinchApp::gpu_frame_kind` adds this frame's slices in paint order to
+what stays split from earlier frames; the first that passes the cap and every
+one after it are refused (`VelloPainter::refuse_split`,
+`Refusal::MemoryCap`) and the frame is painted again with them in the scene.
+They stay refused until the cap grows (a bigger window: a resize that shrinks
+it keeps them), a split surface the cap did not refuse goes, or 120 painted
+frames pass. A painter that splits what it was told to refuse sends every
+surface to the scene, logs an error once and suspends splitting as taint
+does. The scratch target is dropped
+when it is larger than the kept slices need. Oracle:
+`crates/rinch/src/split_runtime_1865_tests.rs` (`gpu_split_runtime_*`, a child of `render_surface`),
+the runtime's own steps against an in-scene window.
+
+**Sharing a high-capability GPU device (issue #57):** zero-copy compositing needs your texture on the *same* device rinch composites with (`gpu_handle()` → `device`/`queue`/**`adapter`**). `gpu_handle()` is `None` whenever the window presents with the software renderer (`RINCH_RENDERER=cpu`, or the `Renderer::Auto` fallback), so handle `None` unless you use one of the two entry points below — they always present on the GPU. By default that device is created with `Features::default()` / `Limits::default()`. To raise it:
+
+| Entry point | Ownership | Use when |
+|---|---|---|
+| `App::new(component).gpu_config(RinchGpuConfig { required_features, required_limits, optional_features, optional_limits })` | rinch creates the device (surface-compatible adapter) with your extra features/limits, and the optional features and limits as far as the adapter has them | You just need more capability — **recommended**, always presents correctly |
+| `App::new(component).external_gpu(ExternalGpu { instance, adapter, device, queue })` | You create the whole stack; rinch makes only the surface, validates present-support, composites onto your device | You must keep your exact `DeviceDescriptor` |
+
+Construct `wgpu` types from **`rinch::wgpu`** (wgpu 30; a separately pinned `wgpu` of another major won't type-match). Both are `#[cfg(feature = "gpu-renderer")]` (which `gpu` implies), re-exported in the prelude. Example: `examples/gpu-device-config` (`RINCH_GPU_MODE=external` toggles the two modes).
+
+**`GameViewport` is the base layer (#1866).** A `GameViewport`'s (and a
+`GpuTextureRegistrar` texture's) frame is a layer *under* the UI — the desktop GPU compositor's,
+or the embed host's under `RinchOverlayRenderer`'s texture — so the UI must be transparent over
+it. Paint erases the viewport's box (its own radius, its clip chain, its transform) when it
+reaches the node in paint order, so nothing painted before it shows there — ancestor
+backgrounds whether or not they clip, earlier siblings, the window base — and what paints after
+it (its border, later siblings, popups, a HUD) covers the game as usual. It replaced the hole
+cut into *clipping* ancestors' backgrounds (#974), under which a non-clipping ancestor with a
+background covered the game and the documented fix was `overflow: hidden` on it. A debug
+build warns once per viewport where the rule cannot hold: an ancestor (or the viewport) with
+`opacity < 1`, `mask-image` or a `filter`, whose group is composited over what is beneath it
+after the erase, and a rotate/scale/skew transform, whose erase is not the axis-aligned rect the
+layer is blitted at. The software window draws the frame in the scene right after the erase,
+under the same transform, so only the group warning applies there. The game fills the viewport's **border box** (its border and children paint over it, its
+padding shows it; `viewport_rect` reports that box), where a `RenderSurface` frame sits in its
+content box. On the GPU window and the embed overlay the viewport is not erased in the scene: it
+is split out as a **base** slice and the split compositor replaces what is beneath it inside its
+box (#1865's compositor with one term changed); a refused split falls back to the layered path
+with an in-scene erase, which is approximate inside clips. `RinchContext::scene()` erases in the
+scene too. Mechanism and pins:
+`paint-and-damage.md`, "Viewport holes". `RenderSurface` frames are drawn in the scene and erase
+nothing.
+
+**Web (canvas viewport, issue #91):** the **same** `RenderSurface` + `create_render_surface()` API works on `rinch-web`, but the model is inverted — the **browser** composites, so rinch only creates and manages a `<canvas>` "viewport hole". With the `web-gpu` feature the GPU render callback draws it on rinch's WebGPU device (above, #1768); without it the **app owns the GPU context** and rinch links **no wgpu** on web.
+
+- `handle.canvas_element() -> Option<web_sys::HtmlCanvasElement>` (wasm only) — returns the `<canvas>` after mount (populated in a post-mount microtask; `None` before). Call `wgpu::Instance::create_surface(SurfaceTarget::Canvas(canvas))` on it to render via WebGPU/WebGL. (The lazy 2D-blit CPU path — `SurfaceWriter::submit_frame` — still works and is portable with desktop; it self-disables once you claim a GPU context.)
+- **HiDPI out of the box:** `layout_size()` reports **physical** px (`CSS px × devicePixelRatio`, matching desktop), rinch sizes the canvas backing store to match, and `set_resize_callback(|w, h| …)` pushes the new physical size on every resize (ResizeObserver-driven) so you can reconfigure your wgpu surface.
+- **Input** (pointer/wheel/keyboard incl. **`KeyUp`**/focus) over the canvas is delivered to `set_event_handler` — rinch does not swallow it. `set_render_callback` drives a `requestAnimationFrame` loop (every frame unless `set_continuous(false)`, which stops it between requested frames).
+- **Teardown** is clean: the ResizeObserver and canvas listeners are removed when the component unmounts (no leaks).
+- Example: `examples/webgpu-surface-web` (rinch DOM chrome + a WebGPU triangle drawn with `set_gpu_render_callback`, the same code as `examples/gpu-surface`; `trunk serve` over localhost so `navigator.gpu` is available).
+
+**Source files:**
+- `crates/rinch/src/render_surface.rs` — All RenderSurface types and registry (incl. the wasm32 canvas path: `canvas_element`, `set_resize_callback`, `setup_canvas_events`, `setup_resize_observer`, `WebSurfaceCleanup`)
+- `crates/rinch-web/src/event_delegation.rs` — document-level keyboard/focus routing into the surface (`KeyDown`/`KeyUp`/`TextInput`, focus-clear on outside click)
+- `crates/rinch/src/shell/desktop.rs` — `GpuHandle`, `WgpuRenderer::new` device injection
+- `crates/rinch/src/gpu_device.rs` — `RinchGpuConfig`, `ExternalGpu`, `device_features` (desktop and web)
+- `crates/rinch/src/web_gpu.rs` — the web's device (`set_gpu_config`, `set_external_gpu`, loss) and a canvas's GPU frame
+- `crates/rinch/src/shell/gpu_device.rs` — the desktop's shared device slot, `gpu_handle`, its generation, device-loss detection and replacement (#1788); `shell/rinch_runtime/device_loss.rs` rebuilds the windows
+
+**Optional device features (#2085).** `request_rinch_device` (`shell/desktop.rs`) asks for
+`device_features(required, optional, adapter.features(), bgra_surface)`: the required features,
+`optional & adapter`, and `BGRA8UNORM_STORAGE` for a `Bgra8Unorm` surface where the adapter has it.
+A required feature the adapter lacks is an `Err` naming it, before `request_device` (which used to
+report it as a generic failure); a `gpu_config` app panics on it at startup as before.
+`GpuHandle::granted_optional_features()` is `device.features() & optional` (empty for
+`external_gpu`). The shared paths are untouched: a later window, the DevTools window and a
+`RenderSurface` reuse the one device, and `external_gpu` and the embed API never request one. The
+web's device, with `web-gpu`, is rinch's too: `web_gpu::acquire` asks for
+`device_features(.., bgra_surface: true)`, since the canvas format is not known before a canvas
+surface exists (without the feature the app requests its own). Android's shell requests
+every adapter feature but the experimental ones. Pins: `pacing_and_features_tests` (pure), and
+`gpu_optional_features_follow_the_adapter_2085` (`#[ignore]`d, lavapipe in CI: a feature the
+adapter has is granted, one it lacks is left out, and the same one required fails, named).
+**Optional device limits (#2121).** The limits are `device_limits(required, optional, adapter.limits())`:
+`required.or_better_values_from(optional.or_worse_values_from(adapter))`, so each wanted limit is clamped to
+the adapter's (a maximum lowered, an alignment raised) and never below the required one; a required limit the
+adapter cannot meet still fails device creation. The web's `web_gpu::acquire` uses the same function.
+Pin: `optional_limits_follow_the_adapter_2121` (pure).
+
+**Memory blocks of 8 MiB (#2473).** `request_rinch_device` asks for
+`MemoryHints::Manual { suballocated_device_memory_block_size: 8..8 MiB }`
+(`DEVICE_MEMORY_BLOCK`). With `MemoryUsage`, wgpu-hal gave gpu-allocator a range of 8 to 64 MiB,
+and each block it opened was twice the last, so a window-sized app reserved far more than it
+allocated. The measurement is the issue's table, summed up beside the constant. Host-visible blocks are half the range
+(4 MiB), and an allocation larger than a block is a dedicated one. Android's two device requests
+keep `MemoryHints::Performance` (not measured), and `external_gpu`'s device is the app's own.
+Pin: `gpu_memory_blocks_stay_at_8_mib_2473` (`#[ignore]`d, lavapipe in CI: ten 3 MiB buffers
+open several blocks, none larger than 8 MiB).
+- `crates/rinch/src/app_builder.rs` — the `App` builder (incl. `gpu_config` / `external_gpu`); `crates/rinch/src/shell/mod.rs` holds the deprecated shims
+
+### Embed API
+
+Your game owns the window and wgpu device. Rinch runs headless — you feed it events, it produces a Vello scene.
+
+**Enable it — the module is feature-gated and the gate is not `desktop`.** `rinch::embed` is
+`#[cfg(any(feature = "gpu-renderer", feature = "embed"))]` (`crates/rinch/src/lib.rs`; `gpu` implies `gpu-renderer`), so on default
+features every type below is a compile error rather than the documented behaviour. Use
+`features = ["embed"]` for the headless case this section describes — it pulls in `rinch-dom`,
+`parley`, `peniko`, `vello` and `wgpu` without the desktop shell — or nothing extra if you already
+build with `"gpu"` or `"gpu-renderer"`.
+
+**Key types** (all in `rinch::embed`, re-exported in prelude):
+
+| Type | Purpose |
+|------|---------|
+| `RinchContext` | Main handle — `new()`, `update()`, `scene()`. Multiple contexts can coexist on one thread (#134): each holds its own `subscribe_signal_change` guard, and bounds signals / editor registrations / focus requests are scoped per document via `DomDocument::doc_key()`. Stores/contexts are namespaced per context with a thread-global fallback (#136): `create_store` inside a context lands in that context's namespace (cleared on drop), its effects/handlers resolve it first, and lookups fall back to stores created outside any context. |
+| `RinchContextConfig` | Width, height, scale factor, optional theme, and `fonts: Vec<FontData>` registered before the mount (owned or `'static`, #2101; font data, so it fills only empty generic slots, #2102). After the mount: `register_font(impl Into<FontData>)`, and `register_app_font(AppFont)` for a face that claims a generic |
+| `RinchOverlayRenderer` | Renders a context's UI to a texture: `render(device, queue, &mut ctx)` (since #1866; it took `ctx.scene()` before). Its `GameViewport`s are cut out by the split compositor, exactly; a host rendering `ctx.scene()` with its own Vello gets an in-scene erase, approximate inside clips. A renderer that does not hold the context's last sliced frame (new after a device loss, or another renderer or context took a turn) has the frame painted again: the stamp check below (#1976) |
+| `OverlayCheck` | From `RinchOverlayRenderer::check_frames(device)`, never waiting (#2071). `render` calls it, so a host rendering every frame can ignore it; an event-driven host must call it, because a lost frame is the renderer's and `needs_update` belongs to the context, of which several renderers may take turns. `needs_render` stays true until a `render`; `check_again_at` until Vello's counters are in. On a lost frame `fed` goes to 0, which repaints the slices. Pin: `gpu_an_event_driven_host_gets_a_lost_overlay_frame_back_2071` |
+| `GameViewport` | Component marking a transparent hole for game rendering. **Hittable by default** (#207): `wants_mouse` routes input by hit-testing the hole and walking up to `data-viewport`, so an unhittable hole makes the UI claim the mouse *everywhere*. `pointer-events: auto; background: transparent;` come from the UA stylesheet rule for `[data-viewport]` — not an inline style — so restyling the hole can't strip them, and a HUD root's inherited `pointer-events: none` can't reach it. Your own HUD controls under such a root still need `pointer-events: auto`. It also stamps **no** `data-viewport-ready`, and absence means ready, so its hole is unconditional (#186) — see the **Viewport holes** note under Rendering Backends. |
+| `LayoutRect` | `{x, y, width, height}` in logical pixels |
+
+**Host textures** (#2082, `crates/rinch/src/host_texture.rs`). `RinchContext::register_texture(_with)` stores the host's `wgpu::Texture` (a clone of the handle), its `HostTextureOptions` and its route (`Direct`: `Rgba8Unorm` + `COPY_SRC`; `Convert(view format)`: the other three 8-bit formats, or `Rgba8Unorm` without `COPY_SRC`, which need `TEXTURE_BINDING`) in `HostTextures`, by name, with a version bumped on every registration and `texture_changed`. Each Vello renderer keeps a `HostTextureImages` (the overlay renderer's own, or one the host keeps beside its Vello for `scene_with_textures`), which keeps **each context's registrations apart** (`per_context`, keyed by the context's `HostTextures::token`, an `Arc<()>` held as a `Weak`; a dropped context's images are unregistered at the next sync), so one renderer drawing several contexts in turn (#1976) registers nothing again. The context records which `HostTextureImages` its scene was painted with (`painted_with`, a per-value id) and repaints for another one, since the cached scene names that renderer's images. Before the paint, `RinchContext::install_host_textures` syncs it — a name whose texture has the same size, alpha and route keeps its `ImageData` (a swapped texture is pointed at with `vello::Renderer::override_image`, the same blob id, so the cached scene stays valid; a converted one is converted again into the same target), anything else is re-registered, a gone name unregistered, and any of those `mark_scene_dirty`s the context (one repaint); an `EveryRender` texture, or one whose version moved, is marked dirty for Vello's atlas (`mark_override_image_dirty`) or converted (a texel-for-texel `textureLoad` pass into an `Rgba8Unorm` texture that allows an `Rgba8UnormSrgb` view, written through that view for an sRGB source so the bytes survive the decode). The map goes to rinch-dom's `HOST_TEXTURE_IMAGES` (`paint::set_host_texture_images`) for the paint and is cleared after; `paint_host_texture` draws a `data-host-texture` element's image in its content box by its `object-fit` (initial `fill`), clipped by the inner radius, never split (#1865's `split_surface` is not offered it). `scene()` installs nothing, so it draws none. Cost with no host texture: two `is_empty` checks a render. Pins: `crates/rinch/tests/embed_host_texture_2082.rs` (5 `#[ignore]`d GPU tests: draw-into / swap / resize / `OnChange` / unregister with `paint_frames` counts; the converted formats and both alphas on four-quadrant textures sampled at eight points; refusals and the `scene_with_textures` route; `HostTexture`'s children over the texture; one overlay renderer taking turns on two contexts with a constant `host_texture_registrations`, and two Vello renderers taking turns on one context).
+
+**Typical game loop:**
+```rust
+let mut ctx = RinchContext::new(config, my_ui);
+let mut overlay = RinchOverlayRenderer::new(&device, w, h, format);
+
+loop {
+    let actions = ctx.update(&events);
+    game.render();
+    let ui = overlay.render(&device, &queue, &mut ctx);
+    composite(game_texture, ui);
+}
+```
+
+**Overlay renderer ↔ context frame stamps (#1976).** The overlay's slices live in the renderer
+(`SplitFrame`), the scene in the context, and `RinchContext::sliced_frame` paints only when the
+scene is dirty, so a renderer that missed the context's last sliced frame would draw the cached
+scene with nothing it split out: everything painted after a `GameViewport` missing. Each sliced
+frame a context paints takes a stamp from one process-wide counter (`NEXT_SLICED_STAMP`, so a
+stamp names one frame of one context; `0` is "none"); the renderer keeps the stamp of the slices
+it holds (`fed`) and passes it in, and a mismatch calls `request_repaint` first. That covers a new
+renderer (a host's device loss: the host used to call `mark_scene_dirty` itself), two renderers taking
+turns on one context, and one renderer on several contexts. A failed `SplitFrame::apply` clears
+the split and resets `fed`, so the next frame asks again. Pins:
+`gpu_a_new_overlay_renderer_on_an_existing_context_draws_the_hud_1976` and
+`gpu_overlay_renderers_taking_turns_draw_their_contexts_current_frame_1976` in
+`crates/rinch/tests/embed_game_viewport_base_layer_1866.rs` (the second kills "repaint only a
+never-fed renderer" and "a per-context counter").
+
+**`update()` runs the desktop loop's per-frame housekeeping** (#172, #141, #331):
+the cross-thread queue, `drain_polls`, the deferred-work inbox, the events, the
+**caret blink** (the one timed wake — `RinchContext::next_wake()` hands an
+event-driven host the instant desktop would arm `WaitUntil` with; the clock is
+one per **document**, keyed by `doc_key` — `rinch-editor-view/src/blink.rs`,
+#1149 — so two contexts, or a desktop window beside a context, each blink their
+own focused editor; a clock is held only for a registered editor), layout, then `AboutToWait`
+(transitions, animations, images, the editor overlay pass, focus requests).
+`scene()` drives the inline `RenderSurface`s **in its own document** as
+desktop's paint does — physical layout size, render callbacks, frames painted
+inline — and skips the pass (a document walk) while the thread has no inline
+surface registered, so an unchanged `scene()` stays a cache hit. The compositor path
+(named `data-viewport` surfaces, video, a `GpuTextureRegistrar` texture) is the
+host's to composite.
+
+**The host drives its own input method** (#1147): `RinchContext::ime_state()`
+is the focus arbiter's `ImeState { enabled, cursor_area }` — on for a focused
+`<input>`/`<textarea>`, a non-read-only editor or an `on_ime` target, off
+otherwise and after a host-fed `WindowFocus(false)`; the area is the painted
+caret as an `ElementBounds` in the context's **logical** px — and
+`take_ime_change()` answers the `ImeChange::{Enable, Update, Disable}` that
+takes the host from what it last reported to that state, through the
+crate-private `ImeState::change_to`, the decision the desktop shell's
+`sync_ime` applies to winit. `ImeState`, `ImeChange` and its two struct
+variants are `#[non_exhaustive]` (a purpose hint or surrounding text can be
+added later). Composition comes back in through
+`update` as `PlatformEvent::Ime`. A `wants_keyboard()` node that takes no text
+wants no IME. Pins: `rinch/tests/embed_ime_state_1147.rs`.
+
+**A context's window requests are its host's** (#2801). `send_native_event_for`
+(`shell/rinch_runtime/wake.rs`) hands an event to `testing::capture_native_event`,
+then to `embed::window_requests::capture`. That takes a window request
+(`WindowRequest::from_native` is `Some`) for a live context: the document
+`EventFor::Sender` names, else for `Sender(None)` (`rinch::exit`) the one
+dispatching, else the context being mounted (`window_requests::mounting`, which
+`RinchContext::new` runs around `mount_component`, since the document has no
+key before the build). `EventFor::Window` (a handle) is never a context's. A
+re-render or debug command goes on as before. Requests are kept in a
+`doc_keyed!` `DocMap<Vec<WindowRequest>>`, so they go with the context's
+document. `RinchContext::take_window_requests` takes them. `set_window_title`
+from a context's code is kept there too (`capture_title`) and not put in
+`STORED_TITLE`. Then, in a process where no `RinchRuntime` was ever made
+(`wake::RUNTIME_MADE`, set by `RinchRuntime::with_app`, never cleared), the
+event is dropped with a `tracing::debug!` rather than queued, since nothing
+would drain it. The crate's own unit tests drive the queue with no runtime,
+so they count as drained (`cfg!(test)`). `WindowRequest` lives in
+`window_request.rs` (`windowing`); `rinch::testing` and `rinch::embed` both
+re-export it. Pins: `rinch/tests/embed_window_requests_2801.rs` (its own
+process, so no runtime is ever made there).
+
+**`wants_mouse`/`wants_keyboard` decide HUD input routing, and `wants_keyboard`
+does not mean "any node is focused"** (#548). A `<button>`/`<a href>` is
+focusable with no `tabindex` (issue #252's tag-implied set), so a plain mouse
+click on one claims `FocusTarget::Node` exactly like Tabbing onto a custom
+widget — but `wants_keyboard()` used to OR in `has_focused_node()`
+unconditionally, so clicking *any* button made it answer `true` until the next
+click landed off a button, and a host following the documented pattern above
+("route keyboard to rinch while `wants_keyboard()`") silently stopped seeing
+its own Esc/hotkeys. `wants_keyboard()` now asks
+`RinchApp::has_focused_key_consumer()` instead, which follows **how the node
+got focus**, not whether anything is registered (the review of #1311 caught a
+first cut that gated purely on registration, which made Tab-focus on a plain
+button answer `false` exactly like a mouse click — breaking Tab navigation
+and Enter/Space activation of ordinary controls under the documented
+pattern):
+
+- A **mouse-clicked** plain button/link: `false` — it only ever consumes
+  Enter/Space through the runtime's own activation path and does not need
+  the host to give up its keyboard just because a click focused it. This is
+  #548's actual repro.
+- A **Tab-focused** (or programmatic `NodeHandle::focus()`-ed) plain
+  button/link: `true` — matching a browser's `:focus-visible` split, read
+  from [`Node::is_focus_visible`](rinch_dom::node::Node::is_focus_visible):
+  Tab/`request_focus` set it, a mouse press claiming `FocusTarget::Node`
+  never does (`claim_press_focus` in `event_dispatch.rs` only clears the
+  *previous* node's ring on a press).
+- A **registered** custom widget
+  ([`FocusEntry::on_key`](crate::focus_registry::FocusEntry::on_key) via
+  `register_focus_target` — arrow-key navigation, a shortcut of its own):
+  `true` either way, click or Tab — the runtime can't know which keys it
+  wants without seeing them.
+- An open native **`<select>`** popup (`FocusTarget::Select`): `true`
+  unconditionally — a separate, pre-existing gap (neither
+  `has_focused_input`/`has_focused_contenteditable` nor, before or after
+  #548's first cut, the generic-node check ever covered it) folded into the
+  same fix, since its own arrow/Enter/Escape handling needs every key.
+
+`RinchApp::has_focused_node()` keeps its original, broader meaning ("is *any*
+generic node focused") for callers that genuinely want that question; it is
+the wrong one for input routing.
+
+**Source files:**
+- `crates/rinch/src/embed.rs` — `RinchContext`, `RinchOverlayRenderer`, `GameViewport`, `wants_keyboard()`
+- `crates/rinch/src/host_texture.rs` — host textures (#2082): `HostTexture`, `HostTextureImages`, the conversion pass
+- `crates/rinch/src/app/mod.rs` — `viewport_rect()`; `app/focus.rs` — `has_focused_input()`, `has_focused_contenteditable()`, `has_focused_node()`, `has_focused_key_consumer()`, `node_is_focus_visible()` (#548)
+- `crates/rinch/src/focus_registry.rs` — `wants_key_routing()`, the `FocusEntry::on_key` check behind `has_focused_key_consumer()`
+
+**Documentation:** `docs/src/guide/game-engine.md`

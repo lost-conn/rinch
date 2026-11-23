@@ -2,11 +2,14 @@
 
 use peniko::Color;
 
+use style::piecewise_linear::PiecewiseLinearFunction;
 use style::values::computed::TransitionProperty as StyloTransitionProperty;
 use style::values::generics::easing::TimingKeyword;
 
+use super::transform::{Affine, TransformOp, compose, interpolate_lists, lists_equivalent};
 use crate::computed_style::{
     DimensionValue, LengthPercentageAutoValue, LengthPercentageValue, TransformValue,
+    VisibilityValue,
 };
 
 // =============================================================================
@@ -43,6 +46,14 @@ pub enum TransitionProperty {
     BorderRadiusBottomLeft,
     FontSize,
     Transform,
+    /// `visibility`, interpolated by css-values-4's rule for it: a discrete
+    /// step in which every progress strictly between 0 and 1 is `visible` when
+    /// either end is (#759). See [`interpolate_visibility`].
+    Visibility,
+    /// `background-position-x` of the first background layer (#468).
+    BackgroundPositionX,
+    /// `background-position-y` of the first background layer (#468).
+    BackgroundPositionY,
 }
 
 /// All individual animatable properties (excluding All).
@@ -74,6 +85,9 @@ const _ALL_ANIMATABLE: &[TransitionProperty] = &[
     TransitionProperty::BorderRadiusBottomLeft,
     TransitionProperty::FontSize,
     TransitionProperty::Transform,
+    TransitionProperty::Visibility,
+    TransitionProperty::BackgroundPositionX,
+    TransitionProperty::BackgroundPositionY,
 ];
 
 impl TransitionProperty {
@@ -108,6 +122,9 @@ impl TransitionProperty {
             "border-bottom-left-radius" => Self::BorderRadiusBottomLeft,
             "font-size" => Self::FontSize,
             "transform" => Self::Transform,
+            "visibility" => Self::Visibility,
+            "background-position-x" => Self::BackgroundPositionX,
+            "background-position-y" => Self::BackgroundPositionY,
             _ => return None,
         })
     }
@@ -138,6 +155,71 @@ impl TransitionProperty {
         matches!(self, Self::FontSize | Self::All)
     }
 
+    /// Whether this property is part of a `display: inline` element's edge
+    /// boxes (#1426): its horizontal margins, borders and paddings take room
+    /// on its lines, so a frame of one re-measures the text around it. Asked
+    /// only of an inline element; a block's padding is a Taffy property.
+    pub fn changes_inline_edge(&self) -> bool {
+        matches!(
+            self,
+            Self::PaddingLeft
+                | Self::PaddingRight
+                | Self::MarginLeft
+                | Self::MarginRight
+                | Self::BorderLeftWidth
+                | Self::BorderRightWidth
+        )
+    }
+
+    /// Whether a transition on this property animates an inset (`left`,
+    /// `top`, `right`, `bottom`).
+    ///
+    /// Asked by the `set_style` inset fast path, which writes an inset
+    /// straight to `ComputedStyle` and Taffy without running the cascade's
+    /// transition hooks (#280): it declines for a node whose `transition`
+    /// covers an inset, so such a move takes the cascade and its transition
+    /// hooks.
+    ///
+    /// No variant answers `true` today — no inset is animatable — and the
+    /// match is exhaustive on purpose, so adding `Left`/`Top`/… here forces
+    /// the question. `All` answers for whatever `_ALL_ANIMATABLE` holds, so
+    /// it follows along without an edit.
+    pub fn covers_inset(&self) -> bool {
+        match self {
+            Self::All => _ALL_ANIMATABLE.iter().any(|p| p.covers_inset()),
+            Self::Opacity
+            | Self::BackgroundColor
+            | Self::Color
+            | Self::BorderTopColor
+            | Self::BorderRightColor
+            | Self::BorderBottomColor
+            | Self::BorderLeftColor
+            | Self::Width
+            | Self::Height
+            | Self::PaddingTop
+            | Self::PaddingRight
+            | Self::PaddingBottom
+            | Self::PaddingLeft
+            | Self::MarginTop
+            | Self::MarginRight
+            | Self::MarginBottom
+            | Self::MarginLeft
+            | Self::BorderTopWidth
+            | Self::BorderRightWidth
+            | Self::BorderBottomWidth
+            | Self::BorderLeftWidth
+            | Self::BorderRadiusTopLeft
+            | Self::BorderRadiusTopRight
+            | Self::BorderRadiusBottomRight
+            | Self::BorderRadiusBottomLeft
+            | Self::FontSize
+            | Self::Transform
+            | Self::Visibility
+            | Self::BackgroundPositionX
+            | Self::BackgroundPositionY => false,
+        }
+    }
+
     /// Whether this property affects layout (needs Taffy re-sync).
     pub fn affects_layout(&self) -> bool {
         !matches!(
@@ -150,6 +232,9 @@ impl TransitionProperty {
                 | Self::BorderBottomColor
                 | Self::BorderLeftColor
                 | Self::Transform
+                | Self::Visibility
+                | Self::BackgroundPositionX
+                | Self::BackgroundPositionY
         )
     }
 }
@@ -158,7 +243,13 @@ impl TransitionProperty {
 // TimingFunction — easing curves
 // =============================================================================
 
-#[derive(Debug, Clone, Copy, Default)]
+/// An easing function (CSS Easing 2).
+///
+/// Every `<easing-function>` Stylo computes reaches rinch as one of these
+/// (#1564: `steps()` and `linear()` used to arrive as `Linear`). Not `Copy`:
+/// a `linear()` function holds its stops behind Stylo's `Arc`, so a clone is a
+/// reference-count bump.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum TimingFunction {
     Linear,
     #[default]
@@ -167,11 +258,43 @@ pub enum TimingFunction {
     EaseOut,
     EaseInOut,
     CubicBezier(f32, f32, f32, f32),
+    /// `steps(<n>, <step-position>)`, `step-start` and `step-end`. The count is
+    /// at least 1 (at least 2 for `jump-none`); Stylo rejects anything else.
+    Steps(u32, StepPosition),
+    /// `linear(<linear-stop>#)`, its stops already placed (missing input
+    /// positions spread evenly, as Stylo's builder does at parse time).
+    LinearFunction(PiecewiseLinearFunction),
+}
+
+/// Where a `steps()` function jumps (CSS Easing 2 §3.3).
+///
+/// Stylo's servo build parses all six since stylo 0.21 (0.11 parsed only
+/// `start` and `end` and dropped a declaration naming a `jump-*` keyword,
+/// #1581).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepPosition {
+    JumpStart,
+    JumpEnd,
+    JumpNone,
+    JumpBoth,
+    Start,
+    End,
 }
 
 impl TimingFunction {
-    /// Evaluate the timing function at progress `t` (0.0 to 1.0).
+    /// Evaluate the timing function at progress `t` (0.0 to 1.0), with the
+    /// before flag unset.
     pub fn apply(&self, t: f32) -> f32 {
+        self.apply_with_before_flag(t, false)
+    }
+
+    /// Evaluate the timing function at input progress `t` with CSS Easing 2's
+    /// **before flag**, which only a step function reads: set, an input that
+    /// lands exactly on a jump takes the step before it. Web Animations sets it
+    /// in the before phase going forwards and in the after phase going
+    /// backwards, so `steps(4, start)` holds its first value through a
+    /// backwards-filled delay rather than its second.
+    pub fn apply_with_before_flag(&self, t: f32, before_flag: bool) -> f32 {
         match self {
             Self::Linear => t,
             Self::Ease => cubic_bezier_solve(0.25, 0.1, 0.25, 1.0, t),
@@ -179,8 +302,39 @@ impl TimingFunction {
             Self::EaseOut => cubic_bezier_solve(0.0, 0.0, 0.58, 1.0, t),
             Self::EaseInOut => cubic_bezier_solve(0.42, 0.0, 0.58, 1.0, t),
             Self::CubicBezier(x1, y1, x2, y2) => cubic_bezier_solve(*x1, *y1, *x2, *y2, t),
+            Self::Steps(steps, position) => step_output(*steps, *position, t, before_flag),
+            Self::LinearFunction(function) => function.at(t),
         }
     }
+}
+
+/// CSS Easing 2 §3.3.1, "the output of a step easing function".
+fn step_output(steps: u32, position: StepPosition, t: f32, before_flag: bool) -> f32 {
+    let steps = i64::from(steps.max(1));
+    let t = f64::from(t);
+    let mut current = (t * steps as f64).floor() as i64;
+    if matches!(
+        position,
+        StepPosition::Start | StepPosition::JumpStart | StepPosition::JumpBoth
+    ) {
+        current += 1;
+    }
+    let scaled = t * steps as f64;
+    if before_flag && (scaled - scaled.round()).abs() < 1e-6 {
+        current -= 1;
+    }
+    if t >= 0.0 && current < 0 {
+        current = 0;
+    }
+    let jumps = match position {
+        StepPosition::JumpBoth => steps + 1,
+        StepPosition::JumpNone => (steps - 1).max(1),
+        _ => steps,
+    };
+    if t <= 1.0 && current > jumps {
+        current = jumps;
+    }
+    (current as f64 / jumps as f64) as f32
 }
 
 /// Solve a cubic bezier curve for the Y value at a given X (time) position.
@@ -273,7 +427,11 @@ impl TransitionSpec {
         for i in 0..prop_count {
             let stylo_prop = ui.transition_property_at(i);
 
-            // Map Stylo's TransitionProperty to our enum
+            // Map Stylo's TransitionProperty to our enum. A shorthand we
+            // carry every longhand of expands to them (#468: without this,
+            // `transition: background-position` — the spelling everyone
+            // writes — started nothing).
+            let mut expanded: &[TransitionProperty] = &[];
             let property = match &stylo_prop {
                 StyloTransitionProperty::NonCustom(id) => {
                     match id.longhand_or_shorthand() {
@@ -286,6 +444,22 @@ impl TransitionSpec {
                             let name = shorthand_id.name();
                             if name == "all" {
                                 Some(TransitionProperty::All)
+                            } else if name == "background-position" {
+                                expanded = &[
+                                    TransitionProperty::BackgroundPositionX,
+                                    TransitionProperty::BackgroundPositionY,
+                                ];
+                                None
+                            } else if name == "border-radius" {
+                                // #977: like `background-position`, the
+                                // spelling everyone writes started nothing.
+                                expanded = &[
+                                    TransitionProperty::BorderRadiusTopLeft,
+                                    TransitionProperty::BorderRadiusTopRight,
+                                    TransitionProperty::BorderRadiusBottomRight,
+                                    TransitionProperty::BorderRadiusBottomLeft,
+                                ];
+                                None
                             } else {
                                 // For shorthands like "border-color", "padding", etc.
                                 // we skip them — individual longhands will be listed
@@ -300,8 +474,9 @@ impl TransitionSpec {
                 }
             };
 
-            let property = match property {
-                Some(p) => p,
+            let properties: &[TransitionProperty] = match &property {
+                Some(p) => std::slice::from_ref(p),
+                None if !expanded.is_empty() => expanded,
                 None => continue,
             };
 
@@ -318,12 +493,14 @@ impl TransitionSpec {
             let timing = convert_timing_function(&stylo_tf);
 
             if duration_ms > 0.0 || delay_ms > 0.0 {
-                specs.push(TransitionSpec {
-                    property,
-                    duration_ms,
-                    delay_ms,
-                    timing,
-                });
+                for &property in properties {
+                    specs.push(TransitionSpec {
+                        property,
+                        duration_ms,
+                        delay_ms,
+                        timing: timing.clone(),
+                    });
+                }
             }
         }
 
@@ -331,10 +508,12 @@ impl TransitionSpec {
     }
 }
 
-/// Convert a Stylo timing function to our TimingFunction.
+/// Convert a Stylo computed timing function to our TimingFunction — every
+/// variant of it, `steps()` and `linear()` included (#1564).
 pub fn convert_timing_function(
     tf: &style::values::computed::easing::TimingFunction,
 ) -> TimingFunction {
+    use style::values::generics::easing::StepPosition as StyloStep;
     use style::values::generics::easing::TimingFunction as StyloTF;
 
     match tf {
@@ -346,8 +525,18 @@ pub fn convert_timing_function(
             TimingKeyword::EaseInOut => TimingFunction::EaseInOut,
         },
         StyloTF::CubicBezier { x1, y1, x2, y2 } => TimingFunction::CubicBezier(*x1, *y1, *x2, *y2),
-        // Steps and linear functions fall back to linear for V1
-        StyloTF::Steps(..) | StyloTF::LinearFunction(..) => TimingFunction::Linear,
+        StyloTF::Steps(steps, position) => TimingFunction::Steps(
+            (*steps).max(1) as u32,
+            match position {
+                StyloStep::JumpStart => StepPosition::JumpStart,
+                StyloStep::JumpEnd => StepPosition::JumpEnd,
+                StyloStep::JumpNone => StepPosition::JumpNone,
+                StyloStep::JumpBoth => StepPosition::JumpBoth,
+                StyloStep::Start => StepPosition::Start,
+                StyloStep::End => StepPosition::End,
+            },
+        ),
+        StyloTF::LinearFunction(function) => TimingFunction::LinearFunction(function.clone()),
     }
 }
 
@@ -363,86 +552,80 @@ pub enum AnimatableValue {
     LengthPercentage(LengthPercentageValue),
     LengthPercentageAuto(LengthPercentageAutoValue),
     Transform(AnimatableTransform),
-    /// Component-based transform for correct interpolation of rotate, scale, etc.
-    ///
-    /// The percentage translate rides alongside the ops rather than inside
-    /// them: a `TransformOp` is resolved by `compose_matrices`, which has no
-    /// box to resolve a percentage against.
-    TransformComponents {
-        ops: Vec<TransformOp>,
-        pct_translate_w: [f64; 2],
-        pct_translate_h: [f64; 2],
-    },
+    /// A `visibility` value — discrete, see [`interpolate_visibility`].
+    Visibility(VisibilityValue),
+    /// A `border-*-radius` corner: its horizontal and vertical radius (#977),
+    /// each interpolated as a `LengthPercentage`. One value, so the two halves
+    /// of a corner start, retarget and finish together.
+    CornerRadius(LengthPercentageValue, LengthPercentageValue),
 }
 
-/// A transform captured for interpolation.
+/// A transform captured for interpolation: the computed **function list**
+/// (#414).
 ///
-/// The composed matrix **plus** the percentage-translate coefficients that
-/// `TransformValue` deliberately keeps outside it, because a percentage
-/// translate cannot be resolved until the element's border box is known
-/// (#212).
-///
-/// Carrying only the matrix — which is what the transition machinery used to do
-/// — makes every percentage translate read as `0` for the whole duration of a
-/// transition (#403). Since the final translation is *linear* in these four
-/// coefficients, interpolating them alongside the six matrix entries is exact;
-/// there is no need to resolve them against the box first, and no way to, since
-/// diffing happens before layout.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// It used to be the composed matrix plus the percentage-translate
+/// coefficients (#403), lerped entry by entry. That kept a percentage
+/// translate alive but made every rotation shrink toward its midpoint; the
+/// function list is what CSS interpolates, and a percentage translate rides
+/// inside its `Translate` function (see [`super::transform`]).
+#[derive(Debug, Clone, PartialEq)]
 pub struct AnimatableTransform {
-    pub matrix: [f64; 6],
-    pub pct_translate_w: [f64; 2],
-    pub pct_translate_h: [f64; 2],
+    /// The functions, in list order. Empty is `none`.
+    pub functions: Vec<TransformOp>,
 }
 
 impl AnimatableTransform {
     /// The interpolable projection of a computed transform.
     pub fn from_style(tf: &TransformValue) -> Self {
         Self {
-            matrix: tf.matrix,
-            pct_translate_w: tf.pct_translate_w,
-            pct_translate_h: tf.pct_translate_h,
+            functions: tf.functions.clone(),
         }
+    }
+
+    /// The composed transform, percentage coefficients included.
+    pub fn composed(&self) -> Affine {
+        compose(&self.functions)
     }
 
     /// Write an interpolated transform back into a computed style.
     ///
-    /// `is_identity` is `false` unconditionally: an element mid-transition has
-    /// a transform even on the frame where it happens to compose to the
-    /// identity, and the flag also decides whether the element establishes a
-    /// stacking context — which must not flicker across the animation.
-    pub fn to_style(self) -> TransformValue {
+    /// The value is never `none` (`is_none: false`), even for an empty list,
+    /// so the element is a stacking context and an absolute containing block
+    /// for as long as a transition or animation writes it, the frames that
+    /// happen to compose to the identity included (#415). Chrome 153 agrees
+    /// where the two can be compared: an `@keyframes` animation filled
+    /// `forwards` at a `transform: none` keyframe reports
+    /// `matrix(1, 0, 0, 1, 0, 0)` — the padded identity list, not `none` — and
+    /// is still its absolute child's containing block. The one write that is
+    /// `none` is a transition *finishing* at `none`, which leaves the cascaded
+    /// value; `tick_transitions` writes that itself.
+    ///
+    /// `is_identity` is `false` for the same reason it always was: an
+    /// interpolated frame is drawn through its transform rather than tested
+    /// for being a no-op. Since #415 it decides only that, not the stacking
+    /// context.
+    ///
+    /// `origin_z` is the element's `transform-origin` z in CSS px, which the
+    /// composed matrix has to be taken about (see
+    /// [`compose_about_origin_z`](super::compose_about_origin_z)).
+    pub fn to_style(&self, origin_z: f64) -> TransformValue {
+        let (c, back_facing) = super::compose_about_origin_z(&self.functions, origin_z);
         TransformValue {
-            matrix: self.matrix,
+            matrix: c.matrix,
             is_identity: false,
-            pct_translate_w: self.pct_translate_w,
-            pct_translate_h: self.pct_translate_h,
+            is_none: false,
+            pct_translate_w: c.pct_w,
+            pct_translate_h: c.pct_h,
+            functions: self.functions.clone(),
+            back_facing,
         }
     }
 
-    fn lerp(&self, to: &AnimatableTransform, t: f64) -> Self {
-        let mix = |a: f64, b: f64| a + (b - a) * t;
+    fn interpolate(&self, to: &AnimatableTransform, t: f64) -> Self {
         Self {
-            matrix: std::array::from_fn(|i| mix(self.matrix[i], to.matrix[i])),
-            pct_translate_w: std::array::from_fn(|i| {
-                mix(self.pct_translate_w[i], to.pct_translate_w[i])
-            }),
-            pct_translate_h: std::array::from_fn(|i| {
-                mix(self.pct_translate_h[i], to.pct_translate_h[i])
-            }),
+            functions: interpolate_lists(&self.functions, &to.functions, t),
         }
     }
-}
-
-/// Individual transform operations for component-wise interpolation.
-#[derive(Debug, Clone)]
-pub enum TransformOp {
-    Rotate(f64),         // radians
-    Scale(f64, f64),     // sx, sy
-    Translate(f64, f64), // tx, ty in px
-    SkewX(f64),          // radians
-    SkewY(f64),          // radians
-    Matrix([f64; 6]),    // fallback
 }
 
 impl AnimatableValue {
@@ -535,34 +718,50 @@ impl AnimatableValue {
                 LengthPercentageValue::Zero,
             )),
             (AnimatableValue::Transform(a), AnimatableValue::Transform(b)) => {
-                Some(AnimatableValue::Transform(a.lerp(b, t as f64)))
+                Some(AnimatableValue::Transform(a.interpolate(b, t as f64)))
+            }
+            (AnimatableValue::Visibility(a), AnimatableValue::Visibility(b)) => Some(
+                AnimatableValue::Visibility(interpolate_visibility(*a, *b, t)),
+            ),
+            // Each axis as a length-percentage, on its own. Every pair of
+            // length-percentages interpolates (a mixed pair as a `calc()`,
+            // #767); the fallback to the end value is kept for safety.
+            (AnimatableValue::CornerRadius(ax, ay), AnimatableValue::CornerRadius(bx, by)) => {
+                let lp = |a: &LengthPercentageValue, b: &LengthPercentageValue| {
+                    match AnimatableValue::LengthPercentage(*a)
+                        .interpolate(&AnimatableValue::LengthPercentage(*b), t)
+                    {
+                        Some(AnimatableValue::LengthPercentage(v)) => v,
+                        _ => *b,
+                    }
+                };
+                Some(AnimatableValue::CornerRadius(lp(ax, bx), lp(ay, by)))
+            }
+            // A length against a percentage (or a `calc()`) interpolates as a
+            // `calc()`: its length and percentage parts each go their own way
+            // (css-values-4 §3.4.3; #767). Every pair of the same kind was
+            // matched above, so these arms see only mixed ones.
+            (AnimatableValue::Dimension(a), AnimatableValue::Dimension(b)) => {
+                let (px, pct) = lerp_mixed(dimension_parts(a)?, dimension_parts(b)?, t);
+                Some(AnimatableValue::Dimension(DimensionValue::Calc { px, pct }))
+            }
+            (AnimatableValue::LengthPercentage(a), AnimatableValue::LengthPercentage(b)) => {
+                let (px, pct) = lerp_mixed(lp_parts(a), lp_parts(b), t);
+                Some(AnimatableValue::LengthPercentage(
+                    LengthPercentageValue::Calc { px, pct },
+                ))
             }
             (
-                AnimatableValue::TransformComponents {
-                    ops: a,
-                    pct_translate_w: aw,
-                    pct_translate_h: ah,
-                },
-                AnimatableValue::TransformComponents {
-                    ops: b,
-                    pct_translate_w: bw,
-                    pct_translate_h: bh,
-                },
+                AnimatableValue::LengthPercentageAuto(a),
+                AnimatableValue::LengthPercentageAuto(b),
             ) => {
-                let mix = |x: f64, y: f64| x + (y - x) * t as f64;
-                Some(AnimatableValue::TransformComponents {
-                    ops: TransformOp::interpolate_lists(a, b, t as f64),
-                    pct_translate_w: [mix(aw[0], bw[0]), mix(aw[1], bw[1])],
-                    pct_translate_h: [mix(ah[0], bh[0]), mix(ah[1], bh[1])],
-                })
+                let (px, pct) = lerp_mixed(lpa_parts(a)?, lpa_parts(b)?, t);
+                Some(AnimatableValue::LengthPercentageAuto(
+                    LengthPercentageAutoValue::Calc { px, pct },
+                ))
             }
-            // Incompatible types — snap immediately.
-            //
-            // A length against a percentage lands here on purpose: CSS
-            // interpolates that pair as a `calc()`, and there is no value in
-            // `ComputedStyle` that can hold one. Snapping is wrong, but it is
-            // the same wrong the transition path has always been, and
-            // inventing a resolution here would need the containing block.
+            // Incompatible types — `auto`, a sizing keyword, or two different
+            // value kinds — are discrete: the caller flips at the midpoint.
             _ => None,
         }
     }
@@ -584,11 +783,8 @@ impl AnimatableValue {
     /// compares only against a percentage — resolving one needs a containing
     /// block, which style resolution does not have at diff time.
     ///
-    /// [`AnimatableValue::TransformComponents`] always compares unequal: it is
-    /// produced only by the `@keyframes` extractor, and animations do not come
-    /// through [`PropertyChange`], which `diff_animatable` is the sole producer
-    /// of. Should one ever arrive, "unequal" means the transition restarts,
-    /// which is what it did before this comparison existed.
+    /// Two transforms are the same value by [`lists_equivalent`]: lists of
+    /// different lengths (`none` and an identity list among them) never are.
     pub fn same_computed_value(&self, other: &AnimatableValue) -> bool {
         use super::diff::{approx_eq, colors_equal};
         match (self, other) {
@@ -603,11 +799,81 @@ impl AnimatableValue {
                 AnimatableValue::LengthPercentageAuto(b),
             ) => length_percentage_auto_eq(a, b),
             (AnimatableValue::Transform(a), AnimatableValue::Transform(b)) => {
-                animatable_transform_eq(a, b)
+                lists_equivalent(&a.functions, &b.functions)
+            }
+            (AnimatableValue::Visibility(a), AnimatableValue::Visibility(b)) => a == b,
+            (AnimatableValue::CornerRadius(ax, ay), AnimatableValue::CornerRadius(bx, by)) => {
+                length_percentage_eq(ax, bx) && length_percentage_eq(ay, by)
             }
             _ => false,
         }
     }
+}
+
+/// `visibility` at eased progress `p` (css-values-4 §3, "Combining Values":
+/// *visibility* is "discrete, except that if one of the values is `visible`,
+/// interpolated as a discrete step where values of p between 0 and 1 map to
+/// `visible` and other values of p map to the closer endpoint").
+///
+/// So a closing overlay (`visible → hidden`) stays visible for the whole
+/// transition and vanishes at its end, and an opening one (`hidden → visible`)
+/// is visible from the first step. Without a `visible` end (`hidden ↔
+/// collapse`) it is the ordinary discrete rule, which flips at 50%. A `p`
+/// outside `0..=1` (an overshooting `cubic-bezier`) is the closer endpoint.
+pub fn interpolate_visibility(
+    from: VisibilityValue,
+    to: VisibilityValue,
+    p: f32,
+) -> VisibilityValue {
+    let either_visible = from == VisibilityValue::Visible || to == VisibilityValue::Visible;
+    if either_visible {
+        if p <= 0.0 {
+            from
+        } else if p >= 1.0 {
+            to
+        } else {
+            VisibilityValue::Visible
+        }
+    } else if p < 0.5 {
+        from
+    } else {
+        to
+    }
+}
+
+/// A length-percentage's `(px, fraction)` parts, the shape a `calc()` holds.
+fn lp_parts(v: &LengthPercentageValue) -> (f32, f32) {
+    match *v {
+        LengthPercentageValue::Zero => (0.0, 0.0),
+        LengthPercentageValue::Length(px) => (px, 0.0),
+        LengthPercentageValue::Percent(p) => (0.0, p),
+        LengthPercentageValue::Calc { px, pct } => (px, pct),
+    }
+}
+
+/// [`lp_parts`] for a size; `None` for `auto` and the sizing keywords, which do
+/// not interpolate with a length.
+fn dimension_parts(v: &DimensionValue) -> Option<(f32, f32)> {
+    match *v {
+        DimensionValue::Length(px) => Some((px, 0.0)),
+        DimensionValue::Percent(p) => Some((0.0, p)),
+        DimensionValue::Calc { px, pct } => Some((px, pct)),
+        DimensionValue::Auto | DimensionValue::Intrinsic(_) => None,
+    }
+}
+
+/// [`lp_parts`] for a margin or inset; `None` for `auto`.
+fn lpa_parts(v: &LengthPercentageAutoValue) -> Option<(f32, f32)> {
+    match *v {
+        LengthPercentageAutoValue::Length(px) => Some((px, 0.0)),
+        LengthPercentageAutoValue::Percent(p) => Some((0.0, p)),
+        LengthPercentageAutoValue::Calc { px, pct } => Some((px, pct)),
+        LengthPercentageAutoValue::Auto => None,
+    }
+}
+
+fn lerp_mixed(a: (f32, f32), b: (f32, f32), t: f32) -> (f32, f32) {
+    (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t)
 }
 
 fn dimension_eq(a: &DimensionValue, b: &DimensionValue) -> bool {
@@ -656,22 +922,6 @@ fn length_percentage_auto_eq(a: &LengthPercentageAutoValue, b: &LengthPercentage
         ) => approx_eq(*px1, *px2) && approx_eq(*pct1, *pct2),
         _ => false,
     }
-}
-
-fn animatable_transform_eq(a: &AnimatableTransform, b: &AnimatableTransform) -> bool {
-    let close = |x: f64, y: f64| (x - y).abs() < 0.001;
-    a.matrix
-        .iter()
-        .zip(b.matrix.iter())
-        .all(|(x, y)| close(*x, *y))
-        && a.pct_translate_w
-            .iter()
-            .zip(b.pct_translate_w.iter())
-            .all(|(x, y)| close(*x, *y))
-        && a.pct_translate_h
-            .iter()
-            .zip(b.pct_translate_h.iter())
-            .all(|(x, y)| close(*x, *y))
 }
 
 /// Linearly interpolate between two colors in sRGB space.
@@ -759,7 +1009,7 @@ impl ActiveTransition {
             reversing_adjusted_start_value: from.clone(),
             from,
             to,
-            timing: spec.timing,
+            timing: spec.timing.clone(),
             start_time_ms: current_time_ms,
             duration_ms: spec.duration_ms,
             delay_ms: spec.delay_ms,
@@ -795,7 +1045,7 @@ impl ActiveTransition {
             // the one the transition it cancelled was heading for.
             reversing_adjusted_start_value: self.to.clone(),
             to,
-            timing: spec.timing,
+            timing: spec.timing.clone(),
             start_time_ms: current_time_ms,
             duration_ms: spec.duration_ms * factor,
             // Only a **negative** delay is shortened. A negative delay is an
@@ -823,7 +1073,9 @@ impl ActiveTransition {
     pub fn output_progress_at(&self, current_time_ms: f64) -> f32 {
         let elapsed = current_time_ms - self.start_time_ms;
         if elapsed < self.delay_ms {
-            return self.timing.apply(0.0);
+            // A transition fills backwards through its delay going forwards,
+            // which is where CSS Easing 2 sets the before flag.
+            return self.timing.apply_with_before_flag(0.0, true);
         }
         if self.duration_ms <= 0.0 {
             return self.timing.apply(1.0);
@@ -836,9 +1088,15 @@ impl ActiveTransition {
     pub fn value_at(&self, current_time_ms: f64) -> Option<AnimatableValue> {
         let elapsed = current_time_ms - self.start_time_ms;
 
-        // Still in delay period
+        // Still in delay period: a transition fills backwards, sampling its
+        // easing at 0 with the before flag (#1564) — `from` for every easing
+        // but one whose output at 0 is not 0, such as `linear(0.5, 1)`.
         if elapsed < self.delay_ms {
-            return Some(self.from.clone());
+            let eased = self.timing.apply_with_before_flag(0.0, true);
+            if eased == 0.0 {
+                return Some(self.from.clone());
+            }
+            return self.from.interpolate(&self.to, eased);
         }
 
         let active_elapsed = elapsed - self.delay_ms;
@@ -856,102 +1114,6 @@ impl ActiveTransition {
         let elapsed = current_time_ms - self.start_time_ms;
         elapsed >= self.delay_ms + self.duration_ms
     }
-}
-
-impl TransformOp {
-    /// Convert a single transform operation to a 2D affine matrix [a, b, c, d, e, f].
-    pub fn to_matrix(&self) -> [f64; 6] {
-        match self {
-            TransformOp::Rotate(rad) => {
-                let cos = rad.cos();
-                let sin = rad.sin();
-                [cos, sin, -sin, cos, 0.0, 0.0]
-            }
-            TransformOp::Scale(sx, sy) => [*sx, 0.0, 0.0, *sy, 0.0, 0.0],
-            TransformOp::Translate(tx, ty) => [1.0, 0.0, 0.0, 1.0, *tx, *ty],
-            TransformOp::SkewX(rad) => [1.0, 0.0, rad.tan(), 1.0, 0.0, 0.0],
-            TransformOp::SkewY(rad) => [1.0, rad.tan(), 0.0, 1.0, 0.0, 0.0],
-            TransformOp::Matrix(m) => *m,
-        }
-    }
-
-    /// Interpolate between two transform op lists component-wise.
-    /// If lists have matching operations, interpolate each pair.
-    /// If lists differ in length/type, fall back to matrix interpolation.
-    pub fn interpolate_lists(a: &[TransformOp], b: &[TransformOp], t: f64) -> Vec<TransformOp> {
-        if a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.same_type(y)) {
-            a.iter()
-                .zip(b.iter())
-                .map(|(x, y)| x.interpolate(y, t))
-                .collect()
-        } else {
-            // Fall back: compose each list to matrix, interpolate matrices
-            let ma = compose_matrices(a);
-            let mb = compose_matrices(b);
-            let mut result = [0.0_f64; 6];
-            for i in 0..6 {
-                result[i] = ma[i] + (mb[i] - ma[i]) * t;
-            }
-            vec![TransformOp::Matrix(result)]
-        }
-    }
-
-    fn same_type(&self, other: &TransformOp) -> bool {
-        matches!(
-            (self, other),
-            (TransformOp::Rotate(_), TransformOp::Rotate(_))
-                | (TransformOp::Scale(_, _), TransformOp::Scale(_, _))
-                | (TransformOp::Translate(_, _), TransformOp::Translate(_, _))
-                | (TransformOp::SkewX(_), TransformOp::SkewX(_))
-                | (TransformOp::SkewY(_), TransformOp::SkewY(_))
-                | (TransformOp::Matrix(_), TransformOp::Matrix(_))
-        )
-    }
-
-    fn interpolate(&self, other: &TransformOp, t: f64) -> TransformOp {
-        match (self, other) {
-            (TransformOp::Rotate(a), TransformOp::Rotate(b)) => {
-                TransformOp::Rotate(a + (b - a) * t)
-            }
-            (TransformOp::Scale(ax, ay), TransformOp::Scale(bx, by)) => {
-                TransformOp::Scale(ax + (bx - ax) * t, ay + (by - ay) * t)
-            }
-            (TransformOp::Translate(ax, ay), TransformOp::Translate(bx, by)) => {
-                TransformOp::Translate(ax + (bx - ax) * t, ay + (by - ay) * t)
-            }
-            (TransformOp::SkewX(a), TransformOp::SkewX(b)) => TransformOp::SkewX(a + (b - a) * t),
-            (TransformOp::SkewY(a), TransformOp::SkewY(b)) => TransformOp::SkewY(a + (b - a) * t),
-            (TransformOp::Matrix(a), TransformOp::Matrix(b)) => {
-                let mut result = [0.0_f64; 6];
-                for i in 0..6 {
-                    result[i] = a[i] + (b[i] - a[i]) * t;
-                }
-                TransformOp::Matrix(result)
-            }
-            _ => self.clone(), // shouldn't happen due to same_type check
-        }
-    }
-}
-
-/// Compose a list of transform operations into a single 2D matrix.
-pub fn compose_matrices(ops: &[TransformOp]) -> [f64; 6] {
-    let mut result = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]; // identity
-    for op in ops {
-        let m = op.to_matrix();
-        result = multiply_2d_matrices(result, m);
-    }
-    result
-}
-
-fn multiply_2d_matrices(a: [f64; 6], b: [f64; 6]) -> [f64; 6] {
-    [
-        a[0] * b[0] + a[2] * b[1],
-        a[1] * b[0] + a[3] * b[1],
-        a[0] * b[2] + a[2] * b[3],
-        a[1] * b[2] + a[3] * b[3],
-        a[0] * b[4] + a[2] * b[5] + a[4],
-        a[1] * b[4] + a[3] * b[5] + a[5],
-    ]
 }
 
 /// A detected change in an animatable property.

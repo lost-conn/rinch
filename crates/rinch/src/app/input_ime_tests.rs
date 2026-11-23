@@ -12,7 +12,7 @@ use rinch_core::events::{InputCallback, register_input_handler};
 use std::cell::Cell;
 
 /// One `<input>` that records every `oninput` payload.
-fn mount_fixture() -> (RinchApp, usize, Rc<RefCell<Vec<String>>>) {
+fn mount_fixture() -> (RinchApp, u64, Rc<RefCell<Vec<String>>>) {
     let log: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let input_id = {
         let log = log.clone();
@@ -20,7 +20,7 @@ fn mount_fixture() -> (RinchApp, usize, Rc<RefCell<Vec<String>>>) {
             log.borrow_mut().push(v);
         }))
     };
-    let id: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+    let id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(None));
     let id_in = id.clone();
     let mut app = RinchApp::new(move |scope: &mut RenderScope| {
         let root = scope.create_element("div");
@@ -37,7 +37,7 @@ fn mount_fixture() -> (RinchApp, usize, Rc<RefCell<Vec<String>>>) {
     (app, a_id, log)
 }
 
-fn focus(app: &mut RinchApp, id: usize) {
+fn focus(app: &mut RinchApp, id: u64) {
     let (cx, cy) = {
         let d = app.doc.as_ref().unwrap().borrow();
         let (ax, ay, ax_w, ay_h) = painted_element_box(&d.tree, id);
@@ -91,7 +91,7 @@ fn preedit(app: &mut RinchApp, text: &str) {
     );
 }
 
-fn attr(app: &RinchApp, id: usize, name: &str) -> Option<String> {
+fn attr(app: &RinchApp, id: u64, name: &str) -> Option<String> {
     let d = app.doc.as_ref().unwrap().borrow();
     d.tree.get(id).and_then(|n| n.attributes.get(name).cloned())
 }
@@ -196,4 +196,35 @@ fn a_disabled_composition_leaves_no_trace_in_the_value() {
     assert_eq!(attr(&app, id, "data-preedit"), None);
     assert_eq!(attr(&app, id, "value").as_deref(), Some("ab"));
     assert!(log.borrow().is_empty());
+}
+
+/// An input method enabled for a focused field changes nothing on screen, so
+/// it asks for no redraw (#2698): at a show that focuses the field, its
+/// redraw presented the frame the show had just presented, again. A
+/// composition does ask for one (positive control).
+#[test]
+fn an_input_method_enabled_asks_for_no_redraw_2698() {
+    let (mut app, id, _log) = mount_fixture();
+    focus(&mut app, id);
+    let redraws = |actions: Vec<AppAction>| {
+        actions
+            .iter()
+            .filter(|a| matches!(a, AppAction::RequestRedraw))
+            .count()
+    };
+    let enabled = app.handle_event(PlatformEvent::Ime(ImeEvent::Enabled), (800, 600), 1.0);
+    assert_eq!(
+        redraws(enabled),
+        0,
+        "an enabled input method asked for a redraw"
+    );
+    let composing = app.handle_event(
+        PlatformEvent::Ime(ImeEvent::Preedit {
+            text: "あ".into(),
+            cursor: None,
+        }),
+        (800, 600),
+        1.0,
+    );
+    assert!(redraws(composing) > 0, "a composition asked for no redraw");
 }

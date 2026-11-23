@@ -21,7 +21,11 @@ rsx! {
 ```
 
 Focusability comes from the **tag** or from an explicit **`tabindex`**, and an
-explicit one always wins — the browser rule.
+explicit one always wins — the browser rule. The value is read the browser's
+way too (HTML's rules for parsing integers): leading whitespace is skipped and
+the number ends at the first non-digit, so `" 3"`, `"2.5"` and `"3abc"` are all
+tab indices (3, 2, 3); a value with no leading digits, or past the 32-bit
+range, is not a `tabindex` at all.
 
 | Focusable by tag | |
 |---|---|
@@ -60,11 +64,16 @@ alone**, exactly as a browser reads them: `disabled="false"` disables and
 That applies to every tag the attribute reaches, so a `<textarea readonly="false">`
 is read-only too.
 
-rinch's **own** `data-disabled`, `data-nofocus` and `data-trap-focus` are the
-exception, and the only one: there the literal `"false"` turns the attribute off.
-`data-nofocus` and `data-trap-focus` are read that way on both backends;
+rinch's **own** `data-disabled`, `data-nofocus`, `data-trap-focus`,
+`data-backdrop` (an overlay backdrop that answers a press of any button, #1093)
+and `data-scroll-lock-exempt` (a scroll container an overlay's scroll lock
+leaves alone, [below](#locking-the-page-behind-an-overlay))
+are the exception, and the only one: there the literal `"false"` turns the
+attribute off. `data-nofocus`, `data-trap-focus` and `data-backdrop` are read
+that way on both backends;
 `data-disabled` is a desktop attribute with no web reader, because the browser
-does not know it. Only `"false"` is excused — `"0"` is on, matching the web's
+does not know it, and so is `data-scroll-lock-exempt`, because the web's lock
+has nothing to exempt. Only `"false"` is excused — `"0"` is on, matching the web's
 `[data-nofocus="false" i]` selector. Reach for the escape
 when you are writing the attribute **by hand with `set_attribute`** and would
 otherwise have to branch between writing and removing it; a `bool` in `rsx!`
@@ -104,35 +113,187 @@ committing an edit, and browsers dispatch no `change` for it either.
 
 Focus arrives three ways, and all three go through the same arbiter:
 
-- **Tab / Shift+Tab** — walks the focusable elements in DOM order, and paints
-  the `:focus-visible` keyboard ring.
+- **Tab / Shift+Tab** — walks the focusable elements in the browser's
+  sequential order, and paints the `:focus-visible` keyboard ring: every
+  positive `tabindex` first, in ascending order, then everything at `0` or
+  focusable by its tag, ties in DOM order — `tabindex="2"` before `"3"` before
+  a plain `<button>`, wherever each sits in the document. Inside a
+  `trap_focus` overlay the same order applies to the overlay's own controls.
+  Tab from an element that is not in that order (a clicked `tabindex="-1"`
+  node, even one inside another Tab stop, or one whose box has just gone) goes to the next Tab stop after it **in
+  DOM order**, and Shift+Tab to the previous one, as Chrome does. What an
+  opening dialog focuses is still its first control in DOM order, not the
+  first in Tab order — HTML picks it that way.
 - **A mouse press** — claims the *nearest focusable ancestor-or-self* of
-  whatever was hit, exactly as a browser does. Pointer focus does **not** paint
-  the `:focus-visible` ring. A press that resolves to something *other* than
-  the current claim holder takes the keyboard away from it, and a press that
-  resolves to nothing releases it — a nested focusable inside a focused node
-  counts as "somewhere else", for every mouse button alike.
+  whatever was hit, exactly as a browser does, and with **any** button: a
+  right or middle press focuses too, as a browser's `mousedown` does (measured
+  in Chrome 153), and it does so before a `data-oncontextmenu` handler or the
+  built-in text menu runs. Only `:active` is the primary button's alone, and
+  a press inside a focused rich-text editor leaves the keyboard with the editor
+  whatever the button.
+  Pointer focus does **not** paint the `:focus-visible` ring. A press that
+  resolves to something *other* than the current claim holder moves the
+  keyboard there — a nested focusable inside a focused node counts as
+  "somewhere else" — and a press that resolves to nothing releases it.
 
   This applies to `tabindex="-1"` too — it keeps an element out of the Tab
   order, but it does not keep a click from focusing it, in rinch or in a
   browser. A control that must **not** steal focus from the field it sits
   beside — a toolbar button over a rich-text editor, a spinner next to a number
   input — needs [`data-nofocus`](#taking-the-click-without-the-keyboard).
+
+  On `rinch-web` the browser moves focus on a press, and rinch keeps that
+  true for a press on an `onclick` element too (issue #1146): a text field
+  inside a clickable is focused by the browser with the caret where the press
+  landed, and any other focusable (a `<button>`, a `tabindex` row) is focused
+  before the handler runs, so the field that had the focus commits its
+  `onchange` first. A press with nothing focusable above it leaves the focus
+  where it was on the web, where desktop releases it. When the browser refuses
+  the nearest candidate (a `disabled` button inside a `tabindex` row), the
+  next focusable ancestor takes it, as Chrome does. A **touch or pen** press
+  moves the focus on release, and only if it was a tap: a finger that starts a
+  scroll on a button leaves the field (and the phone's keyboard) alone.
+  A touch that could start a scroll also runs its handler on release; that
+  press is `preventDefault`ed like any other, so the browser sends no
+  compatibility `mousedown` after the tap to whatever the handler put under
+  the finger — an overlay opened from a button in a scroller keeps the focus
+  it moved inside (#1588).
+
+  Two things follow that web apps used to see differently. An overlay with
+  `trap_focus` opened from a `Button` gives the focus back to that `Button` on
+  close (it was the field focused before the press). And a native `<select>`
+  or `<input type="range">` inside a clickable works natively alongside the
+  handler — its press is no longer prevented.
+
+  "The way a browser does" is Chrome's and desktop rinch's: Safari, and Firefox
+  on macOS, do not focus a `<button>` on a click, and rinch-web focuses it
+  there too.
 - **`node.focus()` / `request_focus(node_id)`** — programmatic, also no ring.
+
+### Selecting a text control's text programmatically
+
+`NodeHandle::select()` and `NodeHandle::set_selection_range(start, end, direction)`
+(issue #552) are `focus()`'s selection counterparts, for the "a rename box
+opens with its name filled in **and selected**, so the first keystroke
+replaces it" shape — `set_selection_range` matches the DOM's own
+`HTMLInputElement.setSelectionRange(start, end, direction)` exactly,
+**including its units**: `start`/`end` are UTF-16 code units, not bytes and
+not `char`s, so a component written once targets desktop and
+`rinch-web` with the same offsets (`"🙂".encode_utf16().count()` is `2`, not
+`1`). `direction` is `SelectionDirection::Forward` (the anchor is `start`),
+`Backward` (the anchor is `end`), or `None` (unspecified, applied the same
+way `Forward` is). `select()` selects the control's whole text — exactly
+`set_selection_range(0, <the UTF-16 length>, Forward)`.
+
+```rust
+// `name_input` is the captured `NodeHandle` for the rename `<input>` (built
+// once, outside the handler, the way `email_field` is above).
+button { onclick: move || {
+    editing.set(true);   // an `if` effect mounts the rename input
+    name_input.focus();
+    name_input.select(); // the whole name, ready to be typed over
+}, "Rename" }
+```
+
+That ordering works because [touching the DOM inside a handler](
+reactivity.md#touching-the-dom-inside-a-handler) flushes the queued effects
+first: by the time `name_input.focus()` runs, the `if` effect has already
+mounted the input `editing.set(true)` asked for.
+
+Both calls work on a control that does not hold the keyboard yet, the same
+way a browser's own `setSelectionRange()`/`select()` do: the range is set
+immediately and simply shows up the first time the control *is* focused — a
+component does not need to call `focus()` first, or in any particular order
+relative to `select()`/`set_selection_range()`. Like `focus()`, both are
+no-ops before this handle is mounted — and, on desktop, also a no-op on a
+node that is not a text control (a checkbox, a `<select>`, a generic
+`tabindex` node): such a node never installs the state a selection would
+apply to, so there is nothing to apply it to or hold it for, the same
+divergence a browser's own thrown-and-discarded `InvalidStateError` would
+be papering over. A mouse click that focuses a field places its own caret
+and clears a selection that was pre-armed for it but never applied —
+calling `set_selection_range()` on a field and then clicking somewhere else
+in it does what you would expect: the click wins.
+
+### Reading the selection and the caret
+
+`NodeHandle::selection_range()` (issue #1678) is the read half:
+`Option<(start, end, SelectionDirection)>` in UTF-16 code units with
+`start <= end`, the DOM's `selectionStart` / `selectionEnd` /
+`selectionDirection`. It answers for a control that does not hold the keyboard
+too, as a browser does: what `set_selection_range` set (at once, before the
+runtime applies it), the selection the control had when it lost the keyboard,
+a caret after the value once a `value` write changed it (a browser's value
+setter moves it there), or a caret at the start, `(0, 0, Forward)`, for a
+parsed or default value nobody has touched — Chrome 155's answers. `None` for
+anything but an `<input>` or `<textarea>`, and — as Chrome answers `null`
+there — for an `<input>` of type `email`, `number`, the date/time family or
+any other type with no text selection. A range set with
+`SelectionDirection::None` reads back `Forward`, as Chrome on Linux and
+Windows reads it (macOS Chrome reads `"none"`; not measured here). On desktop
+the selection a `focus()` or Tab shows is the one `selection_range()` read
+just before — a browser's `focus()` keeps the control's own selection (Chrome
+selects an `<input>`'s whole text on Tab, which desktop does not). A `value`
+write that leaves the value as it was keeps the selection.
+
+`NodeHandle::caret_rect()` and `caret_rect_at(offset)` answer where a caret is
+drawn — at the selection's head, or at a UTF-16 offset — as an `ElementBounds`
+of width 0, in logical window px on desktop and client px on the web, the
+space `EditorHandle::caret_rect` answers in, so one popup positioning works
+for both. Desktop measures with the layout paint draws the field with
+(password bullets, a single-line field's centring and horizontal scroll, the
+placeholder's start in an empty field); an IME composition's text, which is not in the value yet, is
+not counted. A browser exposes no caret geometry for a form control, so the web
+lays the value out in a hidden copy of the control with its computed text
+styles at the width the control lays its text out in; Chrome 155's and
+Firefox 155's own `caretPositionFromPoint` answer the same offset at the
+rect's centre for a textarea scrolled under its scrollbar, right-to-left
+text, line starts after a break, `wrap="off"`, a centred or horizontally
+scrolled `<input>`, a password field and a field under a `transform`. Its height is the
+text's own (the font's content area), where desktop's is the 1.2 × font-size
+caret it paints. A field that is not rendered (`display: none`) has no caret
+rect. Ask after layout — from an effect or an `onkeydown` that did
+not move the caret — since desktop answers from the last layout.
+
+```rust
+textarea {
+    oninput: move |v: String| {
+        draft.set(v.clone());
+        // `[[` just typed: open the picker under it.
+        if let Some((_, end, _)) = field.selection_range()
+            && v.encode_utf16().take(end).collect::<Vec<_>>().ends_with(&[0x5b, 0x5b])
+        {
+            picker_at.set(field.caret_rect_at(end - 2));
+        }
+    },
+}
+```
 
 A focused `<select>` is **closed**, like a browser's: Enter, Space or Alt+Down
 opens its popup, and the popup then owns the keyboard until it commits or is
 dismissed — at which point focus returns to the closed control, so Tab carries
 on from there rather than restarting. (A click *outside* the popup is the
-exception: it belongs to whatever it landed on.) Everything else focusable activates the nearest ancestor-or-self
+exception: it belongs to whatever it landed on.) The pointer opens and picks
+with the **primary button only**, as in a browser: a right or middle press on the
+closed control does not open it, and one on an option picks nothing and leaves
+the list open — but a press of any button *outside* the list dismisses it.
+Everything else focusable activates the nearest ancestor-or-self
 `data-rid` on Enter/Space, which is what makes `div { tabindex: "0", onclick: … }`
 behave like a button — and what makes Space on a `Checkbox`'s visually hidden
 `<input>` toggle the `<label>` that wraps it.
 
-> **Still not matched to the web.** A positive `tabindex` does not order ahead
-> of DOM order — the collector is a plain pre-order walk (issue #435).
-> Arrow/Enter/Escape navigation of the `Select` component's open option list is
-> issue #434.
+The **`Select` component** (not a native `<select>`) behaves the same way on
+both backends (issue #434): its trigger keeps the focus while the list is open,
+ArrowUp/ArrowDown move a highlight (wrapping at the ends), Home/End jump,
+Enter commits the highlighted option, Escape closes without committing, Tab
+closes and moves on, and typing jumps to the first option whose label starts
+with what was typed. Space commits like Enter, except while a type-ahead prefix
+is being typed, when it extends it ("new y" finds New York). The highlight
+starts at the selected option and is announced through
+`aria-activedescendant`. A key with Ctrl, Alt or Meta held is left to the app.
+The list owns keys only while the focus is in the `Select`: if something moves
+the focus elsewhere while it is open (a shortcut focusing a search box, a
+script), the list closes and the keys go to wherever the focus went.
 
 ### Taking the click without the keyboard
 
@@ -158,6 +319,10 @@ rsx! {
 
 The rules:
 
+- It can be written **on a component**: `Group { data-nofocus: "", … }` or
+  `Paper { data-nofocus: "", … }` puts it on the component's root element, so a
+  toolbar built from components needs no wrapper `div`
+  ([Attributes on a component](rsx-syntax.md#attributes-on-a-component)).
 - It is read **anywhere on the pressed element's ancestor chain**, so a toolbar
   carries it once instead of every button in it. Put it on the toolbar, not on
   a big content region — a press inside it suppresses the browser's default,
@@ -165,14 +330,19 @@ The rules:
 - It protects **whatever holds the keyboard** — the rich-text editor, an
   `<input>`, a render surface, another focusable node — not just the editor.
 - The **click still fires**. `data-rid` dispatch is untouched.
-- A **text field inside** a `data-nofocus` region still focuses normally. A
-  link-URL field in a toolbar has to be usable, so the field's own claim wins
-  over the region's opt-out.
+- A **form control inside** a `data-nofocus` region (an `<input>` of any type,
+  a `<textarea>`, a `<select>`, or editable content) still focuses normally, on
+  both backends (the web since issue #1579). A link-URL field in a toolbar has
+  to be usable, so the control's own claim wins over the region's opt-out. That
+  includes a checkbox or `<input type="button">`: pressed inside an editor
+  toolbar, it takes the keyboard from the editor. Use a `<button>` (or any
+  element that is not a form control) for a toolbar action that must not.
 - Boolean attribute, same rule as `data-disabled`: present means on whatever
   the value, and the explicit `"false"` opts out — one of rinch's own three
   attributes where that escape exists.
 - It works on **both backends**. On the web it becomes `preventDefault()` on
-  the `pointerdown`.
+  the `pointerdown` — except a press whose nearest focusable is a form control
+  inside the region, which is left to the browser.
 
 ### Containing Tab inside an overlay
 
@@ -284,6 +454,17 @@ Nesting needs no special case: an inner overlay remembers whatever the outer one
 focused, so closing the inner restores into the outer and closing the outer
 restores to the page.
 
+A rich-text `Editor` counts as an element here, on both backends (issue #1126).
+An editor inside the overlay that holds the keyboard when it closes lets it go
+(its caret disappears, a composition is committed first) and the opener gets it;
+an overlay opened while an editor held the keyboard gives it back to that
+editor, caret and selection where they were. On the web the editor holds the
+keyboard through a hidden field in `<body>`, outside every overlay, so
+`NodeHandle::active_element()` answers the editor's container for it, and a
+removal that takes a focused editor out of the page (`NodeHandle::remove` of a
+part holding it) releases the editor, as the browser blurs any focused element
+it takes out.
+
 Three things to know about the machinery:
 
 - **Desktop decides both a turn later.** An overlay opening or closing is a class
@@ -293,7 +474,12 @@ Three things to know about the machinery:
   question about boxes. The desktop backend therefore parks the request and
   resolves it after the next layout, which is the turn a signal write already
   triggers. `rinch-web` answers on the spot, because the browser lays out on
-  demand and refuses a `focus()` it should refuse.
+  demand and refuses a `focus()` it should refuse. The browser's focus
+  listeners run inside these focus moves (`NodeHandle::focus`, an overlay
+  opening or closing) with the document free: a `blur`, `focusin` or
+  `onchange` handler of yours that they run may use any `NodeHandle`. The same
+  holds when a `NodeHandle` verb takes the focused element out of place (see
+  [When the focused element goes](#when-the-focused-element-goes)).
 - **"Still there" means it can still take focus**, not merely that it is
   attached. An opener that went `disabled` while the dialog worked, or one that
   lives inside an *outer* overlay closed before this one, is connected and
@@ -313,10 +499,32 @@ deliberately no bare `blur()`: releasing the keyboard is never the whole answer,
 only the fallback half of a restore, and a caller that could only blur would have
 to make the decision `restore_focus` exists to make.
 
+### `autofocus` when a window opens
+
+The first element in tree order that carries `autofocus` takes the focus when
+the document mounts, as a page Chrome loads does (issue #2731). On desktop it
+is applied once the mounted document has been laid out with its stylesheet —
+at the event loop's first turn, or before a key or the window's keyboard enter
+if either comes first — so a key typed the moment the window has the keyboard
+reaches it.
+A hidden or disabled `autofocus` element is passed over, and a `focus()` the
+app makes while building wins over it. Only the document's first mount reads
+it; an element given `autofocus` later is focused only by an overlay that moves
+the focus in (above).
+
+```rust
+rsx! {
+    input { placeholder: "Search", autofocus: true }
+}
+```
+
 ## Registering a focus target
 
 `register_focus_target` attaches callbacks to a focusable node. It does not
 change *who* can be focused — it changes what your component is told about it.
+(For keys alone, an element's own `onkeydown` / `onkeyup` — see
+[Keys on an element](./rsx-syntax.md#keys-on-an-element) — work on both
+backends, on a text control too, which `on_key` here never hears.)
 
 ```rust
 use rinch::prelude::*;
@@ -395,6 +603,19 @@ consumer code works against `rinch-web`. Case is identity, so a Shift pressed
 exactly as in a browser; track held keys by the physical `k.code`, or fold
 case at the comparison, if that matters to you.
 
+On **Android** a hardware key's release is spelled as its press was reported,
+whatever happened in between: `"W"` down with Shift held comes up as `"W"` even
+if Shift went up first, and a letter that combined with a dead key (`"é"`)
+comes up as that same string. A release whose press the app never saw (a key
+already held when the app came to the front) is spelled from the layout with
+the modifiers held at the release. An auto-repeat is still spelled from what it
+types: after a dead key the press is `"é"`, the repeats are `"e"` and the
+release is `"é"`, so track held keys by `k.code` there too
+([#1418](https://github.com/joeleaver/rinch/issues/1418)). Text the
+soft keyboard commits goes through `InputConnection` and has no key events; a
+raw key event an IME sends (`sendKeyEvent`, typically Backspace and Enter)
+comes through the same translation as a hardware key, release included.
+
 Two things to know:
 
 - A release is delivered to whoever holds the claim **at release time**. A
@@ -411,14 +632,18 @@ Tab navigation, no Enter/Space activation, no DevTools shortcut. Returning
 exactly as it would for an unregistered node, so registering costs you nothing
 you did not ask for.
 
-`k.key` is spelled the way the browser spells `KeyboardEvent.key` — with one
-long-standing exception, the spacebar, which rinch names `"Space"` where a
-browser reports `" "` (so `rinch-web`, which forwards `event.key()`
-unchanged, reports `" "` there). It is resolved in four steps:
+`k.key` is spelled the way the browser spells `KeyboardEvent.key`, on desktop
+as on `rinch-web` (which forwards `event.key()` unchanged), and `k.code` the
+way it spells `KeyboardEvent.code`. That includes the **spacebar: `k.key` is
+`" "` and `k.code` is `"Space"`**, and `k.is_space()` answers it on every
+backend. (Desktop reported `k.key == "Space"` until issue #1161; code that
+matched that should match `k.code == "Space"` or `k.is_space()` instead.) The
+key is resolved in four steps:
 
-1. **A named key wins over the text it would insert** — `"ArrowLeft"`,
-   `"Enter"`, `"Escape"`, `"Tab"`, `"PageUp"`, `"F1"`…`"F12"`, `"Shift"`, and
-   `"Space"` (not `" "`).
+1. **A key with a fixed spelling wins over the text it would insert** —
+   `"ArrowLeft"`, `"Enter"`, `"Escape"`, `"Tab"`, `"PageUp"`, `"F1"`…`"F12"`,
+   `"Shift"`, and the spacebar's `" "`, so a release (no text) and a chord
+   (text suppressed) spell it like a plain press.
 2. **Otherwise the inserted text wins**, so a non-QWERTY layout reports the
    letter actually typed rather than the physical QWERTY position: the AZERTY
    key at the QWERTY-Q position is `k.key == "a"`, and Shift+A is `"A"`.
@@ -485,8 +710,25 @@ windows.
 
 So the pair to expect is `on_focus_lost` on window blur, `on_focus_gained` on
 window refocus, with no key routing in between. Use it to hide a caret and idle
-a blink timer. While the window is blurred, rinch reports the OS IME disabled,
+a blink timer. An open popup that owns the keyboard (a `Select` list, a native
+`<select>`'s popup, the text context menu) closes on window blur, as in a browser
+(issue #1171); the claim it was opened from is kept. While the window is blurred, rinch reports the OS IME disabled,
 so a candidate box follows the window that actually has the keyboard.
+
+An element's own `onfocus` / `onblur` (issue #2731) follow the same rule as a
+browser's: the window losing the keyboard fires `onblur` on the focused
+element, and getting it back fires `onfocus` again, while the element keeps
+the focus throughout; hiding a desktop window (`hide_window`, to the tray)
+counts as losing it, and showing it again fires `onfocus` at its keyboard
+enter. A desktop window is not focused until the system gives
+it the keyboard, so a field focused while the window is built hears `onfocus`
+at that moment — see [Focus on an element](./rsx-syntax.md#focus-on-an-element).
+And a `focus()` the app made is applied before the window is reported focused
+and before the next key is routed, so a key typed the moment the window has the
+keyboard reaches the field. One exception on the web: the rich-text
+editor's keyboard there is a hidden text area under `<body>`, so an editor's
+container hears none of the four focus events on the web, where on desktop it
+hears them as any focused element does.
 
 The runtime does the same for its own caret: the rich-text editor's caret stops
 blinking while the window is blurred and shows **solid**, resuming from the
@@ -550,6 +792,77 @@ Everything under [Window focus](#window-focus) applies: while the window is
 blurred, IME reports disabled and no composition is routed, but the claim — and
 `on_ime` with it — comes back on refocus.
 
+## App-wide key listeners
+
+`on_app_key` registers a listener that hears every key press and release the
+window (desktop) or page (`rinch-web`) receives that nothing ahead of it
+consumed — whatever has focus, **including nothing** (issue #1784). It is what a
+browser app gets from `window.addEventListener("keydown", …)`, written once for
+both backends, and any number of parties can register one: an app's shortcuts
+next to an embedded code editor's.
+
+```rust
+#[component]
+fn studio() -> NodeHandle {
+    let root = rsx! { div { /* … */ } };
+    let r = root.clone();
+    on_app_key(move |k: &KeyEventData| {
+        // Leave keys typed into a text field to the field.
+        let in_field = r
+            .active_element()
+            .and_then(|el| el.tag_name())
+            .is_some_and(|t| t == "input" || t == "textarea");
+        if !k.is_down() || in_field {
+            return false;
+        }
+        match k.key.as_str() {
+            "Delete" => { /* delete the selection */ true }
+            "z" if k.ctrl => { /* undo */ true }
+            _ => false,
+        }
+    });
+    root
+}
+```
+
+- **Where it runs.** After everything that owns a key: menu chords, a focused
+  editor's `on_key`, the focused element's `onkeydown` and its ancestors',
+  `set_keyboard_interceptor`, an open popup's key entry, the dismiss stack, a
+  focused [registered widget's](#registering-a-focus-target) `on_key` (desktop),
+  and a focused render surface's `set_key_handler` claim. Before the focused
+  element's default: typing into a field, Tab, Enter/Space activation,
+  `onsubmit`. So an open `Select` list keeps its arrows, a `Modal` still closes
+  on Escape, and a key typed into a text field reaches the listener first, as
+  a browser's `window` listener does — check the focused element if your
+  shortcut should leave fields alone.
+- **Consuming.** Listeners are offered a press in registration order; the first
+  to answer `true` consumes it: no later listener and no default sees it, and on
+  the web the event is `preventDefault`ed and stops propagating. A release goes
+  to every listener and the answer is ignored.
+- **Not offered:** a press while the rich-text editor holds the keyboard (its
+  keys are its own), while an input method is composing, and on desktop while
+  the built-in text context menu or an open native `<select>` list owns the
+  keyboard. A key a focused render surface claims is the surface's, press and
+  release.
+- **Lifetime.** A listener belongs to the component that registered it and is
+  released when it unmounts; registered outside any render (from `main`) it
+  lives for the life of the app. `AppKeyListener::remove()` releases one early;
+  dropping the handle releases nothing.
+- **Which document's keys.** On desktop, a listener registered while a
+  document's code runs (its render, an effect, a handler) hears only that
+  document's keys; one registered from `main` hears every document on the
+  thread — the DevTools window's included. On `rinch-web` a listener hears
+  every key the page's `document` sees, whichever root registered it: every
+  island's (`mount_into` roots) and keys typed into page inputs outside any
+  root. Check the focused element if that matters.
+- **Tab.** A listener that consumes Tab takes it before `trap_focus`
+  containment, which runs in the default stage (as a browser `window` listener
+  can `preventDefault` a Tab a dialog would otherwise trap).
+- **Auto-repeat.** A held key arrives as repeated presses, and `KeyEventData`
+  does not tell a repeat from a fresh press (#797): a toggle shortcut fires on
+  every repeat. Track held keys by `k.code` (press until release) if that
+  matters.
+
 ## The dismiss stack
 
 Escape is the one key an overlay has to answer without holding the keyboard: a
@@ -575,6 +888,13 @@ __scope.on_cleanup(move || drop(handle));
 - **It is a stack, last in first out.** The most recently registered handler is
   asked first, so two nested modals close innermost-first. The first handler
   that returns `true` consumes the key and the ones beneath it are never asked.
+- **Name your root, and the DOM orders what it relates.**
+  `push_dismiss_handler_within(&root, f)` registers against `root`'s document
+  and records `root`: an entry whose root lies *inside* another entry's root is
+  asked before it, wherever the two sit on the stack (issue #803). That is what
+  makes an overlay written inside another — `Modal { Popover { … } }`, which
+  renders and registers the popover first — answer Escape before the overlay
+  around it. Entries the DOM does not relate keep the LIFO order.
 - **Answer `false` while you are closed.** An overlay usually stays *mounted*
   when it closes — `opened_fn` only toggles a class — so the check belongs
   inside the handler, at dispatch time, not at registration. A handler that
@@ -607,20 +927,31 @@ while it is closed. That is what `Modal`, `Drawer` and `Popover` do, and it is
 right for an overlay whose open state arrives as a *prop*: `render` runs once,
 so there is no later moment to hang a registration on.
 
-It is the wrong choice for an overlay **statically nested inside another one**.
-A component renders *after* its children, so `Modal { ColorInput { … } }` pushes
-the input's entry first and the modal's on top of it — and the stack is LIFO, so
-the modal answers Escape while the colour picker is the thing on screen.
+A component renders *after* its children, so `Modal { Popover { … } }` pushes
+the popover's entry first and the modal's on top of it. With a bare
+`push_dismiss_handler` the stack is plain LIFO and the modal answers Escape
+while the popover is the thing on screen; registered with
+`push_dismiss_handler_within(&root, …)`, as all three do since issue #803, the
+DOM nesting puts the popover first.
 
-An overlay that owns its open state avoids that by pushing when it **opens** and
-releasing when it closes. Opening happens after every ancestor has mounted, so
-LIFO puts the entry where the user expects it with no precedence rule anywhere.
+An overlay that owns its open state can also push when it **opens** and
+release when it closes. Opening happens after every ancestor has mounted, so
+LIFO alone puts the entry where the user expects it, and the stack holds only
+open overlays.
 This is what the native `<select>` popup does (issue #671) and what
 `ColorInput`'s dropdown does (issue #465); in a component,
 `rinch_components::overlay_dismiss::arm_close_on_escape_while_open` is that
-policy written out. Such a handler consumes unconditionally — it exists only
-while the overlay is open, so it has no closed state to decline in — and the
-release must cover **unmount-while-open** as well as close.
+policy written out. Such a handler has no closed state to decline in — it
+exists only while the overlay is open — but an ancestor can stop *rendering* the
+overlay without closing it: a `ColorInput` whose picker was open when the app
+closed the `Modal` around it is `display: none`, still mounted, still open. So
+the handler first asks `NodeHandle::is_rendered()` (connected, no
+`display: none` on the node or an ancestor, and not `visibility: hidden` or
+`collapse`) and declines while it answers `false`, letting the Escape reach what
+is on screen (issue #802). The overlay stays open, and Escape closes it once its
+ancestor shows it again. On desktop the answer comes from the styles of the last
+layout, so a hide made in the same turn as the key press, before a layout ran,
+is not yet seen. The release must cover **unmount-while-open** as well as close.
 
 `Modal`, `Drawer` and `Popover` already do all of this for you through their
 `close_on_escape` prop — reach for `push_dismiss_handler` when you are building
@@ -628,6 +959,103 @@ an overlay of your own. **Prefer it over `set_keyboard_interceptor` for
 Escape**: the interceptor is a single slot per document, so a second overlay
 registering there silently disables the first, and when it unmounts it clears
 the slot rather than restoring what it displaced.
+
+### A popup that owns every key while it is open and focused
+
+```rust
+let handle = push_key_handler(
+    &root,                                   // the owner: the popup's component root
+    move |k: &KeyEventData| k.key == "ArrowDown" && { step(); true },
+    move || opened.set(false),               // focus left the owner
+);
+```
+
+`push_key_handler` puts an entry on the same stack that is offered **every key
+press** (never a release), ahead of the Escape scan; `true` consumes the key,
+which on `rinch-web` also `preventDefault`s it. It is for a popup whose focus
+stays on something *outside the popup's list* — the `Select` component's option
+list, whose combobox trigger keeps the focus while the arrows move a highlight.
+
+**It is offered a key only while the focused element is the owner or inside
+it.** A field focused while the popup is open — by a shortcut, a script, an
+`autofocus` — keeps its own keys, and on the web a key typed outside the rinch
+mount is never touched. When focus moves and is no longer inside the owner, the
+entry's `on_focus_leave` runs (the backends report every focus move), which is
+where a listbox closes; pass `|| {}` if yours should stay open. It also runs when
+the **window** loses the keyboard, though the focused element stays focused then
+(issue #1171): a native `<select>`'s popup and Mantine's `Select` dropdown both
+close on a window blur, so the `Select` list does too, on both backends — desktop
+from `PlatformEvent::WindowFocus(false)`, `rinch-web` from a `window` `blur`
+(`rinch_core::notify_window_blurred`). The trigger keeps the focus. Desktop's
+native `<select>` popup closes the same way, handing the keyboard back to the
+control. `ColorInput`'s dropdown holds such an entry while it is open (issue
+#1572), owned by the input's root and taking no key, so it closes when the
+focus leaves the field or the window blurs, as Mantine's does in the input's
+`onBlur`.
+
+Register it **at open** and release it at close and on unmount —
+`rinch_components::overlay_dismiss::arm_keys_while_open` is that policy.
+Decline Escape in it and give Escape its own dismiss entry, so "which overlay is
+on top" stays one question.
+
+### When the focused element goes
+
+On the web, a `NodeHandle` verb that removes or moves the focused element, or
+an element around it, **lets the focus go first**: `remove`, `discard`,
+`remove_child`, `replace_with` (for either node), `set_inner_html` and
+`set_text` over it, and `append_child` / `insert_before` / `insert_after` of a
+node that is already in the document. That covers a reactive `if` hiding a
+panel, a keyed `for` moving a row, and unmounting a root. The focused element
+is blurred, with the document free, and then the node goes. So:
+
+- a key entry whose owner is in the part that goes gets its `on_focus_leave`
+  (an open `Select` in a hidden panel closes). Chrome fires the focus events by
+  itself when a focused node is removed; Firefox fires nothing, and rinch's own
+  `blur()` makes the two agree;
+- a modified field in it gets its `onchange` **only while its handler is still
+  alive**: a field removed directly, or a captured one a branch hides
+  (`if show { {field} }`). A field the hidden branch *built*
+  (`if show { input { onchange: … } }`) has had its handlers freed before it
+  goes, and commits nothing;
+- a handler those events run may use any `NodeHandle`, and the node it is
+  about is still where it was. A handler that keeps putting the focus back
+  inside the part that goes is stopped the fourth time: that part is held
+  `inert` for the last blur, so the focus cannot return to it;
+- a verb the browser refuses (an `insert_before` whose reference is not a child
+  of the parent, a node appended into itself) moves nothing and keeps the
+  focus;
+- **a node moved inside the document keeps the focus** where the browser has
+  `Node.moveBefore` (Chrome 133 and later; check your other target browsers),
+  as it always has on desktop. `append_child`, `insert_before` and
+  `insert_after` of a node that is already in the document — a keyed `for`
+  moving a row — are then that call: no focus event fires, an open `Select` in
+  the row stays open and an `<iframe>` in it is not reloaded (measured in
+  Chrome 153 and Firefox 157); a scroller in it keeps its offset in Chrome and
+  is reset to the top in Firefox 157. A running CSS animation or transition
+  in the row carries on and an IME composition in its `<input>` is not ended
+  (measured in Chrome 153). One exception to "keeps the focus": a node moved
+  under a parent where it cannot be focused (`display: none`, `hidden`,
+  `inert`, `visibility: hidden`, a disabled `<fieldset>`, a closed
+  `<details>` or `<dialog>`) keeps it through the move and the browser blurs
+  it afterwards, so a key entry's `on_focus_leave` runs then, once. A page's
+  own `moveBefore` polyfill written over `insertBefore` is recognised and not
+  used. In a browser without the method
+  the move is a removal and an insertion, **the moved node loses the focus**
+  and the list above applies; call `focus()` on it again after the move if it
+  must keep the keyboard there. A move into or out of a detached subtree, and
+  `replace_with`, take that path in every browser.
+
+Three attribute writes can cost the focused element its focus in place:
+`hidden` on it, and removing the `tabindex` or `contenteditable` that made it
+focusable (Chrome blurs inside the write; `disabled`, `inert` and
+`display: none` fire nothing there). `set_attribute`, `write_attribute` and
+`remove_attribute` make those writes with the document free too. A `tabindex`
+write that leaves the element focusable (a roving tabindex) keeps the focus.
+
+Not covered: `UpdateBatch::apply`, which is handed the document already
+borrowed, and any other code that calls a `DomDocument` method directly. A
+`SetText` or attribute write there that unfocuses an element still runs the
+browser's listeners under that borrow.
 
 [`DismissHandle`]: https://docs.rs/rinch/latest/rinch/struct.DismissHandle.html
 
@@ -681,19 +1109,88 @@ Do **not** reach for `RenderScope::body_handle()` and set `overflow: hidden`
 there: on the web that handle is `<div id="rinch-body">`, a descendant of the
 real `<body>`, and styling it does not stop the page scrolling.
 
-**A scroll container the runtime portals to `<body>` is exempt**, because it is
-not a descendant of any overlay's root: the native `<select>` popup registers
-itself with `NodeTree::push_scroll_lock_exempt` while it is open, so a long
-option list inside a dialog still scrolls. Anything else that portals a
-*scrollable* element to the body needs the same, with the same
-push-on-open / release-on-close lifetime.
+### A scroll container outside the overlay: `data-scroll-lock-exempt`
 
-The exemption has no portable spelling yet, so it covers the runtime's own
-portals and nothing else. A scroll container of yours that sits **outside** the
-locking overlay in the tree — window chrome, a panel anchored to the frame — is
-refused while the lock is held; the Linux in-app menu bar's own dropdown is the
-known instance, tracked in
-[issue #701](https://github.com/joeleaver/rinch/issues/701).
+On desktop the lock refuses every scroll container that is not inside a locking
+overlay's root. That is the page behind the overlay, which is the point, but it
+is also any scroll container of yours that sits **outside** the overlay in the
+tree and is still meant to be used while it is open: a popup portalled to
+`<body>`, a menu hanging from window chrome, a panel that paints over the
+dialog. Mark it:
+
+```rust
+div {
+    class: "my-popup-list",
+    style: "max-height: 300px; overflow-y: auto;",
+    data-scroll-lock-exempt: "",
+    // ...
+}
+```
+
+- The attribute exempts its **subtree**, so a popup carries it once on its root
+  and every scroller inside scrolls. On a component, write it the same way: a
+  hyphenated attribute goes on the component's root element.
+- It exempts everything under the marked node and nothing else: an unmarked
+  scroll container outside the overlay stays locked.
+- **It cannot unlock the page.** A mark on a node that contains the locking
+  overlay — `<body>`, an app root, a wrapper around the dialog — is ignored, so
+  the page behind the overlay stays locked whatever its ancestors carry. Mark
+  the popup, not something above it.
+- **It is not checked against paint order.** A marked scroller that the overlay
+  covers also scrolls when the wheel is over it (the pointer is on the backdrop,
+  and the wheel finds the scroller underneath). Mark only what is shown above
+  the overlay.
+- It is one of rinch's `data-` boolean attributes: on unless its value is
+  `"false"`, and a reactive `data-scroll-lock-exempt: {|| flag.get()}` removes
+  it when `flag` is false. `rinch_core::events::SCROLL_LOCK_EXEMPT_ATTRIBUTE`
+  is the name, for code that writes it through a `NodeHandle`.
+- There is nothing to release: the exemption goes with the node.
+- **Desktop only, and the web needs none.** The web's lock is
+  `overflow: hidden` on `<html>`, which stops the page and leaves every scroll
+  container inside it scrolling, so the attribute is inert there.
+
+The DOM menu bar (the in-app bar of a Linux window) marks its own dropdowns and
+submenu flyouts, so a menu too long for the window scrolls while a dialog is
+open (issue #701). The runtime's native `<select>` popup, which it appends to
+`<body>`, is exempt the same way through the runtime's own list
+(`NodeTree::push_scroll_lock_exempt`); you do not need to mark a `<select>`.
+
+## Undo and redo in a text field
+
+A focused `<input>` or `<textarea>` undoes with **Ctrl+Z** and redoes with
+**Ctrl+Shift+Z** or **Ctrl+Y** (`Cmd` on macOS) on desktop, as a browser field
+does on the web (issue #288).
+
+- **`oninput` fires with the restored text**, exactly as for a keystroke, so a
+  controlled field's signal follows the undo. The eventual `onchange` compares
+  what the field shows at the commit with what it showed when focus arrived, so
+  undoing back to the starting text commits nothing.
+- **A `readonly` field refuses both**, like every other text-changing command,
+  and a field that goes `disabled` while focused releases the keyboard instead.
+- **One key press is one undo step.** Each typed character is its own step —
+  desktop does not merge a run of typing into one the way a browser does.
+  Typing over a selection is one step: the selected text comes back whole.
+- **A keystroke and the rewrite its own `oninput` made are one step.** A
+  normalizing field (upper-casing, say) therefore undoes to the text before
+  the keystroke, never to the raw text the handler is about to rewrite again.
+  A keystroke the handler **rejects** — writes the field back to what it
+  showed, as a digits-only filter does with a letter — leaves no step at all.
+  **This is where desktop and the web differ:** a browser treats that
+  rewrite as a script write to `.value` and drops the field's whole undo
+  history, so a normalizing field has no undo on the web.
+- **Any other write to the field's `value` clears its undo and redo
+  history** — a `value_fn` reset, a clear after `onsubmit`, a write from a
+  timer or another handler. It is the app's change, not the user's, so Ctrl+Z
+  cannot bring back text the app replaced. That is what a browser does for a
+  script write to `.value`, so for a write made outside a keystroke desktop
+  and the web agree.
+- **Not with Alt, and not mid-composition.** Ctrl+Alt+Z is left alone, as are
+  Ctrl+Alt+A, C, V and X: Windows reports AltGr as Ctrl+Alt, and AltGr types a
+  character on some layouts (Polish `ż`, `ą`, `ć`, `ź`), which the field (and
+  the rich-text editor) inserts (#934). Ctrl+Z does nothing while an input
+  method is showing a composition.
+- The built-in right-click menu (below) has **no Undo row**; the chords are the
+  way in.
 
 ## Right-clicking a text field
 
@@ -719,7 +1216,8 @@ transparent window, and follows the theme's palette when there is one.
   Cut and Copy; Select all needs content; a `disabled` field takes no focus and
   gets no menu. Without the `clipboard` feature Cut, Copy and Paste are all
   greyed — there is no clipboard for them to reach, and an enabled Cut would
-  delete text it never copied. **Paste is not decided by reading the clipboard** — a read can
+  delete text it never copied. The chords agree: without the feature, Ctrl+X
+  (Cmd+X) on an `<input>`/`<textarea>` does nothing, as in the editor. **Paste is not decided by reading the clipboard** — a read can
   block for up to four seconds on X11 — so it stays enabled over an empty
   clipboard, where a native menu would grey it out; pasting nothing does
   nothing.
@@ -756,12 +1254,32 @@ build on, with this menu as the fallback.
   capture-phase hook for the whole document, dispatched *before* the arbiter and
   regardless of focus. It is for global shortcuts; `on_key` is for a focused
   widget. They are different jobs and both still exist. It routes per document
-  (issue #340): a hook registered while a document's events are being
-  dispatched intercepts only that document's keys, and one registered from
-  `main` or at mount is the thread-global fallback that intercepts for every
-  document without its own — so two windows that each register from inside
-  their own event handling no longer clobber each other. Registrations made
-  outside any dispatch still share the single fallback slot, last-wins. Its *lifetime* does match the arbiter's, though:
+  (issue #340): a hook registered while a document's code is running — its
+  event dispatch, its mount (issue #295), or an effect it owns, wherever that
+  effect happens to be flushed — intercepts only that document's keys, and one
+  registered from `main` is the thread-global fallback that intercepts for
+  every document without its own — so two windows that each register at mount
+  or from their own event handling no longer clobber each other. Registrations
+  made outside any document (from `main`, or a timer or `run_on_main_thread`
+  closure armed there) still share the single fallback slot, last-wins. On
+  rinch-web each mounted root is a document (issue #2811): its build, its
+  effects and the handlers its events run are its document's code, so two
+  islands' interceptors do not clobber each other either, and the fallback is
+  what page script outside any root registers. A timer, `run_on_main_thread` closure or
+  http/ws completion armed *inside* a document runs as that document's code
+  (issue #963), and so does a menu, tray, hotkey, notification, focus-target
+  or Android callback made inside one (issue #1032), so what it registers or
+  clears is that document's. A document is served whichever of its own hook and
+  the fallback was registered **later**, so a single-window app keeps
+  last-registration-wins wherever it registers from; `clear_keyboard_interceptor`
+  from outside any document clears every entry, and from inside one leaves that
+  document with none. The cost with several documents on one thread (two
+  embedded contexts, an app and its DevTools): code outside any document —
+  `main`, a timer armed there, a closure queued from a worker thread, a menu
+  (native or DOM bar) or tray callback built there — cannot say which document it belongs to, so its
+  registration overrides **every** document's own hook and its clear wipes
+  every document's. Registrations made inside documents stay isolated from
+  each other. Its *lifetime* does match the arbiter's, though:
   registering it during a render releases it when that component unmounts,
   exactly as a `FocusEntry` is deregistered (issue #183). Registering it from
   `main` keeps app lifetime. For **Escape**, use

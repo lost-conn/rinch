@@ -1,6 +1,6 @@
 //! Screenshot capture and PNG encoding.
 
-#[cfg(feature = "gpu")]
+#[cfg(feature = "gpu-renderer")]
 use wgpu::{
     BufferDescriptor, BufferUsages, CommandEncoderDescriptor, Device, Extent3d, Queue, Texture,
     TextureFormat,
@@ -9,7 +9,7 @@ use wgpu::{
 /// Capture a screenshot from a GPU texture, returning raw RGBA bytes.
 ///
 /// The caller is responsible for encoding to PNG.
-#[cfg(feature = "gpu")]
+#[cfg(feature = "gpu-renderer")]
 pub fn capture_texture_rgba(
     device: &Device,
     queue: &Queue,
@@ -72,7 +72,9 @@ pub fn capture_texture_rgba(
         .map_err(|e| format!("Channel recv failed: {}", e))?
         .map_err(|e| format!("Buffer mapping failed: {:?}", e))?;
 
-    let data = slice.get_mapped_range();
+    let data = slice
+        .get_mapped_range()
+        .map_err(|e| format!("Buffer view failed: {e}"))?;
 
     // Remove row padding and handle format conversion
     let mut rgba = Vec::with_capacity((width * height * 4) as usize);

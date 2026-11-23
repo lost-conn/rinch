@@ -1,6 +1,5 @@
 //! Keyboard event interception.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 /// Which phase of a keystroke an event reports (issue #337).
@@ -42,9 +41,13 @@ pub enum KeyEventKind {
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct KeyEventData {
-    /// The logical key value (e.g., "a", "Enter", "Backspace")
+    /// The logical key value, spelled as `KeyboardEvent.key` (e.g. `"a"`,
+    /// `"Enter"`, `"Backspace"`). The spacebar is `" "` on every backend — it
+    /// was `"Space"` on desktop until issue #1161; match it with
+    /// [`Self::is_space`] or `code == "Space"`.
     pub key: String,
-    /// The physical key code (e.g., "KeyA", "Enter")
+    /// The physical key code, spelled as `KeyboardEvent.code` (e.g. `"KeyA"`,
+    /// `"Enter"`, `"Space"`).
     pub code: String,
     /// Whether Ctrl/Cmd is pressed
     pub ctrl: bool,
@@ -58,6 +61,13 @@ pub struct KeyEventData {
     /// delivered, so a consumer had no way to see a key let go — and no way to
     /// ask, either, since every event was implicitly a press.
     pub kind: KeyEventKind,
+    /// The element the key was sent to — the focused element, `KeyboardEvent.
+    /// target` on the web — when the backend knows it (#2091). An element
+    /// handler (`onkeydown`) hears keys from its descendants too; this tells a
+    /// key meant for the element itself from one typed in a field inside it.
+    /// Set on the keys offered to element handlers; `None` elsewhere, and from
+    /// a host that does not say.
+    pub target: Option<crate::dom::NodeId>,
 }
 
 impl KeyEventData {
@@ -78,7 +88,14 @@ impl KeyEventData {
             alt: false,
             meta: false,
             kind: KeyEventKind::Down,
+            target: None,
         }
+    }
+
+    /// Name the element the key was sent to ([`Self::target`]).
+    pub fn with_target(mut self, target: Option<crate::dom::NodeId>) -> Self {
+        self.target = target;
+        self
     }
 
     /// Set all four modifiers at once, in the order they are declared:
@@ -111,6 +128,16 @@ impl KeyEventData {
     pub fn is_up(&self) -> bool {
         self.kind == KeyEventKind::Up
     }
+
+    /// Whether this is the spacebar (issue #1161).
+    ///
+    /// `key` is `" "` for it on desktop and on the web alike, as a browser's
+    /// `KeyboardEvent.key` is; `code` is `"Space"`. Either identifies it, and
+    /// this asks both, so a payload built by hand with only one of them — an
+    /// embedder's own event, a test — still answers.
+    pub fn is_space(&self) -> bool {
+        self.key == " " || self.code == "Space"
+    }
 }
 
 /// Type alias for the keyboard interceptor callback.
@@ -121,7 +148,7 @@ pub type KeyboardInterceptor = Rc<dyn Fn(&KeyEventData) -> bool>;
 /// [`DocScopedSlotMap`](crate::reactive::DocScopedSlotMap).
 type InterceptorSlots = crate::reactive::DocScopedSlotMap<dyn Fn(&KeyEventData) -> bool>;
 
-thread_local! {
+crate::doc_keyed! {
     /// One interceptor slot **per document**, plus the ownerless `None` entry
     /// for registrations made outside any dispatch (issue #340).
     ///
@@ -133,11 +160,12 @@ thread_local! {
     /// Now a registration is keyed by
     /// [`current_dispatching_doc`](crate::context::current_dispatching_doc)
     /// and dispatch prefers the dispatching document's interceptor, falling
-    /// back to the ownerless entry — so a hook installed from `main` or at
-    /// mount still intercepts every document's keys, as it always has. The
+    /// back to the ownerless entry — so a hook installed from `main` still
+    /// intercepts every document's keys, as it always has. (A hook installed
+    /// at a `RinchApp` mount, or from an effect a document owns, is that
+    /// document's: both run under its marker since issue #295.) The
     /// *lifetime* of each entry is issue #183 and is handled below.
-    static KEYBOARD_INTERCEPTOR: RefCell<InterceptorSlots> =
-        const { RefCell::new(InterceptorSlots::new()) };
+    static KEYBOARD_INTERCEPTOR: InterceptorSlots = InterceptorSlots::new();
 }
 
 /// Set the keyboard interceptor for the current document.
@@ -145,9 +173,11 @@ thread_local! {
 /// Only one interceptor can be active at a time **per document**: a second
 /// call from the same document replaces the first, while another document's
 /// registration is a separate slot (issue #340). "The current document" is the
-/// one whose events are being dispatched right now; registering outside any
-/// dispatch — from `main`, a timer, or at mount — fills the thread-global
-/// fallback slot, which intercepts for every document that has no interceptor
+/// one whose code is running right now — its event dispatch, its mount, an
+/// effect it owns, or a timer / `run_on_main_thread` closure / socket callback
+/// it armed (issues #295, #963); registering outside any document — from
+/// `main`, or from a timer armed there — fills the thread-global fallback
+/// slot, which intercepts for every document that has no interceptor
 /// of its own.
 ///
 /// **Released on unmount.** Registering from inside a render ties the
@@ -172,8 +202,9 @@ pub fn clear_keyboard_interceptor() {
 }
 
 /// Dispatch a keyboard event to the dispatching document's interceptor (or the
-/// thread-global fallback), then — for an **Escape press** only — to the
-/// [dismiss stack](super::dispatch_dismiss). Returns true if the event was
+/// thread-global fallback), then — for a **press** — to any open popup's
+/// [key handler](super::push_key_handler), then — for an **Escape press**
+/// only — to the [dismiss stack](super::dispatch_dismiss). Returns true if the event was
 /// handled and should not reach the runtime.
 ///
 /// The `Rc` is cloned out before the call so the handler may re-enter (install a
@@ -193,11 +224,23 @@ pub fn clear_keyboard_interceptor() {
 /// an app that consumes Escape there means it. A **release** never dismisses —
 /// `KeyUp` comes through this same function and must not close anything.
 pub fn dispatch_keyboard_event(data: &KeyEventData) -> bool {
+    // One transaction for the interceptor and the dismiss scan together, like
+    // every other handler dispatch (`crate::reactive::batch`).
+    crate::reactive::batch(|| dispatch_keyboard_event_unbatched(data))
+}
+
+fn dispatch_keyboard_event_unbatched(data: &KeyEventData) -> bool {
     let intercepted = match crate::reactive::read_doc_scoped_slot(&KEYBOARD_INTERCEPTOR) {
-        Some(cb) => cb(data),
+        // Untracked (#931): `dispatch_keyboard_event` is public, so it can be
+        // called from inside an effect.
+        Some(cb) => crate::reactive::untracked_handler(|| cb(data)),
         None => false,
     };
     if intercepted {
+        return true;
+    }
+    // An open popup that owns the keyboard (#434) — see `push_key_handler`.
+    if data.is_down() && super::dismiss::dispatch_key_handlers(data) {
         return true;
     }
     if data.key == "Escape" && data.is_down() {
@@ -209,12 +252,30 @@ pub fn dispatch_keyboard_event(data: &KeyEventData) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     use crate::reactive::{Scope, Signal};
 
     fn key(name: &str) -> KeyEventData {
         KeyEventData::new(name.to_string(), name.to_string())
+    }
+
+    /// `is_space` answers the spacebar on either field, and nothing else — not
+    /// a key merely named like it, not a key whose text is some other blank.
+    #[test]
+    fn is_space_answers_the_spacebar_by_key_or_code() {
+        assert!(KeyEventData::new(" ", "Space").is_space(), "every backend");
+        assert!(KeyEventData::new(" ", "").is_space(), "key alone");
+        assert!(KeyEventData::new("", "Space").is_space(), "code alone");
+        for (k, c) in [
+            ("Enter", "Enter"),
+            ("a", "KeyA"),
+            ("\u{a0}", "KeyA"),
+            ("\t", "Tab"),
+            ("Space", "KeyS"),
+        ] {
+            assert!(!KeyEventData::new(k, c).is_space(), "{k:?}/{c:?}");
+        }
     }
 
     /// `with_modifiers` takes four positional bools — the shape whose failure

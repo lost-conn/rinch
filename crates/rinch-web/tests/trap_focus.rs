@@ -462,15 +462,122 @@ fn closing_a_nested_trap_hands_containment_back_to_the_outer_one() {
         .set_attribute("style", "display: none")
         .unwrap();
 
+    // `in-b` is no longer a stop, so Tab resumes at its tree neighbour inside
+    // the outer trap — `out-b`, which follows the inner region — as Chrome 153
+    // does from a focused element hidden under it (issue #435).
     tab(false);
     assert_eq!(
         f.active(),
-        "out-a",
+        "out-b",
         "the outer trap takes over; the inner's two controls are gone"
     );
     tab(false);
-    assert_eq!(f.active(), "out-b");
-    tab(false);
     assert_eq!(f.active(), "out-a", "and the outer cycle wraps");
+    tab(false);
+    assert_eq!(f.active(), "out-b");
     f.teardown();
+}
+
+// ── the Tab sequence inside a trap (issue #435) ─────────────────────────────
+
+/// A trap of `X Y[1] Z` plus a `tabindex="-1"` `F` between `Y` and `Z`, and a
+/// positive stop `P` outside. Desktop's twin is `rinch/src/app/tab_order_tests.rs`.
+fn sequence_fixture() -> Fixture {
+    Fixture::mount(move |scope| {
+        let root = scope.create_element("div");
+        let p = button(scope, "P");
+        p.set_attribute("tabindex", "1");
+        root.append_child(&p);
+        let region = scope.create_element("div");
+        region.set_attribute("style", VISIBLE);
+        region.set_attribute("data-trap-focus", "");
+        region.append_child(&button(scope, "X"));
+        let y = button(scope, "Y");
+        y.set_attribute("tabindex", "1");
+        region.append_child(&y);
+        let f = button(scope, "F");
+        f.set_attribute("tabindex", "-1");
+        region.append_child(&f);
+        region.append_child(&button(scope, "Z"));
+        root.append_child(&region);
+        root
+    })
+}
+
+/// Chrome 153's `showModal()` gives `X Y[1] Z` the cycle `Y X Z`: the trap moves
+/// focus itself, so it has to order its ring the way the browser orders Tab.
+///
+/// **Mutant: no sort** (the ring in tree order) — Tab from `X` goes to `Y`.
+#[wasm_bindgen_test]
+fn a_trap_cycles_positive_tabindex_first() {
+    let f = sequence_fixture();
+    f.el("X").focus().unwrap();
+    let mut tour = Vec::new();
+    for _ in 0..3 {
+        tab(false);
+        tour.push(f.active());
+    }
+    assert_eq!(tour, ["Z", "Y", "X"]);
+    let mut back = Vec::new();
+    for _ in 0..3 {
+        tab(true);
+        back.push(f.active());
+    }
+    assert_eq!(back, ["Y", "Z", "X"]);
+    f.teardown();
+}
+
+/// From a focused `tabindex="-1"` node inside the trap, Tab resumes at the next
+/// stop after it in tree order (`Z`) and Shift+Tab at the previous (`Y`) — not
+/// the ring's first or last, which here are `Y` and `Z` the other way round.
+///
+/// **Mutant: the pre-#435 fallback** (a start not in the ring enters at its
+/// first / last) — Tab gives `Y`, Shift+Tab `Z`.
+#[wasm_bindgen_test]
+fn a_negative_tabindex_start_inside_a_trap_resumes_at_its_tree_neighbour() {
+    let f = sequence_fixture();
+    f.el("F").focus().unwrap();
+    assert_eq!(f.active(), "F", "precondition");
+    tab(false);
+    assert_eq!(f.active(), "Z");
+    f.el("F").focus().unwrap();
+    tab(true);
+    assert_eq!(f.active(), "Y");
+    f.teardown();
+}
+
+// ── review #1167: the negative-tabindex filter reads HTML's integer rules ──
+
+/// `tabindex="-1.5"` is `-1` to the browser (HTML's rules for parsing
+/// integers): focusable by `focus()` but not a Tab stop. The filter must drop
+/// it, because `handle_trapped_tab`'s verification cannot: the browser does
+/// NOT refuse `focus()` on a `tabIndex == -1` element, so a filter that kept it
+/// (`trim().parse::<i32>()` fails on `"-1.5"`) lands Tab on it.
+#[wasm_bindgen_test]
+fn a_fractional_negative_tabindex_is_not_a_trap_stop() {
+    for value in ["-1.5", "-1abc", "\u{c}-1"] {
+        let f = Fixture::mount(move |scope| {
+            let region = scope.create_element("div");
+            region.set_attribute("style", VISIBLE);
+            region.set_attribute("data-trap-focus", "");
+            region.append_child(&button(scope, "in-a"));
+            let neg = scope.create_element("div");
+            neg.set_attribute("id", "neg");
+            neg.set_attribute("tabindex", value);
+            neg.set_attribute("style", "display: block; width: 120px; height: 28px");
+            region.append_child(&neg);
+            region.append_child(&button(scope, "in-b"));
+            region
+        });
+        // Positive control: the browser reads it as -1 and focus() takes it.
+        assert_eq!(f.el("neg").tab_index(), -1, "{value:?}: Chrome's tabIndex");
+        f.el("neg").focus().unwrap();
+        assert_eq!(f.active(), "neg", "{value:?}: focus() is not refused");
+
+        f.el("in-a").focus().unwrap();
+        let ev = tab(false);
+        assert!(ev.default_prevented(), "{value:?}: the trap handled Tab");
+        assert_eq!(f.active(), "in-b", "{value:?}: Tab skips the -1 stop");
+        f.teardown();
+    }
 }
