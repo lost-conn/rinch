@@ -85,6 +85,18 @@ Auto-layout grid.
 | `spacing` | `String` | `""` | Gap between items (xs, sm, md, lg, xl or CSS value) |
 | `vertical_spacing` | `String` | `""` | Vertical gap (xs, sm, md, lg, xl or CSS value); falls back to `spacing` |
 
+The props write only custom properties on the grid's inline style
+(`--rinch-simple-grid-cols`, `--rinch-simple-grid-template` for
+`min_child_width`, `--rinch-simple-grid-gap`, `--rinch-simple-grid-row-gap`),
+each only when set. The grid itself (`display: grid`, the template, the gaps) is
+the `.rinch-simple-grid` rule, which reads them with the defaults above as
+fallbacks. So an app stylesheet can change the layout, for example per
+breakpoint: `@media (max-width: 600px) { .my-grid.rinch-simple-grid {
+grid-template-columns: 1fr; } }` (the second class outranks the component's
+rule), or set the variables on the grid when the prop is unset. The variables
+stop at the grid's children, so a nested SimpleGrid keeps its own defaults.
+There is no `breakpoints` prop.
+
 ### Container
 
 Centered max-width wrapper.
@@ -121,9 +133,12 @@ Empty spacing element.
 |------|------|---------|-------------|
 | `variant` | `String` | `""` | "filled", "outline", "light", "subtle", "transparent", "white", "default", "gradient". `light` (and the hover fill of `outline`/`subtle`) paints the scheme-aware `--rinch-<color>-light` tokens (see theming.md, Variant Colors) |
 | `size` | `String` | `""` | xs, sm, md, lg, xl |
-| `color` | `String` | `""` | Theme color name |
+| `color` | `String` | `""` | A theme color name, or a raw CSS colour (`#…`, `rgb(…)`, `hsl(…)`; its hover and light shades are mixed from it, #2197) |
 | `disabled` | `bool` | `false` | |
-| `loading` | `bool` | `false` | |
+| `loading` | `bool` | `false` | The label stays in place but hidden (`.rinch-button__label`, so the width holds) and the shared `Loader` is drawn over it in the button's text colour (`.rinch-button__loader`); the button stops taking clicks. Until #2197 it only added a class and showed no spinner |
+| `loader_type` | `String` | `""` | The loader drawn while `loading`: "oval", "bars", "dots". Empty uses the app's `LoaderDefaults`, then oval |
+| `loader` | `Option<SectionRenderer>` | `None` | A custom loader drawn while `loading` (`loader: Some(renderer)`) |
+| `type` | `String` | `""` | The HTML `type`: "submit", "button", "reset". Empty writes none, which HTML (and Chrome) read as `submit`; say `"button"` for a button inside a form that must not submit it |
 | `full_width` | `bool` | `false` | |
 | `radius` | `String` | `""` | Border radius override |
 | `onclick` | `Option<Callback>` | `None` | Click handler |
@@ -137,10 +152,16 @@ Icon-only button. For text-based action buttons, use `Button` with compact styli
 | `icon` | `Option<TablerIcon>` | `None` | Tabler icon to display |
 | `variant` | `String` | `""` | Same variants as Button |
 | `size` | `String` | `""` | xs, sm, md, lg, xl |
-| `color` | `String` | `""` | Theme color name |
+| `color` | `String` | `""` | Theme color name or raw CSS colour |
 | `radius` | `String` | `""` | |
 | `disabled` | `bool` | `false` | |
-| `loading` | `bool` | `false` | |
+| `loading` | `bool` | `false` | Draws the shared `Loader` (in `.rinch-action-icon__loader`, 60% of the button, in its text colour) in place of the icon |
+| `loader_type` | `String` | `""` | The loader drawn while `loading`: "oval", "bars", "dots". Empty uses the app's `LoaderDefaults`, then oval |
+| `loader` | `Option<SectionRenderer>` | `None` | A custom loader drawn while `loading` |
+| `icon_size` | `Option<u32>` | `None` | The icon's edge length in px. Unset, it follows `size`: 12 / 14 / 18 / 22 / 28 for xs…xl |
+| `icon_style` | `TablerIconStyle` | `Outline` | The icon's style, `Outline` or `Filled` |
+| `aria_label` | `String` | `""` | The `aria-label` on the root `<button>`: an accessible name without the tooltip `title` shows. Empty writes none |
+| `type` | `String` | `""` | The HTML `type`. Empty is `"button"` — unlike `Button`, an icon button inside a form is almost never its submit button, so this keeps rinch's earlier fixed value as the default; say `"submit"` to make it one |
 | `title` | `String` | `""` | The `title` attribute on the root `<button>`: its tooltip (on desktop too, #1646) and the accessible name an icon-only button otherwise lacks. Empty writes none. A reactive value re-renders the button; `"title": {|| …}` rewrites only the attribute (#1653) |
 | `onclick` | `Option<Callback>` | `None` | Click handler |
 
@@ -150,13 +171,22 @@ Draws a stroked X, sized by `icon_size` or by `size`. Until issue #474 it drew
 nothing at all: the glyph was an empty `<span class="rinch-icon rinch-icon--close">`
 and no stylesheet in the workspace matches that class.
 
+The glyph carries `rinch-icon rinch-icon--close`, and its size is published on it
+as `--rinch-close-button-icon-size`, which the one-class rule `.rinch-icon--close`
+spends. Until #2199 the size was an inline `width`/`height`, which no stylesheet
+could override; now an app rule such as `.rinch-close-button svg { width: 20px;
+height: 20px; }` resizes it. Children, when given, replace the glyph.
+
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
 | `size` | `String` | `""` | xs, sm, md, lg, xl |
 | `radius` | `String` | `""` | |
 | `disabled` | `bool` | `false` | |
 | `icon_size` | `Option<u32>` | `None` | The X's edge length in px. Unset, it follows `size`: 12 / 14 / 16 / 20 / 24 for xs…xl |
-| `title` | `String` | `""` | The `title` attribute on the root `<button>` (its tooltip); empty writes none. The accessible name stays `aria-label="Close"`. A reactive value re-renders the button; `"title": {|| …}` rewrites only the attribute (#1653) |
+| `icon` | `Option<TablerIcon>` | `None` | A Tabler icon drawn instead of the X, at the same size |
+| `aria_label` | `String` | `""` | The button's `aria-label`. Empty is `"Close"` |
+| `type` | `String` | `""` | The HTML `type`. Empty is `"button"`, so a close button inside a form never submits it |
+| `title` | `String` | `""` | The `title` attribute on the root `<button>` (its tooltip); empty writes none. The accessible name stays `aria_label` (by default "Close"). A reactive value re-renders the button; `"title": {|| …}` rewrites only the attribute (#1653) |
 | `onclick` | `Option<Callback>` | `None` | Click handler |
 
 ---
@@ -185,6 +215,7 @@ The rich-text `Editor`'s props (`editor`, `content`, `read_only`, `spellcheck`) 
 | `onchange` | `Option<InputCallback>` | `None` | Commit boundary (#226): fires once with the final value when the gesture ends (blur after a modification, or Enter); only if the value changed since focus |
 | `onsubmit` | `Option<Callback>` | `None` | Fires on Enter key |
 | `spellcheck` | `Option<bool>` | `None` | Spellchecking for the field (#2862): `false` turns it off, `true` turns it on inside a subtree that turned it off, `None` inherits the nearest ancestor's `spellcheck` (on by default). See [Spellcheck](./spellcheck.md) |
+| `autocomplete` | `String` | `""` | The field's HTML `autocomplete` attribute (#3028), e.g. `username`, `email`, `current-password`, `new-password`, `one-time-code`, which password managers and the browser's autofill read. Empty writes no attribute (the browser's default). Accepts `{|| expr}`. On desktop it is kept on the element; there is no autofill there |
 
 ### Textarea
 
@@ -206,6 +237,7 @@ The rich-text `Editor`'s props (`editor`, `content`, `read_only`, `spellcheck`) 
 | `oninput` | `Option<InputCallback>` | `None` | Receives `String` |
 | `onchange` | `Option<InputCallback>` | `None` | Commit boundary (#226): fires once with the final value when the gesture ends (blur after a modification); only if the value changed since focus |
 | `spellcheck` | `Option<bool>` | `None` | Spellchecking for the field (#2862): `false` turns it off, `true` turns it on inside a subtree that turned it off, `None` inherits the nearest ancestor's `spellcheck` (on by default). See [Spellcheck](./spellcheck.md) |
+| `autocomplete` | `String` | `""` | The field's HTML `autocomplete` attribute (#3028), e.g. `username`, `email`, `current-password`, `new-password`, `one-time-code`, which password managers and the browser's autofill read. Empty writes no attribute (the browser's default). Accepts `{|| expr}`. On desktop it is kept on the element; there is no autofill there |
 
 ### PasswordInput
 
@@ -231,6 +263,7 @@ Custom Default: `toggle_visibility` defaults to `true`.
 | `ontoggle` | `Option<Callback>` | `None` | Fires when visibility toggled |
 | `oninput` | `Option<InputCallback>` | `None` | Receives `String` |
 | `onchange` | `Option<InputCallback>` | `None` | Commit boundary (#226): fires once with the final value when the gesture ends (blur after a modification, or Enter); only if the value changed since focus |
+| `autocomplete` | `String` | `""` | The field's HTML `autocomplete` attribute (#3028), e.g. `username`, `email`, `current-password`, `new-password`, `one-time-code`, which password managers and the browser's autofill read. Empty writes no attribute (the browser's default), so a password manager may fill the field; before #3028 it was always `off`. Accepts `{|| expr}`. On desktop it is kept on the element; there is no autofill there |
 
 ### NumberInput
 
@@ -259,6 +292,7 @@ Custom Default: `toggle_visibility` defaults to `true`.
 | `ondecrement` | `Option<Callback>` | `None` | Notification (see `onincrement`) |
 | `oninput` | `Option<InputCallback>` | `None` | Receives `String` from direct text entry, and — uncontrolled — each stepper-written value |
 | `onchange` | `Option<InputCallback>` | `None` | Commit boundary (#226): fires once with the final value when the gesture ends (blur after a modification, or Enter); only if the value changed since focus |
+| `autocomplete` | `String` | `""` | The field's HTML `autocomplete` attribute (#3028), e.g. `username`, `email`, `current-password`, `new-password`, `one-time-code`, which password managers and the browser's autofill read. Empty writes no attribute (the browser's default). Accepts `{|| expr}`. On desktop it is kept on the element; there is no autofill there |
 
 ### Checkbox
 
@@ -515,6 +549,7 @@ Text input with inline color preview and dropdown ColorPicker.
 | `close_on_click_outside` | `bool` | `true` | Mount a backdrop that takes a click outside the field and dismisses the dropdown (#465). Off mounts none, so the click reaches the page under it; the dropdown still closes if that click moves the focus out of the field (#1572). Escape closes the dropdown either way |
 | `z_index` | `Option<i32>` | `None` | Stacking level of the open picker's panel; its click-catching backdrop stays one below and the field one above (defaults 100 / 99 / 101, #801) |
 | `spellcheck` | `Option<bool>` | `None` | Spellchecking for the colour text field (#2862), as `TextInput`'s. A code with a digit is never checked (the default skip rules) |
+| `autocomplete` | `String` | **`"off"`** | The colour text field's HTML `autocomplete` attribute (#3028). Off by default: the picker opens below the field, where the browser would list remembered entries, and a native `<input type="color">` has no autofill. Empty writes no attribute; any other value is written as given |
 
 `size` and `radius` were declared but unread until #263. **`size` always
 resolves to a step, `radius` does not**: an unrecognised `size` falls back to
@@ -594,9 +629,11 @@ when alpha must be externally drivable.
 |------|------|---------|-------------|
 | `size` | `String` | `""` | xs, sm, md, lg, xl |
 | `weight` | `String` | `""` | CSS font-weight |
-| `color` | `String` | `""` | Theme color or "dimmed" |
+| `color` | `String` | `""` | `primary`, `dimmed`, `inherit` or a theme palette name (a class, palette shade 6); a shade as `name.N` (`"blue.3"`); a custom palette name (`"brand"`, falling back to the name itself as a CSS colour, so `"crimson"` works); or any CSS colour (`#hex`, `rgb(…)`, `var(…)`). All but the first group go through `--rinch-text-color` (`.rinch-text--custom-color`) |
 | `align` | `String` | `""` | CSS text-align |
 | `inline` | `bool` | `false` | Use `<span>` instead of `<p>` |
+| `truncate` | `bool` | `false` | One line ending in "…" (`.rinch-text--truncate`, a block) |
+| `line_clamp` | `Option<u32>` | `None` | Clamp to this many lines, the last ending in "…" (`.rinch-text--line-clamp`, reading `--rinch-text-line-clamp`) |
 
 ### Title
 
@@ -604,7 +641,7 @@ when alpha must be externally drivable.
 |------|------|---------|-------------|
 | `order` | `Option<u8>` | `None` | Heading level 1-6 |
 | `align` | `String` | `""` | CSS text-align |
-| `size` | `String` | `""` | Override size independent of order |
+| `size` | `String` | `""` | Font size independent of `order` (which keeps the tag, weight and line height): `"1"`–`"6"` or `"h1"`–`"h6"` for a level's size, `"xs"`–`"xl"` for the theme's text sizes, or any CSS font size (`"40px"`). The last two go through `--rinch-title-size` (`.rinch-title--custom-size`) |
 
 ### Code
 
@@ -623,8 +660,10 @@ when alpha must be externally drivable.
 
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
-| `href` | `String` | `""` | |
-| `target` | `String` | `""` | e.g., "_blank" |
+| `href` | `String` | `""` | Empty writes no `href`: a placeholder link, as in a browser (not focusable, nothing to follow). It used to be `#`. With an `onclick` too, the anchor is a button for the keyboard: `tabindex="0"` and `role="button"`, so Tab reaches it and Enter or Space runs `onclick` on both backends |
+| `target` | `String` | `""` | e.g., "_blank" (which a browser already treats as `noopener`) |
+| `rel` | `String` | `""` | Written as given, e.g. `"noreferrer"`; nothing when empty |
+| `onclick` | `Option<Callback>` | `None` | Runs on a click or Enter on the link. The click is then the app's: on the web the browser does not follow `href` (the link is marked `data-claim-links="menu"`, which keeps the browser's own link menu), so in-app routing works the same on desktop and web. A middle click reaches it too (`click_context().button` is `Middle`); `click_link()` gives the `href` |
 | `size` | `String` | `""` | |
 | `underline` | `bool` | `false` | |
 
@@ -633,9 +672,13 @@ when alpha must be externally drivable.
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
 | `cite` | `String` | `""` | Citation source |
+| `cite_node` | `Option<SectionRenderer>` | `None` | A custom citation node, drawn in the `<cite>` in place of `cite`. Pass `Some(renderer)` |
 | `icon` | `Option<TablerIcon>` | `None` | |
 | `color` | `String` | `""` | |
 | `radius` | `String` | `""` | |
+
+The children go in a `<div class="rinch-blockquote__body">` (a `<p>` until
+#2207, which could not hold block children).
 
 ### Mark
 
@@ -650,9 +693,11 @@ Custom Default: `ignore_case` defaults to `true`.
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
 | `text` | `String` | `""` | Full text to display |
-| `highlight` | `String` | `""` | Substring(s) to highlight |
+| `highlight` | `String` | `""` | A substring to highlight |
+| `highlights` | `Vec<String>` | `[]` | More substrings to highlight, with `highlight`. Where two match at one place the longer wins; matches never overlap |
 | `color` | `String` | `""` | Highlight color. Unset, it is `--rinch-color-mark`, which follows the scheme |
-| `ignore_case` | `bool` | **`true`** | Case-insensitive matching |
+| `ignore_case` | `bool` | **`true`** | Case-insensitive matching, per character by full Unicode lowercase; the text is marked as written |
+| `match_class` | `String` | `""` | Extra class(es) on each `<mark>`, beside `rinch-highlight__match` |
 
 ---
 
@@ -664,11 +709,17 @@ Custom Default: `ignore_case` defaults to `true`.
 |------|------|---------|-------------|
 | `src` | `String` | `""` | Image URL |
 | `alt` | `String` | `""` | |
-| `name` | `String` | `""` | For initials fallback |
+| `name` | `String` | `""` | For initials fallback: the first letters of its first two words, uppercased |
+| `initials` | `String` | `""` | Initials to show instead of the ones `name` gives |
+| `placeholder_icon` | `Option<TablerIcon>` | `None` | The placeholder's icon when there are no children and no initials. `None` draws a person (`TablerIcon::User`) |
 | `size` | `String` | `""` | |
 | `radius` | `String` | `""` | |
 | `color` | `String` | `""` | |
 | `variant` | `String` | `""` | "filled", "light", "outline" |
+| `on_error` | `Option<Callback>` | `None` | Runs when the image fails to load (the browser's `error` event; on the desktop, after the layout that learnt of it) |
+| `keep_failed_image` | `bool` | `false` | Keep an image that failed to load (its `alt` text shows, as in a browser) instead of replacing it with the placeholder |
+
+Without an image (or once it failed, unless `keep_failed_image`), the avatar shows a placeholder, as Mantine's does: its **children** if it has any (`Avatar { "?" }`), else the initials, else the icon. With an image that loads, the children are not shown.
 
 **AvatarGroup:** `spacing: String` — overlap spacing.
 
@@ -678,9 +729,20 @@ Custom Default: `ignore_case` defaults to `true`.
 |------|------|---------|-------------|
 | `variant` | `String` | `""` | "filled", "light", "outline", "dot", "transparent", "white", "default", "gradient" |
 | `size` | `String` | `""` | |
-| `color` | `String` | `""` | |
+| `color` | `String` | `""` | A palette name, `primary`, or a raw CSS colour (`#…`, `rgb(…)`, `hsl(…)`). Empty is the primary colour |
 | `radius` | `String` | `""` | One of `xs sm md lg xl`. A badge is a pill by default, so this squares it off |
 | `full_width` | `bool` | `false` | |
+| `left_section` | `Option<SectionRenderer>` | `None` | Content before the label (a status dot, an icon), in `span.rinch-badge__section[data-position="left"]` |
+| `right_section` | `Option<SectionRenderer>` | `None` | Content after the label (a remove "x"), in `span.rinch-badge__section[data-position="right"]` |
+
+A badge with a section wraps its children in `span.rinch-badge__label`; one
+without keeps them directly in the badge. Every variant reads
+`--rinch-badge-color` (the solid colour), `--rinch-badge-light`,
+`--rinch-badge-light-color` and `--rinch-badge-text` (the filled variant's
+text: the colour's contrast token `--rinch-color-{name}-contrast`, or white or
+black computed from a raw colour, #2208). Every badge sets all four itself,
+so an app rule that changes one targets the badge (`.my-badge.rinch-badge`),
+not an ancestor (#2201).
 
 ### Card
 
@@ -709,6 +771,7 @@ Custom Default: `ignore_case` defaults to `true`.
 | `orientation` | `String` | `""` | "horizontal" or "vertical" |
 | `size` | `String` | `""` | |
 | `label` | `String` | `""` | Text label in the divider |
+| `label_node` | `Option<SectionRenderer>` | `None` | A custom label node (an icon, ...) in the `.rinch-divider__label` span, in place of `label`. Pass `Some(renderer)` |
 | `label_position` | `String` | `""` | "left", "center", "right" |
 
 ### Fieldset
@@ -730,8 +793,14 @@ Custom Default: `ignore_case` defaults to `true`.
 | `height` | `String` | `""` | CSS height |
 | `fit` | `String` | `""` | CSS object-fit |
 | `radius` | `String` | `""` | |
-| `fallback_src` | `String` | `""` | Fallback image URL |
+| `fallback_src` | `String` | `""` | The picture shown when `src` fails to load, or is empty. Tried once: a fallback that fails too does not retry itself. (It used to be a JavaScript `onerror` string, which did nothing on the desktop) |
 | `caption` | `String` | `""` | Caption text below image |
+| `on_error` | `Option<Callback>` | `None` | Runs each time a picture fails to load: `src`, then `fallback_src` if that fails as well |
+| `fallback` | `Option<SectionRenderer>` | `None` | Content that replaces the `<img>` once no picture can be shown (`src` failed or is empty, and `fallback_src` failed or is empty). Pass `Some(renderer)` |
+
+With no fallback, a failed picture shows its `alt` text, as a browser does. An empty `src` loads nothing and fires no `on_error`.
+
+Any `<img>` can take a load failure itself: `img { src: …, onerror: move || … }` (the `data-onerror` attribute). The browser fires it from its `error` event; the desktop fires it after the layout in which the failure arrived, once per failure.
 
 ### List / ListItem
 
@@ -744,10 +813,12 @@ Custom Default: `ignore_case` defaults to `true`.
 | `spacing` | `String` | `""` | |
 | `center` | `bool` | `false` | Center items with icons |
 | `icon` | `Option<TablerIcon>` | `None` | Default icon for this list's items that set none (#707); a `ListItem`'s own `icon` wins, and an item that arrives later, or moves in from another list, takes it as it lands (#716) |
+| `icon_node` | `Option<SectionRenderer>` | `None` | A custom default marker node, in place of `icon` (which it wins over), applied exactly as `icon` is; the renderer runs once per item. Pass `Some(renderer)` |
 | `with_padding` | `bool` | `false` | |
 
 **ListItem:** `icon: Option<TablerIcon>` — per-item icon override, which beats
-`List::icon`.
+`List::icon`; and `icon_node: Option<SectionRenderer>` — a per-item marker node,
+which beats the item's `icon` and both of the list's defaults.
 
 A `List` renders *after* its items, so its default cannot reach them as a prop:
 it finds each item that built no icon layout of its own and rebuilds that item
@@ -835,33 +906,69 @@ this stepper wrote its `data-step` rather than the caller.
 
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
-| `color` | `String` | `""` | |
+| `color` | `String` | `""` | A palette name, `primary`, `info`/`success`/`warning`/`error`, or a raw CSS colour. Empty is blue |
 | `variant` | `String` | `""` | "filled", "light", "outline", "transparent", "white", "default" |
 | `title` | `String` | `""` | |
+| `title_section` | `Option<SectionRenderer>` | `None` | The title as nodes, inside `.rinch-alert__title`; wins over `title` |
+| `role` | `String` | `""` | The root's ARIA role. Empty is `"alert"` (as Mantine's Alert); `"status"` is a polite live region |
 | `radius` | `String` | `""` | |
 | `with_close_button` | `bool` | `false` | |
+| `close_button_label` | `String` | `""` | The close button's `aria-label`. Empty is `"Close"` |
 | `icon` | `Option<TablerIcon>` | `None` | |
 | `onclose` | `Option<Callback>` | `None` | |
+
+Every variant reads `--rinch-alert-color` (filled background, outline),
+`--rinch-alert-light`, `--rinch-alert-light-text`, `--rinch-alert-light-strong`
+(the light title), `--rinch-alert-filled-text` (the colour's contrast token,
+`--rinch-color-{name}-contrast`; yellow-9 on `yellow`; #2208) and
+`--rinch-alert-outline-text`; a built-in colour's class sets all of them, any
+other colour sets all of them inline (#2200), so a nested Alert inherits none. `--rinch-alert-close-hover` is the close
+button's hover background.
 
 ### Loader
 
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
-| `type` | `String` | `""` | "oval", "bars", "dots" |
+| `type` | `String` | `""` | "oval", "bars", "dots". Empty uses the app's `LoaderDefaults`, then oval |
 | `size` | `String` | `""` | |
 | `color` | `String` | `""` | |
+| `aria_label` | `String` | `""` | The loader's `aria-label` (it is `role="status"`). Empty is `"Loading"` |
+| `custom` | `Option<SectionRenderer>` | `None` | A custom loader drawn inside the sized `.rinch-loader` box (class `rinch-loader--custom`) in place of the built-in kinds; wins over `type` |
+
+`Loader` is also what a loading `Button`, `ActionIcon` and `StepperStep` draw
+(#2205), so an app sets its loader once for all of them with the
+`LoaderDefaults` context, near the root:
+
+```rust
+create_context(LoaderDefaults { r#type: "dots".into(), ..Default::default() });
+// or a custom loader everywhere:
+create_context(LoaderDefaults { custom: Some(my_spinner), ..Default::default() });
+```
+
+A loader's own `type` or `custom` (and a component's `loader_type`/`loader`)
+wins over the context.
 
 ### Progress
 
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
-| `value` | `Option<f32>` | `None` | Percentage 0-100 |
-| `value_fn` | `Option<ReactiveF32>` | `None` | Reactive value binding (auto-wrapped) |
+| `value` | `Option<f32>` | `None` | `0..=max`. `None` with no `value_fn` is an indeterminate bar, as a `<progress>` without a value |
+| `value_fn` | `Option<ReactiveF32>` | `None` | Reactive value binding (auto-wrapped); moves the bar and `aria-valuenow` |
+| `max` | `Option<f32>` | `None` | A full bar's value. `None`, or a value that is not a positive number, is 100 (Chrome's `<progress>` defaults to 1.0; 100 keeps a `value` a percentage) |
+| `indeterminate` | `bool` | `false` | An indeterminate bar (a sweeping segment, no `aria-valuenow`) whatever the value |
+| `indeterminate_fn` | `Option<ReactiveBool>` | `None` | Reactive `indeterminate` (auto-wrapped); wins over `indeterminate` |
+| `aria_label` | `String` | `""` | The bar's `aria-label`. Empty writes none |
 | `color` | `String` | `""` | |
 | `size` | `String` | `""` | |
 | `radius` | `String` | `""` | |
 | `striped` | `bool` | `false` | |
 | `animated` | `bool` | `false` | |
+
+A value change animates the width (`width 200ms ease`, as Mantine's Progress
+animates it). `--rinch-progress-transition` changes it; `none` makes a change
+jump, as Chrome's `<progress>` does. `--rinch-progress-indeterminate-duration` (1.5s) times
+the indeterminate sweep, and `--rinch-progress-stripe-color` colours the
+stripes.
 
 ### Skeleton
 
@@ -874,7 +981,8 @@ Custom Default: `animate` and `visible` default to `true`.
 | `radius` | `String` | `""` | |
 | `circle` | `bool` | `false` | |
 | `animate` | `bool` | **`true`** | |
-| `visible` | `bool` | **`true`** | |
+| `duration` | `String` | `""` | One sweep of the animation (`"800ms"`); empty is `1.5s`. Written to `--rinch-skeleton-duration` |
+| `visible` | `bool` | **`true`** | `false` renders the children instead, in a `<span class="rinch-skeleton__content">` with `display: contents`, so they lay out as the parent's own (a flex or grid parent sees each child) |
 
 ---
 
@@ -1416,10 +1524,24 @@ the horizontal underline along the tab's bottom edge.
 
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
-| `separator` | `String` | `""` | Custom separator character |
+| `separator` | `String` | `""` | Separator text, drawn as given (empty: `/`) |
+| `separator_icon` | `Option<TablerIcon>` | `None` | A Tabler icon as the separator, in place of the text |
+| `separator_fn` | `Option<SectionRenderer>` | `None` | Escape hatch: renders each separator's content; wins over the two above |
 | `separator_margin` | `String` | `""` | Spacing around separator |
+| `aria_label` | `String` | `""` | The `<nav>`'s accessible name (empty: `"Breadcrumb"`) |
 
-**BreadcrumbsItem:** `href: String`.
+Each separator is a `<span class="rinch-breadcrumbs__separator" aria-hidden="true">`
+appended to every item but the last, re-settled when a crumb arrives or leaves
+(#2193; it used to be an `::after` whose content came from five whitelisted
+strings, so `›` or `|` drew `/`).
+
+**BreadcrumbsItem:**
+
+| Prop | Type | Default | Description |
+|------|------|---------|-------------|
+| `href` | `String` | `""` | A link (`<a href>`) |
+| `onclick` | `Option<Callback>` | `None` | In-app routing. Without `href` the item is a `<button type="button">` drawn as the link |
+| `active` | `Option<bool>` | `None` | The current page: styled as the current item, with `aria-current="page"`. `None` means "when it has neither `href` nor `onclick`" |
 
 ### Pagination
 
@@ -1439,6 +1561,22 @@ Custom Default: `total`, `value`, `siblings`, `boundaries` default to `1`; `with
 | `disabled` | `bool` | `false` | |
 | `gap` | `String` | `""` | |
 | `onchange` | `Option<ValueCallback<u32>>` | `None` | Receives page number |
+| `aria_label` | `String` | `""` | The `<nav>`'s accessible name (empty: `"Pagination"`) |
+| `first_label` | `String` | `""` | First-page control's accessible name (empty: `"First page"`) |
+| `previous_label` | `String` | `""` | Previous-page control's accessible name (empty: `"Previous page"`) |
+| `next_label` | `String` | `""` | Next-page control's accessible name (empty: `"Next page"`) |
+| `last_label` | `String` | `""` | Last-page control's accessible name (empty: `"Last page"`) |
+| `first_icon` | `Option<TablerIcon>` | `None` | In place of the double chevron |
+| `previous_icon` | `Option<TablerIcon>` | `None` | In place of the chevron |
+| `next_icon` | `Option<TablerIcon>` | `None` | In place of the chevron |
+| `last_icon` | `Option<TablerIcon>` | `None` | In place of the double chevron |
+| `dots` | `String` | `""` | Text for a gap in the page list (empty: `"..."`) |
+| `render_item` | `Option<PaginationItemRenderer>` | `None` | Escape hatch: `Rc<dyn Fn(&mut RenderScope, u32, bool) -> NodeHandle>`, called with the page and whether it is active; draws the page button's content, the button (classes, `aria-current`, click) stays the component's. Pass it as `Some(Rc::new(...))` |
+
+The active page carries `aria-current="page"` (#2194). Its text colour is
+`--rinch-pagination-active-text`; unset, it is the text colour for the
+active fill (`--rinch-pagination-contrast` from `color`, else
+`--rinch-primary-color-contrast`, else `white`; #2208).
 
 ### NavLink
 
@@ -1452,13 +1590,24 @@ Custom Default: `total`, `value`, `siblings`, `boundaries` default to `1`; `with
 | `variant` | `String` | `""` | "light", "filled", "subtle" |
 | `color` | `String` | `""` | |
 | `left_section` | `Option<TablerIcon>` | `None` | |
-| `right_section` | `Option<TablerIcon>` | `None` | |
-| `disabled` | `bool` | `false` | |
+| `right_section` | `Option<TablerIcon>` | `None` | With children it takes the chevron's place, and turns with it |
+| `chevron_icon` | `Option<TablerIcon>` | `None` | The expand chevron, in place of the built-in one (points right, turns 90° open) |
+| `disable_right_section_rotation` | `bool` | `false` | Keeps the chevron or right section still when open |
+| `label_fn` | `Option<SectionRenderer>` | `None` | Escape hatch: renders the label slot (a badge, a count) in place of `label` |
+| `disabled` | `bool` | `false` | No click at all, from mouse or keyboard; an `<a>` gets `aria-disabled="true"` and `tabindex="-1"` |
 | `children_offset` | `String` | `""` | Indentation for nested NavLinks |
-| `opened` | `bool` | `false` | Nested section expanded |
-| `default_opened` | `bool` | `false` | |
+| `opened` | `bool` | `false` | Nested section starts expanded |
+| `default_opened` | `bool` | `false` | Same as `opened` |
+| `opened_fn` | `Option<ReactiveBool>` | `None` | Controlled open state: the children follow the getter, a click only calls `on_opened_change` |
+| `on_opened_change` | `Option<ValueCallback<bool>>` | `None` | Called with the new state when a click toggles |
 | `no_wrap` | `bool` | `false` | |
-| `onclick` | `Option<Callback>` | `None` | |
+| `onclick` | `Option<Callback>` | `None` | Runs before the toggle |
+
+With children, a click toggles them (#2192; it used to set the first class and
+nothing more), and the control carries `aria-expanded`. Open children are as tall
+as their content (a fixed `max-height: 1000px` used to clip a longer list);
+closed, the container is `display: none`, as a closed `<details>` is, so Tab
+skips them. Open and close are instant.
 
 ### Stepper
 
@@ -1474,6 +1623,7 @@ Custom Default: `total`, `value`, `siblings`, `boundaries` default to `1`; `with
 | `on_step_click` | `Option<ValueCallback<u32>>` | `None` | Fired with a step's 0-based position when it is clicked or activated (Enter/Space) on a step the stepper considers reachable (#737). Mantine's default: a strictly **completed** step (`position < active`) is clickable without `allow_next_steps_select`; the active step itself and every step past it need that flag or its own `allow_step_click`/`allow_step_select` (Mantine's active state is `'stepProgress'`, not `'stepCompleted'`, so it is not reachable by default either). `Stepper` does not move `active` itself — the caller does, from this callback, as `Tabs` moves its own selection. The index is read from the step's current position **at click time**, not baked in when the handler was wired (#714's pattern), since a later insertion or removal can renumber a step (#716, #745) — and the clickable class is removed the moment a shift makes a step unreachable, unless the step's own ask keeps it. A step moved into another `Stepper` calls **that** stepper's callback, with its position there (#1428); moved into one with no `on_step_click` it is no longer wired (no `data-rid`, `tabindex` or `role`), and keeps the clickable class only if it asked for it itself or that stepper's `allow_next_steps_select` grants it. A wired step moved out of every stepper keeps its wiring (#1453) |
 | `completed_icon` | `Option<TablerIcon>` | `None` | Default completed icon for the steps that set none (#707); the step's own wins, and a step that arrives later takes this one as it lands (#716) |
 | `progress_icon` | `Option<TablerIcon>` | `None` | Default in-progress icon for the steps that set none (#707). It stands in for the *`progress_icon`* the step did not set, so it outranks that step's plain `icon`. A step that arrives later takes it as it lands (#716) |
+| `content_for_active_only` | `bool` | `true` | Shows only the active step's content, in the `.rinch-stepper__content` region below the steps (#2195, Mantine's layout). `false` moves no step's content: every step shows its own content inside the step, under its label (a vertical stepper reads as a timeline; a horizontal step is at least as wide as its content), and the stepper carries `rinch-stepper--content-in-steps` (hide some steps' content with your own rule, e.g. `.rinch-stepper__step--inactive .rinch-stepper__step-content { display: none }`). The completed block shows below the steps past the last one either way |
 
 **StepperStep:**
 
@@ -1481,20 +1631,50 @@ Custom Default: `total`, `value`, `siblings`, `boundaries` default to `1`; `with
 |------|------|---------|-------------|
 | `label` | `String` | `""` | |
 | `description` | `String` | `""` | |
+| `label_section` | `Option<SectionRenderer>` | `None` | Renders the label as nodes, in place of `label`, inside `.rinch-stepper__step-label` (#2195) |
+| `description_section` | `Option<SectionRenderer>` | `None` | Renders the description as nodes, in place of `description`, inside `.rinch-stepper__step-description` (#2195) |
 | `icon` | `Option<TablerIcon>` | `None` | Default icon |
+| `icon_section` | `Option<SectionRenderer>` | `None` | Renders the icon as nodes (an avatar, a styled number), in place of `icon` or the step number (#2195). Same slot as `icon`: drawn while inactive, and in progress unless a progress icon applies; a completed step draws its completed icon |
 | `completed_icon` | `Option<TablerIcon>` | `None` | Per-step override |
 | `progress_icon` | `Option<TablerIcon>` | `None` | Per-step override |
 | `allow_step_click` | `bool` | `false` | Grants this step the clickable class regardless of its position against `active`. With `Stepper::on_step_click` set, also grants the wiring (handler, `tabindex="0"`, `data-rid`) unless `disabled` is set (#737) |
 | `allow_step_select` | `bool` | `false` | The same grant as `allow_step_click` — Mantine keeps both names, so rinch does too |
-| `loading` | `bool` | `false` | |
+| `loading` | `bool` | `false` | The icon box draws the shared `Loader` (in `.rinch-stepper__loader`) in place of its icon |
+| `loader_type` | `String` | `""` | The loader drawn while `loading`: "oval", "bars", "dots". Empty uses the app's `LoaderDefaults` (which can also give a custom loader), then oval |
 | `disabled` | `bool` | `false` | Never clickable, never focusable, whatever else grants it (#737) — the plain HTML `disabled` attribute, read tag-agnostically |
 | `state` | `String` | `""` | `"completed"` or `"progress"`; anything else is inactive. Leave it unset and the parent `Stepper` derives it from this step's position against `active` (#709). Set it to override that for this one step: what a step names, it keeps |
 | `step` | `Option<u32>` | `None` | Step index, 0-based. Set by the parent `Stepper` from this step's position unless named here, in which case that is the index shown — and the number in the icon box, one higher. An index named here changes the label, **not** the position the state derives from |
 
+**Step content (#2195).** A `StepperStep`'s children are its content. The
+stepper shows the content of the step at `active` in a `.rinch-stepper__content`
+region **below** the row of steps, as Mantine does; the other steps' content
+stays inside their steps, hidden. The content is moved, not copied (its effects
+and handlers are the ones it rendered with), and goes back into its step when
+another step becomes the active one or the step leaves the stepper; a step that
+is discarded (a `for` row going) takes its shown content with it. To keep every
+step's content inside its step instead, set `content_for_active_only: false`
+(above). Restyle the
+region with `.rinch-stepper__content` and the shown content with
+`.rinch-stepper__content > .rinch-stepper__step-content` (padded
+`--rinch-spacing-md` on top; a step with no children shows nothing).
+
+The filled icons' glyph colour is `--rinch-stepper-icon-text` (default: the
+`color` prop's contrast, `--rinch-stepper-contrast`, else the theme's
+`--rinch-primary-color-contrast`; #2208)
+and the progress step's ring is `--rinch-stepper-ring` (a `box-shadow` value;
+`none` drops it).
+
 **StepperCompleted:** No props.
 
+`StepperCompleted` is shown only once `active` is past the last step (`active
+>=` the number of steps), in the content region in place of a step's content
+(Mantine's `Stepper.Completed`, #2195); before that it is hidden, so it needs no
+`if` around it. The stepper keeps it in the region either way (the region
+carries `rinch-stepper__content--completed` while it shows). Outside a
+`Stepper` it renders as is.
+
 `StepperCompleted` is **not a position** (issue #741): it is what the stepper
-shows *instead of* its steps once they are all done. The parent's step walk skips
+shows *instead of* a step's content once they are all done. The parent's step walk skips
 it, so a `StepperStep` placed **inside** it keeps the index and state it rendered
 itself with, and a whole `Stepper` nested inside it keeps its own.
 
@@ -1638,11 +1818,14 @@ see [Sortable Lists](sortable.md#styling)): `--rinch-sortable-gap`,
 
 ### BorderlessWindow
 
-Custom Default: `show_minimize`, `show_maximize`, `show_close` all default to `true`.
+Custom Default: `show_minimize`, `show_maximize`, `show_close` all default to `true`; `titlebar_height` to `36`.
 
 | Prop | Type | Default | Description |
 |------|------|---------|-------------|
-| `title` | `String` | `""` | Window title in titlebar |
+| `title` | `String` | `""` | Window title in titlebar, plain text in `--rinch-titlebar-text` (in the inline menu row too, `.rinch-borderlesswindow__brand`; it was a fixed rainbow there before #2196) |
+| `title_section` | `Option<SectionRenderer>` | `None` | Renders the title as nodes (a logo, coloured text) in place of `title`, in the same element (#2196) |
+| `controls_layout` | `Option<WindowControlsLayout>` | `None` | Which controls go at which end, in order (#2196). `None` follows the platform (`WindowControlsLayout::platform()`): macOS close/minimize/zoom on the left; Linux the desktop's own layout (GNOME `button-layout` via `gsettings` on a GNOME-family desktop, else `gtk-decoration-layout` in `~/.config/gtk-3.0/settings.ini`, which KDE writes; GNOME's stock `appmenu:close` is a close button alone), falling back to Windows' order; minimize/maximize/close on the right elsewhere. Build one with `WindowControlsLayout::windows()` / `macos()`, by fields, or from GTK syntax: `"close,minimize,maximize:".parse().unwrap()`. `show_*` still hides a control |
+| `titlebar_height` | `u32` | **`36`** | Titlebar height in px (#2196): written as `--rinch-titlebar-height`, which sizes the titlebar, the control buttons and the inline menu row, and counted into `--rinch-window-top-inset`; a below-titlebar menu bar is placed under it. Change it here, not in CSS, or the inset does not follow |
 | `radius` | `String` | `""` | Corner radius (none, xs, sm, md, lg, xl) |
 | `show_minimize` | `bool` | **`true`** | |
 | `show_maximize` | `bool` | **`true`** | |
@@ -1704,6 +1887,6 @@ rsx! {
 | `ReactiveBool` | `Rc<dyn Fn() -> bool>` | checked_fn, active_fn, opened_fn, visible_fn |
 | `ReactiveString` | `Rc<dyn Fn() -> String>` | value_fn |
 | `ReactiveF32` | `Rc<dyn Fn() -> f32>` | Progress value_fn |
-| `SectionRenderer` | `Rc<dyn Fn(&mut RenderScope) -> NodeHandle>` | BorderlessWindow sections |
+| `SectionRenderer` | `Rc<dyn Fn(&mut RenderScope) -> NodeHandle>` | BorderlessWindow sections and `title_section`, StepperStep `*_section`, Modal `footer`, custom loaders |
 
 All callback/reactive props are auto-wrapped by the `rsx!` macro — just pass closures directly, do not wrap in `Some(...)` or `Rc::new(...)`.

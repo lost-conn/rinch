@@ -130,6 +130,9 @@ pub struct App<F, M = NoMenuBar> {
     /// See [`title_tooltips`](App::title_tooltips).
     #[cfg(feature = "windowing")]
     pub(crate) title_tooltips: bool,
+    /// See [`font_warmup`](App::font_warmup).
+    #[cfg(feature = "windowing")]
+    pub(crate) font_warmup: crate::font::FontWarmup,
     /// See [`smooth_wheel_scroll`](App::smooth_wheel_scroll).
     #[cfg(feature = "windowing")]
     pub(crate) smooth_wheel_scroll: bool,
@@ -225,6 +228,8 @@ where
             windowless: false,
             #[cfg(feature = "windowing")]
             title_tooltips: true,
+            #[cfg(feature = "windowing")]
+            font_warmup: crate::font::FontWarmup::AfterFirstFrame,
             #[cfg(feature = "windowing")]
             smooth_wheel_scroll: true,
             #[cfg(feature = "windowing")]
@@ -457,6 +462,8 @@ where
             #[cfg(feature = "windowing")]
             title_tooltips: self.title_tooltips,
             #[cfg(feature = "windowing")]
+            font_warmup: self.font_warmup,
+            #[cfg(feature = "windowing")]
             smooth_wheel_scroll: self.smooth_wheel_scroll,
             #[cfg(feature = "windowing")]
             devtools: self.devtools,
@@ -588,6 +595,22 @@ where
         self
     }
 
+    /// When the system's generic font families (`sans-serif`, `system-ui`,
+    /// `serif`, `monospace`, headed by the app's own) are looked up on a
+    /// thread of their own (issue #2552):
+    /// [`FontWarmup::AfterFirstFrame`](crate::font::FontWarmup::AfterFirstFrame)
+    /// by default, [`AtStart`](crate::font::FontWarmup::AtStart) for an app
+    /// whose first text comes late (a hidden launcher, a notification
+    /// daemon), or [`Off`](crate::font::FontWarmup::Off). Text with a glyph
+    /// the first fonts of its stack lack (a menu's `✓`) otherwise looks them
+    /// up one by one the first time, on the UI thread: a panel's first menu
+    /// took 80–560 ms to show.
+    #[cfg(feature = "windowing")]
+    pub fn font_warmup(mut self, when: crate::font::FontWarmup) -> Self {
+        self.font_warmup = when;
+        self
+    }
+
     /// Whether a mouse wheel's notch glides to where it scrolls, as
     /// Chrome's does, rather than jumping there in one frame (issue #2287).
     /// On by default; `false` makes every notch scroll its whole distance at
@@ -612,8 +635,10 @@ where
     /// and a blurred `<input>` hides its marks. On by default, as in Chrome:
     /// misspelled words in a `<textarea>`, a prose `<input>` (no type,
     /// `text`, `search`) and the rich-text editor get a red squiggle once the
-    /// user has focused or edited it, checked against the system's Hunspell dictionaries
-    /// for the user's locale (none installed: nothing is marked). A
+    /// user has focused or edited it, checked by the operating system's
+    /// spellchecker on macOS and Windows and against the system's Hunspell
+    /// dictionaries for the user's locale elsewhere (none installed: nothing
+    /// is marked; [`Backend`](crate::spellcheck::Backend) chooses). A
     /// `spellcheck: false` attribute or component prop turns it off for one
     /// field or a subtree. On the web the browser checks, and `false` here
     /// (or a later [`set_enabled(false)`](crate::spellcheck::set_enabled))
@@ -684,6 +709,22 @@ where
     #[cfg(feature = "windowing")]
     pub fn vsync(mut self, on: bool) -> Self {
         self.vsync = Some(on);
+        self
+    }
+
+    /// Force the reduced-motion preference (issue #2209): `Some(true)` makes
+    /// `@media (prefers-reduced-motion: reduce)` match in every window,
+    /// `Some(false)` makes `no-preference` match, and `None` (the default)
+    /// follows the OS's setting, as Chrome does. The theme's reduced-motion
+    /// rule (`Theme::respect_reduced_motion`, on by default) then shortens
+    /// every transition and animation to 0.01ms.
+    ///
+    /// The same as [`rinch::set_reduced_motion`](crate::reduced_motion::set_reduced_motion),
+    /// which it calls and which also changes it while the app runs; read it
+    /// reactively with [`rinch::prefers_reduced_motion`](crate::reduced_motion::prefers_reduced_motion).
+    #[cfg(any(feature = "windowing", feature = "android"))]
+    pub fn reduced_motion(self, value: Option<bool>) -> Self {
+        crate::reduced_motion::set_reduced_motion(value);
         self
     }
 
@@ -845,6 +886,21 @@ where
         self
     }
 
+    /// How many closed popups' GPU renderers are kept for the next popups
+    /// (#2552; [`DEFAULT_RENDERERS_KEPT`](crate::popup::DEFAULT_RENDERERS_KEPT),
+    /// 3, by default). A GPU popup builds Vello's renderer when it opens
+    /// (about 5 ms on a GPU, 55–85 ms on a software Vulkan driver), unless
+    /// one a closed popup left is kept: then it only makes a surface. The
+    /// kept ones go once the popups' idle period (`WindowProps::idle_trim`,
+    /// two seconds by default) has passed with none kept, and all of them
+    /// when the app ends. `0` keeps none. The software renderer keeps
+    /// nothing either way.
+    #[cfg(feature = "windowing")]
+    pub fn popup_renderers_kept(self, count: usize) -> Self {
+        crate::popup::set_renderers_kept(count);
+        self
+    }
+
     /// Set the macOS activation policy (issue #1528): whether the app has a
     /// Dock icon and a menu bar of its own.
     ///
@@ -908,6 +964,7 @@ where
             exit_when: self.exit_when,
             windowless: self.windowless,
             title_tooltips: self.title_tooltips,
+            font_warmup: self.font_warmup,
             smooth_wheel_scroll: self.smooth_wheel_scroll,
             devtools: self.devtools,
             debug_interface: self.debug_interface,
@@ -1033,6 +1090,11 @@ where
     /// `# Panics`).
     #[cfg(feature = "windowing")]
     pub fn try_run(self) -> Result<(), crate::RunError> {
+        // `rinch::exit` before the run (a signal-watching thread's, #3015):
+        // the app ends before it connects to the display or opens a window.
+        if crate::shell::rinch_runtime::take_exit_before_run() {
+            return Ok(());
+        }
         let Startup {
             component,
             props,
@@ -1048,6 +1110,7 @@ where
             exit_when,
             windowless,
             title_tooltips,
+            font_warmup,
             smooth_wheel_scroll,
             devtools,
             debug_interface,
@@ -1062,6 +1125,9 @@ where
         // The app's text rasterization; the OS's settings it follows are read
         // when the first glyph run is painted (#2286, #2773).
         crate::text_rasterization::set_text_rasterization(text_rasterization);
+        // The OS's reduced-motion setting (#2209), read again whenever a
+        // window gains focus.
+        crate::reduced_motion::refresh_from_os();
         // The app's spellcheck settings, for its text fields and editors
         // (#2862). Installing them loads nothing: the dictionaries are read
         // on the checking thread when the user first edits or focuses a field.
@@ -1080,6 +1146,9 @@ where
         // (#2774), then sleeps in inotify until something it read changes.
         crate::system_font_watch::start_default();
         crate::app::set_title_tooltips_default(title_tooltips);
+        // After the font defaults above: the warm-up heads its lists with
+        // them.
+        crate::font_warmup::app_started(font_warmup);
         crate::app::set_smooth_wheel_scroll_default(smooth_wheel_scroll);
         crate::app::set_devtools_default(devtools);
         crate::shell::rinch_runtime::set_debug_interface_default(debug_interface);
@@ -1515,6 +1584,8 @@ pub(crate) struct Startup<F> {
     pub(crate) windowless: bool,
     /// See [`App::title_tooltips`].
     pub(crate) title_tooltips: bool,
+    /// See [`App::font_warmup`].
+    pub(crate) font_warmup: crate::font::FontWarmup,
     /// See [`App::smooth_wheel_scroll`].
     pub(crate) smooth_wheel_scroll: bool,
     /// See [`App::devtools`].
@@ -1768,6 +1839,36 @@ mod tests {
                 .devtools,
             "the last call wins"
         );
+    }
+
+    /// `popup_renderers_kept` sets how many closed popups' renderers the
+    /// shell keeps (#2552): three unless set.
+    #[test]
+    fn popup_renderers_kept_is_three_unless_set() {
+        assert_eq!(crate::popup::renderers_kept(), 3);
+        let _ = App::new(component).popup_renderers_kept(0);
+        assert_eq!(crate::popup::renderers_kept(), 0);
+        let _ = App::new(component).popup_renderers_kept(crate::popup::DEFAULT_RENDERERS_KEPT);
+    }
+
+    /// `font_warmup` reaches the startup (#2552): after the first frame
+    /// unless set.
+    #[test]
+    fn font_warmup_is_after_the_first_frame_unless_set() {
+        use crate::font::FontWarmup;
+        assert_eq!(
+            App::new(component).into_startup().font_warmup,
+            FontWarmup::AfterFirstFrame
+        );
+        for when in [FontWarmup::AtStart, FontWarmup::Off] {
+            assert_eq!(
+                App::new(component)
+                    .font_warmup(when)
+                    .into_startup()
+                    .font_warmup,
+                when
+            );
+        }
     }
 
     #[test]

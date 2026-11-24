@@ -2065,7 +2065,27 @@ When the app ends is `App::exit_when`:
   window's document, `WindowHandle::current()` answer `None`.
 - `ExitWhen::Explicitly`: the app runs, with or without windows, until `rinch::exit()`.
 
-`rinch::exit()` ends the app under any of them.
+`rinch::exit()` ends the app under any of them. It can be called from any thread, and
+before the app runs: an exit asked for before `App::run` (by a thread that watches for
+`SIGTERM`, started first) is kept, and the run then returns at once, `Ok(())` from
+`App::try_run`, without connecting to the display or opening a window. One that arrives
+while the run is connecting to the display ends it as soon as the app's component is
+mounted, before any window is shown. This holds in an app that made a `RinchContext`
+first (rendered offscreen, say), whether the exit came before the context or after it. One
+asked for while a run is going ends that run; what it leaves unanswered when it ends is
+dropped with it, so a second `exit()` racing the first does not end a later run. It takes a lock, so
+it is not async-signal-safe: never call it from inside a signal handler itself, but from a
+thread the handler wakes (signal-hook's `iterator::Signals`, for instance).
+
+```rust,ignore
+let mut signals = signal_hook::iterator::Signals::new([SIGTERM, SIGINT])?;
+std::thread::spawn(move || {
+    if signals.forever().next().is_some() {
+        rinch::exit();
+    }
+});
+App::new(app).try_run()?; // returns promptly if the signal came first
+```
 
 To keep a window's geometry across runs, persist [`current_window_restore()`](#bringing-the-window-back-as-it-was) (or `handle.restore()`) and give it back as `WindowProps` at the next start.
 
@@ -2230,7 +2250,56 @@ the topmost menu, a child closed by the system closes its popups first, and
 Under `RINCH_PERF`, a popup's lines carry its window id, and two more lines
 say what it is and when it first showed:
 `[PERF] window 5 popup: kind=menu parent=2` and
-`[PERF] window 5 first frame: 12.3 ms after open_popup`.
+
+```text
+[PERF] window 5 first frame: 6.1 ms after open_popup (queued 0.1, mount 4.3, measure 0.0, create 0.2, renderer 0.0, size 0.1, to frame 0.1, paint 1.2)
+```
+
+The steps say where the time went: `queued` until the event loop made the
+popup (a `keyboard_via_parent` menu's wait for the keyboard included),
+`mount` its document built and laid out, `measure` its content's size,
+`create` its OS window, `renderer` its GPU renderer (0 on the software
+renderer), `size` its first size handled, `to frame` until its first redraw,
+and `paint` the frame painted and presented.
+
+### What opening a popup costs
+
+In a release build a menu shows in about 4–8 ms on the software renderer and
+7–19 ms on a GPU (Vello on RADV), from `open_popup` to its first presented
+frame, the first menu of a process included, and the same after the app has
+been idle (measured on sway and KWin). On a software Vulkan driver (llvmpipe)
+the first popup of each depth takes 60–100 ms to build its renderer, and the
+ones after it about 10 ms: rinch's own software renderer is the better choice
+there. Two things make that so:
+
+- **The system's generic fonts are looked up after the first frame**, on a
+  thread of their own. Text with a glyph its fonts' first families lack (a
+  menu's `✓`) otherwise looked them up one by one on the UI thread the first
+  time: a panel's first menu took 80–560 ms. `App::font_warmup` chooses
+  when: `FontWarmup::AfterFirstFrame` (the default), `AtStart` or `Off`.
+  Choose `AtStart` for an app whose first text comes late and must show at
+  once: a launcher that starts hidden and is summoned by a key, or a
+  notification daemon with no window until its first notification. It
+  starts as the app starts, window or not, and makes the font scan itself
+  if no document has (the first document may then wait for it). It costs 250–670 ms of one core once, after the first
+  frame (a host with 578 font families), and about 1 MB of memory kept; an
+  app with no text pays it too (the font scan is made for its first
+  document), and a windowless app, which shows no frame, never runs it
+  unless it asks for `AtStart`.
+  Under `RINCH_PERF` it says when it is done:
+  `[PERF] font warm-up: 249 families in 510.8 ms (look-ups 248.0 ms, longest 2.3 ms, thread CPU 248.7 ms)`;
+  `longest` is about the longest a window's own text waited for it.
+- **A closed popup's GPU renderer is the next popup's.** Building one is
+  most of what a GPU window costs (5 ms on RADV, far more on a software
+  Vulkan driver such as llvmpipe). Up to three are kept
+  (`App::popup_renderers_kept(n)`; `0` keeps none), so a menu with a
+  submenu three deep reopens with none built. Each kept one holds about
+  8 MB of GPU memory (GTT on RADV) and no measurable process memory; they
+  go once the popups' idle period (`WindowProps::idle_trim`, 2 s by
+  default) has passed with none closed, and when the app ends. Under
+  `RINCH_PERF` that prints `[PERF] popup renderers trimmed: 2`.
+
+A debug build is several times slower: measure popups in release.
 
 ## Rendering Backends
 

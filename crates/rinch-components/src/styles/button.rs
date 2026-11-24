@@ -62,7 +62,7 @@ pub fn styles() -> String {
 /* Button variants - filled */
 .rinch-button--filled {
     background-color: var(--rinch-primary-color);
-    color: white;
+    color: var(--rinch-primary-color-contrast, white);
 }
 
 .rinch-button--filled:hover:not(:disabled) {
@@ -162,18 +162,10 @@ pub fn styles() -> String {
     justify-content: center;
 }
 
-.rinch-button__loader::after {
-    content: '';
-    width: 1rem;
-    height: 1rem;
-    border: 2px solid currentColor;
-    border-right-color: transparent;
-    border-radius: 50%;
-    animation: rinch-button-spin 0.6s linear infinite;
-}
-
-@keyframes rinch-button-spin {
-    to { transform: rotate(360deg); }
+/* The shared Loader takes the button's text colour, not the primary colour it
+   would otherwise draw in (which is a filled button's own background). */
+.rinch-button__loader .rinch-loader {
+    color: inherit;
 }
 
 /* Radius overrides */
@@ -186,6 +178,7 @@ pub fn styles() -> String {
 /* Custom color support (via CSS custom properties) */
 .rinch-button--colored.rinch-button--filled {
     background-color: var(--rinch-button-color);
+    color: var(--rinch-button-color-contrast, var(--rinch-primary-color-contrast, white));
 }
 .rinch-button--colored.rinch-button--filled:hover:not(:disabled) {
     background-color: var(--rinch-button-color-hover);

@@ -106,6 +106,24 @@ lines take the form its frames do, `[PERF] trimmed` and `[PERF] untrimmed`. A
 window with `IdleTrim::Never`, a GPU window, and a window whose surface does
 not keep its contents (the trim applies only on Wayland) print neither.
 
+Whether a window will say `trimmed` at all, and when, is printed before its
+first presented frame's line, when its software presentation is made (#2917),
+and again when it is shown after a hide:
+
+```text
+[PERF] window 3 idle_trim=2000ms
+[PERF] window 3 frame 1: ...
+```
+
+`idle_trim=<n>ms` is the idle period after the window's last present at which
+it trims (fractions of a millisecond are kept, `idle_trim=1.5ms`).
+`idle_trim=never` is a software window that will not trim: one opened with
+`IdleTrim::Never`, or one whose surface does not keep its contents. A GPU
+window never trims and prints no `idle_trim=` line. So a tool waiting for the
+idle trim before it measures an idle window waits for `trimmed` from exactly
+the windows that printed a period. The main window's line is
+`[PERF] idle_trim=…`.
+
 On the desktop, one redraw is one frame. On Android, one pass of the loop that
 tries to present a frame is one frame. On an embedded `RinchContext`, one
 `update()` plus the `scene()` call that follows it is one frame.
@@ -790,3 +808,14 @@ A full run takes about 40 seconds on a 24-core workstation with
 `--parallel=4`. Valgrind runs code about 50 times slower than native, and the
 benchmarks are sized for that: 500 rows where the operation touches one row,
 200 where it touches every row.
+
+### Measuring your own app under Valgrind
+
+A rinch app runs under Callgrind and Memcheck (`valgrind --tool=callgrind
+./my-app`). Until #3016 it did not: the font warm-up thread's first
+`clock_gettime` went through rustix, which read the kernel's aux vector rather
+than the one Valgrind gives the process and faulted on the host's vDSO. rinch
+now builds rustix with `use-libc-auxv`; `docs/internals/platform.md` has the
+mechanism. The warm-up thread (#2552) still runs, after the first frame, and
+its font look-ups are in the counts; to leave them out of a measurement, build
+the app with `App::font_warmup(FontWarmup::Off)`.

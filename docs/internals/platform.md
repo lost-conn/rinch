@@ -32,6 +32,38 @@ rinch:       NetworkImageLoader (rinch-http, gated behind image-network feature)
 7a. **Minified pictures** (#2456, #2534): `image::paint_image_pixels` hands a decoded raster picture (`decoded` is `Some`, `ImageSampling::Auto`) to `image_minify::minified` with the image-to-device transform. It draws as Chrome 157 does (its image decode cache, cc's `MipMapUtil`, over Skia; its software and GPU rasters give identical bytes). `mip_level(w, h, transform)` is the deepest level whose `level_size` (each side `ceil(side / 2^L)`, at least 1) is still no smaller than the drawn size (`side * column length`, less 1e-6) on **both** axes, so the less reduced axis picks it and exactly 1/2 of an even side is level 1. A level above 0 gets a copy of that size made by `mip_downscale`, which fills it as Skia scales a picture: premultiplied (`SkMulDiv255Round`; an opaque picture skips this and the unpremultiply), Skia's own `SkMipmap` level `floor(log2(1/s))` for `s` the larger of the two scales to the copy size (halving level by level with each side rounded **down**, each output the sum of its 2x2 sources **shifted right by 2 (truncated)**, an odd side filtered 1-2-1 with one more shift, a side of 1 kept), then resampled bilinearly (pixel-centre taps, edges clamped, rounded) to the copy size when the halvings did not land on it exactly; then unpremultiplied into a `DecodedImage`. When every side halves exactly (a 600px side at 1/2, 1/4, 1/8) the bilinear step is skipped. A 599x597 picture drawn at 299x298 is level 1, 300x299, resampled straight from the picture (`s` = 0.5008, no halving), which is how Chrome keeps a 1px line at 123 in one column rather than spreading it. The painter draws the copy the rest of the way (`img_transform * scale(iw / w, ih / h)`) with `ImageSampling::Smooth`, bilinear on both painters (tiny-skia's `FilterQuality::Bilinear`). A level-0 draw scaled below `MINIFY_BELOW` (1.0, less 1e-6) on some axis (`image_minify::smooth`) is drawn from the image itself with `Smooth`, as Chrome samples level 0; the software painter's `Auto` stays nearest only at 1x and above, and `copy_opaque_image` (nearest) is never taken for a `Smooth` draw. Measured against Chrome's screenshots (`rinch/tests/image_filter_2534.rs`, mean/max per channel, software and Vello within 0.01): 0.00/0 at 1/2 and 1/8, 0.14/1 at 1/3, 1.09/23 at 0.37, 1.16/18 at 0.6x0.3, 0.73/17 at 0.9x0.2, 0.62/11 at 1x0.3, 1.36/26 at 0.76x, and for odd sides (599x597 drawn at 299x298, 250x249, 200x199, 180x179; 599x401 at 150x100) 1.25/20, 1.16/19, 0.81/14, 1.40/22, 0.63/10. What remains is bilinear phase. History: #2456's first design box-filtered to the drawn scale rounded up to a quarter octave and drew it the rest of the way (9.92/99 at 1/3, 16.98/196 at 0.6x0.3: softer than Chrome, #2534). #2534's first version halved odd sides down with 1-2-1 to `floor`-sized levels, which is right only when every side halves exactly: 13.1-13.5 mean at the odd cases (#2629 review). A 0.75 cutoff left 0.75x-1x nearest on software (11.55/191 at 0.76x). A box filter to the drawn size (6.4/90 at 1/3), Mitchell (7.1/71) and Lanczos-3 (6.7/77), fitted offline, were no better: Chrome does not resample static pictures with a cubic. Per-axis levels were 8.6 at 0.6x0.3; Chrome picks one level for both. Why minify at all: the software painter samples an `<img>` nearest (#2110) and Vello bilinearly with no mipmaps, so a 1px line between two samples was dropped (software at 0.6x lost 8 of 20 lines; Vello at 0.4x 4 of 20). A zoom across an octave makes one copy (a `scale(0.30 → 0.49)` transition: 1). The copies sit in a thread-local cache modelled on the SVG rasters' (keyed `(DecodedImage::id, w, h)`, `MINIFY_BUDGET_BYTES` 64 MB at 8 B/px, LRU never evicting one drawn this frame, `MINIFY_IDLE_FRAMES` 60, `begin_frame` beside `svg_image::begin_frame` in `paint_document`); each copy is a `DecodedImage`, so it keeps its own premultiplied form and its own Vello blob (one atlas image while cached). A frame filters at most `MAX_MINIFY_WORK_PER_FRAME` (16M) source pixels into new copies; past that the full image is drawn that frame and `image_minify::refusals()` moves. An image over the whole budget by itself (#2747) was refused on every frame, so `has_deferred_minify` never cleared and the app repainted forever, unfiltered; its copy is now made across frames by `advance_job` (a `Job` per copy key in the cache, holding only the levels it made, the source rows read from the image each call): each frame makes as many rows of the level in progress as the budget left affords, at least one when the frame has made nothing else, so it always progresses even at a budget of 0. The passes are `mip_downscale`'s own: each halving a band of rows through `halve` (2 source rows a row, plus the third of a 1-2-1 across an odd height), the straight source premultiplied band by band (`premultiply_rgba`, opaque bands left alone), or, when no halving does that (level 1 of an odd side), a premultiply pass of its own, which keeps nothing while the rows are opaque (the source is borrowed at the end, as `mip_downscale` borrows it; a 4097² opaque picture used to hold a 67 MB copy) and, at the first translucent band, copies the opaque rows before it and premultiplies from there; then `finish` (bilinear and unpremultiply) in the frame the last row is made. The result is byte for byte `mip_downscale`'s. A job shares the frame's budget with every other copy: it is forced a row only on a frame that has made nothing else. Job buffers are not charged to `MINIFY_BUDGET_BYTES`; they hold no more than the one-shot path allocates. A job not drawn for `JOB_IDLE_FRAMES` (4) painted frames is dropped. A 4200x4200 image at 100px takes two frames. Pins: `image_minify`'s `a_picture_over_the_whole_budget_is_made_across_frames` (byte identity, odd sides, translucent, a budget of 0), `a_job_makes_no_row_on_a_frame_another_image_spent`, `an_opaque_source_is_borrowed_not_copied` and `an_abandoned_job_is_let_go`, and `rinch-dom/tests/image_minify_2747_tests.rs` (4200x4200 in a 100px `<img>`: idle within 4 frames, drawn as the level is). The `<img>` arm and the element's `paint_background` call compare it around their draw (`paint::defer_if_refused`) and push the node onto `NodeTree::minify_deferred` (a `RefCell`: paint holds the tree shared); `NodeTree::drain_deferred_minify` marks those nodes paint-dirty, called by `App::resolve_and_repaint` before `take_dirty_nodes` and by `resolve_layout` beside `drain_pending_images` (for hosts that call only that); `has_deferred_minify` is folded into `App::has_dirty_nodes`/`has_pending_layout` and the resolve short-circuit, so an idle screen still gets the frame. So three 3000x2000 pictures at 0.1x are filtered over two frames, not left aliased until an unrelated repaint. `background::pattern_source` does not keep a tile rasterised while `refusals()` moved: before, the unfiltered tile stayed in `background_tiles` for good. Not minified: SVG files (rasterised at the drawn size already), live frames (`paint_image_data`/`paint_frame_data`: no `decoded`), `pixelated`/`crisp-edges`. A repeating `url()` tile (`background::pattern_source`, both builds) samples the mipmap level in place of the image when its tile scale has one (#1753); the tile is already sampled bilinearly under `auto`. No Vello fork change: the copy is made on the CPU for both painters. Pins: `rinch/tests/image_filter_2534.rs` (error against Chrome's screenshots in 13 cases, odd sides and one-axis draws included, software, and Vello `--ignored`), `image_minify`'s `idle_copies_are_let_go`, `rinch-dom/tests/image_minify_2456_tests.rs` (per-line darkness against Chrome's, ink conserved and each line within 16 of Chrome's at 0.6x, pixelated stays nearest, one copy per level, the same image resized within and across levels, a picture over budget filtered on the next frame, a tile drawn over budget not cached), `image_minify`'s `the_work_budget_is_per_frame`, `rinch/tests/gpu_image_minify_2456.rs`, and `image_minify`'s unit tests.
 8. **Where an `<img>` draws its picture** (#2311): in its **content box**, as a browser draws a replaced element's content. The `<img>` arm of `paint_node_unmasked` fits the picture (`object-fit`, centred: `object-position` is not read, so its initial `50% 50%` is what both painters draw) into the border box less the border and padding layout resolved (`paint::content_box_insets_in`, Taffy's `padding`/`border`, so a percentage padding counts; review of #2311), so the padding shows the element's background and the border is drawn around the picture. A `border-radius` rounds the background and the border (`border_radii`, as on any box) and clips the picture to the content edge's curve (`BorderRadii::inner`), as `RenderSurface` frames and host textures already were (#1768, #2082). Before, the picture was fitted into the border box, covered the padding (the border was drawn over it), and the arm passed `BorderRadii::ZERO`, so a rounded `<img>` was square. The #2309 placeholder is drawn in the same content box under the same curved clip, so a rounded `<img>` whose load failed keeps its silver ring inside the curve. **Its box decorations are drawn as any box's (#2335)**, in the element arm's order: the outer `box-shadow`, every background layer (`background::paint_background`, so a gradient or url `background-image` too), the inset shadow, the picture, the border, then the `outline`. Before, the arm drew only a colour background, so an `<img>` had no shadow, outline or background image on either painter. Damage needed nothing: an `<img>`'s ink outsets are any element's (`own_ink_outsets`). Pinned in `rinch-dom/tests/paint_decorations_2396_tests.rs` and `rinch/tests/gpu_paint_decorations_2396.rs` (Chrome's pixels; the damage of a shadow and outline added and removed). The content box's pins: `rinch-dom/tests/img_content_box_2311_tests.rs` and `rinch/tests/gpu_img_content_box_2311.rs`, both against Chrome 156's pixels (uneven padding, a border, `fill`/`contain`/`cover`/`none`, a 20px radius).
 
+**The `error` event of an `<img>`** (#2202, #2203; rsx `onerror`, the
+`data-onerror` attribute). rinch-dom queues each `<img>` whose picture failed
+in `NodeTree::pending_img_errors` (one entry per element per drain, pruned
+when a node is freed): `drain_pending_images` queues every `<img>` naming a
+newly failed source, and `request_image_load_for_node` queues one whose `src`
+names a source already `Failed` (another element's earlier load, or a
+malformed `data:` URL just decoded in place, which never reaches
+`newly_failed`). An empty `src` (`src=""`, attribute present) is queued
+as it is written and accepted by the drain filter, since Chrome fires `error`
+for it; a missing `src` never reaches `request_image_load_for_node`. Desktop
+`onerror` is `<img>`-only; rinch-web's listener runs any target's
+`data-onerror`, so a failing `<video>`/`<source>` reaches it there. `RinchDocument::drain_img_errors` hands them over, keeping
+only elements that still name a source that `shows_failure` (a `src`
+rewritten to a good picture since is dropped). The shell fires their handlers
+in `after_layout`, after `dispatch_scroll_clamp_events`, with no document
+borrow (`RinchApp::dispatch_img_error_events`), so a handler's DOM writes (a
+fallback picture, an `Avatar`'s initials) are laid out by the bounds settle
+pass in the same frame; the resolve short-circuit stays open while the queue
+is not empty. A reload of a source showing a picture that fails keeps the
+picture and fires nothing, as `drain_pending` lists it nowhere. rinch-web
+listens for the browser's `error` in the capture phase (it does not bubble)
+and runs the target's `data-onerror`. An app scheme answered "not yet" gives
+the browser no `src`, so no `error`: `images.rs` fires `onerror` itself from
+a microtask (`announce_failed` / `fire_failed`) on the first ask, for an
+element given a source already "not yet", and for a reload that leaves an
+element with nothing to show. The queue's dedup (an unknown `register_rgba`
+name reaches it twice in a frame) and the drain's `shows_failure` filter (a
+`src` rewritten to a good picture before the drain) are pinned there too.
+Pins: `rinch/src/app/img_error_2202_tests.rs`,
+`rinch-web/tests/img_onerror_2202.rs`, and the components' markup in
+`rinch-components/tests/media_props_2202.rs`.
+
 **Placeholders for an `<img>` with no picture** (#2309, Joe's rules;
 `crates/rinch-dom/src/img_placeholder.rs`, painted by
 `paint/img_placeholder.rs` for both painters). "No picture" is no `src`
@@ -986,6 +1018,15 @@ after a trim. Both flags are one-shot flags on `Presenter`
 window (a stand-in surface that keeps its contents, on the virtual clock),
 so `testing/idle_trim_perf_2852_tests.rs` pins the lines through
 `window_perf::capture`, a test-only thread-local copy of what is printed.
+Whether a window will trim (#2917) is printed by `window_perf::idle_trim`
+where `paint_software_at` makes the window's `SoftbufferRenderer` (its first
+present, and again after a hide drops it), from
+`SoftbufferRenderer::idle_period`: the `Presenter`'s period, already `None`
+for a surface that does not keep its contents, so the line is the policy the
+trim actually follows rather than `WindowProps::idle_trim`'s. It is not on the
+`opened` line because that is printed at `register_perf`, before the OS
+window, its surface kind and its renderer exist (and the main window has no
+`opened` line). A GPU window makes no `SoftbufferRenderer` and prints none.
 **Reactive counters per document** (#2798). `rinch_core::reactive` keeps the
 thread's totals (`reactive_counters`, which `batch` also reads to tell whether
 it wrote) and, in the doc-keyed registry `DOC_COUNTERS`, each counted
@@ -1379,6 +1420,66 @@ Enable with `features = ["notifications"]` (off by default, no windowing needed;
 
 Enable with `features = ["global-hotkeys"]` (implies `windowing`, not `desktop`, #2435; off by default, adds no package to `Cargo.lock` — `hotkey::tests::the_backends_add_no_package_to_the_lock`). `rinch::hotkey::register(spec, |ev: &HotkeyEvent| …) -> Result<Hotkey, HotkeyError>` gives **press and release** of a system-wide shortcut on the main thread (one `batch` each, through `rinch_core::dispatch_main_callback`); `Hotkey::rebind`, drop unregisters, and a hotkey registered during a render dies with its component (the #183 menu rule: owner captured at registration, `on_cleanup` unregisters, a dead owner's report is dropped). Shortcut strings read their key through the menu's table (`menu::key_spelling_code`, shared — `every_menu_key_spelling_names_the_same_key_here` pins it) and add sided modifiers (`RightCtrl`), modifier-only bindings (last token a modifier), `Super` distinct from Ctrl, and any W3C `code`. `HotkeyCapture` turns the app's own key events into a shortcut for a settings field. Backends (`crates/rinch/src/hotkey/backend/`): Windows = a `WH_KEYBOARD_LL` hook whose proc only `PostThreadMessageW`s to its own pump thread (`LowLevelHooksTimeout`), plus `RegisterHotKey` to reserve (and swallow) plain chords and report `ERROR_HOTKEY_ALREADY_REGISTERED` as `Conflict`; each key-down first drops keys `GetAsyncKeyState` says are up (`Matcher::key_reconciled`) and a 100 ms poll runs while any key is believed down, so a key-up the hook missed (UIPI) neither strands a binding nor refuses the next chord. macOS = Carbon `RegisterEventHotKey` for plain chords (no permission), a listen-only `CGEventTap` started only for a modifier-only or sided binding (Input Monitoring; `permission()` / `request_permission()`); the tap reconciles modifiers against each event's flag bits and does not feed Caps Lock. Lock keys never count as a held key. X11 = `XGrabKey` to reserve chords (`BadAccess` → `Conflict`) + XInput2 raw key events for press/release; while our own grab is active the server sends core `KeyPress`/`KeyRelease` instead, which feed the same `Matcher`, with XKB detectable auto-repeat on (else a held chord was ~25 Released/Pressed pairs a second). Wayland = the GlobalShortcuts portal over raw zbus on a private thread inside a current-thread tokio runtime (not `ashpd`, which refuses to build with both its runtime features, and the workspace has one crate on each; zbus builds with both and then needs a tokio runtime, which the runtime gives either way). The app first names itself with `org.freedesktop.host.portal.Registry.Register` (KDE refuses an app with no id; the id needs an installed `.desktop` entry; `hotkey::set_app_id`, default the window's app id). When Register answers "App info not found", rinch writes a `NoDisplay=true` stub to `$XDG_DATA_HOME/applications/<id>.desktop` (`shell::rinch_runtime::ensure_desktop_entry`: skipped if a system or user entry exists, `create_new` so nothing is overwritten) and retries for up to 2 s; `hotkey::set_write_desktop_entry(false)` opts out. Combining `system-tray` and `file-dialogs` already puts zbus in tokio mode under rfd (#1526). The user binds in a system dialog, so `register` answers `Binding::Pending` and the outcome arrives as `Binding::SystemChosen`/`Declined` through `on_binding_change`. One session for the backend's life; commands queued in one turn are one BindShortcuts; a portal that will not re-bind gets a new session after everything held is released; a rebind opens ConfigureShortcuts on v2. A rebind bumps the entry's generation, which rides in the backend key (`backend_key`, bits 40+), so a report queued for the old binding is dropped. `HotkeyEvent::chorded` marks a `Released` after another key went down during the hold (toggle apps ignore it). Guide: `docs/src/guide/platform.md#global-hotkeys`. Example: `examples/global-hotkey-demo`.
 
+### Reduced motion (#2209)
+
+Stylo's servo build has no `prefers-reduced-motion` media feature: it is in
+Gecko's table only (`stylo/gecko/media_features.rs`; servo's ends at
+`prefers-color-scheme`). A query naming it failed to parse and became `not
+all`, so the theme's reduced-motion rule never applied on desktop, and
+`no-preference` and `not (… reduce)` never matched either. The table is a
+static array, so it has no hook.
+
+- **The answer is written into the sheet.** `rinch_dom::reduced_motion::rewrite`
+  runs on every author sheet in `parse_author_stylesheet`, after
+  `webkit_box::rewrite`. In each `@media` prelude it replaces
+  `(prefers-reduced-motion)`, `(… reduce)` and `(… no-preference)` with
+  `(min-width: 0px)`, which always matches, or `(scan)`, which servo never
+  matches. Any other value is left as the parse error it also is in Chrome.
+  Comments and strings are skipped.
+- **A change re-parses.** Each sheet whose source names the feature is kept
+  with that source (`RinchDocument::motion_sheets`).
+  `RinchDocument::set_prefers_reduced_motion` swaps each live one's
+  `StylesheetContents` for a re-parse (same `DocumentStyleSheet`, so the
+  cascade order is unchanged), forces the author origin dirty, and restyles
+  everything the way a DPR change does (`FullRestyleReason::Stylesheet`).
+  Entries for sheets that left the document are dropped by
+  `forget_dead_motion_sheets`, run there, at the end of `set_theme_css` and at
+  the end of `sync_style_element_sheets`: each entry holds its sheet strongly,
+  and the theme names the feature by default, so before that every theme
+  replacement (and every text change of such a `<style>`) kept one more sheet
+  alive until the preference changed. A document with no such sheet pays a
+  bool compare.
+- **Only `@media` preludes are rewritten.** An `@import`'s media list naming
+  the feature is left as Stylo parses it, which has no such feature.
+- **The process's preference** is `rinch_dom::reduced_motion::prefers_reduced_motion`,
+  an atomic that a new document starts from. `rinch::reduced_motion` sets it
+  from the app's override, else the OS's setting
+  (`effective_of(override, system)`). Each window's
+  `App::reduced_motion_owed` compares its document against it, in both "is
+  there anything to do?" predicates. `App::adopt_reduced_motion` applies it at
+  the top of `resolve_and_repaint`, before the short-circuit, as system fonts
+  are adopted.
+- **The OS read** (`rinch::reduced_motion::refresh_from_os`): at `App::run`, and
+  on every `WindowEvent::Focused(true)`, since the change is made in another
+  window.
+  - Linux: KDE's `kdeglobals` when `XDG_CURRENT_DESKTOP` names KDE; otherwise
+    `gsettings get org.gnome.desktop.interface enable-animations`, then GTK 3's
+    `settings.ini`. Linux reads on a short-lived thread, one at a time.
+  - Windows: `SPI_GETCLIENTAREAANIMATION`, inline.
+  - macOS: `NSWorkspace.accessibilityDisplayShouldReduceMotion`, inline.
+
+  A change is published through `dispatch_main_callback`, which wakes the loop
+  and bumps the signal behind the reactive `rinch::prefers_reduced_motion`.
+- **Not here:** rinch-web, where the browser evaluates the query. Smooth wheel
+  scrolling does not follow the preference by itself.
+
+Tests: `rinch-dom/tests/reduced_motion_2209_tests.rs` (every form with either
+preference, a change restyling `load_css`, theme and `<style>` sheets, and the
+theme rule's 0.01ms transitions), the rewrite's unit tests,
+`rinch/tests/reduced_motion_2209.rs` (the override restyling a running window
+and waking the getter; its own binary because the preference is
+process-wide), and the parsers' unit tests in `rinch/src/reduced_motion.rs`.
+
 ### Theme System (optional)
 
 Enable with `features = ["theme"]` for the theme system inspired by Mantine.
@@ -1434,6 +1535,41 @@ onto them changes nothing there: `crates/rinch/tests/light_variants_dark_scheme_
 compares every light-scheme sample with a swatch of the old shade, and checks the
 dark scheme's fills are dark, its text reads (4.5:1) and rest, hover and active
 stay three colours.
+
+**Text on a filled colour is a contrast token, not `white`** (#2208).
+`generate_css_variables` writes `--rinch-color-{name}-contrast` (from shade 6)
+and `--rinch-primary-color-contrast` (from the primary shade), each
+`rinch_theme::contrast_text` of the hex: black above relative luminance 0.45,
+else white. The threshold was picked so the default palette keeps today's
+text (white everywhere but yellow and lime, Badge's old `#000`); Chrome's own
+midpoint (~0.2) would have flipped blue. A component with a `color` prop writes
+`{prefix}-color` and `{prefix}-contrast` inline through
+`color_utils::accent_vars` (Button through `style_string`'s
+`--rinch-button-color-contrast`), and its rule reads
+`var({prefix}-contrast, var(--rinch-primary-color-contrast))`. Alert's yellow
+keeps its `yellow-9` text. Each use carries a literal fallback (`var(--rinch-primary-color-contrast, white)`, `black` for Badge's yellow/lime), so a document with the component sheet and no theme paints what it painted before (the `css_hook_760`, `decorative_pseudo_773` and `overlay_animation_audit` shell tests load it that way). Pinned by `crates/rinch/tests/filled_contrast_2208.rs`
+(yellow primary reads 4.5:1 in both schemes; the default theme still paints
+white).
+
+**The component sheet can be layered or left out** (#2208).
+`ThemeProviderProps::component_styles` (`rinch_core::ComponentStyles`) reaches
+`generate_theme_css_string`, which hands the theme CSS to
+`rinch_components::compose_theme_and_component_css`: `Unlayered` concatenates
+(the default, unchanged), `Layered` wraps the theme in `@layer rinch-theme` and
+the components in `@layer rinch-components` after a `@layer rinch-theme,
+rinch-components;` statement, `Off` returns the theme plus
+`styles::generate_chrome_styles` (menu bar, borderless window, context menu:
+the shell reserves `MENU_BAR_HEIGHT` from the bar's rules). The bare-focus scan
+(`rules_have_bare_focus`, `style_resolution/mod.rs`) recurses into every rule
+with children (`CssRule::children`), so the theme's `:focus-visible` ring
+inside `@layer rinch-theme` still makes nodes focus-sensitive; it used to look
+only inside `@media` and `@supports`, and under `Layered` no ring painted. Stylo 0.22's servo
+build parses and cascades `@layer` (see `crates/rinch-dom/tests/style_sheet_order_2694_tests.rs`).
+The base styles must be layered with the components: their unlayered
+`button, input, select, textarea { color: inherit }` would otherwise outrank
+every layered component colour. Pinned by `crates/rinch/tests/component_layers_2208.rs`
+(layered paints like unlayered; a `button` rule outranks only the layered sheet;
+`Off` has no fill).
 
 **Generic font families are repaired on Android** (`crates/rinch-dom/src/fonts.rs`,
 issue #322). fontique maps the `monospace` slot to the literal name `"monospace"`,
@@ -1494,6 +1630,75 @@ installed between the start-up scan and the first arm is seen at the next
 change, as before. (Measured with #2773: next paragraph.) Pin: `crates/rinch/tests/system_font_watch_2774.rs` (the
 watch started first scans nothing, then sees an install), beside
 `system_font_watch_2537.rs`.
+
+**The generic families are resolved after the first frame** (#2552 stage
+2, `rinch/src/font_warmup.rs`, `rinch_dom::fonts::warm_generic_families`). A
+glyph the first families of a stack lack (a menu's `✓` or `▸`) makes parley's
+`select_font` walk the generic list family by family until one has it, and
+the first `family(id)` of each is fontique's `family_uncached`, an
+`FcFontSort` over every installed font (1–4 ms each). fontique keeps the
+answers in the `SystemFonts` behind the scan's `Arc<Mutex>`, so they are
+paid once per process, but on the UI thread of whichever document needs
+them first: deskrinch's first panel menu took 80–560 ms to show, 121
+`FcFontSort` calls (counted with a gdb breakpoint) and nothing else of note.
+After the first presented frame of any window (`window_presented`, from the
+`RedrawRequested` arm) a `rinch-font-warmup` thread builds a collection as a
+document's (the UI thread's `FontDefaults` passed in, so the app's own
+`serif`/`sans-serif` head their slots, and the families `standard` names
+are looked up too) and asks `family` for every id of the `sans-serif`,
+`system-ui`, `serif` and `monospace` lists (249 families on a 578-family
+host). Measured with a no-text app (`[PERF] font warm-up: …`, thread CPU
+from `CLOCK_THREAD_CPUTIME_ID`): 0.5–1.2 s wall, 250–670 ms of thread CPU,
+about 1 MB of RSS kept afterwards (38.6 MB against 37.6 MB with it off). An
+app with no text still pays it: its first document makes the scan. A
+windowless app presents nothing and never warms up after a first frame (its RSS stayed at
+33 MB with or without the warm-up): a notification daemon's first popup pays the walk unless
+it shows a window first. The longest single look-up, about the longest a
+document waits for the lock meanwhile, was 2–14 ms. It never scans (none yet: it answers 0), and
+each lookup takes the lock for itself alone with a 1 ms pause after it: the
+lock is not fair, and without the pause the warm-up took it back at once
+while a tooltip opened at start-up waited 260 ms (seen on RADV). It runs once
+per process; `App::font_warmup(FontWarmup::Off)` turns it off, and
+`FontWarmup::AtStart` starts it in `App::run` (`font_warmup::app_started`,
+after the font defaults are set) instead, for a windowless app or a hidden
+main window: the thread then makes the scan itself when no document has
+(`new_font_context`), and its `[PERF]` wall time includes that scan. Pin:
+`at_start_the_warm_up_runs_with_no_window_2552`. A
+refresh (#2486) gives the families new ids and is not warmed again. Pin:
+`rinch-dom/tests/font_warmup_2552.rs`.
+
+**rustix reads the aux vector through libc** (#3016). The warm-up's
+`thread_cpu` (only for the `[PERF]` line and its `tracing::debug!` twin) was
+the process's first rustix `clock_gettime`, which looks up the vDSO in the aux
+vector. rustix 1.x reads that vector with `prctl(PR_GET_AUXV)` unless told
+otherwise; Valgrind passes the prctl to the kernel, which answers with the real
+process's vector, whose `AT_SYSINFO_EHDR` is the host's vDSO, unmapped in the
+guest. So under Callgrind and Memcheck every rinch app died once the warm-up
+started: SIGSEGV in `rustix::backend::param::auxv::check_elf_base` on any
+thread, or Callgrind's `threads.c:247` signal assertion where a handler caught
+it (deskrinch). It was not the warm-up thread as such: `clock_gettime` on the
+main thread, or `rustix::param::page_size`, dies the same way, while libc's
+`clock_gettime` and `getrusage(RUSAGE_THREAD)` run. rinch's rustix dependency
+(`crates/rinch/Cargo.toml`) now has `use-libc-auxv`: glibc's `getauxval`
+returns the vector Valgrind built. Features unify, so it covers every rustix
+1.x user in the process (calloop, polling, wayland-backend, x11rb). Keep it
+when the dependency line is touched. Pin:
+`font_warmup::tests::the_warm_up_runs_under_valgrind_3016`, which runs the
+at-start pin above under both tools; it skips without valgrind, except in CI's
+`test (unit)` shard (`RINCH_REQUIRE_VALGRIND=1`, valgrind installed). An app
+measured under Callgrind that wants the warm-up's own work out of its counts
+sets `App::font_warmup(FontWarmup::Off)`; the measurement itself no longer
+needs turning off. rinch-bench drives `RinchApp` directly, never
+`RinchRuntime` or `App::run`, so its benchmarks start no warm-up thread.
+
+What it leaves per document (measured with `perf` and gdb on the popup menu,
+release, about 1.5–3 ms of a 4–6 ms software popup): `SystemFonts::fallback`
+is not cached across collections (a new collection's `data.fallbacks` starts
+empty), so each new document pays an `FcFontMatch` per script it falls back
+for, two for the menu; and each document's `SourceCache` maps the files of
+the fonts its walk opens (about 20 for the menu) and unmaps them when it
+goes. Sharing either across documents would need fontique's shared modes
+(which share registered fonts and generic slots too) or a fork change.
 
 **The text settings read on the shared scan** (#2773). On Linux
 `rinch::text_rasterization` reads the OS's text settings (antialias, hinting,
@@ -1813,7 +2018,7 @@ get the fallbacks. rinch-web is unaffected: the browser resolves the units.
 is published at runtime by whatever chrome rinch draws above your content — the
 DOM menu bar (28px, on Linux and in the browser alike: `render_with_menu_bar`
 publishes it on its own wrapper *and* on `scope.body_handle()`) and the
-`BorderlessWindow` titlebar (36px, +28 when
+`BorderlessWindow` titlebar (its `titlebar_height`, 36px by default, +28 when
 the menu bar sits below it). That chrome reserves space with in-document padding,
 so normal flow content clears it automatically; a `position: fixed` element does
 **not**, because fixed resolves against the real viewport (matching browsers and
